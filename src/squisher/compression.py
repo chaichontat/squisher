@@ -56,11 +56,7 @@ def compress_czi_to_ome_tiff(
 
     reader = CziFile(path)
     dims = reader.get_dims_shape()[0]
-    plane_count = (
-        len(_czi_dim_indexes(dims, "T"))
-        * len(_czi_dim_indexes(dims, "C"))
-        * len(_czi_dim_indexes(dims, "Z"))
-    )
+    plane_count = _czi_plane_count(dims)
     if resume:
         pending_tiles = []
         incomplete_existing = []
@@ -123,11 +119,7 @@ def verify_czi_ome_tiff_outputs(path: Path, *, decode_samples: bool = False) -> 
     reader = CziFile(path)
     dims = reader.get_dims_shape()[0]
     tiles = _czi_tiles(path)
-    plane_count = (
-        len(_czi_dim_indexes(dims, "T"))
-        * len(_czi_dim_indexes(dims, "C"))
-        * len(_czi_dim_indexes(dims, "Z"))
-    )
+    plane_count = _czi_plane_count(dims)
 
     errors = []
     for tile in tiles:
@@ -162,7 +154,7 @@ def _write_czi_tile_to_ome_tiff(
     c_indexes = _czi_dim_indexes(dims, "C")
     z_indexes = _czi_dim_indexes(dims, "Z")
     out = _czi_tile_ome_tiff_path(path, tile, tile_count)
-    plane_count = len(t_indexes) * len(c_indexes) * len(z_indexes)
+    plane_count = _czi_plane_count(dims)
     ome_shape = (len(t_indexes), len(c_indexes), len(z_indexes), tile["height"], tile["width"])
 
     print(
@@ -203,14 +195,15 @@ def _verify_ome_tiff(path: Path, out: Path, *, tile: CziTile, plane_count: int) 
     errors = []
     try:
         with TiffFile(out) as tif:
+            expected_shape = (tile["height"], tile["width"])
             if len(tif.pages) != plane_count:
                 errors.append(f"{out.name}: expected {plane_count} pages, found {len(tif.pages)}")
             if tif.pages[0].compression != 22610:
                 errors.append(f"{out.name}: expected compression 22610, found {tif.pages[0].compression}")
             if not tif.pages[0].is_tiled:
                 errors.append(f"{out.name}: first page is not tiled")
-            if tif.pages[0].shape != (tile["height"], tile["width"]):
-                errors.append(f"{out.name}: expected page shape {(tile['height'], tile['width'])}, found {tif.pages[0].shape}")
+            if tif.pages[0].shape != expected_shape:
+                errors.append(f"{out.name}: expected page shape {expected_shape}, found {tif.pages[0].shape}")
             errors.extend(_verify_ome_metadata(path, out.name, tif.ome_metadata, tile=tile, plane_count=plane_count))
     except (OSError, ValueError, KeyError, IndexError, tifffile.TiffFileError) as exc:
         errors.append(f"{out.name}: unreadable TIFF/OME metadata: {exc}")
@@ -288,11 +281,11 @@ def _decode_sample_pages(out: Path, *, plane_count: int) -> list[str]:
     with TiffFile(out) as tif:
         for page_index in sorted({0, plane_count // 2, plane_count - 1}):
             try:
-                page = tif.pages[page_index].asarray()
+                decoded = tif.pages[page_index].asarray()
             except (OSError, ValueError, RuntimeError, tifffile.TiffFileError) as exc:
                 errors.append(f"{out.name}: failed to decode page {page_index}: {exc}")
                 continue
-            if page.shape != tif.pages[page_index].shape:
+            if decoded.shape != tif.pages[page_index].shape:
                 errors.append(f"{out.name}: decoded page {page_index} shape mismatch")
     return errors
 
@@ -589,6 +582,14 @@ def _compression_level(level: float) -> float:
 def _czi_dim_indexes(dims: dict[str, tuple[int, int]], dim: str) -> list[int]:
     start, end = dims.get(dim, (0, 1))
     return list(range(int(start), int(end)))
+
+
+def _czi_plane_count(dims: dict[str, tuple[int, int]]) -> int:
+    return (
+        len(_czi_dim_indexes(dims, "T"))
+        * len(_czi_dim_indexes(dims, "C"))
+        * len(_czi_dim_indexes(dims, "Z"))
+    )
 
 
 def _first_czi_dim(dims: dict[str, tuple[int, int]], dim: str) -> int:
