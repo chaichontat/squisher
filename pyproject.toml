@@ -1,0 +1,37 @@
+[project]
+name = "squisher"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Chaichontat Sriworarat", email = "csriwor1@jh.edu" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aicspylibczi>=3.3.1",
+    "imagecodecs>=2026.5.10",
+    "numpy>=2.4.6",
+    "tifffile>=2026.6.1",
+    "typer>=0.26.5",
+]
+
+[project.scripts]
+squisher = "squisher:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pylibczirw>=6.0.1",
+    "pytest>=9.0.3",
+    "ruff>=0.15.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
