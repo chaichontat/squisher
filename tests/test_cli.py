@@ -8,6 +8,7 @@ def test_cli_exposes_compress_subcommand() -> None:
 
     assert result.exit_code == 0
     assert "compress" in result.stdout
+    assert "verify" in result.stdout
 
 
 def test_compress_accepts_czi_options(tmp_path) -> None:
@@ -29,6 +30,16 @@ def test_compress_accepts_czi_options(tmp_path) -> None:
             "--resume",
         ],
     )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ValueError)
+    assert "Expected a .czi input file" in str(result.exception)
+
+
+def test_verify_accepts_decode_samples_option(tmp_path) -> None:
+    non_czi = tmp_path / "sample.txt"
+    non_czi.write_text("not a czi")
+    result = CliRunner().invoke(app, ["verify", str(non_czi), "--decode-samples"])
 
     assert result.exit_code == 1
     assert isinstance(result.exception, ValueError)

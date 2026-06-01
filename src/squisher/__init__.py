@@ -3,7 +3,7 @@ from typing import Annotated
 
 import typer
 
-from squisher.compression import compress_czi_to_ome_tiff
+from squisher.compression import compress_czi_to_ome_tiff, verify_czi_ome_tiff_outputs
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -31,6 +31,14 @@ def compress(
         tile_workers=czi_tile_workers,
         resume=resume,
     )
+
+
+@app.command()
+def verify(
+    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    decode_samples: Annotated[bool, typer.Option("--decode-samples/--no-decode-samples")] = False,
+) -> None:
+    verify_czi_ome_tiff_outputs(path, decode_samples=decode_samples)
 
 
 def main() -> None:

@@ -16,6 +16,7 @@ JPEG_XR_KWARGS = {"photometric": "minisblack", "compression": 22610}
 CZI_PROGRESS_INTERVAL = 100
 OME_ORIGINAL_METADATA_NAMESPACE = "openmicroscopy.org/OriginalMetadata"
 CZI_RAW_METADATA_NAMESPACE = "fishtools/czi/raw-metadata"
+OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
 
 
 class CziTile(TypedDict):
@@ -113,6 +114,39 @@ def compress_czi_to_ome_tiff(
     return True
 
 
+def verify_czi_ome_tiff_outputs(path: Path, *, decode_samples: bool = False) -> bool:
+    from aicspylibczi import CziFile
+
+    if path.suffix.lower() != ".czi":
+        raise ValueError(f"Expected a .czi input file, got {path}")
+
+    reader = CziFile(path)
+    dims = reader.get_dims_shape()[0]
+    tiles = _czi_tiles(path)
+    plane_count = (
+        len(_czi_dim_indexes(dims, "T"))
+        * len(_czi_dim_indexes(dims, "C"))
+        * len(_czi_dim_indexes(dims, "Z"))
+    )
+
+    errors = []
+    for tile in tiles:
+        out = _czi_tile_ome_tiff_path(path, tile, len(tiles))
+        if not out.exists():
+            errors.append(f"{out.name}: missing")
+            continue
+        tile_errors = _verify_ome_tiff(path, out, tile=tile, plane_count=plane_count)
+        errors.extend(tile_errors)
+        if decode_samples and not tile_errors:
+            errors.extend(_decode_sample_pages(out, plane_count=plane_count))
+
+    if errors:
+        preview = "\n".join(f"- {error}" for error in errors[:20])
+        suffix = f"\n... {len(errors) - 20} more error(s)" if len(errors) > 20 else ""
+        raise ValueError(f"OME-TIFF verification failed for {path}:\n{preview}{suffix}")
+    return True
+
+
 def _write_czi_tile_to_ome_tiff(
     reader: Any,
     path: Path,
@@ -163,6 +197,104 @@ def _write_czi_tile_to_ome_tiff(
                         )
     print(f"Finished {out.name}", flush=True)
     return out
+
+
+def _verify_ome_tiff(path: Path, out: Path, *, tile: CziTile, plane_count: int) -> list[str]:
+    errors = []
+    try:
+        with TiffFile(out) as tif:
+            if len(tif.pages) != plane_count:
+                errors.append(f"{out.name}: expected {plane_count} pages, found {len(tif.pages)}")
+            if tif.pages[0].compression != 22610:
+                errors.append(f"{out.name}: expected compression 22610, found {tif.pages[0].compression}")
+            if not tif.pages[0].is_tiled:
+                errors.append(f"{out.name}: first page is not tiled")
+            if tif.pages[0].shape != (tile["height"], tile["width"]):
+                errors.append(f"{out.name}: expected page shape {(tile['height'], tile['width'])}, found {tif.pages[0].shape}")
+            errors.extend(_verify_ome_metadata(path, out.name, tif.ome_metadata, tile=tile, plane_count=plane_count))
+    except (OSError, ValueError, KeyError, IndexError, tifffile.TiffFileError) as exc:
+        errors.append(f"{out.name}: unreadable TIFF/OME metadata: {exc}")
+    return errors
+
+
+def _verify_ome_metadata(
+    path: Path,
+    output_name: str,
+    ome_metadata: str | None,
+    *,
+    tile: CziTile,
+    plane_count: int,
+) -> list[str]:
+    if not ome_metadata:
+        return [f"{output_name}: missing OME metadata"]
+
+    errors = []
+    root = ET.fromstring(ome_metadata)
+    map_values = _map_annotation_values(root)
+    expected_values = {
+        "squisher.source_file": path.name,
+        "squisher.source_format": "CZI",
+        "squisher.output_tile_index": str(tile["index"]),
+        "czi.scene": str(tile["scene"]),
+        "czi.tile_width": str(tile["width"]),
+        "czi.tile_height": str(tile["height"]),
+    }
+    if "mosaic_index" in tile:
+        expected_values["czi.mosaic_index"] = str(tile["mosaic_index"])
+    for key, expected in expected_values.items():
+        if map_values.get(key) != expected:
+            errors.append(f"{output_name}: expected MapAnnotation {key}={expected!r}, found {map_values.get(key)!r}")
+    if not map_values.get("czi.global_metadata_xml", "").startswith("<ImageDocument"):
+        errors.append(f"{output_name}: missing raw global CZI XML in MapAnnotation")
+    if not map_values.get("czi.subblock_metadata_xml", "").startswith("<Subblocks"):
+        errors.append(f"{output_name}: missing raw subblock CZI XML in MapAnnotation")
+
+    raw_annotations = [
+        annotation
+        for annotation in root.findall(".//ome:XMLAnnotation", OME_NS)
+        if annotation.attrib.get("Namespace") == CZI_RAW_METADATA_NAMESPACE
+    ]
+    if len(raw_annotations) != 1:
+        errors.append(f"{output_name}: expected one raw CZI XMLAnnotation, found {len(raw_annotations)}")
+        return errors
+    if root.find(f".//ome:AnnotationRef[@ID='{raw_annotations[0].attrib['ID']}']", OME_NS) is None:
+        errors.append(f"{output_name}: raw CZI XMLAnnotation is not linked by AnnotationRef")
+    value = raw_annotations[0].find("ome:Value", OME_NS)
+    if value is None or len(value) != 1 or value[0].tag != "CZIProvenanceMetadata":
+        errors.append(f"{output_name}: malformed raw CZI XMLAnnotation value")
+        return errors
+
+    provenance = value[0]
+    global_metadata = provenance.find("GlobalMetadata")
+    subblock_metadata = provenance.find("SubblockMetadata")
+    if global_metadata is None or len(global_metadata) != 1 or global_metadata[0].tag != "ImageDocument":
+        errors.append(f"{output_name}: raw provenance is missing CZI ImageDocument")
+    if subblock_metadata is None or len(subblock_metadata) != 1 or subblock_metadata[0].tag != "Subblocks":
+        errors.append(f"{output_name}: raw provenance is missing CZI Subblocks")
+    elif len(subblock_metadata[0]) != plane_count:
+        errors.append(f"{output_name}: expected {plane_count} raw subblock records, found {len(subblock_metadata[0])}")
+    return errors
+
+
+def _map_annotation_values(root: ET.Element) -> dict[str, str]:
+    return {
+        item.attrib["K"]: item.text or ""
+        for item in root.findall(".//ome:MapAnnotation/ome:Value/ome:M", OME_NS)
+    }
+
+
+def _decode_sample_pages(out: Path, *, plane_count: int) -> list[str]:
+    errors = []
+    with TiffFile(out) as tif:
+        for page_index in sorted({0, plane_count // 2, plane_count - 1}):
+            try:
+                page = tif.pages[page_index].asarray()
+            except (OSError, ValueError, RuntimeError, tifffile.TiffFileError) as exc:
+                errors.append(f"{out.name}: failed to decode page {page_index}: {exc}")
+                continue
+            if page.shape != tif.pages[page_index].shape:
+                errors.append(f"{out.name}: decoded page {page_index} shape mismatch")
+    return errors
 
 
 def _write_czi_tile_to_ome_tiff_process(

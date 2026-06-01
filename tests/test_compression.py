@@ -7,7 +7,7 @@ import pytest
 from pylibCZIrw import czi
 from tifffile import TiffFile
 
-from squisher.compression import _czi_subblock_metadata, compress_czi_to_ome_tiff
+from squisher.compression import _czi_subblock_metadata, compress_czi_to_ome_tiff, verify_czi_ome_tiff_outputs
 
 
 OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
@@ -57,6 +57,7 @@ def test_compress_czi_writes_tiled_ome_tiff_with_raw_metadata(tmp_path: Path) ->
         assert readback.shape == data.shape
         assert readback.dtype == data.dtype
         assert abs(float(readback.mean()) - float(data.mean())) < 10
+    assert verify_czi_ome_tiff_outputs(czi_path, decode_samples=True)
 
 
 def test_compress_czi_writes_each_tile_and_placement(tmp_path: Path) -> None:
@@ -99,6 +100,18 @@ def test_compress_czi_refuses_to_overwrite_existing_output(tmp_path: Path) -> No
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1)
+
+
+def test_verify_czi_detects_missing_tile_outputs(tmp_path: Path) -> None:
+    czi_path = tmp_path / "sample.czi"
+    tiles = [
+        np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5)),
+        np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+
+    with pytest.raises(ValueError, match="sample.000.ome.tif: missing"):
+        verify_czi_ome_tiff_outputs(czi_path)
 
 
 def test_empty_subblock_metadata_is_preserved_as_empty_marker() -> None:
