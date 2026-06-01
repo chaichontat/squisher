@@ -465,8 +465,23 @@ def _first_czi_dim(dims: dict[str, tuple[int, int]], dim: str) -> int:
 
 def _czi_subblock_metadata(reader: Any, tile: CziTile) -> ET.Element:
     if "mosaic_index" in tile:
-        return reader.read_subblock_metadata(unified_xml=True, M=tile["mosaic_index"])
-    return reader.read_subblock_metadata(unified_xml=True, S=tile["scene"])
+        subblocks = reader.read_subblock_metadata(unified_xml=False, M=tile["mosaic_index"])
+    else:
+        subblocks = reader.read_subblock_metadata(unified_xml=False, S=tile["scene"])
+
+    root = ET.Element("Subblocks")
+    for dims, raw_metadata in subblocks:
+        subblock = ET.Element("Subblock")
+        for dim, number in dims.items():
+            subblock.set(dim, str(number))
+        if "S" not in dims:
+            subblock.set("S", "0")
+        if raw_metadata.strip():
+            subblock.append(ET.fromstring(raw_metadata))
+        else:
+            subblock.set("MetadataEmpty", "true")
+        root.append(subblock)
+    return root
 
 
 def _metadata_text(metadata: Any) -> str:

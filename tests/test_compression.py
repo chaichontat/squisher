@@ -7,7 +7,7 @@ import pytest
 from pylibCZIrw import czi
 from tifffile import TiffFile
 
-from squisher.compression import compress_czi_to_ome_tiff
+from squisher.compression import _czi_subblock_metadata, compress_czi_to_ome_tiff
 
 
 OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
@@ -99,6 +99,20 @@ def test_compress_czi_refuses_to_overwrite_existing_output(tmp_path: Path) -> No
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1)
+
+
+def test_empty_subblock_metadata_is_preserved_as_empty_marker() -> None:
+    class Reader:
+        def read_subblock_metadata(self, unified_xml: bool, **kwargs):
+            assert unified_xml is False
+            assert kwargs == {"M": 3}
+            return [({"M": 3, "C": 0, "Z": 0}, "")]
+
+    metadata = _czi_subblock_metadata(Reader(), {"index": 0, "scene": 0, "mosaic_index": 3})
+
+    assert ET.tostring(metadata, encoding="unicode") == (
+        '<Subblocks><Subblock M="3" C="0" Z="0" S="0" MetadataEmpty="true" /></Subblocks>'
+    )
 
 
 def _map_annotation_values(ome_metadata: str) -> dict[str, str]:
