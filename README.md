@@ -56,16 +56,14 @@ If `<stem>_placement.json` is present, tile origins are used for OME `PositionX`
 For large tiled CZI files, run from the output directory with a symlink to the source CZI so outputs are written beside the link:
 
 ```bash
-ln -s /data/20x-EdUTest-514-L3.czi 20x-EdUTest-514-L3.czi
-uv run squisher compress 20x-EdUTest-514-L3.czi \
+ln -s /data/sample.czi sample.czi
+uv run squisher compress sample.czi \
   --level 90 \
   --tile-size 512 \
   --czi-tile-workers 8 \
   --tiff-maxworkers 4
-uv run squisher verify 20x-EdUTest-514-L3.czi --decode-samples
+uv run squisher verify sample.czi --decode-samples
 ```
-
-The `20x-EdUTest-514-L3.czi` test run wrote 47 tiled OME-TIFF files, `.000.ome.tif` through `.046.ome.tif`, totaling 113G, and passed `verify --decode-samples`.
 
 Future large runs should try more tile-level parallelism first, for example `--czi-tile-workers 16 --tiff-maxworkers 4`, while watching memory and disk throughput.
 
