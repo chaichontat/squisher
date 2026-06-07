@@ -6,10 +6,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+$runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )
-if (-not $isWindows) {
+if (-not $runningOnWindows) {
     throw "This build script must run on Windows so PyInstaller can collect Windows native DLLs."
 }
 
