@@ -75,6 +75,15 @@ uv run ruff check --output-format=concise src tests
 uv run pytest -q
 ```
 
+Build the standalone Windows executable from Windows:
+
+```powershell
+pwsh ./scripts/build-windows-exe.ps1
+```
+
+The executable is written to `dist/squisher.exe`. GitHub Actions also publishes it as the
+`squisher-windows-exe` artifact.
+
 ## License
 
 MIT

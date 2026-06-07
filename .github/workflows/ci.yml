@@ -30,3 +30,30 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
+
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Build executable
+        shell: pwsh
+        run: ./scripts/build-windows-exe.ps1
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: ./dist/squisher.exe --help
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v5
+        with:
+          name: squisher-windows-exe
+          path: dist/squisher.exe
