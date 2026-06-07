@@ -38,15 +38,11 @@ def smoke_czi(tmp_path: Path) -> Path:
 
 
 def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, tmp_path: Path) -> None:
-    out_dir = tmp_path / "out"
-
     result = subprocess.run(
         [
             str(squisher_exe),
             "compress",
             str(smoke_czi),
-            "--out-dir",
-            str(out_dir),
             "--level",
             "90",
             "--tile-size",
@@ -55,7 +51,6 @@ def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, t
             "1",
             "--czi-tile-workers",
             "1",
-            "--no-thumbnails",
         ],
         check=False,
         capture_output=True,
@@ -63,7 +58,7 @@ def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, t
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    out = out_dir / "sample.ome.tif"
+    out = tmp_path / "sample.ome.tif"
     assert out.exists()
 
     with TiffFile(out) as tif:
@@ -71,7 +66,7 @@ def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, t
         assert tif.pages[0].is_tiled
 
     verify = subprocess.run(
-        [str(squisher_exe), "verify", str(smoke_czi), "--out-dir", str(out_dir), "--decode-samples"],
+        [str(squisher_exe), "verify", str(smoke_czi), "--decode-samples"],
         check=False,
         capture_output=True,
         text=True,

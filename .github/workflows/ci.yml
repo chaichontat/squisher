@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -59,3 +62,19 @@ jobs:
         with:
           name: squisher-windows-exe
           path: dist/squisher.exe
+
+      - name: Publish executable release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $tag = "squisher-exe-$shortSha"
+          $title = "squisher.exe $shortSha"
+          $notes = "Windows standalone executable built from commit ${{ github.sha }}."
+          if (gh release view $tag 2>$null) {
+              gh release upload $tag dist\squisher.exe --clobber
+          } else {
+              gh release create $tag dist\squisher.exe --target "${{ github.sha }}" --title $title --notes $notes
+          }
