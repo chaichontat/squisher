@@ -50,7 +50,9 @@ jobs:
 
       - name: Smoke test executable
         shell: pwsh
-        run: ./dist/squisher.exe --help
+        env:
+          SQUISHER_EXE: ${{ github.workspace }}\dist\squisher.exe
+        run: uv run pytest -q tests/test_exe_smoke.py
 
       - name: Upload executable
         uses: actions/upload-artifact@v5
