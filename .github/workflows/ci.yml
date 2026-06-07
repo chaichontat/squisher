@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -36,6 +36,9 @@ jobs:
 
   build-windows-exe:
     runs-on: windows-latest
+    needs: test
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -69,12 +72,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $shortSha = "${{ github.sha }}".Substring(0, 7)
-          $tag = "squisher-exe-$shortSha"
-          $title = "squisher.exe $shortSha"
+          $tag = "squisher-exe-${{ github.sha }}"
+          $title = "squisher.exe ${{ github.sha }}"
           $notes = "Windows standalone executable built from commit ${{ github.sha }}."
           if (gh release view $tag 2>$null) {
-              gh release upload $tag dist\squisher.exe --clobber
+              Write-Host "Release $tag already exists; leaving existing asset unchanged."
           } else {
               gh release create $tag dist\squisher.exe --target "${{ github.sha }}" --title $title --notes $notes
           }

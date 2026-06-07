@@ -1,8 +1,14 @@
 # squisher
 
-Lossy CZI to tiled OME-TIFF compression with JPEG-XR TIFF tag `22610`.
+Lossy CZI to tiled OME-TIFF or OME-Zarr compression with imagecodecs-backed codecs.
 
-`squisher` is meant for compressed microscopy archives that can replace the original CZI as the record copy. It writes OME-TIFF, preserves parsed OME metadata, and stores raw CZI global and per-tile subblock metadata in a linked OME `XMLAnnotation`.
+`squisher` is meant for compressed microscopy archives that can replace the original CZI as the record copy when lossy output is acceptable. It writes OME-TIFF with JPEG-XR TIFF tag `22610`, or OME-Zarr with imagecodecs-backed JPEG-XR/JPEG-XL chunks. OME-TIFF output preserves parsed OME metadata and stores raw CZI global and per-tile subblock metadata in a linked OME `XMLAnnotation`.
+Each output also records squisher provenance and compression settings in OME `MapAnnotation`
+entries, including the JPEG-XR tag, normalized quality level, tile size, worker settings,
+output directory, and a JSON settings blob.
+
+The default `--level 0.65` is lossy. Use `--level 1` or `--level 100` when you need
+lossless JPEG-XR behavior, then verify with strict sample thresholds.
 
 ## Install
 
@@ -17,17 +23,47 @@ uv sync --locked --all-groups
 Compress one CZI:
 
 ```bash
-uv run squisher compress sample.czi --level 90
+uv run squisher compress sample.czi
+```
+
+By default, compression also writes one center-z PNG thumbnail beside each OME-TIFF:
+
+```text
+sample.ome.tif -> sample.center-z.png
 ```
 
 Use explicit tiling and workers:
 
 ```bash
 uv run squisher compress sample.czi \
-  --level 90 \
+  --level 0.65 \
+  --out-dir compressed \
   --tile-size 512 \
+  --thumbnail-size 512 \
   --tiff-maxworkers 4 \
   --czi-tile-workers 8
+```
+
+Write OME-Zarr instead of OME-TIFF:
+
+```bash
+uv run squisher compress sample.czi \
+  --output-format ome-zarr \
+  --zarr-compressor jpegxr \
+  --zarr-chunk-z 1 \
+  --zarr-chunk-y 4096 \
+  --zarr-chunk-x 4096
+```
+
+OME-Zarr output enforces a minimum requested spatial chunk size so a run cannot
+accidentally create millions of tiny chunk files. The default is
+`--min-zarr-chunk-pixels 16777216`. JPEG-XR chunks are restricted to
+`--zarr-chunk-z 1`; use `--zarr-compressor jpegxl` if you need multi-Z chunks.
+
+Disable thumbnail output when only the archival OME-TIFFs are needed:
+
+```bash
+uv run squisher compress sample.czi --no-thumbnails
 ```
 
 Resume without rewriting complete outputs:
@@ -36,29 +72,78 @@ Resume without rewriting complete outputs:
 uv run squisher compress sample.czi --resume
 ```
 
+Overwrite existing outputs explicitly:
+
+```bash
+uv run squisher compress sample.czi --overwrite
+```
+
 Verify before treating the OME-TIFFs as the record copy:
 
 ```bash
 uv run squisher verify sample.czi --decode-samples
 ```
 
+`--decode-samples` decodes the first, middle, and last page of each output tile, reads the
+matching planes from the source CZI, and logs `max_abs`, `mae`, and `rmse` differences.
+For stricter checks, add thresholds:
+
+```bash
+uv run squisher verify sample.czi \
+  --decode-samples \
+  --max-sample-mae 20 \
+  --max-sample-max-abs 128
+```
+
+Compare crop-level compression quality across a JPEG-XR level sweep:
+
+```bash
+uv run squisher compare sample.czi \
+  --count 6 \
+  --crop-size 256 \
+  --min-level 0.65 \
+  --max-level 0.90 \
+  --level-step 0.05
+```
+
+`compare` writes labeled two-row PNG figures plus `manifest.json` and `size_metrics.csv`.
+Each figure shows raw CZI crops on the top row, aligned compressed-minus-raw diffs on the
+bottom row, and per-level size/error metrics in the column titles.
+For multi-tile CZI files, output is grouped under `<czi-stem>/` by default. If `--out-dir`
+is provided, it is treated as the parent directory and the same `<czi-stem>/` folder is
+created there.
+
 Output naming:
 
 ```text
 sample.czi          -> sample.ome.tif
-multi_tile.czi      -> multi_tile.000.ome.tif, multi_tile.001.ome.tif, ...
+multi_tile.czi      -> multi_tile/multi_tile.000.ome.tif, multi_tile/multi_tile.001.ome.tif, ...
+sample.czi          -> sample.ome.zarr                    # with --output-format ome-zarr
+multi_tile.czi      -> multi_tile/multi_tile.000.ome.zarr, multi_tile/multi_tile.001.ome.zarr, ...
 ```
+
+For multi-tile CZI files, `--out-dir compressed` writes into `compressed/<czi-stem>/`.
+For single-tile CZI files, `--out-dir compressed` writes `compressed/<czi-stem>.ome.tif`.
 
 If `<stem>_placement.json` is present, tile origins are used for OME `PositionX` and `PositionY`.
 
+Supported CZI layout:
+
+- Arbitrary `C`, `Z`, and `T` planes.
+- Mosaic `M` tiles written as separate OME-TIFF files.
+- Exactly one scene (`S`) and only singleton `R`, `I`, `H`, `V`, and `B` dimensions.
+
+Inputs outside that layout are rejected before writing output.
+
 ## Full Dataset Notes
 
-For large tiled CZI files, run from the output directory with a symlink to the source CZI so outputs are written beside the link:
+For large tiled CZI files, run from the output directory with a symlink to the source CZI so the
+stem-named output folder is written beside the link:
 
 ```bash
 ln -s /data/sample.czi sample.czi
 uv run squisher compress sample.czi \
-  --level 90 \
+  --level 0.65 \
   --tile-size 512 \
   --czi-tile-workers 8 \
   --tiff-maxworkers 4

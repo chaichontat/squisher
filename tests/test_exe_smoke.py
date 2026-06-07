@@ -21,28 +21,33 @@ def squisher_exe() -> Path:
 
 
 @pytest.fixture
-def smoke_czi(tmp_path: Path) -> Path:
-    path = tmp_path / "sample.czi"
+def smoke_czis(tmp_path: Path) -> list[Path]:
     data = np.arange(2 * 3 * 16 * 16, dtype=np.uint16).reshape((2, 3, 16, 16))
+    paths = [tmp_path / "sample_a.czi", tmp_path / "sample_b.czi"]
 
-    with czi.create_czi(str(path)) as writer:
-        for channel_index in range(data.shape[0]):
-            for z_index in range(data.shape[1]):
-                assert writer.write(
-                    data[channel_index, z_index],
-                    plane={"C": channel_index, "Z": z_index},
-                    scene=0,
-                )
+    for path in paths:
+        with czi.create_czi(str(path)) as writer:
+            for channel_index in range(data.shape[0]):
+                for z_index in range(data.shape[1]):
+                    assert writer.write(
+                        data[channel_index, z_index],
+                        plane={"C": channel_index, "Z": z_index},
+                        scene=0,
+                    )
 
-    return path
+    return paths
 
 
-def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, tmp_path: Path) -> None:
+def test_windows_exe_compresses_smoke_czi_wildcard(
+    squisher_exe: Path,
+    smoke_czis: list[Path],
+    tmp_path: Path,
+) -> None:
     result = subprocess.run(
         [
             str(squisher_exe),
             "compress",
-            str(smoke_czi),
+            str(tmp_path / "sample_*.czi"),
             "--level",
             "90",
             "--tile-size",
@@ -58,18 +63,51 @@ def test_windows_exe_compresses_smoke_czi(squisher_exe: Path, smoke_czi: Path, t
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    out = tmp_path / "sample.ome.tif"
-    assert out.exists()
+    for czi_path in smoke_czis:
+        out = czi_path.with_suffix(".ome.tif")
+        assert out.exists()
+        assert czi_path.exists()
 
-    with TiffFile(out) as tif:
-        assert tif.pages[0].compression == 22610
-        assert tif.pages[0].is_tiled
+        with TiffFile(out) as tif:
+            assert len(tif.pages) == 6
+            assert all(page.compression == 22610 for page in tif.pages)
+            assert all(page.is_tiled for page in tif.pages)
 
-    verify = subprocess.run(
-        [str(squisher_exe), "verify", str(smoke_czi), "--decode-samples"],
+        verify = subprocess.run(
+            [str(squisher_exe), "verify", str(czi_path), "--decode-samples"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+def test_windows_exe_delete_removes_source_after_success(
+    squisher_exe: Path,
+    smoke_czis: list[Path],
+) -> None:
+    czi_path = smoke_czis[0]
+    result = subprocess.run(
+        [
+            str(squisher_exe),
+            "compress",
+            str(czi_path),
+            "--level",
+            "90",
+            "--tile-size",
+            "16",
+            "--tiff-maxworkers",
+            "1",
+            "--czi-tile-workers",
+            "1",
+            "--delete",
+        ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert verify.returncode == 0, verify.stdout + verify.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert czi_path.with_suffix(".ome.tif").exists()
+    assert not czi_path.exists()
