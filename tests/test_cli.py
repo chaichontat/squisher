@@ -28,18 +28,21 @@ def test_compress_uses_expected_defaults(tmp_path, monkeypatch) -> None:
     result = CliRunner().invoke(app, ["compress", str(czi_path), "--output-format", "ome-zarr"])
 
     assert result.exit_code == 0
-    assert captured["level"] == 0.65
+    assert captured["level"] == 0.7
     assert captured["tile_size"] == 512
     assert captured["maxworkers"] == 8
     assert captured["tile_workers"] == 8
     assert captured["zarr_chunks"] == DEFAULT_ZARR_CHUNKS_TCZYX
     assert captured["min_zarr_chunk_pixels"] == DEFAULT_MIN_ZARR_CHUNK_PIXELS
+    assert captured["pos_path"] is None
     assert czi_path.exists()
 
 
 def test_compress_forwards_options(tmp_path, monkeypatch) -> None:
     czi_path = tmp_path / "sample.czi"
+    pos_path = tmp_path / "sample.pos"
     czi_path.write_bytes(b"not checked by fake compressor")
+    pos_path.write_text("not checked by fake compressor")
     captured = {}
 
     def fake_compress_czi_to_ome_tiff(path, **kwargs):
@@ -76,10 +79,11 @@ def test_compress_forwards_options(tmp_path, monkeypatch) -> None:
             "1",
             "--czi-tile-workers",
             "2",
-            "--resume",
             "--no-thumbnails",
             "--thumbnail-size",
             "256",
+            "--pos",
+            str(pos_path),
         ],
     )
 
@@ -94,10 +98,10 @@ def test_compress_forwards_options(tmp_path, monkeypatch) -> None:
     assert captured["zarr_compressor"] == "jpegxr"
     assert captured["maxworkers"] == 1
     assert captured["tile_workers"] == 2
-    assert captured["resume"] is True
     assert captured["overwrite"] is False
     assert captured["thumbnails"] is False
     assert captured["thumbnail_size"] == 256
+    assert captured["pos_path"] == pos_path
 
 
 def test_compress_accepts_multiple_czi_paths(tmp_path, monkeypatch) -> None:
@@ -105,18 +109,20 @@ def test_compress_accepts_multiple_czi_paths(tmp_path, monkeypatch) -> None:
     second = tmp_path / "second.czi"
     first.write_bytes(b"not checked by fake compressor")
     second.write_bytes(b"not checked by fake compressor")
-    captured_paths = []
+    pos_path = tmp_path / "sample.pos"
+    pos_path.write_text("not checked by fake compressor")
+    captured = []
 
     def fake_compress_czi_to_ome_tiff(path, **kwargs):
-        captured_paths.append(path)
+        captured.append((path, kwargs["pos_path"]))
         return True
 
     monkeypatch.setattr("squisher.compress_czi_to_ome_tiff", fake_compress_czi_to_ome_tiff)
 
-    result = CliRunner().invoke(app, ["compress", str(first), str(second), "--no-thumbnails"])
+    result = CliRunner().invoke(app, ["compress", str(first), str(second), "--no-thumbnails", "--pos", str(pos_path)])
 
     assert result.exit_code == 0
-    assert captured_paths == [first, second]
+    assert captured == [(first, pos_path), (second, pos_path)]
 
 
 def test_compress_expands_literal_glob_patterns(tmp_path, monkeypatch) -> None:
@@ -207,6 +213,10 @@ def test_compress_delete_waits_for_full_batch_success(tmp_path, monkeypatch) -> 
     result = CliRunner().invoke(app, ["compress", str(first), str(second), "--delete"])
 
     assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == f"Compression failed for {second}"
+    assert isinstance(result.exception.__cause__, RuntimeError)
+    assert str(result.exception.__cause__) == "compression failed"
     assert first.exists()
     assert second.exists()
 
@@ -225,17 +235,20 @@ def test_compress_delete_keeps_source_after_failure(tmp_path, monkeypatch) -> No
 
     assert result.exit_code == 1
     assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == f"Compression failed for {czi_path}"
+    assert isinstance(result.exception.__cause__, RuntimeError)
+    assert str(result.exception.__cause__) == "compression failed"
     assert czi_path.exists()
 
 
-def test_compress_delete_rejects_resume(tmp_path) -> None:
+def test_compress_rejects_resume_option(tmp_path) -> None:
     czi_path = tmp_path / "sample.czi"
     czi_path.write_bytes(b"not checked by fake compressor")
 
-    result = CliRunner().invoke(app, ["compress", str(czi_path), "--delete", "--resume"])
+    result = CliRunner().invoke(app, ["compress", str(czi_path), "--resume"])
 
     assert result.exit_code == 2
-    assert "--delete cannot be combined with --resume" in result.output
+    assert "No such option" in result.output
 
 
 def test_verify_forwards_options(tmp_path, monkeypatch) -> None:
@@ -271,6 +284,64 @@ def test_verify_forwards_options(tmp_path, monkeypatch) -> None:
     assert captured["decode_samples"] is True
     assert captured["max_sample_mae"] == 3.5
     assert captured["max_sample_max_abs"] == 25.0
+
+
+def test_verify_accepts_multiple_czi_paths(tmp_path, monkeypatch) -> None:
+    first = tmp_path / "first.czi"
+    second = tmp_path / "second.czi"
+    first.write_bytes(b"not checked by fake verifier")
+    second.write_bytes(b"not checked by fake verifier")
+    captured = []
+
+    def fake_verify_czi_ome_tiff_outputs(path, **kwargs):
+        captured.append((path, kwargs))
+        return True
+
+    monkeypatch.setattr("squisher.verify_czi_ome_tiff_outputs", fake_verify_czi_ome_tiff_outputs)
+
+    result = CliRunner().invoke(app, ["verify", str(first), str(second), "--decode-samples"])
+
+    assert result.exit_code == 0
+    assert captured == [
+        (
+            first,
+            {
+                "out_dir": None,
+                "decode_samples": True,
+                "max_sample_mae": None,
+                "max_sample_max_abs": None,
+            },
+        ),
+        (
+            second,
+            {
+                "out_dir": None,
+                "decode_samples": True,
+                "max_sample_mae": None,
+                "max_sample_max_abs": None,
+            },
+        ),
+    ]
+
+
+def test_verify_expands_literal_glob_patterns(tmp_path, monkeypatch) -> None:
+    first = tmp_path / "first.czi"
+    second = tmp_path / "second.czi"
+    first.write_bytes(b"not checked by fake verifier")
+    second.write_bytes(b"not checked by fake verifier")
+    (tmp_path / "ignored.txt").write_text("not a czi")
+    captured = []
+
+    def fake_verify_czi_ome_tiff_outputs(path, **kwargs):
+        captured.append(path)
+        return True
+
+    monkeypatch.setattr("squisher.verify_czi_ome_tiff_outputs", fake_verify_czi_ome_tiff_outputs)
+
+    result = CliRunner().invoke(app, ["verify", str(tmp_path / "*.czi")])
+
+    assert result.exit_code == 0
+    assert captured == [first, second]
 
 
 def test_compare_forwards_options(tmp_path, monkeypatch) -> None:

@@ -27,7 +27,7 @@ def compress(
     paths: Annotated[list[Path], typer.Argument(help="One or more CZI files or glob patterns.")],
     out_dir: Annotated[Path | None, typer.Option("--out-dir")] = None,
     output_format: Annotated[str, typer.Option("--output-format")] = "ome-tiff",
-    level: Annotated[float, typer.Option("--level", min=0.0, max=100.0)] = 0.65,
+    level: Annotated[float, typer.Option("--level", min=0.0, max=100.0)] = 0.7,
     tile_size: Annotated[int, typer.Option("--tile-size")] = 512,
     zarr_chunk_z: Annotated[int, typer.Option("--zarr-chunk-z", min=1)] = DEFAULT_ZARR_CHUNKS_TCZYX[2],
     zarr_chunk_y: Annotated[int, typer.Option("--zarr-chunk-y", min=1)] = DEFAULT_ZARR_CHUNKS_TCZYX[3],
@@ -38,40 +38,40 @@ def compress(
     zarr_compressor: Annotated[str, typer.Option("--zarr-compressor")] = "jpegxr",
     tiff_maxworkers: Annotated[int, typer.Option("--tiff-maxworkers")] = 8,
     czi_tile_workers: Annotated[int, typer.Option("--czi-tile-workers")] = 8,
-    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = False,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
     thumbnails: Annotated[bool, typer.Option("--thumbnails/--no-thumbnails")] = True,
     thumbnail_size: Annotated[int, typer.Option("--thumbnail-size", min=1)] = 512,
+    pos_path: Annotated[Path | None, typer.Option("--pos", exists=True, dir_okay=False, readable=True)] = None,
     delete_source: Annotated[
         bool,
         typer.Option("--delete/--no-delete", help="Delete each source CZI after successful compression."),
     ] = False,
 ) -> None:
-    if delete_source and resume:
-        raise typer.BadParameter("--delete cannot be combined with --resume")
-
     expanded_paths = _expand_input_paths(paths)
     if out_dir is not None:
         _validate_unique_output_stems(expanded_paths)
 
     compressed_paths = []
     for path in expanded_paths:
-        compressed = compress_czi_to_ome_tiff(
-            path,
-            level=level,
-            out_dir=out_dir,
-            output_format=output_format,
-            tile_size=tile_size,
-            zarr_chunks=(1, 1, zarr_chunk_z, zarr_chunk_y, zarr_chunk_x),
-            min_zarr_chunk_pixels=min_zarr_chunk_pixels,
-            zarr_compressor=zarr_compressor,
-            maxworkers=tiff_maxworkers,
-            tile_workers=czi_tile_workers,
-            resume=resume,
-            overwrite=overwrite,
-            thumbnails=thumbnails,
-            thumbnail_size=thumbnail_size,
-        )
+        try:
+            compressed = compress_czi_to_ome_tiff(
+                path,
+                level=level,
+                out_dir=out_dir,
+                output_format=output_format,
+                tile_size=tile_size,
+                zarr_chunks=(1, 1, zarr_chunk_z, zarr_chunk_y, zarr_chunk_x),
+                min_zarr_chunk_pixels=min_zarr_chunk_pixels,
+                zarr_compressor=zarr_compressor,
+                maxworkers=tiff_maxworkers,
+                tile_workers=czi_tile_workers,
+                overwrite=overwrite,
+                thumbnails=thumbnails,
+                thumbnail_size=thumbnail_size,
+                pos_path=pos_path,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Compression failed for {path}") from exc
         if compressed:
             compressed_paths.append(path)
 
@@ -82,19 +82,24 @@ def compress(
 
 @app.command()
 def verify(
-    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    paths: Annotated[list[Path], typer.Argument(help="One or more CZI files or glob patterns.")],
     out_dir: Annotated[Path | None, typer.Option("--out-dir")] = None,
     decode_samples: Annotated[bool, typer.Option("--decode-samples/--no-decode-samples")] = False,
     max_sample_mae: Annotated[float | None, typer.Option("--max-sample-mae", min=0.0)] = None,
     max_sample_max_abs: Annotated[float | None, typer.Option("--max-sample-max-abs", min=0.0)] = None,
 ) -> None:
-    verify_czi_ome_tiff_outputs(
-        path,
-        out_dir=out_dir,
-        decode_samples=decode_samples,
-        max_sample_mae=max_sample_mae,
-        max_sample_max_abs=max_sample_max_abs,
-    )
+    expanded_paths = _expand_input_paths(paths)
+    if out_dir is not None:
+        _validate_unique_output_stems(expanded_paths)
+
+    for path in expanded_paths:
+        verify_czi_ome_tiff_outputs(
+            path,
+            out_dir=out_dir,
+            decode_samples=decode_samples,
+            max_sample_mae=max_sample_mae,
+            max_sample_max_abs=max_sample_max_abs,
+        )
 
 
 @app.command()

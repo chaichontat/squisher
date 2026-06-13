@@ -12,6 +12,7 @@ from squisher.compression import (
     _czi_subblock_metadata,
     _verify_ome_tiff,
     compress_czi_to_ome_tiff,
+    infer_stage_positions_from_pos,
     verify_czi_ome_tiff_outputs,
 )
 
@@ -39,6 +40,26 @@ def _write_multi_tile_czi(path: Path, tiles: list[np.ndarray]) -> None:
                     )
 
 
+def _write_pos_file(path: Path, points: list[tuple[float, float, float]]) -> None:
+    lines = [
+        "Carl Zeiss LSM 510 - Position list file - Version = 1.000",
+        "BEGIN PositionList Version = 10000",
+        f"\tNumberPositions = {len(points)}",
+    ]
+    for index, (x, y, z) in enumerate(points, start=1):
+        lines.extend(
+            [
+                f"\tBEGIN Position{index} Version = 10000",
+                f"\t\tX = {x} um",
+                f"\t\tY = {y} um",
+                f"\t\tZ = {z} um",
+                "\tEND",
+            ]
+        )
+    lines.append("END")
+    path.write_text("\n".join(lines))
+
+
 def test_compress_czi_writes_tiled_ome_tiff_with_raw_metadata(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
     data = np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5))
@@ -57,10 +78,12 @@ def test_compress_czi_writes_tiled_ome_tiff_with_raw_metadata(tmp_path: Path) ->
         assert annotations["squisher.compression_level_input"] == "90"
         assert annotations["squisher.compression_level_normalized"] == "0.9"
         assert annotations["squisher.tiff_tile_size"] == "16"
-        assert annotations["czi.global_metadata_xml"].startswith("<ImageDocument")
-        assert annotations["czi.subblock_metadata_xml"].startswith("<Subblocks")
+        assert "czi.global_metadata_xml" not in annotations
+        assert "czi.subblock_metadata_xml" not in annotations
+        shared_metadata = _shared_czi_metadata(tif.ome_metadata)
+        assert shared_metadata.tag == "ImageDocument"
         raw_metadata = _raw_czi_metadata(tif.ome_metadata)
-        assert raw_metadata.find("GlobalMetadata")[0].tag == "ImageDocument"
+        assert raw_metadata.find("GlobalMetadata") is None
         assert raw_metadata.find("SubblockMetadata")[0].tag == "Subblocks"
         readback = tif.asarray()
         if tif.series[0].axes == "TCZYX":
@@ -107,7 +130,88 @@ def test_compress_czi_writes_complete_ome_zarr(tmp_path: Path) -> None:
     assert (tmp_path / "sample.center-z.png").exists()
 
 
-def test_resume_rejects_ome_zarr_without_completion_marker(tmp_path: Path) -> None:
+def test_compress_czi_writes_each_illumination_as_separate_ome_tiff(tmp_path: Path, monkeypatch) -> None:
+    class Box:
+        x = 0
+        y = 0
+        w = 16
+        h = 16
+
+    class FakeCziFile:
+        meta = "<ImageDocument />"
+
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 2), "C": (0, 1), "T": (0, 1), "I": (0, 2), "S": (0, 1)}]
+
+        def get_all_mosaic_tile_bounding_boxes(self, **kwargs):
+            assert kwargs == {"C": 0, "Z": 0, "T": 0, "I": 0}
+            raise RuntimeError("not a mosaic")
+
+        def get_tile_bounding_box(self, **kwargs):
+            assert kwargs == {"C": 0, "Z": 0, "T": 0, "I": 0}
+            return Box()
+
+        def read_image(self, **kwargs):
+            assert kwargs["I"] in {0, 1}
+            assert kwargs["Z"] in {0, 1}
+            value = kwargs["I"] * 1000 + kwargs["Z"]
+            plane = np.full((1, 1, 1, 1, 1, 16, 16), value, dtype=np.uint16)
+            return (plane, None)
+
+        def read_subblock_metadata(self, unified_xml: bool, **kwargs):
+            assert not unified_xml
+            assert kwargs["S"] == 0
+            assert kwargs["I"] in {0, 1}
+            return [
+                ({"S": 0, "I": kwargs["I"], "C": 0, "T": 0, "Z": z}, "<Subblock />")
+                for z in range(2)
+            ]
+
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+    assert not (tmp_path / "sample.ome.tif").exists()
+    for illumination in range(2):
+        out = tmp_path / "sample" / f"sample.i{illumination:03d}.ome.tif"
+        assert out.exists()
+        with TiffFile(out) as tif:
+            annotations = _map_annotation_values(tif.ome_metadata)
+            assert annotations["czi.illumination_index"] == str(illumination)
+            raw_metadata = _raw_czi_metadata(tif.ome_metadata)
+            subblocks = raw_metadata.find("SubblockMetadata")[0]
+            assert len(subblocks) == 2
+            assert {subblock.attrib["I"] for subblock in subblocks} == {str(illumination)}
+
+    assert verify_czi_ome_tiff_outputs(czi_path, decode_samples=True)
+
+    import zarr
+
+    assert compress_czi_to_ome_tiff(
+        czi_path,
+        output_format="ome-zarr",
+        level=90,
+        maxworkers=1,
+        thumbnails=False,
+    )
+    for illumination in range(2):
+        out = tmp_path / "sample" / f"sample.i{illumination:03d}.ome.zarr"
+        assert out.exists()
+        root = zarr.open_group(str(out), mode="r")
+        assert root.attrs["squisher"]["czi_illumination_index"] == illumination
+        assert root.attrs["czi"]["shared_metadata_xml"] == "<ImageDocument />"
+        zarr_subblocks = ET.fromstring(root.attrs["czi"]["subblock_metadata_xml"])
+        assert len(zarr_subblocks) == 2
+        assert {subblock.attrib["I"] for subblock in zarr_subblocks} == {str(illumination)}
+        assert zarr.open(str(out / "0"), mode="r").shape == (1, 1, 2, 16, 16)
+
+
+def test_compress_czi_skips_ome_zarr_by_name_without_completion_marker(tmp_path: Path) -> None:
     zarr = pytest.importorskip("zarr")
     czi_path = tmp_path / "sample.czi"
     data = np.arange(2 * 3 * 16 * 16, dtype=np.uint16).reshape((2, 3, 16, 16))
@@ -117,8 +221,20 @@ def test_resume_rejects_ome_zarr_without_completion_marker(tmp_path: Path) -> No
     root = zarr.open_group(str(tmp_path / "sample.ome.zarr"), mode="a")
     del root.attrs["squisher_complete"]
 
-    with pytest.raises(FileExistsError, match="incomplete ome-zarr"):
-        compress_czi_to_ome_tiff(czi_path, output_format="ome-zarr", level=90, resume=True, thumbnails=False)
+    assert compress_czi_to_ome_tiff(czi_path, output_format="ome-zarr", level=90, thumbnails=False)
+
+
+def test_compress_czi_skips_ome_zarr_by_name_without_czi_metadata(tmp_path: Path) -> None:
+    zarr = pytest.importorskip("zarr")
+    czi_path = tmp_path / "sample.czi"
+    data = np.arange(2 * 3 * 16 * 16, dtype=np.uint16).reshape((2, 3, 16, 16))
+    _write_sample_czi(czi_path, data)
+
+    assert compress_czi_to_ome_tiff(czi_path, output_format="ome-zarr", level=90, maxworkers=1, thumbnails=False)
+    root = zarr.open_group(str(tmp_path / "sample.ome.zarr"), mode="a")
+    del root.attrs["czi"]
+
+    assert compress_czi_to_ome_tiff(czi_path, output_format="ome-zarr", level=90, thumbnails=False)
 
 
 def test_compress_czi_rejects_tiny_ome_zarr_chunks(tmp_path: Path) -> None:
@@ -179,19 +295,175 @@ def test_compress_czi_writes_each_tile_and_placement(tmp_path: Path) -> None:
         assert 'PositionX="22.5"' in tif.ome_metadata
         assert 'PositionY="11.5"' in tif.ome_metadata
         assert json.loads(_map_annotation_values(tif.ome_metadata)["squisher.placement_json"])["version"] == 1
+        first_shared_metadata = ET.tostring(_shared_czi_metadata(tif.ome_metadata), encoding="unicode")
     with TiffFile(tmp_path / "sample" / "sample.001.ome.tif") as tif:
         assert 'PositionX="44.5"' in tif.ome_metadata
         assert 'PositionY="33.5"' in tif.ome_metadata
+        assert ET.tostring(_shared_czi_metadata(tif.ome_metadata), encoding="unicode") == first_shared_metadata
 
 
-def test_compress_czi_refuses_to_overwrite_existing_output(tmp_path: Path) -> None:
+def test_infer_stage_positions_from_pos_anchors_mosaic_index_zero(tmp_path: Path) -> None:
+    pos_path = tmp_path / "sample.pos"
+    _write_pos_file(pos_path, [(70.0, 140.0, 9.0), (20.0, 140.0, 9.0), (20.0, 100.0, 9.0), (70.0, 100.0, 9.0)])
+    tiles = [
+        {
+            "index": 0,
+            "scene": 0,
+            "mosaic_index": 0,
+            "x": 0,
+            "y": 0,
+            "width": 5,
+            "height": 4,
+            "position_x": 0.0,
+            "position_y": 0.0,
+        },
+        {
+            "index": 1,
+            "scene": 0,
+            "mosaic_index": 1,
+            "x": 10,
+            "y": 20,
+            "width": 5,
+            "height": 4,
+            "position_x": 10.0,
+            "position_y": 20.0,
+        },
+    ]
+
+    inferred = infer_stage_positions_from_pos(pos_path, tiles)
+
+    assert inferred[0]["stage_position_x_um"] == pytest.approx(45.0)
+    assert inferred[0]["stage_position_y_um"] == pytest.approx(120.0)
+    assert inferred[0]["stage_position_z_um"] == pytest.approx(9.0)
+    assert inferred[1]["stage_position_x_um"] == pytest.approx(145.0)
+    assert inferred[1]["stage_position_y_um"] == pytest.approx(320.0)
+    assert inferred[1]["stage_position_scale_x_um_per_px"] == pytest.approx(10.0)
+    assert inferred[1]["stage_position_scale_y_um_per_px"] == pytest.approx(10.0)
+
+
+def test_infer_stage_positions_from_pos_requires_mosaic_index_zero(tmp_path: Path) -> None:
+    pos_path = tmp_path / "sample.pos"
+    _write_pos_file(pos_path, [(70.0, 140.0, 9.0), (20.0, 140.0, 9.0), (20.0, 100.0, 9.0), (70.0, 100.0, 9.0)])
+
+    with pytest.raises(ValueError, match="do not contain M=0"):
+        infer_stage_positions_from_pos(
+            pos_path,
+            [
+                {
+                    "index": 0,
+                    "scene": 0,
+                    "mosaic_index": 1,
+                    "x": 0,
+                    "y": 0,
+                    "width": 5,
+                    "height": 4,
+                    "position_x": 0.0,
+                    "position_y": 0.0,
+                }
+            ],
+        )
+
+
+def test_infer_stage_positions_from_pos_requires_first_hull(tmp_path: Path) -> None:
+    pos_path = tmp_path / "sample.pos"
+    _write_pos_file(pos_path, [(70.0, 140.0, 9.0), (20.0, 140.0, 9.0), (20.0, 100.0, 9.0)])
+
+    with pytest.raises(ValueError, match="Expected at least four positions"):
+        infer_stage_positions_from_pos(pos_path, [])
+
+
+def test_compress_czi_writes_pos_inferred_stage_positions(tmp_path: Path) -> None:
+    czi_path = tmp_path / "sample.czi"
+    pos_path = tmp_path / "sample.pos"
+    tiles = [
+        np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5)),
+        np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+    _write_pos_file(pos_path, [(70.0, 140.0, 9.0), (20.0, 140.0, 9.0), (20.0, 100.0, 9.0), (70.0, 100.0, 9.0)])
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, pos_path=pos_path)
+
+    with TiffFile(tmp_path / "sample" / "sample.000.ome.tif") as tif:
+        plane = _first_plane_attrs(tif.ome_metadata)
+        annotations = _map_annotation_values(tif.ome_metadata)
+        assert plane["PositionX"] == "45.0"
+        assert plane["PositionY"] == "120.0"
+        assert plane["PositionZ"] == "9.0"
+        assert plane["PositionXUnit"] == "µm"
+        assert plane["PositionYUnit"] == "µm"
+        assert plane["PositionZUnit"] == "µm"
+        assert annotations["squisher.stage_position_x_um"] == "45.0"
+        assert annotations["squisher.stage_position_y_um"] == "120.0"
+        assert annotations["squisher.stage_position_z_um"] == "9.0"
+        assert annotations["squisher.stage_position_source"] == "zeiss-pos"
+        assert annotations["squisher.stage_position_pos_file"] == str(pos_path)
+        assert annotations["squisher.stage_position_anchor_mosaic_index"] == "0"
+        assert annotations["squisher.stage_position_anchor_position_group"] == "1"
+        assert annotations["squisher.stage_position_scale_x_um_per_px"] == "10.0"
+        assert annotations["squisher.stage_position_scale_y_um_per_px"] == "10.0"
+    with TiffFile(tmp_path / "sample" / "sample.001.ome.tif") as tif:
+        plane = _first_plane_attrs(tif.ome_metadata)
+        assert plane["PositionX"] == "145.0"
+        assert plane["PositionY"] == "320.0"
+        assert plane["PositionZ"] == "9.0"
+
+
+def test_compress_czi_skips_existing_output_by_name(tmp_path: Path, monkeypatch) -> None:
+    czi_path = tmp_path / "sample.czi"
+    data = np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16))
+    _write_sample_czi(czi_path, data)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("existing output name should be skipped")
+
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fail_write)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+
+def test_compress_czi_skips_when_all_tile_output_names_exist(tmp_path: Path, monkeypatch) -> None:
+    czi_path = tmp_path / "sample.czi"
+    tiles = [
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)),
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("existing tile output names should be skipped")
+
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fail_write)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+
+def test_compress_czi_refuses_partial_existing_tile_outputs(tmp_path: Path) -> None:
+    czi_path = tmp_path / "sample.czi"
+    tiles = [
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)),
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+    (tmp_path / "sample" / "sample.001.ome.tif").unlink()
+
+    with pytest.raises(FileExistsError, match="partial existing ome-tiff output set"):
+        compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+
+def test_compress_czi_skips_malformed_existing_output_by_name(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
     data = np.arange(4 * 5, dtype=np.uint16).reshape((1, 1, 4, 5))
     _write_sample_czi(czi_path, data)
     (tmp_path / "sample.ome.tif").write_bytes(b"existing")
 
-    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
-        compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1)
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
 
 
 def test_compress_czi_overwrites_existing_output_when_requested(tmp_path: Path) -> None:
@@ -226,15 +498,6 @@ def test_compress_czi_keeps_existing_output_when_overwrite_fails(tmp_path: Path,
         compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, overwrite=True)
 
     assert out.read_bytes() == b"existing"
-
-
-def test_compress_czi_rejects_resume_with_overwrite(tmp_path: Path) -> None:
-    czi_path = tmp_path / "sample.czi"
-    data = np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16))
-    _write_sample_czi(czi_path, data)
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, resume=True, overwrite=True)
 
 
 def test_verify_czi_decode_samples_can_enforce_source_diff_thresholds(tmp_path: Path) -> None:
@@ -321,10 +584,10 @@ def test_compress_czi_uses_out_dir_as_parent_for_multi_tile_outputs(tmp_path: Pa
 def test_czi_output_dir_omits_stem_folder_for_single_tile_outputs(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
 
-    assert _czi_output_dir(czi_path, out_dir=None, tile_count=1) == tmp_path
-    assert _czi_output_dir(czi_path, out_dir=tmp_path / "compressed", tile_count=1) == tmp_path / "compressed"
-    assert _czi_output_dir(czi_path, out_dir=None, tile_count=2) == tmp_path / "sample"
-    assert _czi_output_dir(czi_path, out_dir=tmp_path / "compressed", tile_count=2) == (
+    assert _czi_output_dir(czi_path, out_dir=None, output_count=1) == tmp_path
+    assert _czi_output_dir(czi_path, out_dir=tmp_path / "compressed", output_count=1) == tmp_path / "compressed"
+    assert _czi_output_dir(czi_path, out_dir=None, output_count=2) == tmp_path / "sample"
+    assert _czi_output_dir(czi_path, out_dir=tmp_path / "compressed", output_count=2) == (
         tmp_path / "compressed" / "sample"
     )
 
@@ -350,17 +613,41 @@ def _map_annotation_values(ome_metadata: str) -> dict[str, str]:
     }
 
 
+def _first_plane_attrs(ome_metadata: str) -> dict[str, str]:
+    root = ET.fromstring(ome_metadata)
+    plane = root.find(".//ome:Plane", OME_NS)
+    assert plane is not None
+    return plane.attrib
+
+
 def _raw_czi_metadata(ome_metadata: str) -> ET.Element:
     root = ET.fromstring(ome_metadata)
     raw_annotations = [
         annotation
         for annotation in root.findall(".//ome:XMLAnnotation", OME_NS)
-        if annotation.attrib.get("Namespace") == "fishtools/czi/raw-metadata"
+        if annotation.attrib.get("Namespace") == "squisher/czi/raw-metadata"
     ]
     assert len(raw_annotations) == 1
     assert root.find(f".//ome:AnnotationRef[@ID='{raw_annotations[0].attrib['ID']}']", OME_NS) is not None
     value = raw_annotations[0].find("ome:Value", OME_NS)
     assert value is not None
     assert len(value) == 1
-    assert value[0].tag == "CZIProvenanceMetadata"
+    assert value[0].tag == "CZITileMetadata"
     return value[0]
+
+
+def _shared_czi_metadata(ome_metadata: str) -> ET.Element:
+    root = ET.fromstring(ome_metadata)
+    shared_annotations = [
+        annotation
+        for annotation in root.findall(".//ome:XMLAnnotation", OME_NS)
+        if annotation.attrib.get("Namespace") == "squisher/czi/shared-metadata"
+    ]
+    assert len(shared_annotations) == 1
+    assert root.find(f".//ome:AnnotationRef[@ID='{shared_annotations[0].attrib['ID']}']", OME_NS) is not None
+    value = shared_annotations[0].find("ome:Value", OME_NS)
+    assert value is not None
+    assert len(value) == 1
+    assert value[0].tag == "CZISharedMetadata"
+    assert len(value[0]) == 1
+    return value[0][0]

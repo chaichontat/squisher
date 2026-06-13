@@ -2,12 +2,12 @@
 
 Lossy CZI to tiled OME-TIFF or OME-Zarr compression with imagecodecs-backed codecs.
 
-`squisher` is meant for compressed microscopy archives that can replace the original CZI as the record copy when lossy output is acceptable. It writes OME-TIFF with JPEG-XR TIFF tag `22610`, or OME-Zarr with imagecodecs-backed JPEG-XR/JPEG-XL chunks. OME-TIFF output preserves parsed OME metadata and stores raw CZI global and per-tile subblock metadata in a linked OME `XMLAnnotation`.
+`squisher` is meant for compressed microscopy archives that can replace the original CZI as the record copy when lossy output is acceptable. It writes OME-TIFF with JPEG-XR TIFF tag `22610`, or OME-Zarr with imagecodecs-backed JPEG-XR/JPEG-XL chunks. Every OME-TIFF tile stores the full shared CZI global metadata once, in a linked `squisher/czi/shared-metadata` OME `XMLAnnotation`; tile-specific CZI subblock metadata is stored once, in a linked `squisher/czi/raw-metadata` OME `XMLAnnotation`. OME-Zarr output stores the same shared and tile-specific CZI XML metadata in root attributes.
 Each output also records squisher provenance and compression settings in OME `MapAnnotation`
 entries, including the JPEG-XR tag, normalized quality level, tile size, worker settings,
 output directory, and a JSON settings blob.
 
-The default `--level 0.65` is lossy. Use `--level 1` or `--level 100` when you need
+The default `--level 0.7` is lossy. Use `--level 1` or `--level 100` when you need
 lossless JPEG-XR behavior, then verify with strict sample thresholds.
 
 ## Install
@@ -36,7 +36,7 @@ Use explicit tiling and workers:
 
 ```bash
 uv run squisher compress sample.czi \
-  --level 0.65 \
+  --level 0.7 \
   --out-dir compressed \
   --tile-size 512 \
   --thumbnail-size 512 \
@@ -66,13 +66,14 @@ Disable thumbnail output when only the archival OME-TIFFs are needed:
 uv run squisher compress sample.czi --no-thumbnails
 ```
 
-Resume without rewriting complete outputs:
+When all expected output names already exist, compression skips them automatically. Partial
+existing output sets are rejected; run `verify` to check output integrity:
 
 ```bash
-uv run squisher compress sample.czi --resume
+uv run squisher compress sample.czi
 ```
 
-Overwrite existing outputs explicitly:
+Overwrite existing or incomplete outputs explicitly:
 
 ```bash
 uv run squisher compress sample.czi --overwrite
@@ -109,29 +110,38 @@ uv run squisher compare sample.czi \
 `compare` writes labeled two-row PNG figures plus `manifest.json` and `size_metrics.csv`.
 Each figure shows raw CZI crops on the top row, aligned compressed-minus-raw diffs on the
 bottom row, and per-level size/error metrics in the column titles.
-For multi-tile CZI files, output is grouped under `<czi-stem>/` by default. If `--out-dir`
-is provided, it is treated as the parent directory and the same `<czi-stem>/` folder is
-created there.
+When a CZI produces more than one output, output is grouped under `<czi-stem>/` by default.
+If `--out-dir` is provided, it is treated as the parent directory and the same `<czi-stem>/`
+folder is created there.
 
 Output naming:
 
 ```text
 sample.czi          -> sample.ome.tif
 multi_tile.czi      -> multi_tile/multi_tile.000.ome.tif, multi_tile/multi_tile.001.ome.tif, ...
+multi_illum.czi     -> multi_illum/multi_illum.i000.ome.tif, multi_illum/multi_illum.i001.ome.tif, ...
+tile_illum.czi      -> tile_illum/tile_illum.000.i000.ome.tif, tile_illum/tile_illum.000.i001.ome.tif, ...
 sample.czi          -> sample.ome.zarr                    # with --output-format ome-zarr
 multi_tile.czi      -> multi_tile/multi_tile.000.ome.zarr, multi_tile/multi_tile.001.ome.zarr, ...
 ```
 
-For multi-tile CZI files, `--out-dir compressed` writes into `compressed/<czi-stem>/`.
-For single-tile CZI files, `--out-dir compressed` writes `compressed/<czi-stem>.ome.tif`.
+For any CZI that produces multiple outputs, `--out-dir compressed` writes into
+`compressed/<czi-stem>/`. A CZI that produces exactly one output writes directly under
+`compressed/`.
 
 If `<stem>_placement.json` is present, tile origins are used for OME `PositionX` and `PositionY`.
+Use `--pos BL.pos` to infer actual Zeiss stage positions from a position-list file. The
+first four positions are treated as the M=0 tile field-of-view, and all mosaic tile
+positions are inferred from their CZI bbox offsets relative to M=0. Inferred stage
+`PositionX`, `PositionY`, and `PositionZ` are written in micrometers and also recorded
+in OME `MapAnnotation`.
 
 Supported CZI layout:
 
 - Arbitrary `C`, `Z`, and `T` planes.
 - Mosaic `M` tiles written as separate OME-TIFF files.
-- Exactly one scene (`S`) and only singleton `R`, `I`, `H`, `V`, and `B` dimensions.
+- Arbitrary `I` illuminations written as separate OME-TIFF or OME-Zarr outputs.
+- Exactly one scene (`S`) and only singleton `R`, `H`, `V`, and `B` dimensions.
 
 Inputs outside that layout are rejected before writing output.
 
@@ -143,7 +153,7 @@ stem-named output folder is written beside the link:
 ```bash
 ln -s /data/sample.czi sample.czi
 uv run squisher compress sample.czi \
-  --level 0.65 \
+  --level 0.7 \
   --tile-size 512 \
   --czi-tile-workers 8 \
   --tiff-maxworkers 4

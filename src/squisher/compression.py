@@ -5,6 +5,7 @@ import json
 from multiprocessing import get_context
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any, NotRequired, TypedDict
 import xml.etree.ElementTree as ET
@@ -22,10 +23,11 @@ CZI_PROGRESS_INTERVAL = 100
 DEFAULT_ZARR_CHUNKS_TCZYX = (1, 1, 1, 4096, 4096)
 DEFAULT_MIN_ZARR_CHUNK_PIXELS = 16 * 1024 * 1024
 OME_ORIGINAL_METADATA_NAMESPACE = "openmicroscopy.org/OriginalMetadata"
-CZI_RAW_METADATA_NAMESPACE = "fishtools/czi/raw-metadata"
+CZI_RAW_METADATA_NAMESPACE = "squisher/czi/raw-metadata"
+CZI_SHARED_METADATA_NAMESPACE = "squisher/czi/shared-metadata"
 OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
-SUPPORTED_MULTI_DIMS = {"X", "Y", "Z", "C", "T", "M"}
-SUPPORTED_SINGLETON_DIMS = {"S", "R", "I", "H", "V", "B"}
+SUPPORTED_MULTI_DIMS = {"X", "Y", "Z", "C", "T", "M", "I"}
+SUPPORTED_SINGLETON_DIMS = {"S", "R", "H", "V", "B"}
 OUTPUT_FORMATS = {"ome-tiff", "ome-zarr"}
 ZARR_COMPRESSORS = {"jpegxr", "jpegxl"}
 
@@ -41,6 +43,15 @@ class CziTile(TypedDict):
     height: int
     position_x: float
     position_y: float
+    stage_position_x_um: NotRequired[float]
+    stage_position_y_um: NotRequired[float]
+    stage_position_z_um: NotRequired[float]
+    stage_position_source: NotRequired[str]
+    stage_position_pos_file: NotRequired[str]
+    stage_position_anchor_mosaic_index: NotRequired[int]
+    stage_position_anchor_position_group: NotRequired[int]
+    stage_position_scale_x_um_per_px: NotRequired[float]
+    stage_position_scale_y_um_per_px: NotRequired[float]
 
 
 def compress_czi_to_ome_tiff(
@@ -55,10 +66,10 @@ def compress_czi_to_ome_tiff(
     zarr_compressor: str = "jpegxr",
     maxworkers: int = 4,
     tile_workers: int = 1,
-    resume: bool = False,
     overwrite: bool = False,
     thumbnails: bool = True,
     thumbnail_size: int = 512,
+    pos_path: Path | None = None,
 ) -> bool:
     from aicspylibczi import CziFile
 
@@ -73,61 +84,68 @@ def compress_czi_to_ome_tiff(
             min_zarr_chunk_pixels=min_zarr_chunk_pixels,
             compressor=zarr_compressor,
         )
-    if resume and overwrite:
-        raise ValueError("--resume and --overwrite are mutually exclusive")
-
-    tiles = _czi_tiles(path)
+    reader = CziFile(path)
+    dims = reader.get_dims_shape()[0]
+    illumination_indexes = _czi_dim_indexes(dims, "I")
+    illumination_count = len(illumination_indexes)
+    tiles = _czi_tiles(path, pos_path=pos_path)
     tile_count = len(tiles)
-    output_dir = _czi_output_dir(path, out_dir=out_dir, tile_count=tile_count)
+    output_count = tile_count * illumination_count
+    output_dir = _czi_output_dir(path, out_dir=out_dir, output_count=output_count)
     output_dir.mkdir(parents=True, exist_ok=True)
-    outputs = [_czi_tile_output_path(path, tile, tile_count, output_dir=output_dir, output_format=output_format) for tile in tiles]
+    output_jobs = [(tile, illumination) for illumination in illumination_indexes for tile in tiles]
+    output_path = _czi_tile_ome_tiff_path if output_format == "ome-tiff" else _czi_tile_ome_zarr_path
+    outputs = [
+        output_path(
+            path,
+            tile,
+            tile_count,
+            illumination=illumination,
+            illumination_count=illumination_count,
+            output_dir=output_dir,
+        )
+        for tile, illumination in output_jobs
+    ]
     logger.info(
-        "Compressing {} tile(s) from {} to {} as {} with level={} tile_size={} resume={}",
+        "Compressing {} tile(s), {} illumination(s) from {} to {} as {} with level={} tile_size={}",
         tile_count,
+        illumination_count,
         path,
         output_dir,
         output_format,
         level,
         tile_size,
-        resume,
     )
     existing = [out for out in outputs if out.exists()]
     if existing and overwrite:
         for out in existing:
             logger.warning("Overwriting existing {} output {}", output_format, out)
-    elif existing and not resume:
-        raise FileExistsError(f"Refusing to overwrite existing {output_format} output(s): {existing}")
 
-    reader = CziFile(path)
-    dims = reader.get_dims_shape()[0]
     plane_count = _czi_plane_count(dims)
-    if resume:
-        pending_tiles = []
-        incomplete_existing = []
-        for tile, out in zip(tiles, outputs, strict=True):
-            if _is_complete_output(out, output_format=output_format, ome_shape=_czi_ome_shape(dims, tile)):
-                continue
-            pending_tiles.append(tile)
-            if out.exists():
-                incomplete_existing.append(out)
-        if incomplete_existing:
-            raise FileExistsError(f"Refusing to overwrite incomplete {output_format} output(s): {incomplete_existing}")
+    if overwrite:
+        pending_jobs = output_jobs
+    elif not existing:
+        pending_jobs = output_jobs
+    elif len(existing) == len(outputs):
+        pending_jobs = []
     else:
-        pending_tiles = tiles
-    logger.info("{} complete tile(s), {} pending tile(s)", tile_count - len(pending_tiles), len(pending_tiles))
+        raise FileExistsError(
+            f"Refusing partial existing {output_format} output set; expected all output names to exist: {existing}"
+        )
+    logger.info("{} existing output(s), {} pending output(s)", len(output_jobs) - len(pending_jobs), len(pending_jobs))
 
     if thumbnails:
         _validate_thumbnail_size(thumbnail_size)
 
-    if not pending_tiles:
-        logger.info("No pending tile {} outputs for {}", output_format, path)
+    if not pending_jobs:
+        logger.info("No pending {} outputs for {}", output_format, path)
         if thumbnails:
             for out in outputs:
                 write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=False)
         return True
 
     effective_tile_workers, effective_maxworkers = _effective_czi_workers(
-        len(pending_tiles), tile_workers, maxworkers
+        len(pending_jobs), tile_workers, maxworkers
     )
     settings = _compression_provenance(
         path,
@@ -142,7 +160,6 @@ def compress_czi_to_ome_tiff(
         effective_tiff_maxworkers=effective_maxworkers,
         requested_tile_workers=tile_workers,
         effective_tile_workers=effective_tile_workers,
-        resume=resume,
         overwrite=overwrite,
         thumbnails=thumbnails,
         thumbnail_size=thumbnail_size,
@@ -155,12 +172,14 @@ def compress_czi_to_ome_tiff(
         effective_maxworkers,
     )
     if effective_tile_workers == 1:
-        for tile in pending_tiles:
+        for tile, illumination in pending_jobs:
             out = _write_czi_tile(
                 reader,
                 path,
                 tile=tile,
                 tile_count=tile_count,
+                illumination=illumination,
+                illumination_count=illumination_count,
                 output_dir=output_dir,
                 output_format=output_format,
                 level=level,
@@ -173,8 +192,6 @@ def compress_czi_to_ome_tiff(
             )
             if thumbnails:
                 write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
-        if thumbnails and resume:
-            _write_missing_resume_thumbnails(outputs, pending_tiles, tiles, thumbnail_size)
         logger.success("Finished compression for {}", path)
         return True
 
@@ -188,6 +205,8 @@ def compress_czi_to_ome_tiff(
                 path,
                 tile=tile,
                 tile_count=tile_count,
+                illumination=illumination,
+                illumination_count=illumination_count,
                 output_dir=output_dir,
                 output_format=output_format,
                 level=level,
@@ -197,7 +216,7 @@ def compress_czi_to_ome_tiff(
                 maxworkers=effective_maxworkers,
                 provenance=settings,
             )
-            for tile in pending_tiles
+            for tile, illumination in pending_jobs
         ]
         for future in as_completed(futures):
             out = future.result()
@@ -229,8 +248,6 @@ def compress_czi_to_ome_tiff(
         raise
     else:
         pool.shutdown(wait=True)
-    if thumbnails and resume:
-        _write_missing_resume_thumbnails(outputs, pending_tiles, tiles, thumbnail_size)
     logger.success("Finished compression for {}", path)
     return True
 
@@ -252,30 +269,53 @@ def verify_czi_ome_tiff_outputs(
     dims = reader.get_dims_shape()[0]
     _validate_supported_czi_dims(path, dims)
     tiles = _czi_tiles(path)
+    illumination_indexes = _czi_dim_indexes(dims, "I")
+    illumination_count = len(illumination_indexes)
     tile_count = len(tiles)
     plane_count = _czi_plane_count(dims)
-    output_dir = _czi_output_dir(path, out_dir=out_dir, tile_count=tile_count)
-    logger.info("Verifying {} tile output(s) for {} in {}", tile_count, path, output_dir)
+    output_dir = _czi_output_dir(path, out_dir=out_dir, output_count=tile_count * illumination_count)
+    logger.info(
+        "Verifying {} tile(s), {} illumination(s) for {} in {}",
+        tile_count,
+        illumination_count,
+        path,
+        output_dir,
+    )
 
     errors = []
-    for tile in tiles:
-        out = _czi_tile_ome_tiff_path(path, tile, tile_count, output_dir=output_dir)
-        if not out.exists():
-            errors.append(f"{out.name}: missing")
-            continue
-        tile_errors = _verify_ome_tiff(path, out, tile=tile, plane_count=plane_count)
-        errors.extend(tile_errors)
-        if decode_samples and not tile_errors:
-            errors.extend(
-                _decode_sample_pages(
-                    out,
-                    reader=reader,
-                    dims=dims,
-                    tile=tile,
-                    max_sample_mae=max_sample_mae,
-                    max_sample_max_abs=max_sample_max_abs,
-                )
+    for illumination in illumination_indexes:
+        for tile in tiles:
+            out = _czi_tile_ome_tiff_path(
+                path,
+                tile,
+                tile_count,
+                illumination=illumination,
+                illumination_count=illumination_count,
+                output_dir=output_dir,
             )
+            if not out.exists():
+                errors.append(f"{out.name}: missing")
+                continue
+            tile_errors = _verify_ome_tiff(
+                path,
+                out,
+                tile=tile,
+                plane_count=plane_count,
+                illumination=illumination if illumination_count > 1 else None,
+            )
+            errors.extend(tile_errors)
+            if decode_samples and not tile_errors:
+                errors.extend(
+                    _decode_sample_pages(
+                        out,
+                        reader=reader,
+                        dims=dims,
+                        tile=tile,
+                        illumination=illumination,
+                        max_sample_mae=max_sample_mae,
+                        max_sample_max_abs=max_sample_max_abs,
+                    )
+                )
 
     if errors:
         logger.error("OME-TIFF verification failed for {} with {} error(s)", path, len(errors))
@@ -292,6 +332,8 @@ def _write_czi_tile(
     *,
     tile: CziTile,
     tile_count: int,
+    illumination: int,
+    illumination_count: int,
     output_dir: Path,
     output_format: str,
     level: float,
@@ -308,6 +350,8 @@ def _write_czi_tile(
             path,
             tile=tile,
             tile_count=tile_count,
+            illumination=illumination,
+            illumination_count=illumination_count,
             output_dir=output_dir,
             level=level,
             chunks=zarr_chunks,
@@ -321,7 +365,14 @@ def _write_czi_tile(
     t_indexes = _czi_dim_indexes(dims, "T")
     c_indexes = _czi_dim_indexes(dims, "C")
     z_indexes = _czi_dim_indexes(dims, "Z")
-    out = _czi_tile_ome_tiff_path(path, tile, tile_count, output_dir=output_dir)
+    out = _czi_tile_ome_tiff_path(
+        path,
+        tile,
+        tile_count,
+        illumination=illumination,
+        illumination_count=illumination_count,
+        output_dir=output_dir,
+    )
     write_out = _temporary_output_path(out)
     plane_count = _czi_plane_count(dims)
     ome_shape = (len(t_indexes), len(c_indexes), len(z_indexes), tile["height"], tile["width"])
@@ -340,11 +391,22 @@ def _write_czi_tile(
             for t in t_indexes:
                 for c in c_indexes:
                     for z in z_indexes:
-                        plane = _as_grayscale_plane(reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z))[0])
+                        plane = _as_grayscale_plane(
+                            reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z, illumination))[0]
+                        )
                         raw_bytes += plane.nbytes
                         writer.write(
                             plane,
-                            description=_first_plane_ome_xml(path, reader, tile, ome_shape, plane.dtype, provenance)
+                            description=_first_plane_ome_xml(
+                                path,
+                                reader,
+                                tile,
+                                illumination=illumination,
+                                dims=dims,
+                                shape=ome_shape,
+                                dtype=plane.dtype,
+                                provenance=provenance,
+                            )
                             if plane_index == 0
                             else None,
                             metadata=None,
@@ -376,6 +438,8 @@ def _write_czi_tile_to_ome_zarr(
     *,
     tile: CziTile,
     tile_count: int,
+    illumination: int,
+    illumination_count: int,
     output_dir: Path,
     level: float,
     chunks: tuple[int, int, int, int, int],
@@ -388,7 +452,14 @@ def _write_czi_tile_to_ome_zarr(
     t_indexes = _czi_dim_indexes(dims, "T")
     c_indexes = _czi_dim_indexes(dims, "C")
     z_indexes = _czi_dim_indexes(dims, "Z")
-    out = _czi_tile_ome_zarr_path(path, tile, tile_count, output_dir=output_dir)
+    out = _czi_tile_ome_zarr_path(
+        path,
+        tile,
+        tile_count,
+        illumination=illumination,
+        illumination_count=illumination_count,
+        output_dir=output_dir,
+    )
     write_out = _temporary_output_path(out)
     ome_shape = _czi_ome_shape(dims, tile)
     effective_chunks = tuple(min(chunk, size) for chunk, size in zip(chunks, ome_shape, strict=True))
@@ -402,11 +473,24 @@ def _write_czi_tile_to_ome_zarr(
     _remove_output_if_exists(write_out)
     try:
         first_plane = _as_grayscale_plane(
-            reader.read_image(**_czi_read_kwargs(dims, tile, t_indexes[0], c_indexes[0], z_indexes[0]))[0]
+            reader.read_image(**_czi_read_kwargs(dims, tile, t_indexes[0], c_indexes[0], z_indexes[0], illumination))[
+                0
+            ]
         )
         raw_bytes = 0
+        subblock_metadata = _czi_subblock_metadata(reader, tile, illumination=illumination if "I" in dims else None)
         root = zarr.open_group(str(write_out), mode="w", zarr_format=2)
-        root.attrs.update(_ome_zarr_root_attrs(path, reader, tile, ome_shape, provenance))
+        root.attrs.update(
+            _ome_zarr_root_attrs(
+                path,
+                reader,
+                tile,
+                illumination=illumination if "I" in dims else None,
+                shape=ome_shape,
+                subblock_metadata=subblock_metadata,
+                provenance=provenance,
+            )
+        )
         array = root.create_array(
             "0",
             shape=ome_shape,
@@ -424,7 +508,9 @@ def _write_czi_tile_to_ome_zarr(
                     if plane_index == 0:
                         plane = first_plane
                     else:
-                        plane = _as_grayscale_plane(reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z))[0])
+                        plane = _as_grayscale_plane(
+                            reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z, illumination))[0]
+                        )
                     raw_bytes += plane.nbytes
                     array[t_offset, c_offset, z_offset, :, :] = plane
                     plane_index += 1
@@ -450,12 +536,22 @@ def _ome_zarr_root_attrs(
     path: Path,
     reader: Any,
     tile: CziTile,
+    *,
+    illumination: int | None,
     shape: tuple[int, int, int, int, int],
+    subblock_metadata: Any,
     provenance: dict[str, str],
 ) -> dict[str, Any]:
     scale_x = _czi_scale_um(reader.meta, "X") or 1.0
     scale_y = _czi_scale_um(reader.meta, "Y") or 1.0
     scale_z = _czi_scale_um(reader.meta, "Z") or 1.0
+    translation_z = float(tile["stage_position_z_um"]) if "stage_position_z_um" in tile else 0.0
+    translation_y = (
+        float(tile["stage_position_y_um"]) if "stage_position_y_um" in tile else float(tile["position_y"]) * scale_y
+    )
+    translation_x = (
+        float(tile["stage_position_x_um"]) if "stage_position_x_um" in tile else float(tile["position_x"]) * scale_x
+    )
     return {
         "multiscales": [
             {
@@ -478,9 +574,9 @@ def _ome_zarr_root_attrs(
                                 "translation": [
                                     0.0,
                                     0.0,
-                                    0.0,
-                                    float(tile["position_y"]) * scale_y,
-                                    float(tile["position_x"]) * scale_x,
+                                    translation_z,
+                                    translation_y,
+                                    translation_x,
                                 ],
                             },
                         ],
@@ -494,6 +590,7 @@ def _ome_zarr_root_attrs(
             "source_format": "CZI",
             "output_tile_index": tile["index"],
             "czi_scene": tile["scene"],
+            "czi_illumination_index": illumination,
             "czi_mosaic_index": tile.get("mosaic_index"),
             "czi_tile_x": tile["x"],
             "czi_tile_y": tile["y"],
@@ -501,10 +598,21 @@ def _ome_zarr_root_attrs(
             "czi_tile_height": tile["height"],
             "provenance": provenance,
         },
+        "czi": {
+            "shared_metadata_xml": _xml_metadata_text(reader.meta, "CZI global metadata"),
+            "subblock_metadata_xml": _xml_metadata_text(subblock_metadata, "CZI subblock metadata"),
+        },
     }
 
 
-def _verify_ome_tiff(path: Path, out: Path, *, tile: CziTile, plane_count: int) -> list[str]:
+def _verify_ome_tiff(
+    path: Path,
+    out: Path,
+    *,
+    tile: CziTile,
+    plane_count: int,
+    illumination: int | None = None,
+) -> list[str]:
     errors = []
     try:
         with TiffFile(out) as tif:
@@ -518,7 +626,16 @@ def _verify_ome_tiff(path: Path, out: Path, *, tile: CziTile, plane_count: int) 
                     errors.append(f"{out.name}: page {page_index} is not tiled")
                 if page.shape != expected_shape:
                     errors.append(f"{out.name}: page {page_index} expected shape {expected_shape}, found {page.shape}")
-            errors.extend(_verify_ome_metadata(path, out.name, tif.ome_metadata, tile=tile, plane_count=plane_count))
+            errors.extend(
+                _verify_ome_metadata(
+                    path,
+                    out.name,
+                    tif.ome_metadata,
+                    tile=tile,
+                    plane_count=plane_count,
+                    illumination=illumination,
+                )
+            )
     except (OSError, ValueError, KeyError, IndexError, tifffile.TiffFileError) as exc:
         errors.append(f"{out.name}: unreadable TIFF/OME metadata: {exc}")
     return errors
@@ -531,6 +648,7 @@ def _verify_ome_metadata(
     *,
     tile: CziTile,
     plane_count: int,
+    illumination: int | None,
 ) -> list[str]:
     if not ome_metadata:
         return [f"{output_name}: missing OME metadata"]
@@ -548,13 +666,31 @@ def _verify_ome_metadata(
     }
     if "mosaic_index" in tile:
         expected_values["czi.mosaic_index"] = str(tile["mosaic_index"])
+    if illumination is not None:
+        expected_values["czi.illumination_index"] = str(illumination)
     for key, expected in expected_values.items():
         if map_values.get(key) != expected:
             errors.append(f"{output_name}: expected MapAnnotation {key}={expected!r}, found {map_values.get(key)!r}")
-    if not map_values.get("czi.global_metadata_xml", "").startswith("<ImageDocument"):
-        errors.append(f"{output_name}: missing raw global CZI XML in MapAnnotation")
-    if not map_values.get("czi.subblock_metadata_xml", "").startswith("<Subblocks"):
-        errors.append(f"{output_name}: missing raw subblock CZI XML in MapAnnotation")
+    if "czi.global_metadata_xml" in map_values:
+        errors.append(f"{output_name}: duplicated raw global CZI XML in MapAnnotation")
+    if "czi.subblock_metadata_xml" in map_values:
+        errors.append(f"{output_name}: duplicated raw subblock CZI XML in MapAnnotation")
+
+    shared_annotations = [
+        annotation
+        for annotation in root.findall(".//ome:XMLAnnotation", OME_NS)
+        if annotation.attrib.get("Namespace") == CZI_SHARED_METADATA_NAMESPACE
+    ]
+    if len(shared_annotations) != 1:
+        errors.append(f"{output_name}: expected one shared CZI XMLAnnotation, found {len(shared_annotations)}")
+    else:
+        if root.find(f".//ome:AnnotationRef[@ID='{shared_annotations[0].attrib['ID']}']", OME_NS) is None:
+            errors.append(f"{output_name}: shared CZI XMLAnnotation is not linked by AnnotationRef")
+        value = shared_annotations[0].find("ome:Value", OME_NS)
+        if value is None or len(value) != 1 or value[0].tag != "CZISharedMetadata":
+            errors.append(f"{output_name}: malformed shared CZI XMLAnnotation value")
+        elif len(value[0]) != 1 or value[0][0].tag != "ImageDocument":
+            errors.append(f"{output_name}: shared CZI XMLAnnotation is missing CZI ImageDocument")
 
     raw_annotations = [
         annotation
@@ -567,17 +703,16 @@ def _verify_ome_metadata(
     if root.find(f".//ome:AnnotationRef[@ID='{raw_annotations[0].attrib['ID']}']", OME_NS) is None:
         errors.append(f"{output_name}: raw CZI XMLAnnotation is not linked by AnnotationRef")
     value = raw_annotations[0].find("ome:Value", OME_NS)
-    if value is None or len(value) != 1 or value[0].tag != "CZIProvenanceMetadata":
+    if value is None or len(value) != 1 or value[0].tag != "CZITileMetadata":
         errors.append(f"{output_name}: malformed raw CZI XMLAnnotation value")
         return errors
 
-    provenance = value[0]
-    global_metadata = provenance.find("GlobalMetadata")
-    subblock_metadata = provenance.find("SubblockMetadata")
-    if global_metadata is None or len(global_metadata) != 1 or global_metadata[0].tag != "ImageDocument":
-        errors.append(f"{output_name}: raw provenance is missing CZI ImageDocument")
+    tile_metadata = value[0]
+    if tile_metadata.find("GlobalMetadata") is not None:
+        errors.append(f"{output_name}: duplicated global CZI metadata in tile metadata")
+    subblock_metadata = tile_metadata.find("SubblockMetadata")
     if subblock_metadata is None or len(subblock_metadata) != 1 or subblock_metadata[0].tag != "Subblocks":
-        errors.append(f"{output_name}: raw provenance is missing CZI Subblocks")
+        errors.append(f"{output_name}: raw tile metadata is missing CZI Subblocks")
     elif len(subblock_metadata[0]) != plane_count:
         errors.append(f"{output_name}: expected {plane_count} raw subblock records, found {len(subblock_metadata[0])}")
     return errors
@@ -596,6 +731,7 @@ def _decode_sample_pages(
     reader: Any,
     dims: dict[str, tuple[int, int]],
     tile: CziTile,
+    illumination: int,
     max_sample_mae: float | None,
     max_sample_max_abs: float | None,
 ) -> list[str]:
@@ -612,7 +748,7 @@ def _decode_sample_pages(
                 errors.append(f"{out.name}: failed to decode page {page_index}: {exc}")
                 continue
             t, c, z = _plane_coordinates(t_indexes, c_indexes, z_indexes, page_index)
-            raw = _as_grayscale_plane(reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z))[0])
+            raw = _as_grayscale_plane(reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z, illumination))[0])
             if decoded.shape != raw.shape:
                 errors.append(f"{out.name}: decoded page {page_index} shape {decoded.shape} != CZI {raw.shape}")
                 continue
@@ -734,22 +870,13 @@ def _validate_thumbnail_size(thumbnail_size: int) -> None:
         raise ValueError(f"Thumbnail size must be > 0, got {thumbnail_size}")
 
 
-def _write_missing_resume_thumbnails(
-    outputs: list[Path],
-    pending_tiles: list[CziTile],
-    tiles: list[CziTile],
-    thumbnail_size: int,
-) -> None:
-    for tile, out in zip(tiles, outputs, strict=True):
-        if tile not in pending_tiles and out.exists():
-            write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=False)
-
-
 def _write_czi_tile_process(
     path: Path,
     *,
     tile: CziTile,
     tile_count: int,
+    illumination: int,
+    illumination_count: int,
     output_dir: Path,
     output_format: str,
     level: float,
@@ -767,6 +894,8 @@ def _write_czi_tile_process(
         path,
         tile=tile,
         tile_count=tile_count,
+        illumination=illumination,
+        illumination_count=illumination_count,
         output_dir=output_dir,
         output_format=output_format,
         level=level,
@@ -783,15 +912,19 @@ def _first_plane_ome_xml(
     path: Path,
     reader: Any,
     tile: CziTile,
+    *,
+    illumination: int,
+    dims: dict[str, tuple[int, int]],
     shape: tuple[int, int, int, int, int],
     dtype: np.dtype[Any],
     provenance: dict[str, str],
 ) -> bytes:
-    subblock_metadata = _czi_subblock_metadata(reader, tile)
+    subblock_metadata = _czi_subblock_metadata(reader, tile, illumination=illumination if "I" in dims else None)
     return _czi_ome_xml(
         path,
         reader.meta,
         tile=tile,
+        illumination=illumination if "I" in dims else None,
         shape=shape,
         dtype=dtype,
         subblock_metadata=subblock_metadata,
@@ -799,7 +932,14 @@ def _first_plane_ome_xml(
     )
 
 
-def _czi_read_kwargs(dims: dict[str, tuple[int, int]], tile: CziTile, t: int, c: int, z: int) -> dict[str, int]:
+def _czi_read_kwargs(
+    dims: dict[str, tuple[int, int]],
+    tile: CziTile,
+    t: int,
+    c: int,
+    z: int,
+    illumination: int,
+) -> dict[str, int]:
     read_kwargs = {}
     if "C" in dims:
         read_kwargs["C"] = c
@@ -807,6 +947,8 @@ def _czi_read_kwargs(dims: dict[str, tuple[int, int]], tile: CziTile, t: int, c:
         read_kwargs["Z"] = z
     if "T" in dims:
         read_kwargs["T"] = t
+    if "I" in dims:
+        read_kwargs["I"] = illumination
     if "mosaic_index" in tile:
         read_kwargs["M"] = tile["mosaic_index"]
     elif "S" in dims:
@@ -814,11 +956,32 @@ def _czi_read_kwargs(dims: dict[str, tuple[int, int]], tile: CziTile, t: int, c:
     return read_kwargs
 
 
+def _czi_index_kwargs(
+    dims: dict[str, tuple[int, int]],
+    *,
+    c: int,
+    z: int,
+    t: int,
+    illumination: int,
+) -> dict[str, int]:
+    kwargs = {}
+    if "C" in dims:
+        kwargs["C"] = c
+    if "Z" in dims:
+        kwargs["Z"] = z
+    if "T" in dims:
+        kwargs["T"] = t
+    if "I" in dims:
+        kwargs["I"] = illumination
+    return kwargs
+
+
 def _czi_ome_xml(
     path: Path,
     czi_metadata: Any,
     *,
     tile: CziTile,
+    illumination: int | None,
     shape: tuple[int, int, int, int, int],
     dtype: np.dtype[Any],
     subblock_metadata: Any,
@@ -830,7 +993,7 @@ def _czi_ome_xml(
         czi_metadata,
         tile=tile,
         plane_count=plane_count,
-        subblock_metadata=subblock_metadata,
+        illumination=illumination,
         provenance=provenance,
     )
     metadata.pop("axes", None)
@@ -843,7 +1006,8 @@ def _czi_ome_xml(
         axes="TCZYX",
         **metadata,
     )
-    _add_czi_raw_metadata_annotation(ome, czi_metadata, subblock_metadata)
+    _add_czi_shared_metadata_annotation(ome, czi_metadata)
+    _add_czi_raw_metadata_annotation(ome, subblock_metadata)
     return ome.tostring().encode("utf-8")
 
 
@@ -853,7 +1017,7 @@ def _czi_ome_metadata(
     *,
     tile: CziTile,
     plane_count: int,
-    subblock_metadata: Any,
+    illumination: int | None,
     provenance: dict[str, str],
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
@@ -862,7 +1026,12 @@ def _czi_ome_metadata(
         "StructuredAnnotations": {
             "MapAnnotation": {
                 "Namespace": OME_ORIGINAL_METADATA_NAMESPACE,
-                "Value": _czi_original_metadata(path, czi_metadata, subblock_metadata, tile=tile, provenance=provenance),
+                "Value": _czi_original_metadata(
+                    path,
+                    tile=tile,
+                    illumination=illumination,
+                    provenance=provenance,
+                ),
             }
         },
         "Plane": {
@@ -876,16 +1045,26 @@ def _czi_ome_metadata(
     scale_x = _czi_scale_um(czi_metadata, "X")
     scale_y = _czi_scale_um(czi_metadata, "Y")
     scale_z = _czi_scale_um(czi_metadata, "Z")
+    if "stage_position_x_um" in tile and "stage_position_y_um" in tile and "stage_position_z_um" in tile:
+        metadata["Plane"]["PositionX"] = [float(tile["stage_position_x_um"])] * plane_count
+        metadata["Plane"]["PositionXUnit"] = ["µm"] * plane_count
+        metadata["Plane"]["PositionY"] = [float(tile["stage_position_y_um"])] * plane_count
+        metadata["Plane"]["PositionYUnit"] = ["µm"] * plane_count
+        metadata["Plane"]["PositionZ"] = [float(tile["stage_position_z_um"])] * plane_count
+        metadata["Plane"]["PositionZUnit"] = ["µm"] * plane_count
+    else:
+        if scale_x is not None:
+            metadata["Plane"]["PositionX"] = [tile["position_x"] * scale_x] * plane_count
+            metadata["Plane"]["PositionXUnit"] = ["µm"] * plane_count
+        if scale_y is not None:
+            metadata["Plane"]["PositionY"] = [tile["position_y"] * scale_y] * plane_count
+            metadata["Plane"]["PositionYUnit"] = ["µm"] * plane_count
     if scale_x is not None:
         metadata["PhysicalSizeX"] = scale_x
         metadata["PhysicalSizeXUnit"] = "µm"
-        metadata["Plane"]["PositionX"] = [tile["position_x"] * scale_x] * plane_count
-        metadata["Plane"]["PositionXUnit"] = ["µm"] * plane_count
     if scale_y is not None:
         metadata["PhysicalSizeY"] = scale_y
         metadata["PhysicalSizeYUnit"] = "µm"
-        metadata["Plane"]["PositionY"] = [tile["position_y"] * scale_y] * plane_count
-        metadata["Plane"]["PositionYUnit"] = ["µm"] * plane_count
     if scale_z is not None:
         metadata["PhysicalSizeZ"] = scale_z
         metadata["PhysicalSizeZUnit"] = "µm"
@@ -894,10 +1073,9 @@ def _czi_ome_metadata(
 
 def _czi_original_metadata(
     path: Path,
-    czi_metadata: Any,
-    subblock_metadata: Any,
     *,
     tile: CziTile,
+    illumination: int | None,
     provenance: dict[str, str],
 ) -> dict[str, str]:
     values = {
@@ -909,31 +1087,43 @@ def _czi_original_metadata(
         "czi.tile_y": str(tile["y"]),
         "czi.tile_width": str(tile["width"]),
         "czi.tile_height": str(tile["height"]),
-        "czi.global_metadata_xml": _metadata_text(czi_metadata),
-        "czi.subblock_metadata_xml": _metadata_text(subblock_metadata),
         **provenance,
     }
     if "mosaic_index" in tile:
         values["czi.mosaic_index"] = str(tile["mosaic_index"])
+    if illumination is not None:
+        values["czi.illumination_index"] = str(illumination)
     if "index_zyx" in tile:
         values["squisher.tile_index_zyx"] = json.dumps(tile["index_zyx"])
+    if "stage_position_x_um" in tile and "stage_position_y_um" in tile and "stage_position_z_um" in tile:
+        values.update(
+            {
+                "squisher.stage_position_x_um": str(tile["stage_position_x_um"]),
+                "squisher.stage_position_y_um": str(tile["stage_position_y_um"]),
+                "squisher.stage_position_z_um": str(tile["stage_position_z_um"]),
+                "squisher.stage_position_source": tile["stage_position_source"],
+                "squisher.stage_position_pos_file": tile["stage_position_pos_file"],
+                "squisher.stage_position_anchor_mosaic_index": str(tile["stage_position_anchor_mosaic_index"]),
+                "squisher.stage_position_anchor_position_group": str(tile["stage_position_anchor_position_group"]),
+                "squisher.stage_position_scale_x_um_per_px": str(tile["stage_position_scale_x_um_per_px"]),
+                "squisher.stage_position_scale_y_um_per_px": str(tile["stage_position_scale_y_um_per_px"]),
+            }
+        )
     placement_path = path.with_name(f"{path.stem}_placement.json")
     if placement_path.exists():
         values["squisher.placement_json"] = placement_path.read_text()
     return values
 
 
-def _add_czi_raw_metadata_annotation(ome: OmeXml, czi_metadata: Any, subblock_metadata: Any) -> None:
+def _add_czi_raw_metadata_annotation(ome: OmeXml, subblock_metadata: Any) -> None:
     annotation_id = f"Annotation:{len(ome.annotations)}"
-    global_metadata = _xml_metadata_text(czi_metadata, "CZI global metadata")
     subblock_metadata_text = _xml_metadata_text(subblock_metadata, "CZI subblock metadata")
     ome.annotations.append(
         f'<XMLAnnotation ID="{annotation_id}" Namespace="{CZI_RAW_METADATA_NAMESPACE}">'
         "<Value>"
-        '<CZIProvenanceMetadata xmlns="">'
-        f"<GlobalMetadata>{global_metadata}</GlobalMetadata>"
+        '<CZITileMetadata xmlns="">'
         f"<SubblockMetadata>{subblock_metadata_text}</SubblockMetadata>"
-        "</CZIProvenanceMetadata>"
+        "</CZITileMetadata>"
         "</Value>"
         "</XMLAnnotation>"
     )
@@ -944,7 +1134,93 @@ def _add_czi_raw_metadata_annotation(ome: OmeXml, czi_metadata: Any, subblock_me
     )
 
 
-def _czi_tiles(path: Path) -> list[CziTile]:
+def _add_czi_shared_metadata_annotation(ome: OmeXml, czi_metadata: Any) -> None:
+    annotation_id = f"Annotation:{len(ome.annotations)}"
+    global_metadata = _xml_metadata_text(czi_metadata, "CZI global metadata")
+    ome.annotations.append(
+        f'<XMLAnnotation ID="{annotation_id}" Namespace="{CZI_SHARED_METADATA_NAMESPACE}">'
+        "<Value>"
+        '<CZISharedMetadata xmlns="">'
+        f"{global_metadata}"
+        "</CZISharedMetadata>"
+        "</Value>"
+        "</XMLAnnotation>"
+    )
+    ome.images[-1] = ome.images[-1].replace(
+        "</Image>",
+        f'<AnnotationRef ID="{annotation_id}"/></Image>',
+        1,
+    )
+
+
+def infer_stage_positions_from_pos(pos_path: Path, tiles: list[CziTile]) -> list[CziTile]:
+    positions = _zeiss_pos_positions(pos_path)
+    if len(positions) < 4:
+        raise ValueError(f"Expected at least four positions in {pos_path}, found {len(positions)}")
+
+    anchor_points = positions[:4]
+    anchor_x = sum(point[0] for point in anchor_points) / 4
+    anchor_y = sum(point[1] for point in anchor_points) / 4
+    anchor_z = sum(point[2] for point in anchor_points) / 4
+    hull_width_um = max(point[0] for point in anchor_points) - min(point[0] for point in anchor_points)
+    hull_height_um = max(point[1] for point in anchor_points) - min(point[1] for point in anchor_points)
+    if hull_width_um <= 0 or hull_height_um <= 0:
+        raise ValueError(f"First four positions in {pos_path} do not define a positive-area tile FOV")
+
+    try:
+        anchor_tile = next(tile for tile in tiles if tile.get("mosaic_index") == 0)
+    except StopIteration as exc:
+        raise ValueError(f"Cannot infer stage positions from {pos_path}: CZI tiles do not contain M=0") from exc
+
+    if anchor_tile["width"] <= 0 or anchor_tile["height"] <= 0:
+        raise ValueError(f"Cannot infer stage positions from {pos_path}: M=0 tile has non-positive size")
+
+    scale_x = hull_width_um / float(anchor_tile["width"])
+    scale_y = hull_height_um / float(anchor_tile["height"])
+    anchor_center_x = float(anchor_tile["x"]) + float(anchor_tile["width"]) / 2
+    anchor_center_y = float(anchor_tile["y"]) + float(anchor_tile["height"]) / 2
+
+    inferred_tiles = []
+    for tile in tiles:
+        center_x = float(tile["x"]) + float(tile["width"]) / 2
+        center_y = float(tile["y"]) + float(tile["height"]) / 2
+        inferred_tiles.append(
+            CziTile(
+                **tile,
+                stage_position_x_um=anchor_x + (center_x - anchor_center_x) * scale_x,
+                stage_position_y_um=anchor_y + (center_y - anchor_center_y) * scale_y,
+                stage_position_z_um=anchor_z,
+                stage_position_source="zeiss-pos",
+                stage_position_pos_file=str(pos_path),
+                stage_position_anchor_mosaic_index=0,
+                stage_position_anchor_position_group=1,
+                stage_position_scale_x_um_per_px=scale_x,
+                stage_position_scale_y_um_per_px=scale_y,
+            )
+        )
+    return inferred_tiles
+
+
+def _zeiss_pos_positions(pos_path: Path) -> list[tuple[float, float, float]]:
+    text = pos_path.read_text(errors="replace")
+    positions_by_index = {}
+    for match in re.finditer(
+        r"BEGIN\s+Position(\d+)\b.*?"
+        r"\bX\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)).*?"
+        r"\bY\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)).*?"
+        r"\bZ\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))",
+        text,
+        re.S,
+    ):
+        positions_by_index[int(match.group(1))] = (
+            float(match.group(2)),
+            float(match.group(3)),
+            float(match.group(4)),
+        )
+    return [positions_by_index[index] for index in sorted(positions_by_index)]
+
+
+def _czi_tiles(path: Path, *, pos_path: Path | None = None) -> list[CziTile]:
     from aicspylibczi import CziFile
 
     czi_file = CziFile(path)
@@ -954,10 +1230,13 @@ def _czi_tiles(path: Path) -> list[CziTile]:
     channel = _first_czi_dim(dims, "C")
     z = _first_czi_dim(dims, "Z")
     t = _first_czi_dim(dims, "T")
+    illumination = _first_czi_dim(dims, "I")
     placement_origins = _placement_origins(path)
 
     try:
-        boxes = czi_file.get_all_mosaic_tile_bounding_boxes(C=channel, Z=z, T=t)
+        boxes = czi_file.get_all_mosaic_tile_bounding_boxes(
+            **_czi_index_kwargs(dims, c=channel, z=z, t=t, illumination=illumination)
+        )
     except RuntimeError:
         boxes = {}
 
@@ -983,16 +1262,20 @@ def _czi_tiles(path: Path) -> list[CziTile]:
                 )
             )
         _validate_placement_origins(path, tiles, placement_origins)
+        if pos_path is not None:
+            return infer_stage_positions_from_pos(pos_path, tiles)
         return tiles
 
     try:
-        box = czi_file.get_tile_bounding_box(C=channel, Z=z, T=t)
+        box = czi_file.get_tile_bounding_box(
+            **_czi_index_kwargs(dims, c=channel, z=z, t=t, illumination=illumination)
+        )
         x, y, width, height = int(box.x), int(box.y), int(box.w), int(box.h)
     except RuntimeError:
         x = y = 0
         width = int(dims["X"][1] - dims["X"][0])
         height = int(dims["Y"][1] - dims["Y"][0])
-    return [
+    tiles = [
         CziTile(
             index=0,
             scene=scene,
@@ -1004,6 +1287,9 @@ def _czi_tiles(path: Path) -> list[CziTile]:
             position_x=0.0,
         )
     ]
+    if pos_path is not None:
+        return infer_stage_positions_from_pos(pos_path, tiles)
+    return tiles
 
 
 def _validate_supported_czi_dims(path: Path, dims: dict[str, tuple[int, int]]) -> None:
@@ -1022,7 +1308,7 @@ def _validate_supported_czi_dims(path: Path, dims: dict[str, tuple[int, int]]) -
         raise ValueError(
             f"Unsupported CZI dimensions for {path}: {', '.join(unsupported)}. "
             "squisher currently supports X/Y image axes, arbitrary C/Z/T, mosaic M tiles, "
-            "and only singleton S/R/I/H/V/B dimensions."
+            "arbitrary I illuminations written as separate outputs, and only singleton S/R/H/V/B dimensions."
         )
 
 
@@ -1072,41 +1358,6 @@ def _as_grayscale_plane(data: npt.NDArray[Any]) -> npt.NDArray[Any]:
     if data.ndim == 2:
         return data
     raise ValueError(f"Expected a 2D grayscale CZI plane, found shape {data.shape}")
-
-
-def _is_complete_ome_tiff(path: Path, *, plane_count: int) -> bool:
-    try:
-        with TiffFile(path) as tif:
-            return len(tif.pages) == plane_count and all(page.compression == 22610 and page.is_tiled for page in tif.pages)
-    except (OSError, ValueError, KeyError, IndexError, tifffile.TiffFileError):
-        return False
-
-
-def _is_complete_output(
-    path: Path,
-    *,
-    output_format: str,
-    ome_shape: tuple[int, int, int, int, int],
-) -> bool:
-    if output_format == "ome-tiff":
-        return _is_complete_ome_tiff(path, plane_count=ome_shape[0] * ome_shape[1] * ome_shape[2])
-    if output_format == "ome-zarr":
-        return _is_complete_ome_zarr(path, shape=ome_shape)
-    raise ValueError(f"Unsupported output format {output_format!r}")
-
-
-def _is_complete_ome_zarr(path: Path, *, shape: tuple[int, int, int, int, int]) -> bool:
-    try:
-        import zarr
-
-        _register_imagecodecs_numcodecs()
-        if not path.is_dir():
-            return False
-        array = zarr.open(str(path / "0"), mode="r")
-        attrs = zarr.open_group(str(path), mode="r").attrs
-        return tuple(int(value) for value in array.shape) == shape and "multiscales" in attrs and attrs.get("squisher_complete") is True
-    except (OSError, ValueError, KeyError, ImportError):
-        return False
 
 
 def _validate_output_format(output_format: str) -> None:
@@ -1227,7 +1478,6 @@ def _compression_provenance(
     effective_tiff_maxworkers: int,
     requested_tile_workers: int,
     effective_tile_workers: int,
-    resume: bool,
     overwrite: bool,
     thumbnails: bool,
     thumbnail_size: int,
@@ -1257,7 +1507,6 @@ def _compression_provenance(
         "squisher.effective_tiff_maxworkers": str(effective_tiff_maxworkers),
         "squisher.requested_czi_tile_workers": str(requested_tile_workers),
         "squisher.effective_czi_tile_workers": str(effective_tile_workers),
-        "squisher.resume": json.dumps(resume),
         "squisher.overwrite": json.dumps(overwrite),
         "squisher.thumbnails": json.dumps(thumbnails),
         "squisher.thumbnail_size": str(thumbnail_size),
@@ -1278,7 +1527,6 @@ def _compression_provenance(
                 "effective_tiff_maxworkers": effective_tiff_maxworkers,
                 "requested_czi_tile_workers": requested_tile_workers,
                 "effective_czi_tile_workers": effective_tile_workers,
-                "resume": resume,
                 "overwrite": overwrite,
                 "thumbnails": thumbnails,
                 "thumbnail_size": thumbnail_size,
@@ -1320,11 +1568,12 @@ def _first_czi_dim(dims: dict[str, tuple[int, int]], dim: str) -> int:
     return int(dims.get(dim, (0, 1))[0])
 
 
-def _czi_subblock_metadata(reader: Any, tile: CziTile) -> ET.Element:
+def _czi_subblock_metadata(reader: Any, tile: CziTile, *, illumination: int | None = None) -> ET.Element:
+    kwargs = {"I": illumination} if illumination is not None else {}
     if "mosaic_index" in tile:
-        subblocks = reader.read_subblock_metadata(unified_xml=False, M=tile["mosaic_index"])
+        subblocks = reader.read_subblock_metadata(unified_xml=False, M=tile["mosaic_index"], **kwargs)
     else:
-        subblocks = reader.read_subblock_metadata(unified_xml=False, S=tile["scene"])
+        subblocks = reader.read_subblock_metadata(unified_xml=False, S=tile["scene"], **kwargs)
 
     root = ET.Element("Subblocks")
     for dims, raw_metadata in subblocks:
@@ -1339,14 +1588,6 @@ def _czi_subblock_metadata(reader: Any, tile: CziTile) -> ET.Element:
             subblock.set("MetadataEmpty", "true")
         root.append(subblock)
     return root
-
-
-def _metadata_text(metadata: Any) -> str:
-    if isinstance(metadata, ET.Element):
-        return ET.tostring(metadata, encoding="unicode")
-    if isinstance(metadata, str):
-        return metadata
-    return json.dumps(metadata, sort_keys=True)
 
 
 def _xml_metadata_text(metadata: Any, name: str) -> str:
@@ -1396,41 +1637,58 @@ def _effective_czi_workers(tile_count: int, tile_workers: int, tiff_maxworkers: 
     return min(tile_workers, tile_count), tiff_maxworkers
 
 
-def _czi_output_dir(path: Path, *, out_dir: Path | None, tile_count: int) -> Path:
-    if tile_count <= 1:
+def _czi_output_dir(path: Path, *, out_dir: Path | None, output_count: int) -> Path:
+    if output_count <= 1:
         return out_dir or path.parent
     if out_dir is None:
         return path.with_name(path.stem)
     return out_dir if out_dir.name == path.stem else out_dir / path.stem
 
 
-def _czi_tile_output_path(
+def _czi_tile_ome_tiff_path(
     path: Path,
     tile: CziTile,
     tile_count: int,
     *,
+    illumination: int = 0,
+    illumination_count: int = 1,
     output_dir: Path | None = None,
-    output_format: str,
 ) -> Path:
-    if output_format == "ome-tiff":
-        return _czi_tile_ome_tiff_path(path, tile, tile_count, output_dir=output_dir)
-    if output_format == "ome-zarr":
-        return _czi_tile_ome_zarr_path(path, tile, tile_count, output_dir=output_dir)
-    raise ValueError(f"Unsupported output format {output_format!r}")
-
-
-def _czi_tile_ome_tiff_path(path: Path, tile: CziTile, tile_count: int, *, output_dir: Path | None = None) -> Path:
-    output_dir = output_dir or _czi_output_dir(path, out_dir=None, tile_count=tile_count)
+    output_dir = output_dir or _czi_output_dir(
+        path,
+        out_dir=None,
+        output_count=tile_count * illumination_count,
+    )
+    illumination_suffix = _illumination_output_suffix(illumination, illumination_count)
     if tile_count == 1:
-        return output_dir / f"{path.stem}.ome.tif"
-    return output_dir / f"{path.stem}.{tile['index']:03d}.ome.tif"
+        return output_dir / f"{path.stem}{illumination_suffix}.ome.tif"
+    return output_dir / f"{path.stem}.{tile['index']:03d}{illumination_suffix}.ome.tif"
 
 
-def _czi_tile_ome_zarr_path(path: Path, tile: CziTile, tile_count: int, *, output_dir: Path | None = None) -> Path:
-    output_dir = output_dir or _czi_output_dir(path, out_dir=None, tile_count=tile_count)
+def _czi_tile_ome_zarr_path(
+    path: Path,
+    tile: CziTile,
+    tile_count: int,
+    *,
+    illumination: int = 0,
+    illumination_count: int = 1,
+    output_dir: Path | None = None,
+) -> Path:
+    output_dir = output_dir or _czi_output_dir(
+        path,
+        out_dir=None,
+        output_count=tile_count * illumination_count,
+    )
+    illumination_suffix = _illumination_output_suffix(illumination, illumination_count)
     if tile_count == 1:
-        return output_dir / f"{path.stem}.ome.zarr"
-    return output_dir / f"{path.stem}.{tile['index']:03d}.ome.zarr"
+        return output_dir / f"{path.stem}{illumination_suffix}.ome.zarr"
+    return output_dir / f"{path.stem}.{tile['index']:03d}{illumination_suffix}.ome.zarr"
+
+
+def _illumination_output_suffix(illumination: int, illumination_count: int) -> str:
+    if illumination_count <= 1:
+        return ""
+    return f".i{illumination:03d}"
 
 
 def _czi_ome_shape(dims: dict[str, tuple[int, int]], tile: CziTile) -> tuple[int, int, int, int, int]:
