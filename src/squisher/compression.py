@@ -28,6 +28,8 @@ from rich.progress import (
 import tifffile
 from tifffile import OmeXml, TiffFile, TiffWriter
 
+from squisher.logging import get_shared_console
+
 
 JPEG_XR_KWARGS = {"photometric": "minisblack", "compression": 22610}
 CZI_PROGRESS_INTERVAL = 100
@@ -377,6 +379,7 @@ def _write_czi_tile(
     dims: dict[str, tuple[int, int]],
     provenance: dict[str, str],
     progress_callback: ProgressCallback,
+    log_status: bool = True,
 ) -> Path:
     if output_format == "ome-zarr":
         return _write_czi_tile_to_ome_zarr(
@@ -393,6 +396,7 @@ def _write_czi_tile(
             dims=dims,
             provenance=provenance,
             progress_callback=progress_callback,
+            log_status=log_status,
         )
     if output_format != "ome-tiff":
         raise ValueError(f"Unsupported output format {output_format!r}")
@@ -412,11 +416,12 @@ def _write_czi_tile(
     plane_count = _czi_plane_count(dims)
     ome_shape = (len(t_indexes), len(c_indexes), len(z_indexes), tile["height"], tile["width"])
 
-    logger.info(
-        f"Writing tile {tile['index'] + 1}/{tile_count} "
-        f"at x={_format_signed_coordinate(tile['x'])} y={_format_signed_coordinate(tile['y'])} "
-        f"size={tile['width']}x{tile['height']} to {out.name}"
-    )
+    if log_status:
+        logger.info(
+            f"Writing tile {tile['index'] + 1}/{tile_count} "
+            f"at x={_format_signed_coordinate(tile['x'])} y={_format_signed_coordinate(tile['y'])} "
+            f"size={tile['width']}x{tile['height']} to {out.name}"
+        )
 
     _remove_output_if_exists(write_out)
     try:
@@ -459,6 +464,7 @@ def _write_czi_tile(
                             c=c,
                             z=z,
                             progress_callback=progress_callback,
+                            log_progress=log_status,
                         )
         _replace_output(write_out, out)
     except BaseException:
@@ -467,10 +473,11 @@ def _write_czi_tile(
     compressed_bytes = out.stat().st_size
     ratio = raw_bytes / compressed_bytes if compressed_bytes else 0.0
     saved_fraction = 1.0 - (compressed_bytes / raw_bytes) if raw_bytes else 0.0
-    logger.success(
-        f"Finished {out.name} compressed={_format_bytes(compressed_bytes)} "
-        f"raw={_format_bytes(raw_bytes)} ratio={ratio:.2f}:1 saved={saved_fraction:.1%}"
-    )
+    if log_status:
+        logger.success(
+            f"Finished {out.name} compressed={_format_bytes(compressed_bytes)} "
+            f"raw={_format_bytes(raw_bytes)} ratio={ratio:.2f}:1 saved={saved_fraction:.1%}"
+        )
     return out
 
 
@@ -489,6 +496,7 @@ def _write_czi_tile_to_ome_zarr(
     dims: dict[str, tuple[int, int]],
     provenance: dict[str, str],
     progress_callback: ProgressCallback,
+    log_status: bool = True,
 ) -> Path:
     import zarr
 
@@ -507,11 +515,12 @@ def _write_czi_tile_to_ome_zarr(
     ome_shape = _czi_ome_shape(dims, tile)
     effective_chunks = tuple(min(chunk, size) for chunk, size in zip(chunks, ome_shape, strict=True))
 
-    logger.info(
-        f"Writing tile {tile['index'] + 1}/{tile_count} "
-        f"at x={_format_signed_coordinate(tile['x'])} y={_format_signed_coordinate(tile['y'])} "
-        f"size={tile['width']}x{tile['height']} to {out.name}"
-    )
+    if log_status:
+        logger.info(
+            f"Writing tile {tile['index'] + 1}/{tile_count} "
+            f"at x={_format_signed_coordinate(tile['x'])} y={_format_signed_coordinate(tile['y'])} "
+            f"size={tile['width']}x{tile['height']} to {out.name}"
+        )
 
     _remove_output_if_exists(write_out)
     try:
@@ -565,6 +574,7 @@ def _write_czi_tile_to_ome_zarr(
                         c=c,
                         z=z,
                         progress_callback=progress_callback,
+                        log_progress=log_status,
                     )
         root.attrs["squisher_complete"] = True
         _replace_output(write_out, out)
@@ -575,10 +585,11 @@ def _write_czi_tile_to_ome_zarr(
     compressed_bytes = _directory_size(out)
     ratio = raw_bytes / compressed_bytes if compressed_bytes else 0.0
     saved_fraction = 1.0 - (compressed_bytes / raw_bytes) if raw_bytes else 0.0
-    logger.success(
-        f"Finished {out.name} compressed={_format_bytes(compressed_bytes)} "
-        f"raw={_format_bytes(raw_bytes)} ratio={ratio:.2f}:1 saved={saved_fraction:.1%}"
-    )
+    if log_status:
+        logger.success(
+            f"Finished {out.name} compressed={_format_bytes(compressed_bytes)} "
+            f"raw={_format_bytes(raw_bytes)} ratio={ratio:.2f}:1 saved={saved_fraction:.1%}"
+        )
     return out
 
 
@@ -933,10 +944,12 @@ def _report_czi_plane_progress(
     c: int,
     z: int,
     progress_callback: ProgressCallback,
+    log_progress: bool = True,
 ) -> None:
     if plane_index % CZI_PROGRESS_INTERVAL != 0 and plane_index != plane_count:
         return
-    logger.info(f"{out.name}: wrote plane {plane_index}/{plane_count} (T={t}, C={c}, Z={z})")
+    if log_progress:
+        logger.info(f"{out.name}: wrote plane {plane_index}/{plane_count} (T={t}, C={c}, Z={z})")
     progress_callback(1)
 
 
@@ -953,7 +966,7 @@ def _progress_bar(total: int) -> Generator[ProgressCallback, None, None]:
         TimeRemainingColumn(),
     ]
     lock = threading.RLock()
-    with Progress(*columns) as progress:
+    with Progress(*columns, console=get_shared_console()) as progress:
         task_id = progress.add_task("Compressing", total=total)
 
         def advance(steps: int = 1) -> None:
@@ -1016,6 +1029,7 @@ def _write_czi_tile_process(
         dims=reader.get_dims_shape()[0],
         provenance=provenance,
         progress_callback=progress_callback,
+        log_status=False,
     )
 
 

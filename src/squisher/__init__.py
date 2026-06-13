@@ -12,6 +12,7 @@ from squisher.compression import (
     compress_czi_to_ome_tiff,
     verify_czi_ome_tiff_outputs,
 )
+from squisher.logging import setup_cli_logging
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -19,7 +20,7 @@ app = typer.Typer(no_args_is_help=True)
 
 @app.callback()
 def callback() -> None:
-    pass
+    setup_cli_logging()
 
 
 @app.command()

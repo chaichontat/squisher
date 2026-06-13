@@ -14,6 +14,7 @@ from squisher.compression import (
     _czi_output_dir,
     _czi_progress_steps,
     _czi_subblock_metadata,
+    _progress_bar,
     _report_czi_plane_progress,
     _verify_ome_tiff,
     _write_czi_tile,
@@ -678,6 +679,62 @@ def test_report_czi_plane_progress_advances_every_interval_and_final_plane() -> 
     assert advances == [1, 1, 1]
 
 
+def test_report_czi_plane_progress_can_advance_without_logging(monkeypatch) -> None:
+    advances = []
+    messages = []
+
+    monkeypatch.setattr("squisher.compression.logger.info", lambda message: messages.append(message))
+
+    _report_czi_plane_progress(
+        Path("sample.ome.tif"),
+        plane_index=1,
+        plane_count=1,
+        t=0,
+        c=0,
+        z=0,
+        progress_callback=lambda steps: advances.append(steps),
+        log_progress=False,
+    )
+
+    assert advances == [1]
+    assert messages == []
+
+
+def test_progress_bar_uses_shared_console(monkeypatch) -> None:
+    shared_console = object()
+    captured = {}
+
+    class FakeProgress:
+        def __init__(self, *_columns, console):
+            captured["console"] = console
+            self.advances = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def add_task(self, description, *, total):
+            captured["description"] = description
+            captured["total"] = total
+            return 7
+
+        def update(self, task_id, *, advance):
+            captured.setdefault("updates", []).append((task_id, advance))
+
+    monkeypatch.setattr("squisher.compression.get_shared_console", lambda: shared_console)
+    monkeypatch.setattr("squisher.compression.Progress", FakeProgress)
+
+    with _progress_bar(5) as advance:
+        advance(2)
+
+    assert captured["console"] is shared_console
+    assert captured["description"] == "Compressing"
+    assert captured["total"] == 5
+    assert captured["updates"] == [(7, 2)]
+
+
 def test_compress_czi_progress_total_counts_pending_tile_outputs(tmp_path: Path, monkeypatch) -> None:
     czi_path = tmp_path / "sample.czi"
     czi_path.write_bytes(b"fake")
@@ -839,7 +896,8 @@ def test_write_czi_tile_process_forwards_progress_to_queue(tmp_path: Path, monke
         def put(self, value: int) -> None:
             queued_steps.append(value)
 
-    def fake_write_czi_tile(_reader, _path, *, progress_callback, **_kwargs):
+    def fake_write_czi_tile(_reader, _path, *, progress_callback, log_status, **_kwargs):
+        assert log_status is False
         progress_callback(3)
         out = tmp_path / "sample.ome.tif"
         out.write_bytes(b"complete")
