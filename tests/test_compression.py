@@ -1,3 +1,5 @@
+from concurrent.futures import Future
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -8,9 +10,14 @@ from pylibCZIrw import czi
 from tifffile import TiffFile, TiffWriter
 
 from squisher.compression import (
+    CZI_PROGRESS_INTERVAL,
     _czi_output_dir,
+    _czi_progress_steps,
     _czi_subblock_metadata,
+    _report_czi_plane_progress,
     _verify_ome_tiff,
+    _write_czi_tile,
+    _write_czi_tile_process,
     compress_czi_to_ome_tiff,
     infer_stage_positions_from_pos,
     verify_czi_ome_tiff_outputs,
@@ -644,6 +651,269 @@ def test_czi_output_dir_omits_stem_folder_for_single_tile_outputs(tmp_path: Path
     assert _czi_output_dir(czi_path, out_dir=tmp_path / "compressed", output_count=2) == (
         tmp_path / "compressed" / "sample"
     )
+
+
+def test_czi_progress_steps_count_ceil_plane_blocks() -> None:
+    assert _czi_progress_steps(1) == 1
+    assert _czi_progress_steps(CZI_PROGRESS_INTERVAL) == 1
+    assert _czi_progress_steps(CZI_PROGRESS_INTERVAL + 1) == 2
+    assert _czi_progress_steps(CZI_PROGRESS_INTERVAL * 2) == 2
+
+
+def test_report_czi_plane_progress_advances_every_interval_and_final_plane() -> None:
+    advances = []
+    plane_count = CZI_PROGRESS_INTERVAL * 2 + 25
+
+    for plane_index in range(1, plane_count + 1):
+        _report_czi_plane_progress(
+            Path("sample.ome.tif"),
+            plane_index=plane_index,
+            plane_count=plane_count,
+            t=0,
+            c=0,
+            z=plane_index - 1,
+            progress_callback=lambda steps: advances.append(steps),
+        )
+
+    assert advances == [1, 1, 1]
+
+
+def test_compress_czi_progress_total_counts_pending_tile_outputs(tmp_path: Path, monkeypatch) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    totals = []
+
+    class FakeCziFile:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, CZI_PROGRESS_INTERVAL + 1), "C": (0, 1), "T": (0, 1)}]
+
+    tiles = [
+        {"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        {"index": 1, "scene": 0, "x": 16, "y": 0, "width": 16, "height": 16, "position_x": 16.0, "position_y": 0.0},
+    ]
+
+    @contextmanager
+    def capture_progress(total: int):
+        totals.append(total)
+        yield lambda steps: None
+
+    def fake_write_czi_tile(_reader, _path, *, output_dir, tile, **_kwargs):
+        out = output_dir / f"sample.{tile['index']:03d}.ome.tif"
+        out.write_bytes(b"complete")
+        return out
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._czi_tiles", lambda path, *, pos_path=None: tiles)
+    monkeypatch.setattr("squisher.compression._progress_bar", capture_progress)
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fake_write_czi_tile)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, maxworkers=1, thumbnails=False)
+
+    assert totals == [_czi_progress_steps(CZI_PROGRESS_INTERVAL + 1) * len(tiles)]
+
+
+def test_write_czi_tile_reports_tiff_progress_from_real_writer_loop(tmp_path: Path, monkeypatch) -> None:
+    advances = []
+
+    class FakeTiffWriter:
+        def __init__(self, path: Path, **_kwargs) -> None:
+            self.path = path
+
+        def __enter__(self):
+            self.path.write_bytes(b"tiff")
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def write(self, *_args, **_kwargs) -> None:
+            return None
+
+    class FakeReader:
+        meta = "<ImageDocument />"
+
+        def read_image(self, **_kwargs):
+            return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
+
+        def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
+            assert not unified_xml
+            return [({}, "<Subblock />")]
+
+    monkeypatch.setattr("squisher.compression.TiffWriter", FakeTiffWriter)
+    monkeypatch.setattr("squisher.compression._first_plane_ome_xml", lambda *args, **kwargs: "<OME />")
+
+    out = _write_czi_tile(
+        FakeReader(),
+        tmp_path / "sample.czi",
+        tile={"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        tile_count=1,
+        illumination=0,
+        illumination_count=1,
+        output_dir=tmp_path,
+        output_format="ome-tiff",
+        level=90,
+        tile_size=16,
+        zarr_chunks=(1, 1, 1, 16, 16),
+        zarr_compressor="jpegxr",
+        maxworkers=1,
+        dims={"X": (0, 16), "Y": (0, 16), "Z": (0, CZI_PROGRESS_INTERVAL + 1), "C": (0, 1), "T": (0, 1)},
+        provenance={},
+        progress_callback=lambda steps: advances.append(steps),
+    )
+
+    assert out == tmp_path / "sample.ome.tif"
+    assert advances == [1, 1]
+
+
+def test_write_czi_tile_reports_zarr_progress_from_real_writer_loop(tmp_path: Path, monkeypatch) -> None:
+    zarr = pytest.importorskip("zarr")
+    advances = []
+
+    class FakeArray:
+        attrs = {}
+
+        def __setitem__(self, _key, _value) -> None:
+            return None
+
+    class FakeRoot:
+        def __init__(self, path: str) -> None:
+            Path(path).mkdir()
+            self.attrs = {}
+
+        def create_array(self, *_args, **_kwargs):
+            return FakeArray()
+
+    class FakeReader:
+        meta = "<ImageDocument />"
+
+        def read_image(self, **_kwargs):
+            return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
+
+        def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
+            assert not unified_xml
+            return [({}, "<Subblock />")]
+
+    monkeypatch.setattr(zarr, "open_group", lambda path, **_kwargs: FakeRoot(path))
+    monkeypatch.setattr("squisher.compression._ome_zarr_root_attrs", lambda *args, **kwargs: {})
+    monkeypatch.setattr("squisher.compression._zarr_numcodecs_compressor", lambda *args, **kwargs: None)
+
+    out = _write_czi_tile(
+        FakeReader(),
+        tmp_path / "sample.czi",
+        tile={"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        tile_count=1,
+        illumination=0,
+        illumination_count=1,
+        output_dir=tmp_path,
+        output_format="ome-zarr",
+        level=90,
+        tile_size=16,
+        zarr_chunks=(1, 1, 1, 16, 16),
+        zarr_compressor="jpegxr",
+        maxworkers=1,
+        dims={"X": (0, 16), "Y": (0, 16), "Z": (0, CZI_PROGRESS_INTERVAL + 1), "C": (0, 1), "T": (0, 1)},
+        provenance={},
+        progress_callback=lambda steps: advances.append(steps),
+    )
+
+    assert out == tmp_path / "sample.ome.zarr"
+    assert advances == [1, 1]
+
+
+def test_write_czi_tile_process_forwards_progress_to_queue(tmp_path: Path, monkeypatch) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    queued_steps = []
+
+    class FakeCziFile:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
+
+    class FakeQueue:
+        def put(self, value: int) -> None:
+            queued_steps.append(value)
+
+    def fake_write_czi_tile(_reader, _path, *, progress_callback, **_kwargs):
+        progress_callback(3)
+        out = tmp_path / "sample.ome.tif"
+        out.write_bytes(b"complete")
+        return out
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fake_write_czi_tile)
+
+    assert _write_czi_tile_process(
+        czi_path,
+        tile={"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        tile_count=1,
+        illumination=0,
+        illumination_count=1,
+        output_dir=tmp_path,
+        output_format="ome-tiff",
+        level=90,
+        tile_size=16,
+        zarr_chunks=(1, 1, 1, 16, 16),
+        zarr_compressor="jpegxr",
+        maxworkers=1,
+        provenance={},
+        progress_queue=FakeQueue(),
+    ) == tmp_path / "sample.ome.tif"
+    assert queued_steps == [3]
+
+
+def test_compress_czi_process_pool_failure_stops_progress_listener_and_keeps_temp_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    temp_dir = tmp_path / "sample-temp"
+
+    class FakeCziFile:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
+
+    class FailingPool:
+        _processes = {}
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.shutdown_calls = []
+
+        def submit(self, *_args, **_kwargs):
+            future = Future()
+            future.set_exception(RuntimeError("worker failed"))
+            return future
+
+        def shutdown(self, *args, **kwargs) -> None:
+            self.shutdown_calls.append((args, kwargs))
+
+    @contextmanager
+    def capture_progress(_total: int):
+        yield lambda steps: None
+
+    tiles = [
+        {"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        {"index": 1, "scene": 0, "x": 16, "y": 0, "width": 16, "height": 16, "position_x": 16.0, "position_y": 0.0},
+    ]
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._czi_tiles", lambda path, *, pos_path=None: tiles)
+    monkeypatch.setattr("squisher.compression._progress_bar", capture_progress)
+    monkeypatch.setattr("squisher.compression.ProcessPoolExecutor", FailingPool)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        compress_czi_to_ome_tiff(czi_path, level=90, tile_workers=2, maxworkers=1, thumbnails=False)
+
+    assert temp_dir.exists()
+    assert not (tmp_path / "sample").exists()
 
 
 def test_empty_subblock_metadata_is_preserved_as_empty_marker() -> None:

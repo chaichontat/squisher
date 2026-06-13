@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -7,13 +8,23 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Any, NotRequired, TypedDict
+import threading
+from typing import Any, Callable, Generator, NotRequired, TypedDict
 import xml.etree.ElementTree as ET
 
 import imagecodecs
 from loguru import logger
 import numpy as np
 import numpy.typing as npt
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 import tifffile
 from tifffile import OmeXml, TiffFile, TiffWriter
 
@@ -30,6 +41,7 @@ SUPPORTED_MULTI_DIMS = {"X", "Y", "Z", "C", "T", "M", "I"}
 SUPPORTED_SINGLETON_DIMS = {"S", "R", "H", "V", "B"}
 OUTPUT_FORMATS = {"ome-tiff", "ome-zarr"}
 ZARR_COMPRESSORS = {"jpegxr", "jpegxl"}
+ProgressCallback = Callable[[int], None]
 
 
 class CziTile(TypedDict):
@@ -176,85 +188,97 @@ def compress_czi_to_ome_tiff(
         effective_tile_workers,
         effective_maxworkers,
     )
-    if effective_tile_workers == 1:
-        for tile, illumination in pending_jobs:
-            out = _write_czi_tile(
-                reader,
-                path,
-                tile=tile,
-                tile_count=tile_count,
-                illumination=illumination,
-                illumination_count=illumination_count,
-                output_dir=write_output_dir,
-                output_format=output_format,
-                level=level,
-                tile_size=tile_size,
-                zarr_chunks=zarr_chunks,
-                zarr_compressor=zarr_compressor,
-                maxworkers=effective_maxworkers,
-                dims=dims,
-                provenance=settings,
-            )
-            if thumbnails:
-                write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
-        if use_temp_output_dir:
-            _replace_output(write_output_dir, output_dir)
-        logger.success("Finished compression for {}", path)
-        return True
+    progress_total = _czi_progress_steps(plane_count) * len(pending_jobs)
+    with _progress_bar(progress_total) as progress_callback:
+        if effective_tile_workers == 1:
+            for tile, illumination in pending_jobs:
+                out = _write_czi_tile(
+                    reader,
+                    path,
+                    tile=tile,
+                    tile_count=tile_count,
+                    illumination=illumination,
+                    illumination_count=illumination_count,
+                    output_dir=write_output_dir,
+                    output_format=output_format,
+                    level=level,
+                    tile_size=tile_size,
+                    zarr_chunks=zarr_chunks,
+                    zarr_compressor=zarr_compressor,
+                    maxworkers=effective_maxworkers,
+                    dims=dims,
+                    provenance=settings,
+                    progress_callback=progress_callback,
+                )
+                if thumbnails:
+                    write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
+            if use_temp_output_dir:
+                _replace_output(write_output_dir, output_dir)
+            logger.success("Finished compression for {}", path)
+            return True
 
-    del reader
-    pool = ProcessPoolExecutor(effective_tile_workers, mp_context=get_context("spawn"))
-    futures = []
-    try:
-        futures = [
-            pool.submit(
-                _write_czi_tile_process,
-                path,
-                tile=tile,
-                tile_count=tile_count,
-                illumination=illumination,
-                illumination_count=illumination_count,
-                output_dir=write_output_dir,
-                output_format=output_format,
-                level=level,
-                tile_size=tile_size,
-                zarr_chunks=zarr_chunks,
-                zarr_compressor=zarr_compressor,
-                maxworkers=effective_maxworkers,
-                provenance=settings,
-            )
-            for tile, illumination in pending_jobs
-        ]
-        for future in as_completed(futures):
-            out = future.result()
-            logger.info("Completed {}", out.name)
-            if thumbnails:
-                write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
-    except BaseException as exc:
-        for future in futures:
-            future.cancel()
-        if isinstance(exc, KeyboardInterrupt):
-            logger.warning("KeyboardInterrupt received; cancelling pending CZI tile compression workers.")
-        elif isinstance(exc, Exception):
-            logger.exception("CZI tile compression failed; cancelling pending worker processes.")
+        del reader
+        progress_manager = get_context("spawn").Manager()
+        progress_queue = progress_manager.Queue()
+        progress_thread = _start_progress_queue_listener(progress_queue, progress_callback)
+
+        pool = ProcessPoolExecutor(effective_tile_workers, mp_context=get_context("spawn"))
+        futures = []
+        try:
+            futures = [
+                pool.submit(
+                    _write_czi_tile_process,
+                    path,
+                    tile=tile,
+                    tile_count=tile_count,
+                    illumination=illumination,
+                    illumination_count=illumination_count,
+                    output_dir=write_output_dir,
+                    output_format=output_format,
+                    level=level,
+                    tile_size=tile_size,
+                    zarr_chunks=zarr_chunks,
+                    zarr_compressor=zarr_compressor,
+                    maxworkers=effective_maxworkers,
+                    provenance=settings,
+                    progress_queue=progress_queue,
+                )
+                for tile, illumination in pending_jobs
+            ]
+            for future in as_completed(futures):
+                out = future.result()
+                logger.info("Completed {}", out.name)
+                if thumbnails:
+                    write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
+        except BaseException as exc:
+            for future in futures:
+                future.cancel()
+            if isinstance(exc, KeyboardInterrupt):
+                logger.warning("KeyboardInterrupt received; cancelling pending CZI tile compression workers.")
+            elif isinstance(exc, Exception):
+                logger.exception("CZI tile compression failed; cancelling pending worker processes.")
+            else:
+                logger.warning("CZI tile compression interrupted; cancelling pending worker processes.")
+            terminate_workers = getattr(pool, "terminate_workers", None)
+            if terminate_workers is None:
+                processes = list((getattr(pool, "_processes", None) or {}).values())
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                pool.shutdown(wait=False, cancel_futures=True)
+                for process in processes:
+                    process.join(timeout=1)
+                    if process.is_alive() and hasattr(process, "kill"):
+                        process.kill()
+            else:
+                terminate_workers()
+            raise
         else:
-            logger.warning("CZI tile compression interrupted; cancelling pending worker processes.")
-        terminate_workers = getattr(pool, "terminate_workers", None)
-        if terminate_workers is None:
-            processes = list((getattr(pool, "_processes", None) or {}).values())
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            pool.shutdown(wait=False, cancel_futures=True)
-            for process in processes:
-                process.join(timeout=1)
-                if process.is_alive() and hasattr(process, "kill"):
-                    process.kill()
-        else:
-            terminate_workers()
-        raise
-    else:
-        pool.shutdown(wait=True)
+            pool.shutdown(wait=True)
+        finally:
+            progress_queue.put(None)
+            progress_thread.join()
+            progress_manager.shutdown()
     if use_temp_output_dir:
         _replace_output(write_output_dir, output_dir)
     logger.success("Finished compression for {}", path)
@@ -352,6 +376,7 @@ def _write_czi_tile(
     maxworkers: int,
     dims: dict[str, tuple[int, int]],
     provenance: dict[str, str],
+    progress_callback: ProgressCallback,
 ) -> Path:
     if output_format == "ome-zarr":
         return _write_czi_tile_to_ome_zarr(
@@ -367,6 +392,7 @@ def _write_czi_tile(
             compressor=zarr_compressor,
             dims=dims,
             provenance=provenance,
+            progress_callback=progress_callback,
         )
     if output_format != "ome-tiff":
         raise ValueError(f"Unsupported output format {output_format!r}")
@@ -425,8 +451,15 @@ def _write_czi_tile(
                             maxworkers=maxworkers,
                         )
                         plane_index += 1
-                        if plane_index == 1 or plane_index % CZI_PROGRESS_INTERVAL == 0 or plane_index == plane_count:
-                            logger.info(f"{out.name}: wrote plane {plane_index}/{plane_count} (T={t}, C={c}, Z={z})")
+                        _report_czi_plane_progress(
+                            out,
+                            plane_index=plane_index,
+                            plane_count=plane_count,
+                            t=t,
+                            c=c,
+                            z=z,
+                            progress_callback=progress_callback,
+                        )
         _replace_output(write_out, out)
     except BaseException:
         _remove_output_if_exists(write_out)
@@ -455,6 +488,7 @@ def _write_czi_tile_to_ome_zarr(
     compressor: str,
     dims: dict[str, tuple[int, int]],
     provenance: dict[str, str],
+    progress_callback: ProgressCallback,
 ) -> Path:
     import zarr
 
@@ -523,8 +557,15 @@ def _write_czi_tile_to_ome_zarr(
                     raw_bytes += plane.nbytes
                     array[t_offset, c_offset, z_offset, :, :] = plane
                     plane_index += 1
-                    if plane_index == 1 or plane_index % CZI_PROGRESS_INTERVAL == 0 or plane_index == plane_count:
-                        logger.info(f"{out.name}: wrote plane {plane_index}/{plane_count} (T={t}, C={c}, Z={z})")
+                    _report_czi_plane_progress(
+                        out,
+                        plane_index=plane_index,
+                        plane_count=plane_count,
+                        t=t,
+                        c=c,
+                        z=z,
+                        progress_callback=progress_callback,
+                    )
         root.attrs["squisher_complete"] = True
         _replace_output(write_out, out)
     except BaseException:
@@ -879,6 +920,62 @@ def _validate_thumbnail_size(thumbnail_size: int) -> None:
         raise ValueError(f"Thumbnail size must be > 0, got {thumbnail_size}")
 
 
+def _czi_progress_steps(plane_count: int) -> int:
+    return max(1, (plane_count + CZI_PROGRESS_INTERVAL - 1) // CZI_PROGRESS_INTERVAL)
+
+
+def _report_czi_plane_progress(
+    out: Path,
+    *,
+    plane_index: int,
+    plane_count: int,
+    t: int,
+    c: int,
+    z: int,
+    progress_callback: ProgressCallback,
+) -> None:
+    if plane_index % CZI_PROGRESS_INTERVAL != 0 and plane_index != plane_count:
+        return
+    logger.info(f"{out.name}: wrote plane {plane_index}/{plane_count} (T={t}, C={c}, Z={z})")
+    progress_callback(1)
+
+
+@contextmanager
+def _progress_bar(total: int) -> Generator[ProgressCallback, None, None]:
+    columns = [
+        SpinnerColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ]
+    lock = threading.RLock()
+    with Progress(*columns) as progress:
+        task_id = progress.add_task("Compressing", total=total)
+
+        def advance(steps: int = 1) -> None:
+            with lock:
+                progress.update(task_id, advance=steps)
+
+        yield advance
+
+
+def _start_progress_queue_listener(progress_queue: Any, progress_callback: ProgressCallback) -> threading.Thread:
+    def consume() -> None:
+        while True:
+            steps = progress_queue.get()
+            if steps is None:
+                return
+            progress_callback(int(steps))
+
+    thread = threading.Thread(target=consume, name="squisher-progress", daemon=True)
+    thread.start()
+    return thread
+
+
 def _write_czi_tile_process(
     path: Path,
     *,
@@ -894,8 +991,12 @@ def _write_czi_tile_process(
     zarr_compressor: str,
     maxworkers: int,
     provenance: dict[str, str],
+    progress_queue: Any,
 ) -> Path:
     from aicspylibczi import CziFile
+
+    def progress_callback(steps: int) -> None:
+        progress_queue.put(steps)
 
     reader = CziFile(path)
     return _write_czi_tile(
@@ -914,6 +1015,7 @@ def _write_czi_tile_process(
         maxworkers=maxworkers,
         dims=reader.get_dims_shape()[0],
         provenance=provenance,
+        progress_callback=progress_callback,
     )
 
 
