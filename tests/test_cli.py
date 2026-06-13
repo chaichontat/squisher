@@ -1,5 +1,10 @@
+from pathlib import Path
+
+import pytest
+import typer
 from typer.testing import CliRunner
 
+import squisher
 from squisher import DEFAULT_MIN_ZARR_CHUNK_PIXELS, DEFAULT_ZARR_CHUNKS_TCZYX
 from squisher import app
 
@@ -178,7 +183,11 @@ def test_compress_rejects_duplicate_stems_with_shared_out_dir(tmp_path, monkeypa
     result = CliRunner().invoke(app, ["compress", str(first), str(second), "--out-dir", str(tmp_path / "out")])
 
     assert result.exit_code == 2
-    assert "would collide under --out-dir" in result.output
+
+
+def test_validate_unique_output_stems_reports_shared_out_dir_collision() -> None:
+    with pytest.raises(typer.BadParameter, match="would collide under --out-dir"):
+        squisher._validate_unique_output_stems([Path("/a/sample.czi"), Path("/b/sample.czi")])
 
 
 def test_compress_delete_removes_source_after_success(tmp_path, monkeypatch) -> None:
