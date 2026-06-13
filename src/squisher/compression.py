@@ -92,7 +92,6 @@ def compress_czi_to_ome_tiff(
     tile_count = len(tiles)
     output_count = tile_count * illumination_count
     output_dir = _czi_output_dir(path, out_dir=out_dir, output_count=output_count)
-    output_dir.mkdir(parents=True, exist_ok=True)
     output_jobs = [(tile, illumination) for illumination in illumination_indexes for tile in tiles]
     output_path = _czi_tile_ome_tiff_path if output_format == "ome-tiff" else _czi_tile_ome_zarr_path
     outputs = [
@@ -144,6 +143,12 @@ def compress_czi_to_ome_tiff(
                 write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=False)
         return True
 
+    use_temp_output_dir = output_format == "ome-tiff" and output_count > 1
+    write_output_dir = output_dir.with_name(f"{output_dir.name}-temp") if use_temp_output_dir else output_dir
+    if use_temp_output_dir and write_output_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite existing temporary output directory {write_output_dir}")
+    write_output_dir.mkdir(parents=True, exist_ok=True)
+
     effective_tile_workers, effective_maxworkers = _effective_czi_workers(
         len(pending_jobs), tile_workers, maxworkers
     )
@@ -180,7 +185,7 @@ def compress_czi_to_ome_tiff(
                 tile_count=tile_count,
                 illumination=illumination,
                 illumination_count=illumination_count,
-                output_dir=output_dir,
+                output_dir=write_output_dir,
                 output_format=output_format,
                 level=level,
                 tile_size=tile_size,
@@ -192,6 +197,8 @@ def compress_czi_to_ome_tiff(
             )
             if thumbnails:
                 write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
+        if use_temp_output_dir:
+            _replace_output(write_output_dir, output_dir)
         logger.success("Finished compression for {}", path)
         return True
 
@@ -207,7 +214,7 @@ def compress_czi_to_ome_tiff(
                 tile_count=tile_count,
                 illumination=illumination,
                 illumination_count=illumination_count,
-                output_dir=output_dir,
+                output_dir=write_output_dir,
                 output_format=output_format,
                 level=level,
                 tile_size=tile_size,
@@ -248,6 +255,8 @@ def compress_czi_to_ome_tiff(
         raise
     else:
         pool.shutdown(wait=True)
+    if use_temp_output_dir:
+        _replace_output(write_output_dir, output_dir)
     logger.success("Finished compression for {}", path)
     return True
 

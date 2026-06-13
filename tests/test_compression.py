@@ -581,6 +581,60 @@ def test_compress_czi_uses_out_dir_as_parent_for_multi_tile_outputs(tmp_path: Pa
     assert verify_czi_ome_tiff_outputs(czi_path, out_dir=out_dir)
 
 
+def test_compress_czi_promotes_multi_ome_tiff_temp_output_dir_after_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    czi_path = tmp_path / "sample.czi"
+    tiles = [
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)),
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+    final_dir = tmp_path / "sample"
+    temp_dir = tmp_path / "sample-temp"
+
+    def fake_write_czi_tile(_reader, _path, *, output_dir, tile, **_kwargs):
+        assert output_dir == temp_dir
+        assert not final_dir.exists()
+        out = output_dir / f"sample.{tile['index']:03d}.ome.tif"
+        out.write_bytes(b"complete")
+        return out
+
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fake_write_czi_tile)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+    assert not temp_dir.exists()
+    assert (final_dir / "sample.000.ome.tif").read_bytes() == b"complete"
+    assert (final_dir / "sample.001.ome.tif").read_bytes() == b"complete"
+
+
+def test_compress_czi_keeps_failed_multi_ome_tiff_output_dir_as_temp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    czi_path = tmp_path / "sample.czi"
+    tiles = [
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)),
+        np.arange(16 * 16, dtype=np.uint16).reshape((1, 1, 16, 16)) + 1000,
+    ]
+    _write_multi_tile_czi(czi_path, tiles)
+    final_dir = tmp_path / "sample"
+    temp_dir = tmp_path / "sample-temp"
+
+    def fail_write_czi_tile(_reader, _path, *, output_dir, tile, **_kwargs):
+        assert output_dir == temp_dir
+        (output_dir / f"sample.{tile['index']:03d}.ome.tif").write_bytes(b"partial")
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fail_write_czi_tile)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, thumbnails=False)
+
+    assert not final_dir.exists()
+    assert (temp_dir / "sample.000.ome.tif").read_bytes() == b"partial"
+
+
 def test_czi_output_dir_omits_stem_folder_for_single_tile_outputs(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
 
