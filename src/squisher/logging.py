@@ -4,6 +4,7 @@ from loguru import logger
 from rich.console import Console
 
 
+LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{line} - {message}"
 _SHARED_CONSOLE: Console | None = None
 
 
@@ -25,7 +26,24 @@ def setup_cli_logging(*, level: str = "INFO") -> None:
     logger.add(
         sink,
         level=level,
-        format="{message}",
+        format=LOG_FORMAT,
+        enqueue=False,
+        backtrace=False,
+        diagnose=False,
+    )
+
+
+def setup_queue_logging(progress_queue: object, *, level: str = "INFO") -> None:
+    """Configure worker Loguru output to be emitted by the parent process."""
+    logger.remove()
+
+    def sink(message: str) -> None:
+        progress_queue.put(("log", str(message)))
+
+    logger.add(
+        sink,
+        level=level,
+        format=LOG_FORMAT,
         enqueue=False,
         backtrace=False,
         diagnose=False,

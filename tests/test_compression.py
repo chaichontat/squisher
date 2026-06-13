@@ -2,6 +2,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -16,6 +17,7 @@ from squisher.compression import (
     _czi_subblock_metadata,
     _progress_bar,
     _report_czi_plane_progress,
+    _start_progress_queue_listener,
     _verify_ome_tiff,
     _write_czi_tile,
     _write_czi_tile_process,
@@ -880,31 +882,44 @@ def test_write_czi_tile_reports_zarr_progress_from_real_writer_loop(tmp_path: Pa
     assert advances == [1, 1]
 
 
-def test_write_czi_tile_process_forwards_progress_to_queue(tmp_path: Path, monkeypatch) -> None:
+def test_write_czi_tile_process_forwards_real_tile_progress_and_logs(tmp_path: Path, monkeypatch) -> None:
     czi_path = tmp_path / "sample.czi"
     czi_path.write_bytes(b"fake")
-    queued_steps = []
+    queued_events = []
 
     class FakeCziFile:
+        meta = "<ImageDocument />"
+
         def __init__(self, path: Path) -> None:
             self.path = path
 
         def get_dims_shape(self):
             return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
 
-    class FakeQueue:
-        def put(self, value: int) -> None:
-            queued_steps.append(value)
+        def read_image(self, **_kwargs):
+            return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
 
-    def fake_write_czi_tile(_reader, _path, *, progress_callback, log_status, **_kwargs):
-        assert log_status is False
-        progress_callback(3)
-        out = tmp_path / "sample.ome.tif"
-        out.write_bytes(b"complete")
-        return out
+    class FakeTiffWriter:
+        def __init__(self, path: Path, **_kwargs) -> None:
+            self.path = path
+
+        def __enter__(self):
+            self.path.write_bytes(b"tiff")
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def write(self, *_args, **_kwargs) -> None:
+            return None
+
+    class FakeQueue:
+        def put(self, value: object) -> None:
+            queued_events.append(value)
 
     monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
-    monkeypatch.setattr("squisher.compression._write_czi_tile", fake_write_czi_tile)
+    monkeypatch.setattr("squisher.compression.TiffWriter", FakeTiffWriter)
+    monkeypatch.setattr("squisher.compression._first_plane_ome_xml", lambda *args, **kwargs: "<OME />")
 
     assert _write_czi_tile_process(
         czi_path,
@@ -922,7 +937,53 @@ def test_write_czi_tile_process_forwards_progress_to_queue(tmp_path: Path, monke
         provenance={},
         progress_queue=FakeQueue(),
     ) == tmp_path / "sample.ome.tif"
-    assert queued_steps == [3]
+    assert ("progress", 1) in queued_events
+    log_events = [payload for kind, payload in queued_events if kind == "log"]
+    plane_log = next(event for event in log_events if "sample.ome.tif: wrote plane 1/1" in event)
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| INFO\s+\| "
+        r"squisher\.compression:\d+ - sample\.ome\.tif: wrote plane 1/1 \(T=0, C=0, Z=0\)\n",
+        plane_log,
+    )
+    assert any("Writing tile 1/1" in event for event in log_events)
+    assert any("Finished sample.ome.tif" in event for event in log_events)
+
+
+def test_progress_queue_listener_prints_log_events_and_advances(monkeypatch) -> None:
+    printed = []
+    advances = []
+
+    class FakeConsole:
+        def print(self, message, *, end) -> None:
+            printed.append((message, end))
+
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.events = [
+                ("log", "2026-06-13 12:00:00.000 | INFO     | worker:1 - update\n"),
+                ("progress", 2),
+                ("progress", 1, "extra"),
+                "legacy-progress",
+                ("other", 1),
+                None,
+            ]
+
+        def get(self):
+            return self.events.pop(0)
+
+    monkeypatch.setattr("squisher.compression.get_shared_console", lambda: FakeConsole())
+
+    thread = _start_progress_queue_listener(FakeQueue(), lambda steps: advances.append(steps))
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert printed == [
+        ("2026-06-13 12:00:00.000 | INFO     | worker:1 - update\n", ""),
+        ("Unexpected progress queue event ('progress', 1, 'extra')", "\n"),
+        ("Unexpected progress queue event 'legacy-progress'", "\n"),
+        ("Unexpected progress queue event 'other'", "\n"),
+    ]
+    assert advances == [2]
 
 
 def test_compress_czi_process_pool_failure_stops_progress_listener_and_keeps_temp_dir(
@@ -972,6 +1033,165 @@ def test_compress_czi_process_pool_failure_stops_progress_listener_and_keeps_tem
 
     assert temp_dir.exists()
     assert not (tmp_path / "sample").exists()
+
+
+def test_compress_czi_process_pool_keyboard_interrupt_terminates_workers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    pools = []
+
+    class FakeCziFile:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
+
+    class InterruptingPool:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.terminated = False
+            pools.append(self)
+
+        def submit(self, *_args, **_kwargs):
+            future = Future()
+            future.set_exception(KeyboardInterrupt())
+            return future
+
+        def terminate_workers(self) -> None:
+            self.terminated = True
+
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.events = []
+
+        def put(self, value) -> None:
+            self.events.append(value)
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.queue = FakeQueue()
+            self.shutdown_called = False
+
+        def Queue(self):
+            return self.queue
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.manager = FakeManager()
+
+        def Manager(self):
+            return self.manager
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.joined = False
+
+        def join(self) -> None:
+            self.joined = True
+
+    @contextmanager
+    def capture_progress(_total: int):
+        yield lambda steps: None
+
+    fake_context = FakeContext()
+    manager = fake_context.manager
+    listener_thread = FakeThread()
+    tiles = [
+        {"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        {"index": 1, "scene": 0, "x": 16, "y": 0, "width": 16, "height": 16, "position_x": 16.0, "position_y": 0.0},
+    ]
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._czi_tiles", lambda path, *, pos_path=None: tiles)
+    monkeypatch.setattr("squisher.compression._progress_bar", capture_progress)
+    monkeypatch.setattr("squisher.compression.get_context", lambda _method: fake_context)
+    monkeypatch.setattr("squisher.compression._start_progress_queue_listener", lambda queue, callback: listener_thread)
+    monkeypatch.setattr("squisher.compression.ProcessPoolExecutor", InterruptingPool)
+
+    with pytest.raises(KeyboardInterrupt):
+        compress_czi_to_ome_tiff(czi_path, level=90, tile_workers=2, maxworkers=1, thumbnails=False)
+
+    assert pools[0].terminated
+    assert manager.queue.events[-1] is None
+    assert listener_thread.joined
+    assert manager.shutdown_called
+
+
+def test_compress_czi_process_pool_keyboard_interrupt_during_shutdown_terminates_workers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    pools = []
+
+    class FakeCziFile:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
+
+    class InterruptingShutdownPool:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.terminated = False
+            pools.append(self)
+
+        def submit(self, *_args, **_kwargs):
+            future = Future()
+            future.set_result(tmp_path / "sample.000.ome.tif")
+            return future
+
+        def shutdown(self, *, wait: bool) -> None:
+            assert wait is True
+            raise KeyboardInterrupt
+
+        def terminate_workers(self) -> None:
+            self.terminated = True
+
+    class FakeQueue:
+        def put(self, _value) -> None:
+            return None
+
+    class FakeManager:
+        def Queue(self):
+            return FakeQueue()
+
+        def shutdown(self) -> None:
+            return None
+
+    class FakeContext:
+        def Manager(self):
+            return FakeManager()
+
+    class FakeThread:
+        def join(self) -> None:
+            return None
+
+    @contextmanager
+    def capture_progress(_total: int):
+        yield lambda steps: None
+
+    tiles = [
+        {"index": 0, "scene": 0, "x": 0, "y": 0, "width": 16, "height": 16, "position_x": 0.0, "position_y": 0.0},
+        {"index": 1, "scene": 0, "x": 16, "y": 0, "width": 16, "height": 16, "position_x": 16.0, "position_y": 0.0},
+    ]
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._czi_tiles", lambda path, *, pos_path=None: tiles)
+    monkeypatch.setattr("squisher.compression._progress_bar", capture_progress)
+    monkeypatch.setattr("squisher.compression.get_context", lambda _method: FakeContext())
+    monkeypatch.setattr("squisher.compression._start_progress_queue_listener", lambda queue, callback: FakeThread())
+    monkeypatch.setattr("squisher.compression.ProcessPoolExecutor", InterruptingShutdownPool)
+
+    with pytest.raises(KeyboardInterrupt):
+        compress_czi_to_ome_tiff(czi_path, level=90, tile_workers=2, maxworkers=1, thumbnails=False)
+
+    assert pools[0].terminated
 
 
 def test_empty_subblock_metadata_is_preserved_as_empty_marker() -> None:

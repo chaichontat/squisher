@@ -28,7 +28,7 @@ from rich.progress import (
 import tifffile
 from tifffile import OmeXml, TiffFile, TiffWriter
 
-from squisher.logging import get_shared_console
+from squisher.logging import get_shared_console, setup_queue_logging
 
 
 JPEG_XR_KWARGS = {"photometric": "minisblack", "compression": 22610}
@@ -252,6 +252,7 @@ def compress_czi_to_ome_tiff(
                 logger.info("Completed {}", out.name)
                 if thumbnails:
                     write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
+            pool.shutdown(wait=True)
         except BaseException as exc:
             for future in futures:
                 future.cancel()
@@ -275,8 +276,6 @@ def compress_czi_to_ome_tiff(
             else:
                 terminate_workers()
             raise
-        else:
-            pool.shutdown(wait=True)
         finally:
             progress_queue.put(None)
             progress_thread.join()
@@ -979,10 +978,20 @@ def _progress_bar(total: int) -> Generator[ProgressCallback, None, None]:
 def _start_progress_queue_listener(progress_queue: Any, progress_callback: ProgressCallback) -> threading.Thread:
     def consume() -> None:
         while True:
-            steps = progress_queue.get()
-            if steps is None:
+            event = progress_queue.get()
+            if event is None:
                 return
-            progress_callback(int(steps))
+            if not isinstance(event, tuple) or len(event) != 2:
+                get_shared_console().print(f"Unexpected progress queue event {event!r}", end="\n")
+                continue
+            kind, payload = event
+            if kind == "log":
+                get_shared_console().print(str(payload), end="")
+                continue
+            if kind == "progress":
+                progress_callback(int(payload))
+                continue
+            get_shared_console().print(f"Unexpected progress queue event {kind!r}", end="\n")
 
     thread = threading.Thread(target=consume, name="squisher-progress", daemon=True)
     thread.start()
@@ -1008,8 +1017,10 @@ def _write_czi_tile_process(
 ) -> Path:
     from aicspylibczi import CziFile
 
+    setup_queue_logging(progress_queue)
+
     def progress_callback(steps: int) -> None:
-        progress_queue.put(steps)
+        progress_queue.put(("progress", steps))
 
     reader = CziFile(path)
     return _write_czi_tile(
@@ -1029,7 +1040,6 @@ def _write_czi_tile_process(
         dims=reader.get_dims_shape()[0],
         provenance=provenance,
         progress_callback=progress_callback,
-        log_status=False,
     )
 
 
