@@ -159,6 +159,15 @@ def compress_czi_to_ome_tiff(
         if thumbnails:
             for out in outputs:
                 write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=False)
+            _write_stitched_tile_previews(
+                path,
+                tiles=tiles,
+                illumination_indexes=illumination_indexes,
+                illumination_count=illumination_count,
+                output_dir=output_dir,
+                output_format=output_format,
+                overwrite=False,
+            )
         return True
 
     use_temp_output_dir = output_format == "ome-tiff" and output_count > 1
@@ -222,6 +231,16 @@ def compress_czi_to_ome_tiff(
                     write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
             if use_temp_output_dir:
                 _replace_output(write_output_dir, output_dir)
+            if thumbnails:
+                _write_stitched_tile_previews(
+                    path,
+                    tiles=tiles,
+                    illumination_indexes=illumination_indexes,
+                    illumination_count=illumination_count,
+                    output_dir=output_dir,
+                    output_format=output_format,
+                    overwrite=True,
+                )
             logger.success("Finished compression for {}", path)
             return True
 
@@ -289,6 +308,16 @@ def compress_czi_to_ome_tiff(
             progress_manager.shutdown()
     if use_temp_output_dir:
         _replace_output(write_output_dir, output_dir)
+    if thumbnails:
+        _write_stitched_tile_previews(
+            path,
+            tiles=tiles,
+            illumination_indexes=illumination_indexes,
+            illumination_count=illumination_count,
+            output_dir=output_dir,
+            output_format=output_format,
+            overwrite=True,
+        )
     logger.success("Finished compression for {}", path)
     return True
 
@@ -988,6 +1017,97 @@ def write_center_z_thumbnail(path: Path, *, max_size: int = 512, overwrite: bool
     imagecodecs.imwrite(out, rgb)
     logger.info("Wrote thumbnail {}", out.name)
     return out
+
+
+def _write_stitched_tile_previews(
+    path: Path,
+    *,
+    tiles: list[CziTile],
+    illumination_indexes: list[int],
+    illumination_count: int,
+    output_dir: Path,
+    output_format: str,
+    overwrite: bool,
+) -> None:
+    if len(tiles) <= 1:
+        return
+
+    output_path = _czi_tile_ome_tiff_path if output_format == "ome-tiff" else _czi_tile_ome_zarr_path
+    for illumination in illumination_indexes:
+        previews = []
+        for tile in sorted(tiles, key=lambda item: item["index"]):
+            tile_output = output_path(
+                path,
+                tile,
+                len(tiles),
+                illumination=illumination,
+                illumination_count=illumination_count,
+                output_dir=output_dir,
+            )
+            previews.append((tile, _read_rgb_preview_image(_thumbnail_path(tile_output))))
+
+        out = _stitched_preview_path(
+            path,
+            illumination=illumination,
+            illumination_count=illumination_count,
+            output_dir=output_dir,
+        )
+        if out.exists() and not overwrite:
+            continue
+        write_out = out.with_name(f".{out.name}.tmp-{os.getpid()}.png")
+        _remove_output_if_exists(write_out)
+        try:
+            imagecodecs.imwrite(write_out, _stitch_tile_preview_images(previews))
+            _replace_output(write_out, out)
+        except BaseException:
+            _remove_output_if_exists(write_out)
+            raise
+        logger.info("Wrote stitched preview {}", out.name)
+
+
+def _stitch_tile_preview_images(
+    previews: list[tuple[CziTile, npt.NDArray[np.uint8]]],
+) -> npt.NDArray[np.uint8]:
+    if not previews:
+        raise ValueError("Expected at least one tile preview to stitch")
+
+    first_tile, first_image = previews[0]
+    if first_tile["width"] <= 0 or first_tile["height"] <= 0:
+        raise ValueError(f"Tile {first_tile['index']} has non-positive size")
+    scale_x = first_image.shape[1] / float(first_tile["width"])
+    scale_y = first_image.shape[0] / float(first_tile["height"])
+    min_x = min(tile["x"] for tile, _image in previews)
+    min_y = min(tile["y"] for tile, _image in previews)
+
+    placements = []
+    canvas_height = 1
+    canvas_width = 1
+    for tile, image in previews:
+        if tile["width"] <= 0 or tile["height"] <= 0:
+            raise ValueError(f"Tile {tile['index']} has non-positive size")
+        top = int(round((tile["y"] - min_y) * scale_y))
+        left = int(round((tile["x"] - min_x) * scale_x))
+        placements.append((top, left, image))
+        canvas_height = max(canvas_height, top + image.shape[0])
+        canvas_width = max(canvas_width, left + image.shape[1])
+
+    stitched = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    for top, left, image in placements:
+        stitched[top : top + image.shape[0], left : left + image.shape[1], :] = image
+    return stitched
+
+
+def _read_rgb_preview_image(path: Path) -> npt.NDArray[np.uint8]:
+    image = np.asarray(imagecodecs.imread(path))
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=2)
+    elif image.ndim == 3 and image.shape[2] == 4:
+        image = image[..., :3]
+    elif image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Expected RGB/RGBA/grayscale PNG preview at {path}, found shape {image.shape}")
+    if image.dtype == np.uint8:
+        return image
+    return np.clip(image, 0, 255).astype(np.uint8)
 
 
 def _center_zarr_thumbnail_rgb(path: Path, *, max_size: int) -> npt.NDArray[np.uint8]:
@@ -1828,6 +1948,17 @@ def _thumbnail_path(path: Path) -> Path:
     if path.name.endswith(".ome.zarr"):
         return path.with_name(path.name.removesuffix(".ome.zarr") + ".center-z.png")
     return path.with_name(path.name.removesuffix(".ome.tif") + ".center-z.png")
+
+
+def _stitched_preview_path(
+    path: Path,
+    *,
+    illumination: int = 0,
+    illumination_count: int = 1,
+    output_dir: Path,
+) -> Path:
+    illumination_suffix = _illumination_output_suffix(illumination, illumination_count)
+    return output_dir / f"{path.stem}{illumination_suffix}.stitched-preview.png"
 
 
 def _czi_dim_indexes(dims: dict[str, tuple[int, int]], dim: str) -> list[int]:

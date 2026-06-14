@@ -18,6 +18,8 @@ from squisher.compression import (
     _czi_subblock_metadata,
     _progress_bar,
     _report_czi_plane_progress,
+    _stitched_preview_path,
+    _stitch_tile_preview_images,
     _start_progress_queue_listener,
     _verify_ome_tiff,
     _write_czi_tile,
@@ -378,6 +380,62 @@ def test_compress_czi_writes_each_tile_and_placement(tmp_path: Path) -> None:
         assert 'PositionX="44.5"' in tif.ome_metadata
         assert 'PositionY="33.5"' in tif.ome_metadata
         assert ET.tostring(_shared_czi_metadata(tif.ome_metadata), encoding="unicode") == first_shared_metadata
+    assert (tmp_path / "sample" / "sample.stitched-preview.png").exists()
+
+
+def test_stitch_tile_preview_images_places_tiles_by_czi_coordinates() -> None:
+    first = np.zeros((2, 3, 3), dtype=np.uint8)
+    first[..., 0] = 255
+    second = np.zeros((2, 3, 3), dtype=np.uint8)
+    second[..., 1] = 255
+
+    stitched = _stitch_tile_preview_images(
+        [
+            (
+                {
+                    "index": 0,
+                    "scene": 0,
+                    "x": -10,
+                    "y": 20,
+                    "width": 30,
+                    "height": 20,
+                    "position_x": 0.0,
+                    "position_y": 0.0,
+                },
+                first,
+            ),
+            (
+                {
+                    "index": 1,
+                    "scene": 0,
+                    "x": 20,
+                    "y": 40,
+                    "width": 30,
+                    "height": 20,
+                    "position_x": 30.0,
+                    "position_y": 20.0,
+                },
+                second,
+            ),
+        ]
+    )
+
+    assert stitched.shape == (4, 6, 3)
+    np.testing.assert_array_equal(stitched[:2, :3], first)
+    np.testing.assert_array_equal(stitched[2:4, 3:6], second)
+    assert np.all(stitched[:2, 3:6] == 0)
+
+
+def test_stitched_preview_path_includes_illumination_suffix(tmp_path: Path) -> None:
+    assert (
+        _stitched_preview_path(
+            tmp_path / "sample.czi",
+            illumination=2,
+            illumination_count=3,
+            output_dir=tmp_path / "sample",
+        )
+        == tmp_path / "sample" / "sample.i002.stitched-preview.png"
+    )
 
 
 def test_infer_stage_positions_from_pos_anchors_mosaic_index_zero(tmp_path: Path) -> None:
