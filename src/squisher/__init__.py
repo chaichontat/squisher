@@ -43,6 +43,10 @@ def compress(
     thumbnails: Annotated[bool, typer.Option("--thumbnails/--no-thumbnails")] = True,
     thumbnail_size: Annotated[int, typer.Option("--thumbnail-size", min=1)] = 512,
     pos_path: Annotated[Path | None, typer.Option("--pos", exists=True, dir_okay=False, readable=True)] = None,
+    pyramid: Annotated[
+        bool,
+        typer.Option("--pyramid/--no-pyramid", help="Write XY SubIFD pyramids for OME-TIFF outputs."),
+    ] = True,
     delete_source: Annotated[
         bool,
         typer.Option("--delete/--no-delete", help="Delete each source CZI after successful compression."),
@@ -70,6 +74,7 @@ def compress(
                 thumbnails=thumbnails,
                 thumbnail_size=thumbnail_size,
                 pos_path=pos_path,
+                pyramid=pyramid,
             )
         except Exception as exc:
             raise RuntimeError(f"Compression failed for {path}") from exc

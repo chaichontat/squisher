@@ -12,6 +12,7 @@ from tifffile import TiffFile, TiffWriter
 
 from squisher.compression import (
     CZI_PROGRESS_INTERVAL,
+    _block_mean_xy,
     _czi_output_dir,
     _czi_progress_steps,
     _czi_subblock_metadata,
@@ -68,6 +69,73 @@ def _write_pos_file(path: Path, points: list[tuple[float, float, float]]) -> Non
         )
     lines.append("END")
     path.write_text("\n".join(lines))
+
+
+def _minimal_ome_xml_bytes(*, size_x: int, size_y: int, tiff_pyramid: bool | None = None) -> bytes:
+    annotation_ref = ""
+    structured_annotations = ""
+    if tiff_pyramid is not None:
+        annotation_ref = '<AnnotationRef ID="Annotation:0"/>'
+        structured_annotations = f"""
+  <StructuredAnnotations>
+    <MapAnnotation ID="Annotation:0" Namespace="squisher">
+      <Value>
+        <M K="squisher.tiff_pyramid">{json.dumps(tiff_pyramid)}</M>
+      </Value>
+    </MapAnnotation>
+  </StructuredAnnotations>"""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0">
+    {annotation_ref}
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16"
+            SizeX="{size_x}" SizeY="{size_y}" SizeZ="1" SizeC="1" SizeT="1">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"><LightPath/></Channel>
+      <TiffData IFD="0" PlaneCount="1"/>
+      <Plane TheC="0" TheZ="0" TheT="0"/>
+    </Pixels>
+  </Image>
+  {structured_annotations}
+</OME>
+""".encode()
+
+
+def test_block_mean_xy_downsamples_integer_plane_with_cpu_fallback(monkeypatch) -> None:
+    plane = np.arange(4 * 4, dtype=np.uint16).reshape(4, 4)
+
+    monkeypatch.setattr("squisher.compression._gpu_block_reduce_modules", lambda: None)
+    reduced = _block_mean_xy(plane, factor=2)
+
+    np.testing.assert_array_equal(reduced, np.array([[2, 4], [10, 12]], dtype=np.uint16))
+
+
+def test_block_mean_xy_uses_gpu_result_when_available(monkeypatch) -> None:
+    class FakeCupy:
+        float32 = np.float32
+        mean = np.mean
+
+        @staticmethod
+        def asarray(data, dtype):
+            return np.asarray(data, dtype=dtype)
+
+        @staticmethod
+        def rint(data):
+            return np.rint(data)
+
+        @staticmethod
+        def clip(data, lo, hi):
+            return np.clip(data, lo, hi)
+
+        @staticmethod
+        def asnumpy(data):
+            return np.asarray(data)
+
+    monkeypatch.setattr(
+        "squisher.compression._gpu_block_reduce_modules",
+        lambda: (FakeCupy, lambda *_args, **_kwargs: np.full((2, 2), 7.0, dtype=np.float32)),
+    )
+
+    np.testing.assert_array_equal(_block_mean_xy(np.zeros((4, 4), dtype=np.uint16), factor=2), np.full((2, 2), 7))
 
 
 def test_compress_czi_writes_tiled_ome_tiff_with_raw_metadata(tmp_path: Path) -> None:
@@ -568,6 +636,30 @@ def test_verify_ome_tiff_checks_all_pages(tmp_path: Path) -> None:
     assert any("page 1" in error and "compression" in error for error in errors)
 
 
+def test_verify_ome_tiff_requires_declared_pyramid_subifds(tmp_path: Path) -> None:
+    czi_path = tmp_path / "sample.czi"
+    out = tmp_path / "sample.ome.tif"
+    with TiffWriter(out, bigtiff=True) as writer:
+        writer.write(
+            np.zeros((512, 512), dtype=np.uint16),
+            description=_minimal_ome_xml_bytes(size_x=512, size_y=512, tiff_pyramid=True),
+            tile=(256, 256),
+            photometric="minisblack",
+            compression=22610,
+            compressionargs={"level": 0.9},
+            metadata=None,
+        )
+
+    errors = _verify_ome_tiff(
+        czi_path,
+        out,
+        tile={"index": 0, "scene": 0, "x": 0, "y": 0, "width": 512, "height": 512, "position_x": 0.0, "position_y": 0.0},
+        plane_count=1,
+    )
+
+    assert any("page 0 expected 1 SubIFDs, found 0" in error for error in errors)
+
+
 def test_compress_czi_uses_out_dir_as_parent_for_multi_tile_outputs(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
     out_dir = tmp_path / "compressed"
@@ -825,6 +917,114 @@ def test_write_czi_tile_reports_tiff_progress_from_real_writer_loop(tmp_path: Pa
 
     assert out == tmp_path / "sample.ome.tif"
     assert advances == [1, 1]
+
+
+def test_write_czi_tile_adds_pyramid_subifds_by_default(tmp_path: Path, monkeypatch) -> None:
+    class FakeReader:
+        meta = "<ImageDocument />"
+
+        def read_image(self, **_kwargs):
+            data = np.arange(512 * 512, dtype=np.uint16).reshape(1, 1, 1, 1, 1, 512, 512)
+            return (data, None)
+
+        def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
+            assert not unified_xml
+            return [({}, "<Subblock />")]
+
+    monkeypatch.setattr(
+        "squisher.compression._first_plane_ome_xml",
+        lambda *args, **kwargs: _minimal_ome_xml_bytes(size_x=512, size_y=512),
+    )
+
+    out = _write_czi_tile(
+        FakeReader(),
+        tmp_path / "sample.czi",
+        tile={
+            "index": 0,
+            "scene": 0,
+            "x": 0,
+            "y": 0,
+            "width": 512,
+            "height": 512,
+            "position_x": 0.0,
+            "position_y": 0.0,
+        },
+        tile_count=1,
+        illumination=0,
+        illumination_count=1,
+        output_dir=tmp_path,
+        output_format="ome-tiff",
+        level=90,
+        tile_size=256,
+        zarr_chunks=(1, 1, 1, 512, 512),
+        zarr_compressor="jpegxr",
+        maxworkers=1,
+        dims={"X": (0, 512), "Y": (0, 512), "Z": (0, 1), "C": (0, 1), "T": (0, 1)},
+        provenance={},
+        progress_callback=lambda _steps: None,
+    )
+
+    with TiffFile(out) as tif:
+        assert tif.is_ome
+        assert len(tif.pages) == 1
+        page = tif.pages[0]
+        assert page.compression == 22610
+        assert page.shape == (512, 512)
+        assert len(page.subifds) == 1
+        subifd = page.pages[0]
+        assert subifd.is_subifd
+        assert subifd.compression == 22610
+        assert subifd.shape == (256, 256)
+
+
+def test_write_czi_tile_can_disable_pyramid_subifds(tmp_path: Path, monkeypatch) -> None:
+    class FakeReader:
+        meta = "<ImageDocument />"
+
+        def read_image(self, **_kwargs):
+            return (np.zeros((1, 1, 1, 1, 1, 512, 512), dtype=np.uint16), None)
+
+        def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
+            assert not unified_xml
+            return [({}, "<Subblock />")]
+
+    monkeypatch.setattr(
+        "squisher.compression._first_plane_ome_xml",
+        lambda *args, **kwargs: _minimal_ome_xml_bytes(size_x=512, size_y=512),
+    )
+
+    out = _write_czi_tile(
+        FakeReader(),
+        tmp_path / "sample.czi",
+        tile={
+            "index": 0,
+            "scene": 0,
+            "x": 0,
+            "y": 0,
+            "width": 512,
+            "height": 512,
+            "position_x": 0.0,
+            "position_y": 0.0,
+        },
+        tile_count=1,
+        illumination=0,
+        illumination_count=1,
+        output_dir=tmp_path,
+        output_format="ome-tiff",
+        level=90,
+        tile_size=256,
+        zarr_chunks=(1, 1, 1, 512, 512),
+        zarr_compressor="jpegxr",
+        maxworkers=1,
+        dims={"X": (0, 512), "Y": (0, 512), "Z": (0, 1), "C": (0, 1), "T": (0, 1)},
+        provenance={},
+        progress_callback=lambda _steps: None,
+        pyramid=False,
+    )
+
+    with TiffFile(out) as tif:
+        assert len(tif.pages) == 1
+        assert not tif.pages[0].subifds
 
 
 def test_write_czi_tile_reports_zarr_progress_from_real_writer_loop(tmp_path: Path, monkeypatch) -> None:

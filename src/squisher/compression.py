@@ -1,6 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 import json
 from multiprocessing import get_context
@@ -35,6 +36,7 @@ JPEG_XR_KWARGS = {"photometric": "minisblack", "compression": 22610}
 CZI_PROGRESS_INTERVAL = 100
 DEFAULT_ZARR_CHUNKS_TCZYX = (1, 1, 1, 4096, 4096)
 DEFAULT_MIN_ZARR_CHUNK_PIXELS = 16 * 1024 * 1024
+DEFAULT_TIFF_PYRAMID_MIN_SIZE = 256
 OME_ORIGINAL_METADATA_NAMESPACE = "openmicroscopy.org/OriginalMetadata"
 CZI_RAW_METADATA_NAMESPACE = "squisher/czi/raw-metadata"
 CZI_SHARED_METADATA_NAMESPACE = "squisher/czi/shared-metadata"
@@ -84,6 +86,7 @@ def compress_czi_to_ome_tiff(
     thumbnails: bool = True,
     thumbnail_size: int = 512,
     pos_path: Path | None = None,
+    pyramid: bool = True,
 ) -> bool:
     from aicspylibczi import CziFile
 
@@ -98,6 +101,7 @@ def compress_czi_to_ome_tiff(
             min_zarr_chunk_pixels=min_zarr_chunk_pixels,
             compressor=zarr_compressor,
         )
+    tiff_pyramid = output_format == "ome-tiff" and pyramid
     reader = CziFile(path)
     dims = reader.get_dims_shape()[0]
     illumination_indexes = _czi_dim_indexes(dims, "I")
@@ -184,6 +188,7 @@ def compress_czi_to_ome_tiff(
         thumbnail_size=thumbnail_size,
         tile_count=tile_count,
         plane_count=plane_count,
+        pyramid=tiff_pyramid,
     )
     logger.info(
         "Using {} CZI tile worker(s) and {} codec worker(s) per tile",
@@ -211,6 +216,7 @@ def compress_czi_to_ome_tiff(
                     dims=dims,
                     provenance=settings,
                     progress_callback=progress_callback,
+                    pyramid=tiff_pyramid,
                 )
                 if thumbnails:
                     write_center_z_thumbnail(out, max_size=thumbnail_size, overwrite=True)
@@ -244,6 +250,7 @@ def compress_czi_to_ome_tiff(
                     maxworkers=effective_maxworkers,
                     provenance=settings,
                     progress_queue=progress_queue,
+                    pyramid=tiff_pyramid,
                 )
                 for tile, illumination in pending_jobs
             ]
@@ -360,6 +367,61 @@ def verify_czi_ome_tiff_outputs(
     return True
 
 
+def _tiff_pyramid_level_count(height: int, width: int) -> int:
+    count = 0
+    current_height = height
+    current_width = width
+    while min(current_height, current_width) // 2 >= DEFAULT_TIFF_PYRAMID_MIN_SIZE:
+        current_height //= 2
+        current_width //= 2
+        count += 1
+    return count
+
+
+@lru_cache(maxsize=1)
+def _gpu_block_reduce_modules() -> tuple[Any, Any] | None:
+    try:
+        import cupy as cp
+        from cucim.skimage.measure import block_reduce
+    except ImportError:
+        return None
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            return None
+    except cp.cuda.runtime.CUDARuntimeError:
+        return None
+    return cp, block_reduce
+
+
+def _block_mean_xy(data: npt.NDArray[Any], *, factor: int) -> npt.NDArray[Any]:
+    dtype = np.dtype(data.dtype)
+    height, width = data.shape[-2:]
+    modules = _gpu_block_reduce_modules()
+    if modules is not None:
+        cp, block_reduce = modules
+        block_size = (1,) * (data.ndim - 2) + (factor, factor)
+        reduced = block_reduce(cp.asarray(data, dtype=cp.float32), block_size=block_size, func=cp.mean)
+        if np.issubdtype(dtype, np.integer):
+            info = np.iinfo(dtype)
+            reduced = cp.rint(reduced)
+            reduced = cp.clip(reduced, info.min, info.max)
+        return cp.asnumpy(reduced.astype(dtype, copy=False))
+
+    reshaped = data.astype(np.float32, copy=False).reshape(
+        *data.shape[:-2],
+        height // factor,
+        factor,
+        width // factor,
+        factor,
+    )
+    reduced = reshaped.mean(axis=(-3, -1))
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        reduced = np.rint(reduced)
+        reduced = np.clip(reduced, info.min, info.max)
+    return reduced.astype(dtype, copy=False)
+
+
 def _write_czi_tile(
     reader: Any,
     path: Path,
@@ -379,6 +441,7 @@ def _write_czi_tile(
     provenance: dict[str, str],
     progress_callback: ProgressCallback,
     log_status: bool = True,
+    pyramid: bool = True,
 ) -> Path:
     if output_format == "ome-zarr":
         return _write_czi_tile_to_ome_zarr(
@@ -414,12 +477,13 @@ def _write_czi_tile(
     write_out = _temporary_output_path(out)
     plane_count = _czi_plane_count(dims)
     ome_shape = (len(t_indexes), len(c_indexes), len(z_indexes), tile["height"], tile["width"])
+    pyramid_levels = _tiff_pyramid_level_count(tile["height"], tile["width"]) if pyramid else 0
 
     if log_status:
         logger.info(
             f"Writing tile {tile['index'] + 1}/{tile_count} "
             f"at x={_format_signed_coordinate(tile['x'])} y={_format_signed_coordinate(tile['y'])} "
-            f"size={tile['width']}x{tile['height']} to {out.name}"
+            f"size={tile['width']}x{tile['height']} pyramid_levels={pyramid_levels} to {out.name}"
         )
 
     _remove_output_if_exists(write_out)
@@ -450,10 +514,23 @@ def _write_czi_tile(
                             else None,
                             metadata=None,
                             tile=(tile_size, tile_size),
+                            subifds=pyramid_levels or None,
                             **JPEG_XR_KWARGS,
                             compressionargs={"level": _compression_level(level)},
                             maxworkers=maxworkers,
                         )
+                        reduced = plane
+                        for _level_index in range(pyramid_levels):
+                            reduced = _block_mean_xy(reduced, factor=2)
+                            writer.write(
+                                reduced,
+                                metadata=None,
+                                tile=(tile_size, tile_size),
+                                subfiletype=1,
+                                **JPEG_XR_KWARGS,
+                                compressionargs={"level": _compression_level(level)},
+                                maxworkers=maxworkers,
+                            )
                         plane_index += 1
                         _report_czi_plane_progress(
                             out,
@@ -677,6 +754,8 @@ def _verify_ome_tiff(
     try:
         with TiffFile(out) as tif:
             expected_shape = (tile["height"], tile["width"])
+            expected_pyramid_levels = _tiff_pyramid_level_count(tile["height"], tile["width"])
+            requires_pyramid = _ome_tiff_metadata_requests_pyramid(tif.ome_metadata)
             if len(tif.pages) != plane_count:
                 errors.append(f"{out.name}: expected {plane_count} pages, found {len(tif.pages)}")
             for page_index, page in enumerate(tif.pages):
@@ -686,6 +765,17 @@ def _verify_ome_tiff(
                     errors.append(f"{out.name}: page {page_index} is not tiled")
                 if page.shape != expected_shape:
                     errors.append(f"{out.name}: page {page_index} expected shape {expected_shape}, found {page.shape}")
+                if requires_pyramid or getattr(page, "subifds", None):
+                    errors.extend(
+                        _verify_ome_tiff_subifds(
+                            tif,
+                            out.name,
+                            page_index=page_index,
+                            page=page,
+                            expected_levels=expected_pyramid_levels,
+                            expected_shape=expected_shape,
+                        )
+                    )
             errors.extend(
                 _verify_ome_metadata(
                     path,
@@ -698,6 +788,53 @@ def _verify_ome_tiff(
             )
     except (OSError, ValueError, KeyError, IndexError, tifffile.TiffFileError) as exc:
         errors.append(f"{out.name}: unreadable TIFF/OME metadata: {exc}")
+    return errors
+
+
+def _ome_tiff_metadata_requests_pyramid(ome_metadata: str | None) -> bool:
+    if not ome_metadata:
+        return False
+    try:
+        root = ET.fromstring(ome_metadata)
+    except ET.ParseError:
+        return False
+    return _map_annotation_values(root).get("squisher.tiff_pyramid") == "true"
+
+
+def _verify_ome_tiff_subifds(
+    tif: TiffFile,
+    output_name: str,
+    *,
+    page_index: int,
+    page: Any,
+    expected_levels: int,
+    expected_shape: tuple[int, int],
+) -> list[str]:
+    errors = []
+    subifds = page.subifds or ()
+    if len(subifds) != expected_levels:
+        errors.append(f"{output_name}: page {page_index} expected {expected_levels} SubIFDs, found {len(subifds)}")
+    height, width = expected_shape
+    for level_index, offset in enumerate(subifds):
+        height //= 2
+        width //= 2
+        tif.filehandle.seek(offset)
+        subifd = tifffile.TiffPage(tif, (page_index, level_index), keyframe=tif.pages[0])
+        expected_subifd_shape = (height, width)
+        if not subifd.is_subifd:
+            errors.append(f"{output_name}: page {page_index} SubIFD {level_index} is not marked as SubIFD")
+        if subifd.compression != 22610:
+            errors.append(
+                f"{output_name}: page {page_index} SubIFD {level_index} expected compression 22610, "
+                f"found {subifd.compression}"
+            )
+        if not subifd.is_tiled:
+            errors.append(f"{output_name}: page {page_index} SubIFD {level_index} is not tiled")
+        if subifd.shape != expected_subifd_shape:
+            errors.append(
+                f"{output_name}: page {page_index} SubIFD {level_index} expected shape "
+                f"{expected_subifd_shape}, found {subifd.shape}"
+            )
     return errors
 
 
@@ -1014,6 +1151,7 @@ def _write_czi_tile_process(
     maxworkers: int,
     provenance: dict[str, str],
     progress_queue: Any,
+    pyramid: bool = True,
 ) -> Path:
     from aicspylibczi import CziFile
 
@@ -1040,6 +1178,7 @@ def _write_czi_tile_process(
         dims=reader.get_dims_shape()[0],
         provenance=provenance,
         progress_callback=progress_callback,
+        pyramid=pyramid,
     )
 
 
@@ -1618,6 +1757,7 @@ def _compression_provenance(
     thumbnail_size: int,
     tile_count: int,
     plane_count: int,
+    pyramid: bool,
 ) -> dict[str, str]:
     normalized_level = _compression_level(level)
     compression_name = "JPEG-XR" if output_format == "ome-tiff" else zarr_compressor.upper()
@@ -1645,6 +1785,8 @@ def _compression_provenance(
         "squisher.overwrite": json.dumps(overwrite),
         "squisher.thumbnails": json.dumps(thumbnails),
         "squisher.thumbnail_size": str(thumbnail_size),
+        "squisher.tiff_pyramid": json.dumps(pyramid),
+        "squisher.tiff_pyramid_min_size": str(DEFAULT_TIFF_PYRAMID_MIN_SIZE),
         "squisher.settings_json": json.dumps(
             {
                 "source_path": str(path),
@@ -1667,6 +1809,8 @@ def _compression_provenance(
                 "thumbnail_size": thumbnail_size,
                 "tile_count": tile_count,
                 "plane_count": plane_count,
+                "tiff_pyramid": pyramid,
+                "tiff_pyramid_min_size": DEFAULT_TIFF_PYRAMID_MIN_SIZE,
             },
             sort_keys=True,
         ),

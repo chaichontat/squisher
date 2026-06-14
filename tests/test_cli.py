@@ -40,6 +40,7 @@ def test_compress_uses_expected_defaults(tmp_path, monkeypatch) -> None:
     assert captured["zarr_chunks"] == DEFAULT_ZARR_CHUNKS_TCZYX
     assert captured["min_zarr_chunk_pixels"] == DEFAULT_MIN_ZARR_CHUNK_PIXELS
     assert captured["pos_path"] is None
+    assert captured["pyramid"] is True
     assert czi_path.exists()
 
 
@@ -89,6 +90,7 @@ def test_compress_forwards_options(tmp_path, monkeypatch) -> None:
             "256",
             "--pos",
             str(pos_path),
+            "--no-pyramid",
         ],
     )
 
@@ -107,6 +109,7 @@ def test_compress_forwards_options(tmp_path, monkeypatch) -> None:
     assert captured["thumbnails"] is False
     assert captured["thumbnail_size"] == 256
     assert captured["pos_path"] == pos_path
+    assert captured["pyramid"] is False
 
 
 def test_compress_accepts_multiple_czi_paths(tmp_path, monkeypatch) -> None:

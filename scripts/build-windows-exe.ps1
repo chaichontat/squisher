@@ -52,6 +52,8 @@ if __name__ == "__main__":
         "--collect-all", "numcodecs",
         "--collect-all", "zarr",
         "--collect-all", "squisher",
+        "--exclude-module", "cupy",
+        "--exclude-module", "cucim",
         $entrypoint
     )
 
