@@ -11,6 +11,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: squisher
     steps:
       - uses: actions/checkout@v5
 
@@ -18,6 +21,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
+          cache-dependency-glob: squisher/uv.lock
 
       - name: Set up Python
         run: uv python install
@@ -39,6 +43,9 @@ jobs:
     needs: test
     permissions:
       contents: write
+    defaults:
+      run:
+        working-directory: squisher
     steps:
       - uses: actions/checkout@v5
 
@@ -46,6 +53,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
+          cache-dependency-glob: squisher/uv.lock
 
       - name: Set up Python
         run: uv python install
@@ -57,14 +65,14 @@ jobs:
       - name: Smoke test executable
         shell: pwsh
         env:
-          SQUISHER_EXE: ${{ github.workspace }}\dist\squisher.exe
+          SQUISHER_EXE: ${{ github.workspace }}\squisher\dist\squisher.exe
         run: uv run pytest -q tests/test_exe_smoke.py
 
       - name: Upload executable
         uses: actions/upload-artifact@v5
         with:
           name: squisher-windows-exe
-          path: dist/squisher.exe
+          path: squisher/dist/squisher.exe
 
       - name: Publish executable release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
