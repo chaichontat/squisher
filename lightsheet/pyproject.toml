@@ -1,0 +1,37 @@
+[project]
+name = "squisher-lightsheet"
+version = "0.1.0"
+description = "Lightsheet metadata positioning, stitching, fusion, pyramid, and QC workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dask[array]>=2026.5.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.0",
+    "numpy>=2.4.6",
+    "pillow>=12.0.0",
+    "rich>=15.0.0",
+    "scikit-image>=0.26.0",
+    "scipy>=1.16.0",
+    "tifffile>=2026.6.1",
+    "typer>=0.26.5",
+    "zarr>=3.2.1",
+]
+
+[project.scripts]
+lightsheet = "squisher_lightsheet.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
