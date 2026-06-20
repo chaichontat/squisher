@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from squisher_lightsheet._legacy import render_lr_level4_registration_qc as legacy
 from squisher_lightsheet.legacy_runner import run_legacy_script
+
+
+side_by_tile = legacy.side_by_tile
 
 
 def render_registration_qc(

@@ -13,6 +13,7 @@ from collections import Counter, OrderedDict
 from contextlib import contextmanager, nullcontext
 import copy
 from datetime import datetime
+import hashlib
 import io
 import json
 import math
@@ -39,9 +40,9 @@ except NameError:
 
 TRANSFORM_KEY = "stage_metadata"
 REGISTERED_TRANSFORM_KEY = "translation_registered"
-SEED_TRANSFORM_KEY = "translation_seed"
 FUSION_BACKEND = "cupy"
 DEFAULT_REGISTRATION_READ_CHUNK_Z = 128
+PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
 NGFF_VERSION = "0.5"
 ZSTD_LEVEL = 0
 DEFAULT_JPEGXR_LEVEL = 0.7
@@ -61,6 +62,107 @@ class FilesystemProgressSnapshot:
 
 class ProfileFusionStop(RuntimeError):
     """Internal stop signal for bounded fusion profiling runs."""
+
+
+@contextmanager
+def cupy_cleanup_context(per_chunk_cleanup: bool):
+    if per_chunk_cleanup:
+        yield
+        return
+
+    from multiview_stitcher import misc_utils
+
+    def skip_cupy_cleanup():
+        return False
+
+    originals: list[tuple[Any, str, Any]] = [
+        (misc_utils, "clear_cupy_memory", misc_utils.clear_cupy_memory)
+    ]
+    try:
+        from multiview_stitcher import weights
+
+        if hasattr(weights, "clear_cupy_memory"):
+            originals.append((weights, "clear_cupy_memory", weights.clear_cupy_memory))
+    except ImportError:
+        pass
+
+    for module, name, _original in originals:
+        setattr(module, name, skip_cupy_cleanup)
+    try:
+        yield
+    finally:
+        originals[0][2]()
+        for module, name, original in originals:
+            setattr(module, name, original)
+
+
+def basic_array_fingerprint(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.shape).encode())
+    digest.update(str(contiguous.dtype).encode())
+    digest.update(contiguous.view(np.uint8))
+    return digest.hexdigest()[:16]
+
+
+def basic_disk_cache_paths(cache_dir: Path, cache_key: str) -> tuple[Path, Path]:
+    digest = hashlib.sha256(cache_key.encode()).hexdigest()
+    return cache_dir / f"{digest}.npy", cache_dir / f"{digest}.json"
+
+
+def read_basic_disk_cache_entry(
+    cache_dir: Path,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    data_path, metadata_path = basic_disk_cache_paths(cache_dir, cache_key)
+    if not data_path.exists() or not metadata_path.exists():
+        return None
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("cache_key") != cache_key:
+        raise ValueError(f"BaSiC disk cache metadata mismatch for {metadata_path}")
+    data = np.load(data_path, allow_pickle=False)
+    return {
+        "data": data,
+        "dims": tuple(metadata["dims"]),
+        "offsets": {dim: int(offset) for dim, offset in metadata["offsets"].items()},
+        "bytes": int(data.nbytes),
+    }
+
+
+def write_basic_disk_cache_entry(
+    cache_dir: Path,
+    cache_key: str,
+    cached: dict[str, Any],
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    data_path, metadata_path = basic_disk_cache_paths(cache_dir, cache_key)
+    suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp_data_path = data_path.with_name(f"{data_path.name}{suffix}")
+    tmp_metadata_path = metadata_path.with_name(f"{metadata_path.name}{suffix}")
+    with tmp_data_path.open("wb") as handle:
+        np.save(handle, cached["data"], allow_pickle=False)
+    metadata = {
+        "cache_key": cache_key,
+        "dims": list(cached["dims"]),
+        "offsets": {dim: int(offset) for dim, offset in cached["offsets"].items()},
+        "shape": [int(value) for value in cached["data"].shape],
+        "dtype": str(cached["data"].dtype),
+        "bytes": int(cached["data"].nbytes),
+    }
+    tmp_metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
+    os.replace(tmp_data_path, data_path)
+    os.replace(tmp_metadata_path, metadata_path)
+
+
+@contextmanager
+def temporary_basic_disk_cache_dir(base_dir: Path | None, output: Path):
+    root = output.parent if base_dir is None else base_dir
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.basic-cache-",
+        dir=root,
+    ) as cache_dir:
+        yield Path(cache_dir)
 
 
 def make_profile_limited_batch_func(
@@ -118,6 +220,7 @@ def coarse_preibisch_content_weights(
     sigma_1: int,
     sigma_2: int,
     stride_zyx: tuple[int, int, int],
+    softmax_exponent: float = 2.0,
 ):
     try:
         import cupy as cp
@@ -162,7 +265,12 @@ def coarse_preibisch_content_weights(
 
     valid_full = (blending_weights > 1e-7) & ~xp.isnan(transformed_views)
     weights = xp.where(valid_full, weights, 0.0)
-    return normalize_or_uniform_valid(weights, valid_full, xp).astype(xp.float32, copy=False)
+    weights = normalize_or_uniform_valid(weights, valid_full, xp)
+    if softmax_exponent > 1.0:
+        eps = xp.asarray(1e-12, dtype=weights.dtype)
+        weights = xp.where(valid_full, xp.power(xp.maximum(weights, eps), float(softmax_exponent)), 0.0)
+        weights = normalize_or_uniform_valid(weights, valid_full, xp)
+    return weights.astype(xp.float32, copy=False)
 
 
 def fusion_weight_config(args: argparse.Namespace, resolved_chunksize: dict[str, int]) -> tuple[Any | None, dict[str, Any] | None]:
@@ -203,6 +311,8 @@ def fusion_weight_config(args: argparse.Namespace, resolved_chunksize: dict[str,
             raise ValueError("--content-preibisch-sigma1 must be positive")
         if args.content_preibisch_sigma2 <= 0.0:
             raise ValueError("--content-preibisch-sigma2 must be positive")
+        if args.content_preibisch_softmax_exponent < 1.0:
+            raise ValueError("--content-preibisch-softmax-exponent must be at least 1.0")
         strides = tuple(int(value) for value in args.content_preibisch_coarse_stride)
         if any(value <= 0 for value in strides):
             raise ValueError("--content-preibisch-coarse-stride values must be positive")
@@ -210,6 +320,7 @@ def fusion_weight_config(args: argparse.Namespace, resolved_chunksize: dict[str,
             "sigma_1": int(args.content_preibisch_sigma1),
             "sigma_2": int(args.content_preibisch_sigma2),
             "stride_zyx": strides,
+            "softmax_exponent": float(args.content_preibisch_softmax_exponent),
         }
 
     raise ValueError(f"Unsupported fusion weight mode {args.fusion_weight_mode!r}")
@@ -642,7 +753,6 @@ class TrackRunConfig:
     output: Path
     registration_output: Path
     registration_input: Path | None
-    seed_registration_input: Path | None
     registration_plots_dir: Path
     robust_boundary_qc_dir: Path
     selected_channels: tuple[int, ...] | None
@@ -1458,6 +1568,114 @@ def phase_correlation_shift_gpu(fixed: Any, moving: Any) -> tuple[tuple[float, f
     return phase_correlation_shift_gpu_arrays(fixed_gpu, moving_gpu)
 
 
+def quantize_phase_shift(
+    shift: float,
+    *,
+    upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
+) -> float:
+    if upsample_factor <= 1:
+        quantized = float(round(shift))
+    else:
+        quantized = round(float(shift) * upsample_factor) / float(upsample_factor)
+    return 0.0 if quantized == 0.0 else quantized
+
+
+def quadratic_subpixel_peak_offset(left: float, center: float, right: float) -> float:
+    if not all(math.isfinite(value) for value in (left, center, right)):
+        return 0.0
+    denominator = left - 2.0 * center + right
+    if abs(denominator) < 1e-12:
+        return 0.0
+    offset = 0.5 * (left - right) / denominator
+    if not math.isfinite(offset):
+        return 0.0
+    return min(0.5, max(-0.5, float(offset)))
+
+
+def refined_phase_shift_from_samples(
+    peak_index: int,
+    size: int,
+    left: float,
+    center: float,
+    right: float,
+    *,
+    upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
+) -> float:
+    refined = float(peak_index) + quadratic_subpixel_peak_offset(left, center, right)
+    if refined > float(size) / 2.0:
+        refined -= float(size)
+    return quantize_phase_shift(refined, upsample_factor=upsample_factor)
+
+
+def upsampled_dft_gpu(
+    data: Any,
+    upsampled_region_size: int,
+    upsample_factor: int,
+    axis_offsets: list[float],
+) -> Any:
+    import cupy as cp
+
+    if len(axis_offsets) != data.ndim:
+        raise ValueError("axis_offsets must match data dimensionality")
+    float_dtype = data.real.dtype
+    im2pi = 1j * 2.0 * math.pi
+    for n_items, axis_offset in zip(data.shape[::-1], axis_offsets[::-1], strict=True):
+        sample_positions = cp.arange(upsampled_region_size, dtype=float_dtype) - float(axis_offset)
+        frequencies = cp.fft.fftfreq(n_items, d=float(upsample_factor)).astype(float_dtype, copy=False)
+        kernel = cp.exp((-im2pi * sample_positions[:, None]) * frequencies[None, :])
+        kernel = kernel.astype(data.dtype, copy=False)
+        data = cp.tensordot(kernel, data, axes=(1, -1))
+    return data
+
+
+def refined_phase_shifts_gpu(
+    image_product: Any,
+    peak_index: tuple[int, ...],
+    *,
+    upsample_factor: int,
+) -> tuple[float, ...]:
+    import cupy as cp
+
+    shape = tuple(int(value) for value in image_product.shape)
+    shifts = []
+    for index, size in zip(peak_index, shape, strict=True):
+        shift = float(index)
+        if index > size // 2:
+            shift -= float(size)
+        shifts.append(shift)
+
+    if upsample_factor <= 1:
+        return tuple(quantize_phase_shift(shift, upsample_factor=1) for shift in shifts)
+
+    shifts = [
+        quantize_phase_shift(shift, upsample_factor=upsample_factor)
+        for shift in shifts
+    ]
+    upsampled_region_size = int(math.ceil(float(upsample_factor) * 1.5))
+    dftshift = int(math.trunc(upsampled_region_size / 2.0))
+    sample_region_offset = [
+        float(dftshift) - shift * float(upsample_factor)
+        for shift in shifts
+    ]
+    refined = upsampled_dft_gpu(
+        image_product.conj(),
+        upsampled_region_size,
+        upsample_factor,
+        sample_region_offset,
+    ).conj()
+    refined_peak = tuple(
+        int(value)
+        for value in cp.unravel_index(cp.argmax(cp.abs(refined)), refined.shape)
+    )
+    output = []
+    for shift, maximum, size in zip(shifts, refined_peak, shape, strict=True):
+        refined_shift = shift + (float(maximum) - float(dftshift)) / float(upsample_factor)
+        if size == 1:
+            refined_shift = 0.0
+        output.append(quantize_phase_shift(refined_shift, upsample_factor=upsample_factor))
+    return tuple(output)
+
+
 def content_mask_gpu_array(values_gpu: Any, settings: RobustBoundarySettings) -> Any:
     import cupy as cp
 
@@ -1495,6 +1713,7 @@ def phase_correlation_shift_gpu_arrays(
     moving_mask_gpu: Any | None = None,
     *,
     min_mask_voxels: int = 2,
+    upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
 ) -> tuple[tuple[float, float, float], float]:
     import cupy as cp
 
@@ -1510,110 +1729,12 @@ def phase_correlation_shift_gpu_arrays(
     corr = cp.real(cp.fft.ifftn(cross_power))
     peak_index = tuple(int(value) for value in cp.unravel_index(cp.argmax(corr), corr.shape))
     peak = float(corr[peak_index].get())
-    shape = corr.shape
-    shifts = []
-    for index, size in zip(peak_index, shape, strict=True):
-        shift = float(index)
-        if index > size // 2:
-            shift -= float(size)
-        shifts.append(shift)
+    shifts = refined_phase_shifts_gpu(
+        cross_power,
+        peak_index,
+        upsample_factor=upsample_factor,
+    )
     return (shifts[0], shifts[1], shifts[2]), peak
-
-
-def phase_correlation_shift_1d_numpy(fixed_profile: np.ndarray, moving_profile: np.ndarray) -> tuple[float, float]:
-    fixed = np.asarray(fixed_profile, dtype=np.float32)
-    moving = np.asarray(moving_profile, dtype=np.float32)
-    finite = np.isfinite(fixed) & np.isfinite(moving)
-    if int(np.count_nonzero(finite)) < 8:
-        return 0.0, float("nan")
-    fixed = np.where(finite, fixed, 0.0)
-    moving = np.where(finite, moving, 0.0)
-    fixed = fixed - np.mean(fixed[finite])
-    moving = moving - np.mean(moving[finite])
-    cross_power = np.fft.fft(fixed) * np.conj(np.fft.fft(moving))
-    magnitude = np.abs(cross_power)
-    cross_power = cross_power / np.maximum(magnitude, np.finfo(np.float32).eps)
-    corr = np.real(np.fft.ifft(cross_power))
-    peak_index = int(np.argmax(corr))
-    shift = float(peak_index)
-    if peak_index > corr.shape[0] // 2:
-        shift -= float(corr.shape[0])
-    return shift, float(corr[peak_index])
-
-
-def phase_correlation_shift_1d_gpu(fixed_profile: Any, moving_profile: Any) -> tuple[float, float]:
-    import cupy as cp
-
-    fixed = cp.asarray(fixed_profile, dtype=cp.float32)
-    moving = cp.asarray(moving_profile, dtype=cp.float32)
-    finite = cp.isfinite(fixed) & cp.isfinite(moving)
-    if int(cp.count_nonzero(finite).get()) < 8:
-        return 0.0, float("nan")
-    fixed = cp.where(finite, fixed, 0.0)
-    moving = cp.where(finite, moving, 0.0)
-    fixed = fixed - cp.mean(fixed[finite])
-    moving = moving - cp.mean(moving[finite])
-    cross_power = cp.fft.fft(fixed) * cp.conj(cp.fft.fft(moving))
-    magnitude = cp.abs(cross_power)
-    cross_power = cross_power / cp.maximum(magnitude, cp.finfo(cp.float32).eps)
-    corr = cp.real(cp.fft.ifft(cross_power))
-    peak_index = int(cp.argmax(corr).get())
-    peak = float(corr[peak_index].get())
-    shift = float(peak_index)
-    if peak_index > corr.shape[0] // 2:
-        shift -= float(corr.shape[0])
-    return shift, peak
-
-
-def z_only_phase_correlation_registration(
-    fixed_data: Any,
-    moving_data: Any,
-    **_kwargs: Any,
-) -> dict[str, Any]:
-    """Estimate only axial residual shift after the current affine placement."""
-    from multiview_stitcher import param_utils
-
-    fixed = np.asarray(fixed_data.data, dtype=np.float32)
-    moving = np.asarray(moving_data.data, dtype=np.float32)
-    finite = np.isfinite(fixed) & np.isfinite(moving)
-    if int(np.count_nonzero(finite)) < 8:
-        shift = 0.0
-        peak = float("nan")
-    else:
-        fixed_profile = np.nanmean(np.where(np.isfinite(fixed), fixed, np.nan), axis=(1, 2))
-        moving_profile = np.nanmean(np.where(np.isfinite(moving), moving, np.nan), axis=(1, 2))
-        shift, peak = phase_correlation_shift_1d_numpy(fixed_profile, moving_profile)
-    return {
-        "affine_matrix": param_utils.affine_from_translation([shift, 0.0, 0.0]),
-        "quality": peak,
-    }
-
-
-def cupy_z_only_phase_correlation_registration(
-    fixed_data: Any,
-    moving_data: Any,
-    **_kwargs: Any,
-) -> dict[str, Any]:
-    """CuPy-backed axial-only pairwise registration for multiview-stitcher."""
-    import cupy as cp
-    from multiview_stitcher import param_utils
-
-    fixed = cp.asarray(np.asarray(fixed_data.data, dtype=np.float32))
-    moving = cp.asarray(np.asarray(moving_data.data, dtype=np.float32))
-    finite = cp.isfinite(fixed) & cp.isfinite(moving)
-    if int(cp.count_nonzero(finite).get()) < 8:
-        shift = 0.0
-        peak = float("nan")
-    else:
-        fixed = cp.where(cp.isfinite(fixed), fixed, cp.nan)
-        moving = cp.where(cp.isfinite(moving), moving, cp.nan)
-        fixed_profile = cp.nanmean(fixed, axis=(1, 2))
-        moving_profile = cp.nanmean(moving, axis=(1, 2))
-        shift, peak = phase_correlation_shift_1d_gpu(fixed_profile, moving_profile)
-    return {
-        "affine_matrix": param_utils.affine_from_translation([shift, 0.0, 0.0]),
-        "quality": peak,
-    }
 
 
 def cupy_pairwise_phase_correlation_registration(
@@ -1643,11 +1764,9 @@ def cupy_pairwise_phase_correlation_registration(
     }
 
 
-def pairwise_registration_function(*, registration_axis: str, use_gpu: bool) -> Any:
+def pairwise_registration_function(*, use_gpu: bool) -> Any:
     from multiview_stitcher import registration
 
-    if registration_axis == "z":
-        return cupy_z_only_phase_correlation_registration if use_gpu else z_only_phase_correlation_registration
     return cupy_pairwise_phase_correlation_registration if use_gpu else registration.phase_correlation_registration
 
 
@@ -1673,8 +1792,25 @@ def integer_shift_slices(
     return tuple(source_slices), tuple(destination_slices)
 
 
+def is_integer_shift(shift_zyx: tuple[float, float, float]) -> bool:
+    return all(abs(float(shift) - round(float(shift))) < 1e-6 for shift in shift_zyx)
+
+
 def shift_array_gpu_array(source: Any, shift_zyx: tuple[float, float, float]) -> Any:
     import cupy as cp
+
+    if not is_integer_shift(shift_zyx):
+        import cupyx.scipy.ndimage as cpx_ndimage
+
+        is_bool = source.dtype == cp.bool_
+        return cpx_ndimage.shift(
+            source,
+            shift=shift_zyx,
+            order=0 if is_bool else 1,
+            mode="constant",
+            cval=0 if is_bool else 0.0,
+            prefilter=False,
+        )
 
     shifted = cp.zeros_like(source)
     slices = integer_shift_slices(tuple(source.shape), shift_zyx)
@@ -1689,6 +1825,19 @@ def shift_array_cpu(array: Any, shift_zyx: tuple[float, float, float]) -> Any:
     import numpy as np
 
     source = np.asarray(array)
+    if not is_integer_shift(shift_zyx):
+        import scipy.ndimage as scipy_ndimage
+
+        is_bool = source.dtype == np.bool_
+        return scipy_ndimage.shift(
+            source,
+            shift=shift_zyx,
+            order=0 if is_bool else 1,
+            mode="constant",
+            cval=0 if is_bool else 0.0,
+            prefilter=False,
+        )
+
     shifted = np.zeros_like(source)
     slices = integer_shift_slices(tuple(source.shape), shift_zyx)
     if slices is None:
@@ -1840,6 +1989,250 @@ def accepted_boundary_weight(
     return evidence * support * peak_weight
 
 
+def boundary_constraint_from_evaluation(
+    *,
+    spec: BoundaryPatchSpec,
+    fixed_index: int,
+    moving_index: int,
+    fixed_slices: tuple[slice, slice, slice],
+    moving_slices: tuple[slice, slice, slice],
+    fixed_support: tuple[float, float],
+    moving_support: tuple[float, float],
+    fixed_content: float,
+    moving_content: float,
+    corr_before: float,
+    shift: tuple[float, float, float],
+    peak: float,
+    corr_after: float,
+    settings: RobustBoundarySettings,
+    source_label: str | None = None,
+) -> BoundaryConstraint:
+    fixed_nonzero, fixed_std = fixed_support
+    moving_nonzero, moving_std = moving_support
+    reject_reason = None
+    if fixed_nonzero < settings.min_nonzero_fraction or moving_nonzero < settings.min_nonzero_fraction:
+        reject_reason = "low_nonzero_fraction"
+    elif fixed_std < settings.min_std or moving_std < settings.min_std:
+        reject_reason = "low_texture"
+    elif fixed_content < settings.min_content_fraction or moving_content < settings.min_content_fraction:
+        reject_reason = "low_content"
+
+    stable_alignment = False
+    if reject_reason is None:
+        improvement = corr_after - corr_before if math.isfinite(corr_before) else corr_after
+        stable_alignment = is_stable_aligned_patch(corr_before, shift, settings)
+        if stable_alignment and (
+            not math.isfinite(improvement)
+            or improvement < settings.min_improvement
+        ):
+            shift = (0.0, 0.0, 0.0)
+            corr_after = corr_before
+            improvement = 0.0
+        elif not math.isfinite(corr_after) or corr_after < settings.min_correlation:
+            reject_reason = "weak_correlation"
+        elif not math.isfinite(improvement) or improvement < settings.min_improvement:
+            reject_reason = "weak_improvement"
+    else:
+        improvement = 0.0
+
+    if reject_reason is None:
+        weight = accepted_boundary_weight(
+            improvement=improvement,
+            fixed_content=fixed_content,
+            moving_content=moving_content,
+            peak=peak,
+            stable_alignment=stable_alignment,
+            settings=settings,
+        )
+        if weight <= 0:
+            reject_reason = "zero_weight"
+    else:
+        weight = 0.0
+
+    return BoundaryConstraint(
+        fixed=fixed_index,
+        moving=moving_index,
+        pair=spec.pair,
+        axis=spec.axis,
+        patch_index=spec.patch_index,
+        shift_zyx=shift,
+        weight=weight,
+        correlation_before=corr_before,
+        correlation_after=corr_after,
+        improvement=improvement,
+        fixed_nonzero_fraction=fixed_nonzero,
+        moving_nonzero_fraction=moving_nonzero,
+        fixed_std=fixed_std,
+        moving_std=moving_std,
+        accepted=reject_reason is None,
+        fixed_content_fraction=fixed_content,
+        moving_content_fraction=moving_content,
+        reject_reason=reject_reason,
+        fixed_slices=fixed_slices,
+        moving_slices=moving_slices,
+        source_label=source_label,
+    )
+
+
+def evaluate_boundary_patch_constraint(
+    *,
+    arrays: list[Any],
+    tiles: list[TileMetadata],
+    channel: int,
+    spec: BoundaryPatchSpec,
+    settings: RobustBoundarySettings,
+    source_label: str | None = None,
+) -> BoundaryConstraint:
+    fixed_index, moving_index = spec.pair
+    fixed_patch = read_native_patch(
+        arrays[fixed_index],
+        tiles[fixed_index].axes,
+        channel,
+        spec.fixed_slices,
+    )
+    moving_patch = read_native_patch(
+        arrays[moving_index],
+        tiles[moving_index].axes,
+        channel,
+        spec.moving_slices,
+    )
+    (
+        fixed_support,
+        moving_support,
+        (fixed_content, moving_content),
+        corr_before,
+        shift,
+        peak,
+        corr_after,
+    ) = evaluate_boundary_patch_gpu(fixed_patch, moving_patch, settings)
+    return boundary_constraint_from_evaluation(
+        spec=spec,
+        fixed_index=fixed_index,
+        moving_index=moving_index,
+        fixed_slices=spec.fixed_slices,
+        moving_slices=spec.moving_slices,
+        fixed_support=fixed_support,
+        moving_support=moving_support,
+        fixed_content=fixed_content,
+        moving_content=moving_content,
+        corr_before=corr_before,
+        shift=shift,
+        peak=peak,
+        corr_after=corr_after,
+        settings=settings,
+        source_label=source_label,
+    )
+
+
+def finite_weighted_average(values: list[float], weights: np.ndarray) -> float:
+    finite = np.asarray([math.isfinite(value) for value in values], dtype=bool)
+    if not np.any(finite):
+        return float("nan")
+    selected_values = np.asarray(values, dtype=float)[finite]
+    selected_weights = weights[finite]
+    if float(np.sum(selected_weights)) <= 0.0:
+        return float(np.mean(selected_values))
+    return float(np.average(selected_values, weights=selected_weights))
+
+
+def combine_channel_boundary_constraints(
+    constraints: list[BoundaryConstraint],
+    *,
+    source_label: str,
+    settings: RobustBoundarySettings,
+) -> BoundaryConstraint:
+    if not constraints:
+        raise ValueError("Cannot combine an empty boundary constraint list")
+    first = constraints[0]
+    accepted = [constraint for constraint in constraints if constraint.accepted]
+    if not accepted:
+        best = max(
+            constraints,
+            key=lambda constraint: (
+                constraint.correlation_after
+                if math.isfinite(constraint.correlation_after)
+                else float("-inf")
+            ),
+        )
+        return replace(
+            best,
+            weight=0.0,
+            accepted=False,
+            reject_reason="all_channels_rejected",
+            source_label=source_label,
+        )
+
+    weights = np.asarray([max(constraint.weight, 0.0) for constraint in accepted], dtype=float)
+    if float(np.sum(weights)) <= 0.0:
+        weights = np.ones(len(accepted), dtype=float)
+    shifts = np.asarray([constraint.shift_zyx for constraint in accepted], dtype=float)
+    combined_shift = tuple(
+        quantize_phase_shift(float(value))
+        for value in np.average(shifts, axis=0, weights=weights)
+    )
+    disagreement = np.max(np.abs(shifts - np.asarray(combined_shift, dtype=float)), axis=0)
+    residual_scale = np.asarray(settings.max_final_residual_zyx, dtype=float)
+    normalized_disagreement = float(np.max(disagreement / residual_scale))
+    consensus_weight = 1.0 / max(1.0, normalized_disagreement)
+    combined_weight = float(np.sum([constraint.weight for constraint in accepted]) / len(constraints))
+    combined_weight *= consensus_weight
+
+    metric_weights = weights
+    corr_before = finite_weighted_average(
+        [constraint.correlation_before for constraint in accepted],
+        metric_weights,
+    )
+    corr_after = finite_weighted_average(
+        [constraint.correlation_after for constraint in accepted],
+        metric_weights,
+    )
+    improvement = finite_weighted_average(
+        [constraint.improvement for constraint in accepted],
+        metric_weights,
+    )
+    return BoundaryConstraint(
+        fixed=first.fixed,
+        moving=first.moving,
+        pair=first.pair,
+        axis=first.axis,
+        patch_index=first.patch_index,
+        shift_zyx=combined_shift,
+        weight=combined_weight,
+        correlation_before=corr_before,
+        correlation_after=corr_after,
+        improvement=improvement,
+        fixed_nonzero_fraction=finite_weighted_average(
+            [constraint.fixed_nonzero_fraction for constraint in accepted],
+            metric_weights,
+        ),
+        moving_nonzero_fraction=finite_weighted_average(
+            [constraint.moving_nonzero_fraction for constraint in accepted],
+            metric_weights,
+        ),
+        fixed_std=finite_weighted_average(
+            [constraint.fixed_std for constraint in accepted],
+            metric_weights,
+        ),
+        moving_std=finite_weighted_average(
+            [constraint.moving_std for constraint in accepted],
+            metric_weights,
+        ),
+        accepted=combined_weight > 0.0,
+        fixed_content_fraction=finite_weighted_average(
+            [constraint.fixed_content_fraction for constraint in accepted],
+            metric_weights,
+        ),
+        moving_content_fraction=finite_weighted_average(
+            [constraint.moving_content_fraction for constraint in accepted],
+            metric_weights,
+        ),
+        reject_reason=None if combined_weight > 0.0 else "zero_weight",
+        fixed_slices=first.fixed_slices,
+        moving_slices=first.moving_slices,
+        source_label=source_label,
+    )
+
+
 def build_boundary_constraints(
     tiles: list[TileMetadata],
     channel: int,
@@ -1856,99 +2249,73 @@ def build_boundary_constraints(
             stores.append(store)
 
         for spec_index, spec in enumerate(patch_specs, start=1):
-            fixed_index, moving_index = spec.pair
-            fixed_patch = read_native_patch(
-                arrays[fixed_index],
-                tiles[fixed_index].axes,
-                channel,
-                spec.fixed_slices,
+            constraint = evaluate_boundary_patch_constraint(
+                arrays=arrays,
+                tiles=tiles,
+                channel=channel,
+                spec=spec,
+                settings=settings,
             )
-            moving_patch = read_native_patch(
-                arrays[moving_index],
-                tiles[moving_index].axes,
-                channel,
-                spec.moving_slices,
-            )
-            (
-                (fixed_nonzero, fixed_std),
-                (moving_nonzero, moving_std),
-                (fixed_content, moving_content),
-                corr_before,
-                shift,
-                peak,
-                corr_after,
-            ) = evaluate_boundary_patch_gpu(fixed_patch, moving_patch, settings)
-            reject_reason = None
-            if fixed_nonzero < settings.min_nonzero_fraction or moving_nonzero < settings.min_nonzero_fraction:
-                reject_reason = "low_nonzero_fraction"
-            elif fixed_std < settings.min_std or moving_std < settings.min_std:
-                reject_reason = "low_texture"
-            elif fixed_content < settings.min_content_fraction or moving_content < settings.min_content_fraction:
-                reject_reason = "low_content"
-
-            stable_alignment = False
-            if reject_reason is None:
-                improvement = corr_after - corr_before if math.isfinite(corr_before) else corr_after
-                stable_alignment = is_stable_aligned_patch(corr_before, shift, settings)
-                if stable_alignment and (
-                    not math.isfinite(improvement)
-                    or improvement < settings.min_improvement
-                ):
-                    shift = (0.0, 0.0, 0.0)
-                    corr_after = corr_before
-                    improvement = 0.0
-                elif not math.isfinite(corr_after) or corr_after < settings.min_correlation:
-                    reject_reason = "weak_correlation"
-                elif not math.isfinite(improvement) or improvement < settings.min_improvement:
-                    reject_reason = "weak_improvement"
-            else:
-                improvement = 0.0
-
-            if reject_reason is None:
-                weight = accepted_boundary_weight(
-                    improvement=improvement,
-                    fixed_content=fixed_content,
-                    moving_content=moving_content,
-                    peak=peak,
-                    stable_alignment=stable_alignment,
-                    settings=settings,
-                )
-                if weight <= 0:
-                    reject_reason = "zero_weight"
-            else:
-                weight = 0.0
-
-            constraints.append(
-                BoundaryConstraint(
-                    fixed=fixed_index,
-                    moving=moving_index,
-                    pair=spec.pair,
-                    axis=spec.axis,
-                    patch_index=spec.patch_index,
-                    shift_zyx=shift,
-                    weight=weight,
-                    correlation_before=corr_before,
-                    correlation_after=corr_after,
-                    improvement=improvement,
-                    fixed_nonzero_fraction=fixed_nonzero,
-                    moving_nonzero_fraction=moving_nonzero,
-                    fixed_std=fixed_std,
-                    moving_std=moving_std,
-                    accepted=reject_reason is None,
-                    fixed_content_fraction=fixed_content,
-                    moving_content_fraction=moving_content,
-                    reject_reason=reject_reason,
-                    fixed_slices=spec.fixed_slices,
-                    moving_slices=spec.moving_slices,
-                )
-            )
+            constraints.append(constraint)
             if spec_index <= 3 or spec_index % 25 == 0 or spec_index == len(patch_specs):
                 log(
                     "Boundary patch "
                     f"{spec_index}/{len(patch_specs)} pair={spec.pair} axis={spec.axis} "
-                    f"shift_zyx={tuple(round(value, 3) for value in shift)} "
-                    f"corr={corr_before:.3f}->{corr_after:.3f} "
-                    f"{'accepted' if reject_reason is None else 'rejected=' + reject_reason}"
+                    f"shift_zyx={tuple(round(value, 3) for value in constraint.shift_zyx)} "
+                    f"corr={constraint.correlation_before:.3f}->{constraint.correlation_after:.3f} "
+                    f"{'accepted' if constraint.accepted else 'rejected=' + str(constraint.reject_reason)}"
+                )
+    finally:
+        close_stores(stores)
+    return constraints
+
+
+def build_combined_boundary_constraints(
+    tiles: list[TileMetadata],
+    channels: tuple[int, ...],
+    patch_specs: list[BoundaryPatchSpec],
+    settings: RobustBoundarySettings,
+    *,
+    source_label: str,
+) -> list[BoundaryConstraint]:
+    if not channels:
+        raise ValueError("At least one channel is required for combined boundary constraints")
+    arrays = []
+    stores = []
+    constraints: list[BoundaryConstraint] = []
+    try:
+        for tile in tiles:
+            array, store = open_tile_array(tile)
+            arrays.append(array)
+            stores.append(store)
+
+        for spec_index, spec in enumerate(patch_specs, start=1):
+            channel_constraints = [
+                evaluate_boundary_patch_constraint(
+                    arrays=arrays,
+                    tiles=tiles,
+                    channel=channel,
+                    spec=spec,
+                    settings=settings,
+                    source_label=f"channel{channel}",
+                )
+                for channel in channels
+            ]
+            constraint = combine_channel_boundary_constraints(
+                channel_constraints,
+                source_label=source_label,
+                settings=settings,
+            )
+            constraints.append(constraint)
+            if spec_index <= 3 or spec_index % 25 == 0 or spec_index == len(patch_specs):
+                accepted_channels = sum(item.accepted for item in channel_constraints)
+                log(
+                    "Combined boundary patch "
+                    f"{spec_index}/{len(patch_specs)} pair={spec.pair} axis={spec.axis} "
+                    f"channels={channels} accepted_channels={accepted_channels}/{len(channels)} "
+                    f"shift_zyx={tuple(round(value, 3) for value in constraint.shift_zyx)} "
+                    f"corr={constraint.correlation_before:.3f}->{constraint.correlation_after:.3f} "
+                    f"{'accepted' if constraint.accepted else 'rejected=' + str(constraint.reject_reason)}"
                 )
     finally:
         close_stores(stores)
@@ -2013,7 +2380,8 @@ def solve_tile_corrections_zyx(
     import numpy as np
     from scipy.optimize import lsq_linear
 
-    fixed_dim_indices = {{"z": 0, "y": 1, "x": 2}[axis] for axis in (fixed_axes or set())}
+    axis_to_index = {"z": 0, "y": 1, "x": 2}
+    fixed_dim_indices = {axis_to_index[axis] for axis in (fixed_axes or set())}
     connected_tiles = anchor_connected_tiles(n_tiles, constraints, anchor_tile)
     accepted = [
         constraint
@@ -2026,64 +2394,149 @@ def solve_tile_corrections_zyx(
     if not accepted:
         return [tuple(float(value) for value in row) for row in corrections]
 
-    variable_tiles = [index for index in sorted(connected_tiles) if index != anchor_tile]
-    if not variable_tiles:
-        return [tuple(float(value) for value in row) for row in corrections]
-    variable_index = {tile: index for index, tile in enumerate(variable_tiles)}
     clamp = np.asarray(settings.max_correction_zyx, dtype=float)
-    prior_weights = np.asarray(reference_prior_weights_zyx or (0.0, 0.0, 0.0), dtype=float)
+    prior_weights = np.asarray(
+        reference_prior_weights_zyx or (0.0, 0.0, 0.0),
+        dtype=float,
+    )
+    if np.any(prior_weights < 0.0):
+        raise ValueError("Reference prior weights must be non-negative")
 
-    for dim in range(3):
-        if dim in fixed_dim_indices:
-            continue
-        rows = []
-        targets = []
-        weights = []
-        is_prior = []
-        for constraint in accepted:
-            row = np.zeros(len(variable_tiles), dtype=float)
-            if constraint.moving != anchor_tile:
-                row[variable_index[constraint.moving]] += 1.0
-            if constraint.fixed != anchor_tile:
-                row[variable_index[constraint.fixed]] -= 1.0
-            rows.append(row)
-            targets.append(constraint.shift_zyx[dim])
-            weights.append(max(constraint.weight, 1e-6))
-            is_prior.append(False)
-        if prior_weights[dim] > 0.0:
-            for tile in variable_tiles:
-                row = np.zeros(len(variable_tiles), dtype=float)
-                row[variable_index[tile]] = 1.0
-                rows.append(row)
-                targets.append(0.0)
-                weights.append(float(prior_weights[dim]))
-                is_prior.append(True)
+    active_dims = [dim for dim in range(3) if dim not in fixed_dim_indices]
+    if not active_dims:
+        return [tuple(float(value) for value in row) for row in corrections]
 
-        a = np.vstack(rows)
-        b = np.asarray(targets, dtype=float)
-        base_w = np.asarray(weights, dtype=float)
-        prior_mask = np.asarray(is_prior, dtype=bool)
-        w = base_w.copy()
-        solution = np.zeros(len(variable_tiles), dtype=float)
-        for _ in range(settings.irls_iterations):
-            sqrt_w = np.sqrt(w)
-            aw = a * sqrt_w[:, None]
-            bw = b * sqrt_w
+    n_constraints = len(accepted)
+    fixed_tile_indices = np.fromiter(
+        (constraint.fixed for constraint in accepted),
+        dtype=np.intp,
+        count=n_constraints,
+    )
+    moving_tile_indices = np.fromiter(
+        (constraint.moving for constraint in accepted),
+        dtype=np.intp,
+        count=n_constraints,
+    )
+    measured_shifts = np.asarray(
+        [constraint.shift_zyx for constraint in accepted],
+        dtype=float,
+    )
+    base_edge_weights = np.asarray(
+        [max(constraint.weight, 1e-6) for constraint in accepted],
+        dtype=float,
+    )
+    edge_weights = base_edge_weights.copy()
+
+    # Each dimension has the same edge rows, but dimensions with an absolute
+    # prior include every tile as a variable. This avoids giving the selected
+    # anchor an unintended infinite-precision prior in y/x.
+    dimension_systems: dict[
+        int,
+        tuple[np.ndarray, np.ndarray, dict[int, int], np.ndarray],
+    ] = {}
+    design_cache: dict[bool, tuple[np.ndarray, dict[int, int]]] = {}
+    sorted_connected_tiles = sorted(connected_tiles)
+    for dim in active_dims:
+        has_absolute_prior = prior_weights[dim] > 0.0
+        cached_design = design_cache.get(has_absolute_prior)
+        if cached_design is None:
+            variable_tiles = (
+                sorted_connected_tiles
+                if has_absolute_prior
+                else [tile for tile in sorted_connected_tiles if tile != anchor_tile]
+            )
+            if not variable_tiles:
+                continue
+            variable_index = {
+                tile: index for index, tile in enumerate(variable_tiles)
+            }
+            edge_a = np.zeros((n_constraints, len(variable_tiles)), dtype=float)
+            for row_index, constraint in enumerate(accepted):
+                moving_index = variable_index.get(constraint.moving)
+                fixed_index = variable_index.get(constraint.fixed)
+                if moving_index is not None:
+                    edge_a[row_index, moving_index] += 1.0
+                if fixed_index is not None:
+                    edge_a[row_index, fixed_index] -= 1.0
+            a = (
+                np.vstack((edge_a, np.eye(len(variable_tiles), dtype=float)))
+                if has_absolute_prior
+                else edge_a
+            )
+            design_cache[has_absolute_prior] = (a, variable_index)
+        else:
+            a, variable_index = cached_design
+
+        edge_b = measured_shifts[:, dim]
+        if has_absolute_prior:
+            b = np.concatenate(
+                (edge_b, np.zeros(len(variable_index), dtype=float))
+            )
+            prior_row_weights = np.full(
+                len(variable_index),
+                prior_weights[dim],
+                dtype=float,
+            )
+        else:
+            b = edge_b
+            prior_row_weights = np.empty(0, dtype=float)
+
+        dimension_systems[dim] = (a, b, variable_index, prior_row_weights)
+
+    if not dimension_systems:
+        return [tuple(float(value) for value in row) for row in corrections]
+
+    # Preserve the existing scalar Huber control while respecting the existing
+    # anisotropic residual thresholds. With the defaults this is (4, 8, 8) px.
+    max_residual = np.asarray(settings.max_final_residual_zyx, dtype=float)
+    if np.any(max_residual <= 0.0):
+        raise ValueError("Final residual thresholds must be positive")
+    z_scale = max(max_residual[0], np.finfo(float).eps)
+    huber_delta_zyx = max_residual * (
+        max(float(settings.huber_delta), np.finfo(float).eps) / z_scale
+    )
+    solved_dims = sorted(dimension_systems)
+
+    for _ in range(max(1, settings.irls_iterations)):
+        for dim in solved_dims:
+            a, b, variable_index, prior_row_weights = dimension_systems[dim]
+            row_weights = (
+                np.concatenate((edge_weights, prior_row_weights))
+                if prior_row_weights.size
+                else edge_weights
+            )
+            sqrt_w = np.sqrt(row_weights)
             result = lsq_linear(
-                aw,
-                bw,
+                a * sqrt_w[:, None],
+                b * sqrt_w,
                 bounds=(-clamp[dim], clamp[dim]),
                 lsmr_tol="auto",
             )
+            if not result.success:
+                raise RuntimeError(
+                    f"Tile correction solve failed for axis {('z', 'y', 'x')[dim]}: "
+                    f"{result.message}"
+                )
             solution = np.asarray(result.x, dtype=float)
-            residual = a @ solution - b
-            scale = np.maximum(1.0, np.abs(residual) / settings.huber_delta)
-            scale[prior_mask] = 1.0
-            w = base_w / scale
-        for tile, index in variable_index.items():
-            corrections[tile, dim] = solution[index]
+            for tile, index in variable_index.items():
+                corrections[tile, dim] = solution[index]
+            if prior_weights[dim] <= 0.0:
+                corrections[anchor_tile, dim] = 0.0
 
-    corrections[anchor_tile, :] = 0.0
+        # One robust inlier weight per patch vector. A gross mismatch in any
+        # solved axis downweights that patch in z/y/x together.
+        residuals = (
+            corrections[moving_tile_indices]
+            - corrections[fixed_tile_indices]
+            - measured_shifts
+        )
+        normalized = np.abs(residuals[:, solved_dims]) / huber_delta_zyx[solved_dims]
+        robust_scale = np.maximum(1.0, np.max(normalized, axis=1))
+        next_edge_weights = base_edge_weights / robust_scale
+        if np.allclose(next_edge_weights, edge_weights, rtol=1e-3, atol=1e-12):
+            break
+        edge_weights = next_edge_weights
+
     return [tuple(float(value) for value in row) for row in corrections]
 
 
@@ -2095,8 +2548,14 @@ def annotate_final_residuals(
     *,
     reject_axes: set[str] | None = None,
 ) -> list[BoundaryConstraint]:
+    axis_to_index = {"z": 0, "y": 1, "x": 2}
+    selected_axes = {"z", "y", "x"} if reject_axes is None else set(reject_axes)
+    unknown_axes = selected_axes - axis_to_index.keys()
+    if unknown_axes:
+        raise ValueError(f"Unsupported residual rejection axes: {sorted(unknown_axes)}")
+
     max_residual = settings.max_final_residual_zyx
-    reject_dim_indices = {{"z": 0, "y": 1, "x": 2}[axis] for axis in (reject_axes or {"z", "y", "x"})}
+    reject_dim_indices = {axis_to_index[axis] for axis in selected_axes}
     updated = []
     for constraint in constraints:
         residual = tuple(
@@ -2113,13 +2572,14 @@ def annotate_final_residuals(
                 or constraint.moving not in connected_tiles
             )
         )
-        reject = disconnected or (
-            constraint.accepted
-            and any(abs(residual[index]) > max_residual[index] for index in reject_dim_indices)
+        high_residual = constraint.accepted and any(
+            abs(residual[index]) > max_residual[index]
+            for index in reject_dim_indices
         )
+        reject = disconnected or high_residual
         if disconnected:
             reject_reason = "disconnected_from_anchor"
-        elif reject:
+        elif high_residual:
             reject_reason = "high_final_residual"
         else:
             reject_reason = constraint.reject_reason
@@ -2129,7 +2589,6 @@ def annotate_final_residuals(
                 accepted=constraint.accepted and not reject,
                 reject_reason=reject_reason,
                 final_residual_zyx=residual,
-                weight=0.0 if reject else constraint.weight,
             )
         )
     return updated
@@ -2147,6 +2606,12 @@ def solve_tile_corrections_with_residual_rejection(
     n_tiles = len(tiles)
     current = constraints
     anchor_tile = choose_anchor_tile(tiles, current)
+    hard_reject_axes = (
+        set(residual_reject_axes)
+        if residual_reject_axes is not None
+        else {"z", "y", "x"} - (fixed_axes or set())
+    )
+
     for _ in range(len(constraints) + n_tiles + 1):
         connected_tiles = anchor_connected_tiles(n_tiles, current, anchor_tile)
         corrections_zyx = solve_tile_corrections_zyx(
@@ -2162,9 +2627,7 @@ def solve_tile_corrections_with_residual_rejection(
             corrections_zyx,
             settings,
             connected_tiles,
-            reject_axes=residual_reject_axes
-            if residual_reject_axes is not None
-            else {"z", "y", "x"} - (fixed_axes or set()),
+            reject_axes=hard_reject_axes,
         )
         next_anchor_tile = choose_anchor_tile(tiles, updated)
         if all(
@@ -2256,8 +2719,15 @@ def reference_geometry_solver_options(
     if mode == "penalized-xy":
         return ReferenceGeometrySolverOptions(
             fixed_axes=set(),
-            reference_prior_weights_zyx=(0.0, float(reference_xy_prior_weight), float(reference_xy_prior_weight)),
-            residual_reject_axes={"z"},
+            reference_prior_weights_zyx=(
+                0.0,
+                float(reference_xy_prior_weight),
+                float(reference_xy_prior_weight),
+            ),
+            # All solved axes participate in joint Huber IRLS. Disable only the
+            # post-fit hard gate because the xy prior intentionally leaves
+            # nonzero xy residuals when it resists a measured edge shift.
+            residual_reject_axes=set(),
         )
     return ReferenceGeometrySolverOptions(
         fixed_axes=set(),
@@ -2516,6 +2986,7 @@ def constraint_payload(constraint: BoundaryConstraint) -> dict[str, Any]:
         ),
         "fixed_slices_zyx": slices_payload(constraint.fixed_slices),
         "moving_slices_zyx": slices_payload(constraint.moving_slices),
+        "source_label": constraint.source_label,
     }
 
 
@@ -2978,7 +3449,7 @@ def narrow_fusion_blending_widths(
     tiles: list[TileMetadata],
     params: list[Any] | None,
     *,
-    default_width_voxels: float = 64.0,
+    default_width_voxels_zyx: tuple[float, float, float] = (64.0, 64.0, 64.0),
     max_overlap_fraction: float = 0.25,
 ) -> dict[str, float]:
     """Return multiview-stitcher blending widths in physical z/y/x units.
@@ -3002,11 +3473,11 @@ def narrow_fusion_blending_widths(
                 positive_overlaps[dim].append(float(overlap))
 
     widths = {}
-    for dim in ("z", "y", "x"):
+    for dim_index, dim in enumerate(("z", "y", "x")):
         if positive_overlaps[dim]:
-            width_px = min(default_width_voxels, max_overlap_fraction * min(positive_overlaps[dim]))
+            width_px = min(default_width_voxels_zyx[dim_index], max_overlap_fraction * min(positive_overlaps[dim]))
         else:
-            width_px = default_width_voxels
+            width_px = default_width_voxels_zyx[dim_index]
         widths[dim] = width_px * tiles[0].spacing[dim]
     return widths
 
@@ -3368,53 +3839,69 @@ def load_inverse_flatfield(flatfield_dir: Path, channel: int, tile_shape: tuple[
 
 
 def load_fusion_inverse_flatfields(
-    args: argparse.Namespace,
     tiles: list[TileMetadata],
     *,
     flatfield_dir: Path,
+    flatfield_dirs_by_source_view: dict[str, Path] | None = None,
     channel: int,
 ):
-    left_dir = args.left_flatfield_dir.resolve() if args.left_flatfield_dir is not None else None
-    right_dir = args.right_flatfield_dir.resolve() if args.right_flatfield_dir is not None else None
-    if (left_dir is None) != (right_dir is None):
-        raise ValueError("--left-flatfield-dir and --right-flatfield-dir must be provided together")
+    if flatfield_dirs_by_source_view:
+        missing_source_view = [tile.path.name for tile in tiles if tile.source_view is None]
+        if missing_source_view:
+            raise ValueError(
+                "--flatfield-dir-by-source-view requires every tile to have source_view; "
+                f"missing for {missing_source_view[:5]}"
+            )
+        source_views = sorted({tile.source_view for tile in tiles if tile.source_view is not None})
+        missing = [view for view in source_views if view not in flatfield_dirs_by_source_view]
+        if missing:
+            raise ValueError(
+                "Missing --flatfield-dir-by-source-view entries for source_view(s): "
+                f"{missing}"
+            )
 
-    if left_dir is None and right_dir is None:
-        inverse, source, pre_scale, scale_source = load_inverse_flatfield(flatfield_dir, channel, tiles[0].shape)
-        log(f"Fusing channel {channel} with BaSiC flatfield {source}")
-        if scale_source is None:
-            log(f"BaSiC pre-scale for channel {channel}: {pre_scale:.9g} (no corrected-max JSON found)")
-        else:
-            log(f"BaSiC pre-scale for channel {channel}: {pre_scale:.9g} from {scale_source}")
-        log(
-            "Normalized inverse flatfield stats: "
-            f"shape={inverse.shape}, "
-            f"min={float(inverse.min()):.6f}, "
-            f"max={float(inverse.max()):.6f}"
-        )
-        return inverse, ()
+        inverse_by_view = {}
+        for view in source_views:
+            view_flatfield_dir = flatfield_dirs_by_source_view[view]
+            inverse, source, pre_scale, scale_source = load_inverse_flatfield(
+                view_flatfield_dir,
+                channel,
+                tiles[0].shape,
+            )
+            inverse_by_view[view] = inverse
+            log(f"Fusing channel {channel} source_view={view} with BaSiC flatfield {source}")
+            if scale_source is None:
+                log(
+                    f"BaSiC pre-scale for channel {channel} source_view={view}: "
+                    f"{pre_scale:.9g} (no corrected-max JSON found)"
+                )
+            else:
+                log(
+                    f"BaSiC pre-scale for channel {channel} source_view={view}: "
+                    f"{pre_scale:.9g} from {scale_source}"
+                )
+            log(
+                "Normalized inverse flatfield stats: "
+                f"source_view={view}, "
+                f"shape={inverse.shape}, "
+                f"min={float(inverse.min()):.6f}, "
+                f"max={float(inverse.max()):.6f}"
+            )
+        return inverse_by_view
 
-    by_view = {tile.source_view: tile for tile in tiles if tile.source_view is not None}
-    missing = [view for view in ("L", "R") if view not in by_view]
-    if missing:
-        raise ValueError(f"Per-side flatfields require position-input source_view for {missing}")
-
-    inverse_by_view = {}
-    for view, view_dir in (("L", left_dir), ("R", right_dir)):
-        if view_dir is None:
-            raise RuntimeError("unreachable: missing side flatfield directory")
-        inverse, source, pre_scale, scale_source = load_inverse_flatfield(view_dir, channel, by_view[view].shape)
-        inverse_by_view[view] = inverse
-        log(f"{view} channel {channel} BaSiC flatfield: {source}")
-        if scale_source is None:
-            log(f"{view} channel {channel} BaSiC pre-scale: {pre_scale:.9g} (no corrected-max JSON found)")
-        else:
-            log(f"{view} channel {channel} BaSiC pre-scale: {pre_scale:.9g} from {scale_source}")
-        log(
-            f"{view} channel {channel} inverse flatfield stats: "
-            f"shape={inverse.shape}, min={float(inverse.min()):.6f}, max={float(inverse.max()):.6f}"
-        )
-    return inverse_by_view, ("source_view",)
+    inverse, source, pre_scale, scale_source = load_inverse_flatfield(flatfield_dir, channel, tiles[0].shape)
+    log(f"Fusing channel {channel} with pooled BaSiC flatfield {source}")
+    if scale_source is None:
+        log(f"BaSiC pre-scale for channel {channel}: {pre_scale:.9g} (no corrected-max JSON found)")
+    else:
+        log(f"BaSiC pre-scale for channel {channel}: {pre_scale:.9g} from {scale_source}")
+    log(
+        "Normalized inverse flatfield stats: "
+        f"shape={inverse.shape}, "
+        f"min={float(inverse.min()):.6f}, "
+        f"max={float(inverse.max()):.6f}"
+    )
+    return inverse
 
 
 def _validate_basic_correction_bounds(
@@ -3523,6 +4010,8 @@ def basic_corrected_zarr_reads(
     dataset_attr_keys: tuple[str, ...] = (),
     cache_key_attr: str | None = None,
     tile_cache_size: int = 0,
+    tile_cache_max_bytes: int | None = None,
+    tile_cache_disk_dir: Path | None = None,
     tile_cache_z_chunk: int = 16,
     log_prefix: str = "BaSiC-correcting zarr slice",
     error_prefix: str = "BaSiC correction",
@@ -3544,9 +4033,36 @@ def basic_corrected_zarr_reads(
         dataset: cp.asarray(inverse, dtype=cp.float32)
         for dataset, inverse in inverse_by_dataset.items()
     }
+    flatfield_fingerprints = {
+        dataset: basic_array_fingerprint(np.asarray(inverse))
+        for dataset, inverse in inverse_by_dataset.items()
+    }
     state = {"corrected_slices": 0}
     tile_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    cache_stats = {
+        "hits": 0,
+        "misses": 0,
+        "disk_hits": 0,
+        "evictions": 0,
+        "loaded_bytes": 0,
+        "current_bytes": 0,
+    }
     cache_lock = threading.RLock()
+
+    def log_basic_cache_summary(*, event: str, key: str) -> None:
+        total_requests = cache_stats["hits"] + cache_stats["misses"]
+        if total_requests <= 3 or total_requests % 100 == 0:
+            log(
+                "BaSiC tile-slab cache "
+                f"{event}: requests={total_requests}, hits={cache_stats['hits']}, "
+                f"misses={cache_stats['misses']}, disk_hits={cache_stats['disk_hits']}, "
+                f"evictions={cache_stats['evictions']}, "
+                f"entries={len(tile_cache)}/{tile_cache_size}, "
+                f"max={format_bytes(tile_cache_max_bytes) if tile_cache_max_bytes is not None else 'none'}, "
+                f"current={format_bytes(cache_stats['current_bytes'])}, "
+                f"loaded_total={format_bytes(cache_stats['loaded_bytes'])}, "
+                f"key={key}"
+            )
 
     def dataset_serialize_zarr_backed_sim(sim):
         info = original_serialize(sim)
@@ -3617,54 +4133,78 @@ def basic_corrected_zarr_reads(
                 f"Invalid BaSiC tile cache z slab for {base_cache_key}: "
                 f"request_z={request_z0}:{request_z1}, tile_z={z_total}"
             )
-        cache_key = f"{base_cache_key}::z{slab_z0}:{slab_z1}"
+        cache_key = (
+            f"{base_cache_key}::basic{flatfield_fingerprints[dataset]}::"
+            f"z{slab_z0}:{slab_z1}"
+        )
 
         with cache_lock:
             cached = tile_cache.get(cache_key)
             if cached is not None:
                 tile_cache.move_to_end(cache_key)
+                cache_stats["hits"] += 1
+                log_basic_cache_summary(event="hit", key=cache_key)
                 return cached
 
-            log(f"BaSiC tile-slab cache miss: loading corrected tile slab {cache_key}")
-            tile_bb = {
-                "origin": {
-                    "z": info["origin"]["z"] + slab_z0 * info["spacing"]["z"],
-                    "y": info["origin"]["y"],
-                    "x": info["origin"]["x"],
-                },
-                "shape": {"z": slab_z1 - slab_z0, "y": y_size, "x": x_size},
-            }
-            slab = original_deserialize(
-                info,
-                reconstruct_slice=True,
-                overlap_bb=tile_bb,
-                sim_coord_dict=None,
+            cache_stats["misses"] += 1
+            cached = (
+                None
+                if tile_cache_disk_dir is None
+                else read_basic_disk_cache_entry(tile_cache_disk_dir, cache_key)
             )
-            slab_data = si_utils._get_backend_data(slab)
-            data_dtype = np.dtype(slab.dtype)
-            reshape = [1] * slab_data.ndim
-            reshape[slab.get_axis_num("y")] = y_size
-            reshape[slab.get_axis_num("x")] = x_size
-            corrected = _apply_basic_correction_gpu(
-                slab_data,
-                inverse_gpu[dataset],
-                reshape,
-                data_dtype,
-            )
-            cached = {
-                "data": cp.asnumpy(corrected),
-                "dims": tuple(slab.dims),
-                "offsets": {"z": slab_z0, "y": 0, "x": 0},
-            }
+            if cached is not None:
+                cache_stats["disk_hits"] += 1
+            else:
+                tile_bb = {
+                    "origin": {
+                        "z": info["origin"]["z"] + slab_z0 * info["spacing"]["z"],
+                        "y": info["origin"]["y"],
+                        "x": info["origin"]["x"],
+                    },
+                    "shape": {"z": slab_z1 - slab_z0, "y": y_size, "x": x_size},
+                }
+                slab = original_deserialize(
+                    info,
+                    reconstruct_slice=True,
+                    overlap_bb=tile_bb,
+                    sim_coord_dict=None,
+                )
+                slab_data = si_utils._get_backend_data(slab)
+                data_dtype = np.dtype(slab.dtype)
+                reshape = [1] * slab_data.ndim
+                reshape[slab.get_axis_num("y")] = y_size
+                reshape[slab.get_axis_num("x")] = x_size
+                corrected = _apply_basic_correction_gpu(
+                    slab_data,
+                    inverse_gpu[dataset],
+                    reshape,
+                    data_dtype,
+                )
+                cached = {
+                    "data": cp.asnumpy(corrected),
+                    "dims": tuple(slab.dims),
+                    "offsets": {"z": slab_z0, "y": 0, "x": 0},
+                }
+                if tile_cache_disk_dir is not None:
+                    write_basic_disk_cache_entry(tile_cache_disk_dir, cache_key, cached)
+            cached_bytes = int(cached["data"].nbytes)
+            cached["bytes"] = cached_bytes
             tile_cache[cache_key] = cached
             tile_cache.move_to_end(cache_key)
-            while len(tile_cache) > tile_cache_size:
-                evicted_key, _evicted = tile_cache.popitem(last=False)
-                log(f"BaSiC tile-slab cache evicted: {evicted_key}")
-            log(
-                f"BaSiC tile-slab cache loaded {cache_key}: "
-                f"shape={cached['data'].shape}, dtype={cached['data'].dtype}"
-            )
+            cache_stats["loaded_bytes"] += cached_bytes
+            cache_stats["current_bytes"] += cached_bytes
+            while (
+                len(tile_cache) > tile_cache_size
+                or (
+                    tile_cache_max_bytes is not None
+                    and len(tile_cache) > 1
+                    and cache_stats["current_bytes"] > tile_cache_max_bytes
+                )
+            ):
+                _evicted_key, evicted = tile_cache.popitem(last=False)
+                cache_stats["evictions"] += 1
+                cache_stats["current_bytes"] -= int(evicted.get("bytes", 0))
+            log_basic_cache_summary(event="miss-loaded", key=cache_key)
             return cached
 
     @profile
@@ -3760,11 +4300,11 @@ def registration_source_channel(
 ) -> int:
     if selected_channels is None:
         if reg_channel_index < 0 or reg_channel_index >= n_channels:
-            raise ValueError(f"--reg-channel-index must be in [0, {n_channels - 1}]")
+            raise ValueError(f"registration source channel index must be in [0, {n_channels - 1}]")
         return reg_channel_index
 
     if reg_channel_index < 0 or reg_channel_index >= len(selected_channels):
-        raise ValueError(f"--reg-channel-index must be in [0, {len(selected_channels) - 1}]")
+        raise ValueError(f"registration source channel index must be in [0, {len(selected_channels) - 1}]")
     return selected_channels[reg_channel_index]
 
 
@@ -3861,18 +4401,25 @@ def robust_boundary_residual_warning_payload(
     robust_refinement: RobustBoundaryRefinementResult,
     spacing_um: dict[str, float],
 ) -> dict[str, Any] | None:
-    spacing = np.asarray([spacing_um["z"], spacing_um["y"], spacing_um["x"]], dtype=np.float64)
+    spacing = np.asarray(
+        [spacing_um["z"], spacing_um["y"], spacing_um["x"]],
+        dtype=np.float64,
+    )
     axis_to_index = {"z": 0, "y": 1, "x": 2}
     if robust_refinement.reference_geometry is not None:
-        if robust_refinement.reference_geometry.residual_reject_axes is not None:
-            warning_axes = set(robust_refinement.reference_geometry.residual_reject_axes)
-        else:
-            warning_axes = {"z", "y", "x"} - set(robust_refinement.reference_geometry.fixed_axes)
+        warning_axes = {"z", "y", "x"} - set(
+            robust_refinement.reference_geometry.fixed_axes
+        )
     else:
         warning_axes = {"z", "y", "x"}
-    warning_indices = [axis_to_index[axis] for axis in ("z", "y", "x") if axis in warning_axes]
+    warning_indices = [
+        axis_to_index[axis]
+        for axis in ("z", "y", "x")
+        if axis in warning_axes
+    ]
     if not warning_indices:
         return None
+
     residual_records = []
     for constraint in robust_refinement.constraints:
         if not constraint.accepted or constraint.final_residual_zyx is None:
@@ -3884,12 +4431,16 @@ def robust_boundary_residual_warning_payload(
                 {
                     "edge": f"{constraint.pair}",
                     "residual_um": residual_um,
-                    "axes": [axis for axis in ("z", "y", "x") if axis in warning_axes],
+                    "axes": [
+                        axis for axis in ("z", "y", "x") if axis in warning_axes
+                    ],
                 }
             )
     warning = residual_warning_from_records(residual_records)
     if warning is not None:
-        warning["axes"] = [axis for axis in ("z", "y", "x") if axis in warning_axes]
+        warning["axes"] = [
+            axis for axis in ("z", "y", "x") if axis in warning_axes
+        ]
     return warning
 
 
@@ -4654,6 +5205,165 @@ def write_jpegxr_level(
             )
 
 
+def block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    import cupy as cp
+
+    block_gpu = cp.asarray(block)
+    reshape = []
+    mean_axes = []
+    reshaped_axis = 0
+    for size, factor in zip(block_gpu.shape, factors, strict=True):
+        if factor > 1:
+            if int(size) % factor != 0:
+                raise ValueError(f"Block shape {block_gpu.shape} is not divisible by factors {factors}")
+            reshape.extend([int(size) // factor, factor])
+            mean_axes.append(reshaped_axis + 1)
+            reshaped_axis += 2
+        else:
+            reshape.append(int(size))
+            reshaped_axis += 1
+    reduced = block_gpu.reshape(tuple(reshape))
+    if mean_axes:
+        reduced = cp.mean(reduced, axis=tuple(mean_axes), dtype=cp.float32)
+    return cp.asnumpy(reduced.astype(dtype, copy=False))
+
+
+def write_zstd_downsampled_level(
+    source_array: Any,
+    destination: Path,
+    *,
+    dataset_path: str,
+    dimension_names: tuple[str, ...],
+    factors: dict[str, int],
+) -> None:
+    import zarr
+
+    factor_tuple = tuple(int(factors[dim]) for dim in dimension_names)
+    shape = tuple(
+        int(size) // factor
+        for size, factor in zip(source_array.shape, factor_tuple, strict=True)
+    )
+    output_chunks = tuple(
+        min(int(chunk), int(size))
+        for chunk, size in zip(source_array.chunks, shape, strict=True)
+    )
+    destination_array_path = destination / dataset_path
+    destination_array_path.parent.mkdir(parents=True, exist_ok=True)
+    destination_array = zarr.open(
+        str(destination_array_path),
+        mode="w",
+        shape=shape,
+        chunks=output_chunks,
+        dtype=source_array.dtype,
+        zarr_format=3,
+        dimension_names=dimension_names,
+        codecs=zarr_v3_array_creation_kwargs(dimension_names)["codecs"],
+    )
+
+    n_chunks = chunk_count(shape, output_chunks)
+    log(
+        f"Writing pyramid level {dataset_path} from completed Zarr level: "
+        f"shape={shape}, factors={factors}, chunks={output_chunks}, chunks_total={n_chunks}"
+    )
+    for chunk_index, selection in enumerate(chunk_slices(shape, output_chunks), start=1):
+        source_selection = tuple(
+            slice(
+                part.start * factor,
+                part.stop * factor,
+            )
+            for part, factor in zip(selection, factor_tuple, strict=True)
+        )
+        destination_array[selection] = block_reduce_mean_gpu(
+            np.asarray(source_array[source_selection]),
+            factor_tuple,
+            np.dtype(source_array.dtype),
+        )
+        if chunk_index <= 3 or chunk_index % 1000 == 0 or chunk_index == n_chunks:
+            log(
+                f"Writing pyramid level {dataset_path}: "
+                f"{chunk_index}/{n_chunks} chunk(s)"
+            )
+
+
+def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
+    import zarr
+
+    group = zarr.open_group(str(output), mode="a", zarr_format=3)
+    source_attrs = group.attrs.asdict()
+    ome_attrs = source_attrs.get("ome") or {}
+    multiscales = ome_attrs.get("multiscales") or []
+    if not multiscales:
+        raise ValueError(f"{output} does not contain OME multiscales metadata")
+
+    datasets = multiscales[0].get("datasets") or []
+    if not datasets:
+        raise ValueError(f"{output} OME multiscales metadata does not list datasets")
+
+    source_array = zarr.open_array(str(output / "0"), mode="r", zarr_format=3)
+    dimension_names = tuple(source_array.metadata.dimension_names or ())
+    if not dimension_names:
+        dimension_names = tuple(f"dim_{axis}" for axis in range(len(source_array.shape)))
+    current_shape = tuple(int(size) for size in source_array.shape)
+    abs_factors = [{dim: 1 for dim in dimension_names}]
+    level_factors = []
+
+    while True:
+        factors = pyramid_relative_factors(
+            current_shape,
+            dimension_names,
+        )
+        if not any(factor > 1 for factor in factors.values()):
+            break
+        level_factors.append(factors)
+        abs_factors.append(
+            {
+                dim: abs_factors[-1][dim] * factors[dim]
+                for dim in dimension_names
+            }
+        )
+        current_shape = tuple(
+            size // int(factors[dim])
+            for size, dim in zip(current_shape, dimension_names, strict=True)
+        )
+
+    if not level_factors:
+        log(f"Completed fusion output {output} does not need pyramid levels")
+        return
+
+    base_multiscale = copy.deepcopy(multiscales[0])
+    axes = base_multiscale.get("axes") or [{"name": dim} for dim in dimension_names]
+    base_transforms = datasets[0].get("coordinateTransformations") or []
+    base_multiscale["datasets"] = [
+        {
+            "path": str(level_index),
+            "coordinateTransformations": level_coordinate_transformations(
+                base_transforms,
+                axes,
+                factors,
+            ),
+        }
+        for level_index, factors in enumerate(abs_factors)
+    ]
+    final_ome_attrs = copy.deepcopy(ome_attrs)
+    final_ome_attrs["multiscales"] = [base_multiscale]
+    destination_attrs = copy.deepcopy(source_attrs)
+    destination_attrs["ome"] = final_ome_attrs
+
+    log(f"Building completed-fusion Zarr pyramid for {output}: levels={len(abs_factors)}")
+    previous_array = source_array
+    for level_index, factors in enumerate(level_factors, start=1):
+        write_zstd_downsampled_level(
+            previous_array,
+            output,
+            dataset_path=str(level_index),
+            dimension_names=dimension_names,
+            factors=factors,
+        )
+        previous_array = zarr.open_array(str(output / str(level_index)), mode="r", zarr_format=3)
+    group.attrs.update(destination_attrs)
+    repair_ome_metadata_axes(output)
+
+
 def recompress_ome_zarr_to_jpegxr(
     source: Path,
     destination: Path,
@@ -4993,29 +5703,14 @@ def should_run_registration(
     args: argparse.Namespace,
     registration_input: Path | None,
 ) -> bool:
-    if registration_input is not None and args.register:
-        raise ValueError("--registration-input cannot be combined with --register")
-    if (
-        registration_input is not None
-        and args.register_only
-        and args.registration_pair_mode != "robust-boundary"
-    ):
-        raise ValueError(
-            "--registration-input can only be combined with --register-only "
-            "when --registration-pair-mode=robust-boundary"
-        )
-    return args.register or args.register_only or registration_input is None
+    return args.register_only or registration_input is None
 
 
 def should_refine_registration_input(
     args: argparse.Namespace,
     registration_input: Path | None,
 ) -> bool:
-    return (
-        registration_input is not None
-        and args.register_only
-        and args.registration_pair_mode == "robust-boundary"
-    )
+    return registration_input is not None and args.register_only
 
 
 def should_run_coarse_registration(
@@ -5106,41 +5801,24 @@ def parse_args() -> argparse.Namespace:
         help="JSON output path for registration-only mode. Defaults to INPUT_DIR/registration.json.",
     )
     parser.add_argument(
-        "--registration-plots-dir",
-        type=Path,
-        help="Directory for registration metric positional plots. Defaults to INPUT_DIR/registration-plots.",
-    )
-    parser.add_argument(
         "--registration-input",
         type=Path,
         help="Use registration parameters previously written by --register-only.",
-    )
-    parser.add_argument(
-        "--seed-registration-input",
-        type=Path,
-        help=(
-            "Use a previous registration JSON as the affine starting point for a new "
-            "registration run. Unlike --registration-input, this still runs coarse "
-            "registration and writes a new registration output."
-        ),
     )
     parser.add_argument(
         "--reference-registration-input",
         type=Path,
         help=(
             "Use a completed registration JSON as a physical geometry reference. "
-            "With --reference-geometry-mode fixed-xy, saved y/x translations are "
-            "copied from this reference after robust-boundary z correction."
+            "Required when --reference-geometry-mode is penalized-xy."
         ),
     )
     parser.add_argument(
         "--reference-geometry-mode",
-        choices=("none", "fixed-xy", "full-xyz", "penalized-xy"),
+        choices=("none", "penalized-xy"),
         default="none",
         help=(
             "Constrain final registration geometry to --reference-registration-input. "
-            "fixed-xy keeps y/x identical to the reference and leaves z data-driven. "
-            "full-xyz uses the reference as the shared starting geometry without pinning axes. "
             "penalized-xy adds a soft y/x prior to keep geometry near the reference."
         ),
     )
@@ -5158,9 +5836,8 @@ def parse_args() -> argparse.Namespace:
         type=parse_track_slug_list,
         help=(
             "Comma-separated track slugs to solve as one shared geometry group, "
-            "for example track1,track2. Requires --reference-geometry-mode fixed-xy, "
-            "full-xyz, or penalized-xy "
-            "and robust-boundary register-only mode."
+            "for example track1,track2. Requires --reference-geometry-mode penalized-xy "
+            "and --register-only."
         ),
     )
     parser.add_argument(
@@ -5180,14 +5857,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--left-flatfield-dir",
-        type=Path,
-        help="BaSiC flatfield directory for position-input tiles with side/source_view L.",
-    )
-    parser.add_argument(
-        "--right-flatfield-dir",
-        type=Path,
-        help="BaSiC flatfield directory for position-input tiles with side/source_view R.",
+        "--flatfield-dir-by-source-view",
+        type=parse_source_view_flatfield_dir,
+        action="append",
+        default=[],
+        metavar="VIEW=DIR",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--channels",
@@ -5196,115 +5871,9 @@ def parse_args() -> argparse.Namespace:
         help="Optional zero-based channel indices to stitch. Defaults to all channels.",
     )
     parser.add_argument(
-        "--register",
-        action="store_true",
-        help="Run multiview-stitcher translation registration after metadata placement.",
-    )
-    parser.add_argument(
         "--register-only",
         action="store_true",
         help="Run registration and write registration parameters, but do not fuse.",
-    )
-    parser.add_argument(
-        "--reg-channel-index",
-        type=int,
-        default=0,
-        help="Channel index within the selected channels to use for optional registration.",
-    )
-    parser.add_argument(
-        "--registration-binning",
-        type=int,
-        nargs=3,
-        metavar=("Z", "Y", "X"),
-        help="Optional binning applied during registration as Z Y X.",
-    )
-    parser.add_argument(
-        "--reg-res-level",
-        type=int,
-        default=4,
-        help=(
-            "Multiscale pyramid level to use for registration. Defaults to 4 "
-            "unless --registration-binning or --auto-reg-res-level is set."
-        ),
-    )
-    parser.add_argument(
-        "--coarse-reg-res-levels",
-        type=int,
-        nargs="+",
-        help=(
-            "Run coarse registration hierarchically at these downsampled resolution levels, "
-            "in order. Example: 6 5 4 starts coarsest, then refines at level 5 and 4."
-        ),
-    )
-    parser.add_argument(
-        "--auto-reg-res-level",
-        action="store_true",
-        help="Let multiview-stitcher choose the registration resolution level.",
-    )
-    parser.add_argument(
-        "--n-parallel-pairwise-regs",
-        type=int,
-        help=(
-            "Maximum pairwise registrations to compute at once. "
-            "Defaults to all edges at once for robust-boundary and 4 for other modes."
-        ),
-    )
-    parser.add_argument(
-        "--dask-num-workers",
-        type=int,
-        default=32,
-        help="Explicit Dask threaded-scheduler worker count for pairwise registration.",
-    )
-    parser.add_argument(
-        "--registration-read-chunk-z",
-        type=int,
-        default=DEFAULT_REGISTRATION_READ_CHUNK_Z,
-        help=(
-            "Z chunk size used when building Dask arrays for registration input reads. "
-            f"Defaults to {DEFAULT_REGISTRATION_READ_CHUNK_Z}."
-        ),
-    )
-    parser.add_argument(
-        "--registration-pair-mode",
-        choices=("robust-boundary", "axis-aligned", "spanning-tree", "package"),
-        default="robust-boundary",
-        help=(
-            "Tile-pair graph/refinement mode for registration. 'robust-boundary' first "
-            "registers overlapping axis-aligned neighbors, then refines tile translations "
-            "from accepted GPU boundary patches; 'axis-aligned' and 'spanning-tree' keep "
-            "the coarse package transforms only; 'package' lets multiview-stitcher build "
-            "and prune all pairs for comparison."
-        ),
-    )
-    parser.add_argument(
-        "--registration-axis",
-        choices=("xyz", "z"),
-        default="xyz",
-        help=(
-            "Degrees of freedom allowed during pairwise phase correlation. "
-            "'z' estimates axial residual shifts only and clamps saved y/x "
-            "translation corrections to zero. Defaults to xyz."
-        ),
-    )
-    parser.add_argument(
-        "--gpu-pairwise-phase-correlation",
-        action="store_true",
-        help=(
-            "Use a CuPy FFT pairwise phase-correlation function for the coarse "
-            "multiview-stitcher registration stage. This keeps multiview-stitcher "
-            "graph/global optimization but replaces the pairwise registration metric."
-        ),
-    )
-    parser.add_argument(
-        "--robust-boundary-qc-dir",
-        type=Path,
-        help="Directory for robust boundary residual QC. Defaults to INPUT_DIR/robust-boundary-qc.",
-    )
-    parser.add_argument(
-        "--skip-registration-plots",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip registration metric positional plots to reduce registration runtime. Defaults to enabled.",
     )
     parser.add_argument(
         "--output-chunksize",
@@ -5312,85 +5881,61 @@ def parse_args() -> argparse.Namespace:
         nargs=3,
         metavar=("Z", "Y", "X"),
         default=(32, 1024, 1024),
-        help="Spatial output chunk size passed to fusion.fuse as Z Y X. Defaults to 32 1024 1024.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fusion-level",
         type=int,
         default=0,
-        help="Fuse directly at pyramid-equivalent level N by multiplying output spacing by 2**N.",
-    )
-    parser.add_argument(
-        "--fusion-compressor",
-        choices=("zstd", "jpegxr"),
-        default="zstd",
-        help=(
-            "Final Zarr v3 compressor. Defaults to zstd. "
-            "jpegxr first fuses to temporary zstd chunks, then rewrites the completed pyramid "
-            "to JPEG-XR image-plane chunks."
-        ),
-    )
-    parser.add_argument(
-        "--jpegxr-level",
-        type=parse_jpegxr_level,
-        default=DEFAULT_JPEGXR_LEVEL,
-        help="JPEG-XR quality level for --fusion-compressor jpegxr. Defaults to 0.7.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--batch-size",
         type=parse_batch_size,
         default="auto",
-        help=(
-            "Number of output chunks fused per batch, or 'auto'. "
-            "Auto batches one full z-chunk plane to keep TIFF reads spatially local."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--batch-jobs",
         type=int,
         default=16,
-        help="Number of threaded jobs used to process each fusion batch.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fusion-weight-mode",
         choices=("geometric", "content-dct", "content-preibisch", "content-preibisch-coarse"),
-        default="geometric",
-        help=(
-            "Fusion weighting beyond border blending. 'geometric' uses only valid-support/border weights; "
-            "'content-dct' uses multiview-stitcher's DCT content-quality weights; "
-            "'content-preibisch' uses Gaussian high-frequency content weights; "
-            "'content-preibisch-coarse' computes those content weights on a strided grid."
-        ),
+        default="content-preibisch-coarse",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-dct-size",
         type=int,
         default=32,
-        help="DCT chunk size in output pixels for --fusion-weight-mode content-dct.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-dct-exponent",
         type=float,
         default=1.0,
-        help="Exponent applied to content-DCT quality values.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-dct-otf-support-fraction",
         type=float,
         default=0.5,
-        help="OTF support fraction for content-DCT weights; use a negative value to disable OTF masking.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-preibisch-sigma1",
         type=int,
         default=7,
-        help="Inner Gaussian sigma for --fusion-weight-mode content-preibisch.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-preibisch-sigma2",
         type=int,
         default=17,
-        help="Outer Gaussian sigma for --fusion-weight-mode content-preibisch.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--content-preibisch-coarse-stride",
@@ -5398,55 +5943,91 @@ def parse_args() -> argparse.Namespace:
         nargs=3,
         metavar=("Z", "Y", "X"),
         default=(1, 8, 8),
-        help="Z/Y/X stride for --fusion-weight-mode content-preibisch-coarse.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--profile-max-fusion-chunks",
-        type=parse_positive_int,
+        "--content-preibisch-softmax-exponent",
+        type=float,
+        default=2.0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--fusion-blend-width-voxels",
+        type=float,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+        default=(64.0, 64.0, 64.0),
         help=(
-            "Profiling-only limit for streaming fusion. Processes this many output "
-            "chunks, then stops before pyramid, recompression, or thumbnail work."
+            "Maximum border blending width in source voxels as Z Y X before conversion to physical units. "
+            "Increase Y/X to soften residual flatfield or tile-gain seams."
         ),
     )
     parser.add_argument(
-        "--profile-skip-fusion-chunks",
-        type=parse_nonnegative_int,
-        default=0,
-        help="Profiling-only offset: skip this many output chunks before --profile-max-fusion-chunks starts.",
+        "--fusion-blend-max-overlap-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum fraction of the smallest positive tile overlap used for border blending. "
+            "Increase this to use more of the overlap ramp."
+        ),
     )
     parser.add_argument(
         "--basic-cache-tiles",
         type=parse_nonnegative_int,
-        default=64,
-        help=(
-            "Number of corrected tile z-slabs to keep in CPU RAM during fusion. "
-            "Defaults to 64; 0 disables the cache."
-        ),
+        default=128,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--basic-cache-max-gib",
+        type=parse_nonnegative_float,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--basic-cache-disk-dir",
+        type=Path,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--basic-cache-z-chunk",
         type=parse_positive_int,
         default=32,
-        help="Z-slab depth used for each BaSiC tile-cache entry. Defaults to 32.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fusion-progress-log-seconds",
         type=parse_nonnegative_int,
         default=60,
-        help=(
-            "During fusion, log output zarr file-count and byte growth every N seconds. "
-            "Use 0 to disable filesystem progress logging. Defaults to 60."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print metadata-derived translations and estimated shape without fusing.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--log-file",
         type=Path,
         help="Also write timestamped progress logs to this file. Useful when launchers buffer stdout.",
+    )
+    parser.set_defaults(
+        registration_plots_dir=None,
+        reg_channel_index=0,
+        registration_binning=None,
+        reg_res_level=4,
+        coarse_reg_res_levels=None,
+        auto_reg_res_level=False,
+        n_parallel_pairwise_regs=None,
+        dask_num_workers=32,
+        registration_read_chunk_z=DEFAULT_REGISTRATION_READ_CHUNK_Z,
+        registration_pair_mode="robust-boundary",
+        gpu_pairwise_phase_correlation=False,
+        robust_boundary_qc_dir=None,
+        skip_registration_plots=True,
+        fusion_compressor="zstd",
+        jpegxr_level=DEFAULT_JPEGXR_LEVEL,
+        profile_max_fusion_chunks=None,
+        profile_skip_fusion_chunks=0,
+        per_chunk_cupy_cleanup=False,
     )
     return parser.parse_args()
 
@@ -5461,6 +6042,21 @@ def parse_batch_size(value: str) -> int | str:
     if batch_size <= 0:
         raise argparse.ArgumentTypeError("batch size must be a positive integer or 'auto'")
     return batch_size
+
+
+def parse_source_view_flatfield_dir(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "Expected source-view flatfield entry as VIEW=DIR, "
+            f"got {value!r}"
+        )
+    view, path = value.split("=", 1)
+    view = view.strip()
+    if not view:
+        raise argparse.ArgumentTypeError(f"Missing source-view name in {value!r}")
+    if not path:
+        raise argparse.ArgumentTypeError(f"Missing flatfield directory in {value!r}")
+    return view, Path(path)
 
 
 def parse_track_slug_list(value: str) -> tuple[str, ...]:
@@ -5489,6 +6085,16 @@ def parse_nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("value must be a non-negative integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be a non-negative integer")
+    return parsed
+
+
+def parse_nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a non-negative number") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative number")
     return parsed
 
 
@@ -5586,14 +6192,16 @@ def run_stitch_once(
     registration_plots_dir: Path,
     robust_boundary_qc_dir: Path,
     flatfield_dir: Path,
+    flatfield_dirs_by_source_view: dict[str, Path] | None,
     selected_channels: tuple[int, ...] | None,
     registration_input: Path | None,
-    seed_registration_input: Path | None,
     reference_registration_input: Path | None = None,
     source_label: str | None = None,
 ) -> int:
     log(f"Input directory: {input_dir}")
     log(f"Flatfield directory: {flatfield_dir}")
+    if flatfield_dirs_by_source_view:
+        log(f"Flatfield directories by source_view: {flatfield_dirs_by_source_view}")
     log(f"Registration output path: {registration_output}")
     log_tile_run_summary(tiles)
 
@@ -5684,7 +6292,6 @@ def run_stitch_once(
 
     transform_key = TRANSFORM_KEY
     params = None
-    seed_params = None
     reference_params = None
     fixed_reference_axes: set[str] | None = None
     reference_prior_weights_zyx: tuple[float, float, float] | None = None
@@ -5696,13 +6303,6 @@ def run_stitch_once(
         transform_key = REGISTERED_TRANSFORM_KEY
         log(f"Loaded {len(params)} registration transforms")
         log_transform_translation_summary("Loaded registration", params)
-    if seed_registration_input is not None:
-        if not should_run_coarse:
-            raise ValueError("--seed-registration-input requires a coarse registration run")
-        log(f"Loading seed registration params from {seed_registration_input.resolve()}")
-        seed_params = load_registration_params(seed_registration_input.resolve(), tiles)
-        log(f"Loaded {len(seed_params)} seed registration transforms")
-        log_transform_translation_summary("Seed registration", seed_params)
     if args.reference_geometry_mode != "none":
         if reference_registration_input is None:
             raise ValueError("--reference-geometry-mode requires --reference-registration-input")
@@ -5795,23 +6395,10 @@ def run_stitch_once(
             source_level=registration_source_level,
         )
         initial_transform_key = TRANSFORM_KEY
-        if seed_params is not None:
-            set_msims_relative_affine_transform(
-                reg_msims,
-                seed_params,
-                transform_key=SEED_TRANSFORM_KEY,
-                base_transform_key=TRANSFORM_KEY,
-            )
-            initial_transform_key = SEED_TRANSFORM_KEY
-            log(f"Applied seed registration as starting transform: {seed_registration_input}")
-        pairwise_reg_func = pairwise_registration_function(
-            registration_axis=args.registration_axis,
-            use_gpu=args.gpu_pairwise_phase_correlation,
-        )
+        pairwise_reg_func = pairwise_registration_function(use_gpu=args.gpu_pairwise_phase_correlation)
         log(
             "Pairwise registration function: "
-            f"{pairwise_reg_func.__name__}; allowed_axis={args.registration_axis}; "
-            f"gpu={args.gpu_pairwise_phase_correlation}"
+            f"{pairwise_reg_func.__name__}; gpu={args.gpu_pairwise_phase_correlation}"
         )
         try:
             full_params = None
@@ -5859,24 +6446,12 @@ def run_stitch_once(
             if registration_result is None or full_params is None:
                 raise RuntimeError("Registration did not produce parameters")
             params = full_params_relative_to_stage(reg_msims, full_params)
-            if args.registration_axis == "z":
-                params = clamp_relative_affine_translations(
-                    params,
-                    {"z"},
-                    reference_params=seed_params,
-                )
             log_transform_translation_summary("Coarse registration", params)
             registration_result = {
                 **registration_result,
                 "params": params,
                 "hierarchical_coarse_registration": {
                     "reg_res_levels": list(coarse_reg_res_levels),
-                    "registration_axis": args.registration_axis,
-                    "seed_registration_input": (
-                        str(seed_registration_input)
-                        if seed_registration_input is not None
-                        else None
-                    ),
                 },
             }
             transform_key = REGISTERED_TRANSFORM_KEY
@@ -5903,15 +6478,8 @@ def run_stitch_once(
                         residual_reject_axes=residual_reject_axes,
                         reference_geometry_mode=args.reference_geometry_mode,
                         source_label=source_label,
-                    )
+                )
                 params = robust_refinement.params
-                if args.registration_axis == "z" and fixed_reference_axes is None:
-                    params = clamp_relative_affine_translations(
-                        params,
-                        {"z"},
-                        reference_params=seed_params,
-                    )
-                    robust_refinement = replace(robust_refinement, params=params)
                 log_transform_translation_summary("Robust-boundary registration", params)
             save_registration_params(
                 registration_result,
@@ -5995,13 +6563,16 @@ def run_stitch_once(
                     f"before JPEG-XR z-plane recompression to {channel_output}"
                 )
 
-            inverse_flatfield, flatfield_attr_keys = load_fusion_inverse_flatfields(
-                args,
+            inverse_flatfield = load_fusion_inverse_flatfields(
                 source_tiles,
                 flatfield_dir=flatfield_dir,
+                flatfield_dirs_by_source_view=flatfield_dirs_by_source_view or None,
                 channel=channel,
             )
-            log(f"Resolved BaSiC correction attrs for channel {channel}: {flatfield_attr_keys or ('__default__',)}")
+            if isinstance(inverse_flatfield, dict):
+                log(f"Resolved source-view BaSiC corrections for channel {channel}")
+            else:
+                log(f"Resolved pooled BaSiC correction for channel {channel}")
             resolved_chunksize = process_output_chunksize(sims, output_chunksize)
             log(f"Resolved fusion output chunksize: {resolved_chunksize}")
             resolved_batch_size = resolve_fusion_batch_size(
@@ -6010,7 +6581,12 @@ def run_stitch_once(
                 resolved_chunksize,
             )
             weights_func, weights_func_kwargs = fusion_weight_config(args, resolved_chunksize)
-            blending_widths = narrow_fusion_blending_widths(source_tiles, params)
+            blending_widths = narrow_fusion_blending_widths(
+                source_tiles,
+                params,
+                default_width_voxels_zyx=tuple(float(value) for value in args.fusion_blend_width_voxels),
+                max_overlap_fraction=args.fusion_blend_max_overlap_fraction,
+            )
             log(
                 "Resolved fusion batch settings: "
                 f"n_batch={resolved_batch_size}, threaded_jobs={args.batch_jobs}"
@@ -6022,6 +6598,8 @@ def run_stitch_once(
             log(
                 "BaSiC cache settings: "
                 f"tile_cache_size={args.basic_cache_tiles}, "
+                f"tile_cache_max_gib={args.basic_cache_max_gib}, "
+                f"tile_cache_disk_root={args.basic_cache_disk_dir or fusion_output.parent}, "
                 f"tile_cache_z_chunk={args.basic_cache_z_chunk}"
             )
             batch_func = misc_utils.process_batch_using_joblib
@@ -6040,6 +6618,10 @@ def run_stitch_once(
                     f"{args.profile_max_fusion_chunks} output chunk(s) "
                     f"after skipping {args.profile_skip_fusion_chunks}"
                 )
+            if args.per_chunk_cupy_cleanup:
+                log("Fusion uses per-chunk CuPy cleanup")
+            else:
+                log("Fusion defers CuPy cleanup until the fusion context exits")
             log(f"Fusion blending widths (physical units): {blending_widths}")
             log(f"Entering multiview-stitcher fusion.fuse streaming write to {fusion_output}")
             if args.fusion_progress_log_seconds > 0:
@@ -6051,20 +6633,24 @@ def run_stitch_once(
             else:
                 fusion_progress_context = nullcontext()
                 log("Filesystem progress logging for fusion output is disabled")
-            fusion_output_context = (
-                single_scale_fusion_output()
-                if args.fusion_compressor == "jpegxr"
-                else nullcontext()
-            )
+            fusion_output_context = single_scale_fusion_output()
             with (
+                temporary_basic_disk_cache_dir(args.basic_cache_disk_dir, fusion_output) as basic_cache_disk_dir,
                 basic_corrected_zarr_reads(
                     inverse_flatfield,
-                    dataset_info_key="source_view" if flatfield_attr_keys else None,
-                    dataset_attr_keys=flatfield_attr_keys,
+                    dataset_info_key="source_view" if isinstance(inverse_flatfield, dict) else None,
+                    dataset_attr_keys=("source_view",) if isinstance(inverse_flatfield, dict) else (),
                     cache_key_attr="basic_tile_cache_key",
                     tile_cache_size=args.basic_cache_tiles,
+                    tile_cache_max_bytes=(
+                        None
+                        if args.basic_cache_max_gib is None
+                        else int(args.basic_cache_max_gib * 1024**3)
+                    ),
+                    tile_cache_disk_dir=basic_cache_disk_dir,
                     tile_cache_z_chunk=args.basic_cache_z_chunk,
                 ),
+                cupy_cleanup_context(args.per_chunk_cupy_cleanup),
                 spatial_chunks_for_package_pyramid(),
                 fusion_output_context,
                 fusion_progress_context,
@@ -6101,9 +6687,9 @@ def run_stitch_once(
                             f"{args.profile_max_fusion_chunks} output chunk(s)"
                         )
                         return 0
-            log(f"Finished multiview-stitcher fusion.fuse for channel {channel}")
+            log(f"Finished multiview-stitcher fusion.fuse scale0 write for channel {channel}")
             log(
-                "Fusion output after package write: "
+                "Fusion scale0 output after package write: "
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
             )
             if args.fusion_compressor == "jpegxr":
@@ -6119,6 +6705,13 @@ def run_stitch_once(
                     raise FileExistsError(f"{channel_output} appeared during JPEG-XR recompression")
                 recompressed_output.rename(channel_output)
                 log(f"Moved completed JPEG-XR output to {channel_output}")
+            else:
+                with heartbeat(f"completed Zarr pyramid channel {channel}"):
+                    build_ome_zarr_pyramid_from_scale0(fusion_output)
+                log(
+                    "Fusion output after completed-Zarr pyramid write: "
+                    f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
+                )
         finally:
             if temp_workspace is not None:
                 temp_workspace.cleanup()
@@ -6138,20 +6731,16 @@ def validate_shared_reference_geometry_run(
 ) -> None:
     if not configs:
         return
-    if args.reference_geometry_mode not in {"fixed-xy", "full-xyz", "penalized-xy"}:
-        raise ValueError("--shared-geometry-tracks requires --reference-geometry-mode fixed-xy, full-xyz, or penalized-xy")
+    if args.reference_geometry_mode != "penalized-xy":
+        raise ValueError("--shared-geometry-tracks requires --reference-geometry-mode penalized-xy")
     if reference_registration_input is None:
         raise ValueError("--shared-geometry-tracks requires --reference-registration-input")
     if args.reference_xy_prior_weight < 0.0:
         raise ValueError("--reference-xy-prior-weight must be non-negative")
     if not args.register_only:
         raise ValueError("--shared-geometry-tracks is only supported with --register-only")
-    if args.registration_pair_mode != "robust-boundary":
-        raise ValueError("--shared-geometry-tracks currently requires --registration-pair-mode robust-boundary")
     if any(config.registration_input is not None for config in configs):
         raise ValueError("--shared-geometry-tracks cannot be combined with --registration-input")
-    if any(config.seed_registration_input is not None for config in configs):
-        raise ValueError("--shared-geometry-tracks cannot be combined with --seed-registration-input")
 
 
 def run_shared_reference_geometry_registration(
@@ -6191,7 +6780,6 @@ def run_shared_reference_geometry_registration(
     log_transform_translation_summary("Shared reference registration", reference_params)
 
     settings = RobustBoundarySettings()
-    combined_constraints: list[BoundaryConstraint] = []
     patch_specs = sample_boundary_patches(
         tiles,
         reference_params,
@@ -6200,20 +6788,29 @@ def run_shared_reference_geometry_registration(
     )
     log(
         "Shared robust boundary refinement sampled "
-        f"{len(patch_specs)} patch(es) per grouped track"
+        f"{len(patch_specs)} combined patch(es)"
     )
+    source_channels: list[int] = []
     for config in configs:
         reg_source_channel = registration_source_channel(
             config.selected_channels,
             reg_channel_index=args.reg_channel_index,
             n_channels=tile_channel_count(tiles[0]),
         )
-        log(f"Building shared boundary constraints for {config.track.slug} from channel {reg_source_channel}")
-        constraints = build_boundary_constraints(tiles, reg_source_channel, patch_specs, settings)
-        combined_constraints.extend(
-            replace(constraint, source_label=config.track.slug)
-            for constraint in constraints
-        )
+        source_channels.append(reg_source_channel)
+    combined_source_label = "+".join(config.track.slug for config in configs)
+    source_channels_tuple = tuple(source_channels)
+    log(
+        "Building combined shared boundary constraints for "
+        f"{combined_source_label} from channels {source_channels_tuple}"
+    )
+    combined_constraints = build_combined_boundary_constraints(
+        tiles,
+        source_channels_tuple,
+        patch_specs,
+        settings,
+        source_label=combined_source_label,
+    )
 
     corrections_zyx, combined_constraints, anchor_tile = solve_tile_corrections_with_residual_rejection(
         tiles,
@@ -6240,12 +6837,7 @@ def run_shared_reference_geometry_registration(
     log_transform_translation_summary("Shared reference-constrained registration", shared_params)
 
     for config in configs:
-        track_constraints = [
-            constraint
-            for constraint in combined_constraints
-            if constraint.source_label == config.track.slug
-        ]
-        summary = robust_summary(track_constraints, corrections_zyx)
+        summary = robust_summary(combined_constraints, corrections_zyx)
         reg_source_channel = registration_source_channel(
             config.selected_channels,
             reg_channel_index=args.reg_channel_index,
@@ -6256,7 +6848,7 @@ def run_shared_reference_geometry_registration(
             tiles,
             shared_params,
             channel=reg_source_channel,
-            constraints=track_constraints,
+            constraints=combined_constraints,
             corrections_zyx=corrections_zyx,
             summary=summary,
             reference_geometry=reference_geometry,
@@ -6264,7 +6856,7 @@ def run_shared_reference_geometry_registration(
         )
         robust_refinement = RobustBoundaryRefinementResult(
             params=shared_params,
-            constraints=track_constraints,
+            constraints=combined_constraints,
             corrections_zyx=corrections_zyx,
             anchor_tile=anchor_tile,
             output_dir=config.robust_boundary_qc_dir,
@@ -6286,16 +6878,15 @@ def main() -> int:
     configure_writable_caches(root)
     configure_log_file(args.log_file)
     log("Starting 20x-TL multiview stitching script")
+    if any(value <= 0.0 for value in args.fusion_blend_width_voxels):
+        raise ValueError("--fusion-blend-width-voxels values must be positive")
+    if not 0.0 < args.fusion_blend_max_overlap_fraction <= 1.0:
+        raise ValueError("--fusion-blend-max-overlap-fraction must be in (0, 1]")
 
     input_dir = args.input_dir.resolve()
     output = (args.output or input_dir / "fused.ome.zarr").resolve()
     registration_output = (args.registration_output or input_dir / "registration.json").resolve()
     registration_input = args.registration_input.resolve() if args.registration_input is not None else None
-    seed_registration_input = (
-        args.seed_registration_input.resolve()
-        if args.seed_registration_input is not None
-        else None
-    )
     reference_registration_input = (
         args.reference_registration_input.resolve()
         if args.reference_registration_input is not None
@@ -6304,8 +6895,6 @@ def main() -> int:
     if args.reference_geometry_mode != "none":
         if reference_registration_input is None:
             raise ValueError("--reference-geometry-mode requires --reference-registration-input")
-        if args.registration_pair_mode != "robust-boundary":
-            raise ValueError("--reference-geometry-mode currently requires --registration-pair-mode robust-boundary")
     registration_plots_dir = (
         args.registration_plots_dir.resolve()
         if args.registration_plots_dir is not None
@@ -6321,6 +6910,21 @@ def main() -> int:
         if args.flatfield_dir is not None
         else input_dir / "basic_nz25_pooled"
     )
+    flatfield_source_views = [view for view, _path in args.flatfield_dir_by_source_view]
+    duplicate_flatfield_views = sorted(
+        view
+        for view, count in Counter(flatfield_source_views).items()
+        if count > 1
+    )
+    if duplicate_flatfield_views:
+        raise ValueError(
+            "Duplicate --flatfield-dir-by-source-view entries for source_view(s): "
+            f"{duplicate_flatfield_views}"
+        )
+    flatfield_dirs_by_source_view = {
+        view: path.resolve()
+        for view, path in args.flatfield_dir_by_source_view
+    }
     position_input = args.position_input.resolve() if args.position_input is not None else None
     if position_input is not None:
         tiles = read_position_input_tiles(position_input)
@@ -6361,11 +6965,6 @@ def main() -> int:
             if registration_input is not None and split_by_track
             else registration_input
         )
-        track_seed_registration_input = (
-            insert_track_suffix(seed_registration_input, track.slug)
-            if seed_registration_input is not None and split_by_track
-            else seed_registration_input
-        )
         track_plots_dir = (
             track_registration_plots_dir(registration_plots_dir, track.slug)
             if split_by_track
@@ -6382,7 +6981,6 @@ def main() -> int:
                 output=track_output,
                 registration_output=track_registration_output,
                 registration_input=track_registration_input,
-                seed_registration_input=track_seed_registration_input,
                 registration_plots_dir=track_plots_dir,
                 robust_boundary_qc_dir=track_robust_boundary_qc_dir,
                 selected_channels=track.channels,
@@ -6421,9 +7019,9 @@ def main() -> int:
             registration_plots_dir=config.registration_plots_dir,
             robust_boundary_qc_dir=config.robust_boundary_qc_dir,
             flatfield_dir=flatfield_dir,
+            flatfield_dirs_by_source_view=flatfield_dirs_by_source_view or None,
             selected_channels=config.selected_channels,
             registration_input=config.registration_input,
-            seed_registration_input=config.seed_registration_input,
             reference_registration_input=reference_registration_input,
             source_label=track.slug,
         )

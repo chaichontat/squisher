@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from squisher_lightsheet._legacy import stitch_20x_tl_multiview as stitch
+from squisher_lightsheet import registration as stitch
 
 
 def affine_param(z: float = 0.0, y: float = 0.0, x: float = 0.0) -> xr.DataArray:
@@ -64,6 +64,40 @@ def constraint(
         accepted=True,
         source_label=source_label,
     )
+
+
+def test_phase_peak_refinement_quantizes_to_tenth_pixel() -> None:
+    true_offset = 0.24
+    left = -((-1.0 - true_offset) ** 2)
+    center = -(true_offset**2)
+    right = -((1.0 - true_offset) ** 2)
+
+    shift = stitch.refined_phase_shift_from_samples(
+        3,
+        16,
+        left,
+        center,
+        right,
+    )
+
+    assert shift == pytest.approx(3.2)
+
+
+def test_phase_peak_refinement_wraps_negative_tenth_pixel_shift() -> None:
+    true_offset = 0.24
+    left = -((-1.0 - true_offset) ** 2)
+    center = -(true_offset**2)
+    right = -((1.0 - true_offset) ** 2)
+
+    shift = stitch.refined_phase_shift_from_samples(
+        15,
+        16,
+        left,
+        center,
+        right,
+    )
+
+    assert shift == pytest.approx(-0.8)
 
 
 def test_fixed_xy_solver_solves_z_only_and_keeps_xy_corrections_zero() -> None:
@@ -129,16 +163,37 @@ def test_reference_prior_penalizes_lateral_corrections_without_fixing_them() -> 
         constraints,
         settings,
         reference_prior_weights_zyx=(0.0, 0.01, 0.01),
-        residual_reject_axes={"z"},
+        residual_reject_axes=set(),
     )
 
     assert anchor_tile == 0
     assert all(item.accepted for item in filtered)
-    assert corrections[0] == pytest.approx((0.0, 0.0, 0.0))
-    assert corrections[1][0] == pytest.approx(0.0)
-    assert corrections[1][1] == pytest.approx(40.0 / 11.0)
-    assert corrections[1][2] == pytest.approx(-20.0 / 11.0)
+    assert corrections[0] == pytest.approx((0.0, -10.0 / 3.0, 5.0 / 3.0))
+    assert corrections[1] == pytest.approx((0.0, 10.0 / 3.0, -5.0 / 3.0))
     assert abs(filtered[0].final_residual_zyx[1]) > settings.max_final_residual_zyx[1]
+
+
+def test_joint_huber_downweights_a_patch_outlying_in_any_solved_axis() -> None:
+    settings = stitch.RobustBoundarySettings(
+        max_correction_zyx=(16, 96, 96),
+        max_final_residual_zyx=(4.0, 8.0, 8.0),
+        irls_iterations=8,
+    )
+    constraints = [
+        constraint(0, 1, (0.0, 0.0, 0.0), weight=1.0),
+        constraint(0, 1, (0.0, 0.0, 0.0), weight=1.0),
+        constraint(0, 1, (2.0, 0.0, 40.0), weight=1.0),
+    ]
+
+    corrections = stitch.solve_tile_corrections_zyx(
+        2,
+        constraints,
+        settings,
+        anchor_tile=0,
+    )
+
+    assert corrections[1][0] < 0.25
+    assert corrections[1][2] < 4.1
 
 
 def test_reference_geometry_solver_options_define_reference_prior_contract() -> None:
@@ -156,12 +211,29 @@ def test_reference_geometry_solver_options_define_reference_prior_contract() -> 
 
     assert penalized_xy.fixed_axes == set()
     assert penalized_xy.reference_prior_weights_zyx == (0.0, 0.01, 0.01)
-    assert penalized_xy.residual_reject_axes == {"z"}
+    assert penalized_xy.residual_reject_axes == set()
 
 
 def test_reference_geometry_solver_options_reject_negative_prior() -> None:
     with pytest.raises(ValueError, match="must be non-negative"):
         stitch.reference_geometry_solver_options("penalized-xy", -0.01)
+
+
+def test_combined_channel_constraint_averages_track_measurements_without_row_duplication() -> None:
+    settings = stitch.RobustBoundarySettings()
+    track1 = constraint(0, 1, (0.2, -1.0, 3.0), weight=0.4, source_label="track1")
+    track2 = constraint(0, 1, (0.4, -3.0, 5.0), weight=0.4, source_label="track2")
+
+    combined = stitch.combine_channel_boundary_constraints(
+        [track1, track2],
+        source_label="track1+track2",
+        settings=settings,
+    )
+
+    assert combined.accepted
+    assert combined.source_label == "track1+track2"
+    assert combined.shift_zyx == pytest.approx((0.3, -2.0, 4.0))
+    assert combined.weight == pytest.approx(0.4)
 
 
 def test_apply_reference_fixed_axes_overwrites_xy_in_physical_units() -> None:

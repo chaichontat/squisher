@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shlex
 import subprocess
 import sys
@@ -20,5 +21,14 @@ def run_legacy_script(script_name: str, args: list[str], *, dry_run: bool = Fals
         print(f"DRY RUN not executed: {text}", flush=True)
         return text
     print(text, flush=True)
-    subprocess.run(command, check=True)
+    env = os.environ.copy()
+    extra_pythonpath = env.pop("SQUISHER_LEGACY_EXTRA_PYTHONPATH", "")
+    if extra_pythonpath:
+        current_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            extra_pythonpath
+            if not current_pythonpath
+            else f"{extra_pythonpath}{os.pathsep}{current_pythonpath}"
+        )
+    subprocess.run(command, check=True, env=env)
     return text

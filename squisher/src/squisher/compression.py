@@ -1789,7 +1789,7 @@ def _zarr_numcodecs_compressor(name: str, level: float):
 
     _register_imagecodecs_numcodecs()
     if name == "jpegxr":
-        return imagecodecs_numcodecs.Jpegxr(level=_compression_level(level), photometric="minisblack")
+        return imagecodecs_numcodecs.Jpegxr(level=_compression_level(level), photometric="GRAY")
     if name == "jpegxl":
         normalized_level = _compression_level(level)
         return imagecodecs_numcodecs.Jpegxl(level=int(round(normalized_level * 100)), lossless=normalized_level >= 1.0)

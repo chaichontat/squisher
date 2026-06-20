@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
 from squisher_lightsheet.legacy_runner import run_legacy_script
+
+
+coarse_preibisch_content_weights = legacy.coarse_preibisch_content_weights
+temporary_basic_disk_cache_dir = legacy.temporary_basic_disk_cache_dir
 
 
 def channel_output_path(output: Path, channel: int) -> Path:
@@ -26,10 +31,10 @@ def fuse_tiles(
     output: Path,
     channels: list[int] | None = None,
     fusion_weight_mode: str = "content-preibisch-coarse",
-    content_preibisch_sigma1: int = 7,
-    content_preibisch_sigma2: int = 17,
-    content_preibisch_coarse_stride: tuple[int, int, int] = (1, 8, 8),
-    basic_cache_tiles: int = 128,
+    batch_size: int = 4,
+    basic_cache_tiles: int = 64,
+    basic_cache_disk_dir: Path | None = None,
+    flatfield_dirs_by_source_view: dict[str, Path] | None = None,
     dry_run: bool = False,
 ) -> str:
     args = [
@@ -42,15 +47,16 @@ def fuse_tiles(
         str(output),
         "--fusion-weight-mode",
         fusion_weight_mode,
-        "--content-preibisch-sigma1",
-        str(content_preibisch_sigma1),
-        "--content-preibisch-sigma2",
-        str(content_preibisch_sigma2),
-        "--content-preibisch-coarse-stride",
-        *(str(value) for value in content_preibisch_coarse_stride),
+        "--batch-size",
+        str(batch_size),
         "--basic-cache-tiles",
         str(basic_cache_tiles),
     ]
+    if flatfield_dirs_by_source_view is not None:
+        for view, flatfield_dir in flatfield_dirs_by_source_view.items():
+            args.extend(["--flatfield-dir-by-source-view", f"{view}={flatfield_dir}"])
+    if basic_cache_disk_dir is not None:
+        args.extend(["--basic-cache-disk-dir", str(basic_cache_disk_dir)])
     if channels is not None:
         args.extend(["--channels", *(str(channel) for channel in channels)])
     if dry_run:

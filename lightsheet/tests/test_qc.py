@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from squisher_lightsheet._legacy.render_lr_level4_registration_qc import side_by_tile
+from squisher_lightsheet.qc import side_by_tile
 
 
 def test_side_lookup_uses_resolved_paths_for_duplicate_basenames() -> None:

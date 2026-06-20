@@ -6,6 +6,20 @@ from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
 from squisher_lightsheet.legacy_runner import run_legacy_script
 
 
+TrackMetadata = legacy.TrackMetadata
+TileMetadata = legacy.TileMetadata
+RobustBoundarySettings = legacy.RobustBoundarySettings
+BoundaryConstraint = legacy.BoundaryConstraint
+affine_translation_zyx = legacy.affine_translation_zyx
+refined_phase_shift_from_samples = legacy.refined_phase_shift_from_samples
+combine_channel_boundary_constraints = legacy.combine_channel_boundary_constraints
+solve_tile_corrections_zyx = legacy.solve_tile_corrections_zyx
+solve_tile_corrections_with_residual_rejection = legacy.solve_tile_corrections_with_residual_rejection
+apply_reference_fixed_axes = legacy.apply_reference_fixed_axes
+reference_geometry_solver_options = legacy.reference_geometry_solver_options
+reference_geometry_constraint = legacy.reference_geometry_constraint
+
+
 def ensure_single_track_position_input(position_input: Path) -> None:
     tiles = legacy.read_position_input_tiles(position_input.resolve())
     if len(tiles[0].tracks) > 1:

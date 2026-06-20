@@ -20,6 +20,30 @@ from squisher_lightsheet.workflow import DEFAULT_LEVEL, DEFAULT_OVERLAP_FRACTION
 app = typer.Typer(no_args_is_help=True)
 
 
+def _parse_source_view_flatfield_dir(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise typer.BadParameter(f"Expected source-view flatfield entry as VIEW=DIR, got {value!r}")
+    view, path = value.split("=", 1)
+    view = view.strip()
+    if not view:
+        raise typer.BadParameter(f"Missing source-view name in {value!r}")
+    if not path:
+        raise typer.BadParameter(f"Missing flatfield directory in {value!r}")
+    return view, Path(path)
+
+
+def _parse_source_view_flatfield_dirs(values: list[str] | None) -> dict[str, Path] | None:
+    if values is None:
+        return None
+    parsed: dict[str, Path] = {}
+    for value in values:
+        view, path = _parse_source_view_flatfield_dir(value)
+        if view in parsed:
+            raise typer.BadParameter(f"Duplicate --flatfield-dir-by-source-view entry for {view!r}")
+        parsed[view] = path
+    return parsed
+
+
 @app.command()
 def position(
     left_dir: Annotated[Path, typer.Option("--left-dir", exists=True, file_okay=False, readable=True)],
@@ -119,6 +143,19 @@ def fuse(
     registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
     output: Annotated[Path, typer.Option("--output")],
     channel: Annotated[list[int] | None, typer.Option("--channel", min=0)] = None,
+    flatfield_dir_by_source_view: Annotated[
+        list[str] | None,
+        typer.Option("--flatfield-dir-by-source-view"),
+    ] = None,
+    fusion_weight_mode: Annotated[
+        str,
+        typer.Option("--fusion-weight-mode"),
+    ] = "content-preibisch-coarse",
+    batch_size: Annotated[int, typer.Option("--batch-size", min=1)] = 4,
+    basic_cache_disk_dir: Annotated[
+        Path | None,
+        typer.Option("--basic-cache-disk-dir", file_okay=False),
+    ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
     fuse_tiles(
@@ -127,6 +164,10 @@ def fuse(
         registration_input=registration_input,
         output=output,
         channels=channel,
+        flatfield_dirs_by_source_view=_parse_source_view_flatfield_dirs(flatfield_dir_by_source_view),
+        fusion_weight_mode=fusion_weight_mode,
+        batch_size=batch_size,
+        basic_cache_disk_dir=basic_cache_disk_dir,
         dry_run=dry_run,
     )
 
@@ -198,7 +239,7 @@ def tile_phase_align(
     level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_LEVEL,
     upsample_factor: Annotated[int, typer.Option("--upsample-factor", min=1)] = 10,
     patch_shape_zyx: Annotated[str | None, typer.Option("--patch-shape-zyx")] = None,
-    min_inliers: Annotated[int, typer.Option("--min-inliers", min=1)] = 2,
+    min_inliers: Annotated[int, typer.Option("--min-inliers", min=3)] = 3,
     max_candidate_patches: Annotated[int, typer.Option("--max-candidate-patches", min=1)] = 24,
     coarse_level: Annotated[int, typer.Option("--coarse-level", min=0)] = DEFAULT_LEVEL,
     reference_registration_input: Annotated[
