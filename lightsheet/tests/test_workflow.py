@@ -8,8 +8,7 @@ from squisher_lightsheet import workflow
 
 
 def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(workflow, "create_position_file", lambda **_kwargs: None)
-    monkeypatch.setattr(workflow, "rough_phase_align", lambda **_kwargs: None)
+    monkeypatch.setattr(workflow, "run_lr_dumb_stitch_alignment", lambda **_kwargs: None)
     monkeypatch.setattr(workflow, "register_tiles", lambda **_kwargs: "registration command")
     monkeypatch.setattr(workflow, "render_registration_qc", lambda **_kwargs: "qc command")
     monkeypatch.setattr(workflow, "fuse_tiles", lambda **_kwargs: "fusion command")
@@ -31,8 +30,15 @@ def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_
     summary = json.loads(paths.summary_json.read_text())
     assert summary["outputs"]["fusion_base_output"].endswith("fused.ome.zarr")
     assert summary["outputs"]["fusion_outputs"] == [str((paths.registration_dir / "fused.ch0.ome.zarr").resolve())]
+    assert summary["outputs"]["corrected_overlay"] == str(paths.corrected_overlay.resolve())
+    assert paths.corrected_overlay.name == "level2_phase_corrected_zyx_yellowOverlay_ch0.png"
     assert "search_margin_px" in summary["parameters"]
     assert "phase_upsample_factor" in summary["parameters"]
+    assert summary["parameters"]["rough_phase_level"] == 2
+    assert summary["parameters"]["rough_phase_xy_downsample_factor"] == 4
+    assert summary["parameters"]["rough_phase_dimensions"] == "zyx"
+    assert summary["parameters"]["rough_phase_z_sampling"] == "native_center_z_slab"
+    assert summary["parameters"]["rough_phase_z_slab_planes"] == 8
     assert {"position", "rough_phase", "registration", "qc", "fusion", "pyramid"} <= set(summary["commands"])
 
 

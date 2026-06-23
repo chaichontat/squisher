@@ -104,6 +104,7 @@ def test_rough_phase_output_remains_a_position_artifact(monkeypatch, tmp_path) -
         position_input=position_input,
         output_position=output_position,
         output_dir=output_dir,
+        z_slab_planes=1,
     )
 
     payload = json.loads(output_position.read_text())
@@ -208,6 +209,7 @@ def test_rough_phase_uses_xz_for_z_join(monkeypatch, tmp_path) -> None:
         position_input=position_input,
         output_position=output_position,
         output_dir=output_dir,
+        phase_downsample_zyx=(1, 1, 1),
     )
 
     payload = json.loads(output_position.read_text())
@@ -251,7 +253,11 @@ def test_rough_phase_uses_zyx_slab_for_x_join_when_requested(monkeypatch, tmp_pa
             {"L": volume, "R": volume},
             {"L": np.ones(volume.shape, dtype=bool), "R": np.ones(volume.shape, dtype=bool)},
             [],
-            {"slab_planes": slab_planes},
+            {
+                "slab_planes": slab_planes,
+                "z_sampling": "native_center_z_slab",
+                "native_z_spacing_um": 2.5,
+            },
         ),
     )
     monkeypatch.setattr(
@@ -269,6 +275,7 @@ def test_rough_phase_uses_zyx_slab_for_x_join_when_requested(monkeypatch, tmp_pa
         output_dir=output_dir,
         z_slab_planes=4,
         crop_overlap=False,
+        phase_downsample_zyx=(1, 1, 1),
     )
 
     payload = json.loads(output_position.read_text())
@@ -277,11 +284,16 @@ def test_rough_phase_uses_zyx_slab_for_x_join_when_requested(monkeypatch, tmp_pa
     assert summary["phase_plane"] == "zyx"
     assert summary["phase_axes"] == ["z", "y", "x"]
     assert summary["phase_alignment"]["crop_to_overlap"] is False
-    assert summary["phase_alignment"]["slab"] == {"slab_planes": 4}
+    assert summary["phase_alignment"]["slab"] == {
+        "slab_planes": 4,
+        "z_sampling": "native_center_z_slab",
+        "native_z_spacing_um": 2.5,
+    }
+    assert summary["phase_alignment"]["shift_spacing_zyx_um"] == [2.5, 2.0, 4.0]
     assert set(summary["corrected_projection_overlays"]) == {"xy_overlap_center"}
     assert summary["corrected_projection_contact_sheet"] is None
     assert summary["corrected_overlap_center_plane"]["overlap_plane_pixels"] == 30
-    assert record == {"z": 20.0, "y": 16.0, "x": 42.0}
+    assert record == {"z": 12.5, "y": 16.0, "x": 42.0}
 
 
 def test_seam_band_mask_uses_only_requested_fraction_next_to_z_seam() -> None:
@@ -324,3 +336,55 @@ def test_seam_band_mask_uses_only_requested_fraction_next_to_z_seam() -> None:
     assert details["seam_band_range_um"] == [0.0, 10.0]
     assert details["seam_band_range_px"] == [75, 85]
     assert int(mask.sum()) == 10 * 10
+
+
+def test_center_z_slab_reads_native_z_range_and_downsamples_yx(monkeypatch) -> None:
+    tile = rough_phase.legacy.TileRecord(
+        tile="L0",
+        side="L",
+        path=Path("L0.tif"),
+        translation_zyx_um=np.array([0.0, 0.0, 0.0]),
+        scale_zyx_um=np.array([1.0, 1.0, 1.0]),
+        shape_zyx=np.array([20, 16, 16]),
+        axes="ZYX",
+    )
+    geometry = SimpleNamespace(
+        level_factor=4,
+        level_spacing_zyx_um=np.array([4.0, 4.0, 4.0]),
+        global_min_zyx_um=np.array([0.0, 0.0, 0.0]),
+        global_max_zyx_um=np.array([20.0, 16.0, 16.0]),
+        shape_zyx=np.array([5, 4, 4]),
+    )
+    observed = {}
+
+    def fake_sampled_tile_center_z_slab(
+        _tile,
+        *,
+        channel,
+        source_z_start,
+        source_z_stop,
+        yx_level_factor,
+    ):
+        observed.update(
+            channel=channel,
+            source_z_range=[source_z_start, source_z_stop],
+            yx_level_factor=yx_level_factor,
+        )
+        return np.ones((source_z_stop - source_z_start, 4, 4), dtype=np.float32)
+
+    monkeypatch.setattr(rough_phase.legacy, "sampled_tile_center_z_slab", fake_sampled_tile_center_z_slab)
+
+    images, coverage, rows, details = rough_phase.legacy.render_center_z_slab_canvases(
+        [tile],
+        geometry=geometry,
+        channel=0,
+        slab_planes=6,
+    )
+
+    assert observed == {"channel": 0, "source_z_range": [7, 13], "yx_level_factor": 4}
+    assert details["z_sampling"] == "native_center_z_slab"
+    assert details["slab_range_z_px"] == [7, 13]
+    assert details["yx_downsample_factor"] == 4
+    assert images["L"].shape == (6, 4, 4)
+    assert coverage["L"].shape == (6, 4, 4)
+    assert rows[0]["source_z_range"] == [7, 13]

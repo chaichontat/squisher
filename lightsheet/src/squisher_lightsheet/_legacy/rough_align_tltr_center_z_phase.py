@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from squisher_lightsheet import phase_metrics
+from squisher_lightsheet import qc as qc_core
+from squisher_lightsheet.tiff import choose_tiff_source_level, spatial_shape_array_zyx_from_axes
 
 
 DIMENSIONS = ("z", "y", "x")
@@ -97,6 +100,22 @@ def base_zarr_array(zarr_obj: Any) -> Any:
     raise TypeError(f"Expected zarr array or group with base array '0', got {type(zarr_obj).__name__}")
 
 
+def source_slices_for_factor(
+    tile: TileRecord,
+    *,
+    source_factor_zyx: np.ndarray,
+    desired_factor_zyx: np.ndarray,
+) -> tuple[slice, slice, slice]:
+    remaining_step = np.maximum(
+        1,
+        np.ceil(np.asarray(desired_factor_zyx, dtype=np.float64) / source_factor_zyx.astype(np.float64)).astype(np.int64),
+    )
+    z_step = int(-remaining_step[0] if tile.scale_zyx_um[0] < 0 else remaining_step[0])
+    y_step = int(-remaining_step[1] if tile.scale_zyx_um[1] < 0 else remaining_step[1])
+    x_step = int(-remaining_step[2] if tile.scale_zyx_um[2] < 0 else remaining_step[2])
+    return slice(None, None, z_step), slice(None, None, y_step), slice(None, None, x_step)
+
+
 def load_tiles(position_payload: dict[str, Any]) -> list[TileRecord]:
     tiles = []
     for record in position_payload["tiles"]:
@@ -161,23 +180,30 @@ def sampled_center_z_plane(tile: TileRecord, *, channel: int, level_factor: int)
     import tifffile
     import zarr
 
-    store = tifffile.imread(tile.path, aszarr=True)
+    desired_factor = np.asarray([1, level_factor, level_factor], dtype=np.int64)
+    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
+    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
     try:
         zarray = base_zarr_array(zarr.open(store, mode="r"))
         array = da.from_zarr(zarray)
-        z_index = int(tile.shape_zyx[0] // 2)
+        source_shape_zyx = spatial_shape_array_zyx_from_axes(tuple(array.shape), tile.axes)
+        z_index = int(round((tile.shape_zyx[0] // 2) / max(int(source_factor[0]), 1)))
+        z_index = min(max(z_index, 0), int(source_shape_zyx[0]) - 1)
         if tile.scale_zyx_um[0] < 0:
-            z_index = int(tile.shape_zyx[0] - 1 - z_index)
-        y_step = -level_factor if tile.scale_zyx_um[1] < 0 else level_factor
-        x_step = -level_factor if tile.scale_zyx_um[2] < 0 else level_factor
+            z_index = int(source_shape_zyx[0] - 1 - z_index)
+        _z_slice, y_slice, x_slice = source_slices_for_factor(
+            tile,
+            source_factor_zyx=source_factor,
+            desired_factor_zyx=desired_factor,
+        )
         if tile.axes == "CZYX":
             if channel < 0 or channel >= int(array.shape[0]):
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
-            plane = array[channel, z_index, ::y_step, ::x_step]
+            plane = array[channel, z_index, y_slice, x_slice]
         elif tile.axes == "ZYX":
             if channel != 0:
                 raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
-            plane = array[z_index, ::y_step, ::x_step]
+            plane = array[z_index, y_slice, x_slice]
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
         return np.asarray(plane.compute(), dtype=np.float32)
@@ -192,21 +218,82 @@ def sampled_tile_volume(tile: TileRecord, *, channel: int, level_factor: int) ->
     import tifffile
     import zarr
 
-    store = tifffile.imread(tile.path, aszarr=True)
+    desired_factor = np.asarray([level_factor, level_factor, level_factor], dtype=np.int64)
+    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
+    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
     try:
         zarray = base_zarr_array(zarr.open(store, mode="r"))
         array = da.from_zarr(zarray)
-        z_step = -level_factor if tile.scale_zyx_um[0] < 0 else level_factor
-        y_step = -level_factor if tile.scale_zyx_um[1] < 0 else level_factor
-        x_step = -level_factor if tile.scale_zyx_um[2] < 0 else level_factor
+        z_slice, y_slice, x_slice = source_slices_for_factor(
+            tile,
+            source_factor_zyx=source_factor,
+            desired_factor_zyx=desired_factor,
+        )
         if tile.axes == "CZYX":
             if channel < 0 or channel >= int(array.shape[0]):
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
-            volume = array[channel, ::z_step, ::y_step, ::x_step]
+            volume = array[channel, z_slice, y_slice, x_slice]
         elif tile.axes == "ZYX":
             if channel != 0:
                 raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
-            volume = array[::z_step, ::y_step, ::x_step]
+            volume = array[z_slice, y_slice, x_slice]
+        else:
+            raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
+        return np.asarray(volume.compute(), dtype=np.float32)
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
+def sampled_tile_center_z_slab(
+    tile: TileRecord,
+    *,
+    channel: int,
+    source_z_start: int,
+    source_z_stop: int,
+    yx_level_factor: int,
+) -> np.ndarray:
+    import dask.array as da
+    import tifffile
+    import zarr
+
+    if source_z_start < 0 or source_z_stop > int(tile.shape_zyx[0]) or source_z_stop <= source_z_start:
+        raise ValueError(
+            f"Invalid source z slab [{source_z_start}, {source_z_stop}) for tile {tile.tile} "
+            f"with z size {int(tile.shape_zyx[0])}"
+        )
+
+    desired_factor = np.asarray([1, yx_level_factor, yx_level_factor], dtype=np.int64)
+    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
+    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    try:
+        zarray = base_zarr_array(zarr.open(store, mode="r"))
+        array = da.from_zarr(zarray)
+        source_shape_zyx = spatial_shape_array_zyx_from_axes(tuple(array.shape), tile.axes)
+        source_z_start = int(np.floor(source_z_start / max(int(source_factor[0]), 1)))
+        source_z_stop = int(np.ceil(source_z_stop / max(int(source_factor[0]), 1)))
+        source_z_start = min(max(source_z_start, 0), int(source_shape_zyx[0]))
+        source_z_stop = min(max(source_z_stop, source_z_start + 1), int(source_shape_zyx[0]))
+        if tile.scale_zyx_um[0] < 0:
+            z_start = int(source_shape_zyx[0] - 1 - source_z_start)
+            z_stop = int(source_shape_zyx[0] - source_z_stop - 1)
+            z_slice = slice(z_start, None if z_stop < 0 else z_stop, -1)
+        else:
+            z_slice = slice(source_z_start, source_z_stop)
+        _z_slice, y_slice, x_slice = source_slices_for_factor(
+            tile,
+            source_factor_zyx=source_factor,
+            desired_factor_zyx=desired_factor,
+        )
+        if tile.axes == "CZYX":
+            if channel < 0 or channel >= int(array.shape[0]):
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
+            volume = array[channel, z_slice, y_slice, x_slice]
+        elif tile.axes == "ZYX":
+            if channel != 0:
+                raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
+            volume = array[z_slice, y_slice, x_slice]
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
         return np.asarray(volume.compute(), dtype=np.float32)
@@ -217,21 +304,7 @@ def sampled_tile_volume(tile: TileRecord, *, channel: int, level_factor: int) ->
 
 
 def place_max(canvas: np.ndarray, image: np.ndarray, start_yx: tuple[int, int]) -> None:
-    y0, x0 = start_yx
-    if y0 >= canvas.shape[0] or x0 >= canvas.shape[1]:
-        return
-    src_y0 = max(0, -y0)
-    src_x0 = max(0, -x0)
-    dst_y0 = max(0, y0)
-    dst_x0 = max(0, x0)
-    y_size = min(image.shape[0] - src_y0, canvas.shape[0] - dst_y0)
-    x_size = min(image.shape[1] - src_x0, canvas.shape[1] - dst_x0)
-    if y_size <= 0 or x_size <= 0:
-        return
-    canvas[dst_y0 : dst_y0 + y_size, dst_x0 : dst_x0 + x_size] = np.maximum(
-        canvas[dst_y0 : dst_y0 + y_size, dst_x0 : dst_x0 + x_size],
-        image[src_y0 : src_y0 + y_size, src_x0 : src_x0 + x_size],
-    )
+    qc_core.place_max(canvas, image, start_yx)
 
 
 def place_max_nd(canvas: np.ndarray, image: np.ndarray, start: tuple[int, ...]) -> None:
@@ -327,36 +400,57 @@ def render_center_z_slab_canvases(
     channel: int,
     slab_planes: int,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]], dict[str, Any]]:
-    slab_start, slab_stop = center_slab_range(int(geometry.shape_zyx[0]), slab_planes)
+    native_z_spacing_um = abs(float(tiles[0].scale_zyx_um[0]))
+    native_global_shape_z = int(
+        np.ceil((geometry.global_max_zyx_um[0] - geometry.global_min_zyx_um[0]) / native_z_spacing_um)
+    )
+    slab_start, slab_stop = center_slab_range(native_global_shape_z, slab_planes)
     slab_shape = (slab_stop - slab_start, int(geometry.shape_zyx[1]), int(geometry.shape_zyx[2]))
     images = {side: np.zeros(slab_shape, dtype=np.float32) for side in SIDES}
     coverage = {side: np.zeros(slab_shape, dtype=bool) for side in SIDES}
     rows = []
     for tile in tiles:
         start_um, _stop_um = tile_bounds_zyx_um(tile)
-        start_zyx = np.rint((start_um - geometry.global_min_zyx_um) / geometry.level_spacing_zyx_um).astype(int)
-        volume = sampled_tile_volume(tile, channel=channel, level_factor=geometry.level_factor)
-        slab_start_zyx = (int(start_zyx[0]) - slab_start, int(start_zyx[1]), int(start_zyx[2]))
+        start_z = int(round((start_um[0] - geometry.global_min_zyx_um[0]) / native_z_spacing_um))
+        start_yx = np.rint((start_um[1:3] - geometry.global_min_zyx_um[1:3]) / geometry.level_spacing_zyx_um[1:3]).astype(int)
+        global_z_start = max(slab_start, start_z)
+        global_z_stop = min(slab_stop, start_z + int(tile.shape_zyx[0]))
+        if global_z_stop <= global_z_start:
+            continue
+        source_z_start = global_z_start - start_z
+        source_z_stop = global_z_stop - start_z
+        volume = sampled_tile_center_z_slab(
+            tile,
+            channel=channel,
+            source_z_start=source_z_start,
+            source_z_stop=source_z_stop,
+            yx_level_factor=geometry.level_factor,
+        )
+        slab_start_zyx = (int(global_z_start) - slab_start, int(start_yx[0]), int(start_yx[1]))
         place_max_nd(images[tile.side], volume, slab_start_zyx)
         place_max_nd(coverage[tile.side], np.ones(volume.shape, dtype=bool), slab_start_zyx)
         rows.append(
             {
                 "tile": tile.tile,
                 "side": tile.side,
-                "level_start_zyx": [int(value) for value in start_zyx],
+                "level_start_zyx": [int(start_z), int(start_yx[0]), int(start_yx[1])],
+                "source_z_range": [int(source_z_start), int(source_z_stop)],
                 "slab_start_zyx": [int(value) for value in slab_start_zyx],
                 "sampled_shape_zyx": [int(value) for value in volume.shape],
             }
         )
         print(
-            f"placed-slab {tile.tile} side={tile.side} start_zyx={start_zyx.tolist()} "
+            f"placed-slab {tile.tile} side={tile.side} start_zyx={[int(start_z), int(start_yx[0]), int(start_yx[1])]} "
             f"slab_start_zyx={list(slab_start_zyx)} shape={list(volume.shape)}",
             flush=True,
         )
     details = {
         "slab_range_z_px": [int(slab_start), int(slab_stop)],
         "slab_planes": int(slab_shape[0]),
-        "global_shape_zyx": [int(value) for value in geometry.shape_zyx],
+        "z_sampling": "native_center_z_slab",
+        "native_z_spacing_um": native_z_spacing_um,
+        "global_shape_zyx": [int(native_global_shape_z), int(geometry.shape_zyx[1]), int(geometry.shape_zyx[2])],
+        "yx_downsample_factor": int(geometry.level_factor),
     }
     return images, coverage, rows, details
 
@@ -441,84 +535,12 @@ def seam_band_mask(
     return mask, details
 
 
-def scale_u8(image: np.ndarray) -> np.ndarray:
-    finite = image[np.isfinite(image)]
-    positive = finite[finite > 0]
-    if positive.size == 0:
-        return np.zeros(image.shape, dtype=np.uint8)
-    low, high = np.percentile(positive, [1.0, 99.8])
-    scaled = np.clip((image - low) / max(float(high - low), 1.0), 0.0, 1.0)
-    return np.rint(scaled * 255.0).astype(np.uint8)
-
-
-def write_overlay(path: Path, *, left: np.ndarray, right: np.ndarray) -> None:
-    from PIL import Image
-
-    rgb = np.zeros((*left.shape, 3), dtype=np.uint8)
-    rgb[..., 0] = scale_u8(right)
-    rgb[..., 1] = scale_u8(left)
-    Image.fromarray(rgb).save(path)
-
-
-def write_overlay_scaled(path: Path, *, left: np.ndarray, right: np.ndarray, y_scale: float = 1.0) -> None:
-    from PIL import Image
-
-    rgb = np.zeros((*left.shape, 3), dtype=np.uint8)
-    rgb[..., 0] = scale_u8(right)
-    rgb[..., 1] = scale_u8(left)
-    image = Image.fromarray(rgb)
-    if not np.isclose(y_scale, 1.0):
-        image = image.resize(
-            (image.width, max(1, int(round(image.height * y_scale)))),
-            Image.Resampling.BILINEAR,
-        )
-    image.save(path)
-
-
-def write_contact_sheet(output: Path, images: list[tuple[str, Path]]) -> None:
-    from PIL import Image, ImageDraw
-
-    opened = [(title, Image.open(path).convert("RGB")) for title, path in images]
-    target_width = max(image.width for _, image in opened)
-    resized = []
-    for title, image in opened:
-        if image.width != target_width:
-            height = max(1, int(round(image.height * target_width / image.width)))
-            image = image.resize((target_width, height), Image.Resampling.LANCZOS)
-        resized.append((title, image))
-    title_height = 28
-    sheet = Image.new("RGB", (target_width, sum(image.height + title_height for _, image in resized)), "white")
-    draw = ImageDraw.Draw(sheet)
-    y = 0
-    for title, image in resized:
-        draw.text((8, y + 7), title, fill=(0, 0, 0))
-        y += title_height
-        sheet.paste(image, (0, y))
-        y += image.height
-    sheet.save(output)
-
-
-def empty_projection_canvases(shape_zyx: np.ndarray) -> dict[str, dict[str, np.ndarray]]:
-    return {
-        side: {
-            "xy": np.zeros((shape_zyx[1], shape_zyx[2]), dtype=np.float32),
-            "xz": np.zeros((shape_zyx[0], shape_zyx[2]), dtype=np.float32),
-            "yz": np.zeros((shape_zyx[0], shape_zyx[1]), dtype=np.float32),
-        }
-        for side in SIDES
-    }
-
-
-def place_global_projections(
-    projections: dict[str, dict[str, np.ndarray]],
-    *,
-    side: str,
-    volume: np.ndarray,
-    start_zyx: np.ndarray,
-) -> None:
-    place_max(projections[side]["xy"], volume.max(axis=0), (int(start_zyx[1]), int(start_zyx[2])))
-    place_max(projections[side]["xz"], volume.max(axis=1), (int(start_zyx[0]), int(start_zyx[2])))
-    place_max(projections[side]["yz"], volume.max(axis=2), (int(start_zyx[0]), int(start_zyx[1])))
+scale_u8 = qc_core.scale_u8
+write_overlay = qc_core.write_overlay
+write_overlay_scaled = qc_core.write_overlay_scaled
+write_contact_sheet = qc_core.write_contact_sheet
+empty_projection_canvases = qc_core.empty_projection_canvases
+place_global_projections = qc_core.place_global_projections
 
 
 def render_global_projection_canvases(
@@ -680,13 +702,7 @@ def estimate_shift_yx_px(
 
 
 def corrcoef_on_mask(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) -> float | None:
-    if int(mask.sum()) < 8:
-        return None
-    a = fixed[mask].astype(np.float64)
-    b = moving[mask].astype(np.float64)
-    if float(np.std(a)) == 0.0 or float(np.std(b)) == 0.0:
-        return None
-    return float(np.corrcoef(a, b)[0, 1])
+    return phase_metrics.corrcoef_on_mask(fixed, moving, mask)
 
 
 def shifted_payload_by_axes(

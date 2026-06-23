@@ -4,20 +4,27 @@ from pathlib import Path
 
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
 from squisher_lightsheet.legacy_runner import run_legacy_script
+from squisher_lightsheet import seams
 
 
 TrackMetadata = legacy.TrackMetadata
 TileMetadata = legacy.TileMetadata
-RobustBoundarySettings = legacy.RobustBoundarySettings
-BoundaryConstraint = legacy.BoundaryConstraint
+RobustBoundarySettings = seams.RobustBoundarySettings
+BoundaryPatchSpec = seams.BoundaryPatchSpec
+BoundaryConstraint = seams.BoundaryConstraint
 affine_translation_zyx = legacy.affine_translation_zyx
-refined_phase_shift_from_samples = legacy.refined_phase_shift_from_samples
+refined_phase_shift_from_samples = seams.refined_phase_shift_from_samples
 combine_channel_boundary_constraints = legacy.combine_channel_boundary_constraints
 solve_tile_corrections_zyx = legacy.solve_tile_corrections_zyx
 solve_tile_corrections_with_residual_rejection = legacy.solve_tile_corrections_with_residual_rejection
+axis_aligned_registration_pairs = legacy.axis_aligned_registration_pairs
+replace_tile_stage_transform = legacy.replace_tile_stage_transform
 apply_reference_fixed_axes = legacy.apply_reference_fixed_axes
 reference_geometry_solver_options = legacy.reference_geometry_solver_options
 reference_geometry_constraint = legacy.reference_geometry_constraint
+refinement_start_params = legacy.refinement_start_params
+align_params_to_reference = legacy.align_params_to_reference
+align_refinement_start_to_reference = legacy.align_refinement_start_to_reference
 
 
 def ensure_single_track_position_input(position_input: Path) -> None:
@@ -35,20 +42,37 @@ def register_tiles(
     position_input: Path,
     registration_output: Path,
     level: int = 4,
-    registration_pair_mode: str = "robust-boundary",
+    registration_pair_mode: str = legacy.DEFAULT_REGISTRATION_PAIR_MODE,
     robust_boundary_qc_dir: Path | None = None,
     registration_plots_dir: Path | None = None,
     skip_registration_plots: bool = True,
     dask_num_workers: int | None = None,
     pairwise_jobs: int | None = None,
+    registration_pair_file: Path | None = None,
+    groupwise_transform: str = legacy.MVS_GROUPWISE_TRANSFORM,
     reference_registration_input: Path | None = None,
     reference_geometry_mode: str = "none",
     reference_xy_prior_weight: float | None = None,
+    reference_initial_alignment: str = "none",
     shared_geometry_tracks: tuple[str, ...] | None = None,
+    channels: tuple[int, ...] | None = None,
+    log_file: Path | None = None,
     dry_run: bool = False,
 ) -> str:
-    if not dry_run and shared_geometry_tracks is None:
+    if not dry_run and shared_geometry_tracks is None and channels is None:
         ensure_single_track_position_input(position_input)
+    if level != 4:
+        raise ValueError("The current legacy registration CLI only supports level 4 registration")
+    if robust_boundary_qc_dir is not None and robust_boundary_qc_dir != run_dir / "robust-boundary-qc":
+        raise ValueError("The current legacy registration CLI writes robust-boundary QC to RUN_DIR/robust-boundary-qc")
+    if registration_plots_dir is not None and registration_plots_dir != run_dir / "registration-plots":
+        raise ValueError("The current legacy registration CLI writes registration plots to RUN_DIR/registration-plots")
+    if not skip_registration_plots:
+        raise ValueError("The current legacy registration CLI does not expose registration plot generation")
+    if dask_num_workers is not None:
+        raise ValueError("The current legacy registration CLI does not expose dask_num_workers")
+    if pairwise_jobs is not None:
+        raise ValueError("The current legacy registration CLI does not expose pairwise_jobs")
 
     args = [
         str(run_dir),
@@ -58,31 +82,28 @@ def register_tiles(
         "--register-only",
         "--registration-output",
         str(registration_output),
-        "--registration-pair-mode",
-        registration_pair_mode,
-        "--reg-res-level",
-        str(level),
     ]
-    if skip_registration_plots:
-        args.append("--skip-registration-plots")
-    else:
-        args.append("--no-skip-registration-plots")
-    if registration_plots_dir is not None:
-        args.extend(["--registration-plots-dir", str(registration_plots_dir)])
-    if robust_boundary_qc_dir is not None:
-        args.extend(["--robust-boundary-qc-dir", str(robust_boundary_qc_dir)])
-    if dask_num_workers is not None:
-        args.extend(["--dask-num-workers", str(dask_num_workers)])
-    if pairwise_jobs is not None:
-        args.extend(["--n-parallel-pairwise-regs", str(pairwise_jobs)])
     if reference_registration_input is not None:
         args.extend(["--reference-registration-input", str(reference_registration_input)])
     if reference_geometry_mode != "none":
         args.extend(["--reference-geometry-mode", reference_geometry_mode])
     if reference_xy_prior_weight is not None:
         args.extend(["--reference-xy-prior-weight", str(reference_xy_prior_weight)])
+    if reference_initial_alignment != "none":
+        args.extend(["--reference-initial-alignment", reference_initial_alignment])
     if shared_geometry_tracks is not None:
         args.extend(["--shared-geometry-tracks", ",".join(shared_geometry_tracks)])
+    if channels is not None:
+        args.append("--channels")
+        args.extend(str(channel) for channel in channels)
+    if registration_pair_mode != legacy.DEFAULT_REGISTRATION_PAIR_MODE:
+        args.extend(["--registration-pair-mode", registration_pair_mode])
+    if registration_pair_file is not None:
+        args.extend(["--registration-pair-file", str(registration_pair_file)])
+    if groupwise_transform != legacy.MVS_GROUPWISE_TRANSFORM:
+        args.extend(["--groupwise-transform", groupwise_transform])
+    if log_file is not None:
+        args.extend(["--log-file", str(log_file)])
     if dry_run:
         args.append("--dry-run")
     return run_legacy_script("stitch_20x_tl_multiview.py", args, dry_run=dry_run)

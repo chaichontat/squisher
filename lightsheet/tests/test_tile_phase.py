@@ -278,6 +278,36 @@ def test_patch_quality_gates_reject_low_correlation_and_periodic_wrap() -> None:
     assert "residual_near_periodic_wrap" in reasons
 
 
+def test_patch_quality_rejects_weak_zero_residual_gradient_match() -> None:
+    reasons = patch_quality_rejection_reasons(
+        details={
+            "corr_before": 0.70,
+            "corr_after": 0.70,
+            "gradient_component_ncc_before": 0.05,
+            "gradient_component_ncc_after": 0.05,
+        },
+        residual_shift_px=np.asarray([0.0, 0.0, 0.0]),
+        patch_shape_zyx=(32, 512, 512),
+    )
+
+    assert "weak_gradient_component_ncc_zero_residual" in reasons
+
+
+def test_patch_quality_keeps_low_gradient_nonzero_refinement() -> None:
+    reasons = patch_quality_rejection_reasons(
+        details={
+            "corr_before": 0.70,
+            "corr_after": 0.70,
+            "gradient_component_ncc_before": 0.05,
+            "gradient_component_ncc_after": 0.05,
+        },
+        residual_shift_px=np.asarray([1.0, 0.0, 0.0]),
+        patch_shape_zyx=(32, 512, 512),
+    )
+
+    assert "weak_gradient_component_ncc_zero_residual" not in reasons
+
+
 def test_tile_phase_cli_min_inliers_default_and_floor() -> None:
     parameter = inspect.signature(cli_module.tile_phase_align).parameters["min_inliers"]
     assert parameter.default == 3
@@ -324,13 +354,13 @@ def test_cache_key_changes_when_position_or_tile_stat_changes(tmp_path) -> None:
 
 def test_phase_cache_key_ignores_quality_metric_only_changes() -> None:
     current = {
-        "cache_version": "tile_phase_robust_v2",
+        "cache_version": "tile_phase_robust_v3",
         "reference_position": "/tmp/positions.json",
         "patch_shape_zyx": [32, 512, 512],
         "quality_thresholds": {"corr_improvement_metric": "same_shifted_overlap_support"},
     }
     stored = {
-        "cache_version": "tile_phase_robust_v2",
+        "cache_version": "tile_phase_robust_v3",
         "reference_position": "/tmp/positions.json",
         "patch_shape_zyx": [32, 512, 512],
         "quality_thresholds": {"min_corr_improvement": 0.0},

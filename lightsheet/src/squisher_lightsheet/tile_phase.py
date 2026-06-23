@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal, Mapping, TypedDict, cast
 
@@ -10,6 +11,8 @@ import numpy as np
 from squisher_lightsheet.artifacts import stamp_artifact
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as stitch_legacy
+from squisher_lightsheet import phase_metrics
+from squisher_lightsheet.tiff import tiff_series_level_count
 
 
 DIMENSIONS = ("z", "y", "x")
@@ -18,6 +21,8 @@ PATCH_MIN_CORR_AFTER = 0.15
 PATCH_MIN_CORR_IMPROVEMENT = 0.0
 PATCH_MAX_RESIDUAL_FRACTION = 0.45
 PATCH_MIN_QUALITY_ACCEPTED_FOR_EARLY_STOP = 3
+PATCH_MIN_GRADIENT_COMPONENT_NCC_AFTER_FOR_ZERO_RESIDUAL = 0.15
+PATCH_ZERO_RESIDUAL_NORM_PX = 0.5
 TILE_PHASE_MEASUREMENT_STATUSES = ("direct_accepted", "direct_failed", "fallback_accepted")
 
 
@@ -70,18 +75,7 @@ TilePhaseRow = TilePhaseAcceptedRow | TilePhaseFailedAttemptRow
 
 
 def normalize_volume_for_phase(volume: np.ndarray) -> np.ndarray:
-    finite = volume[np.isfinite(volume)]
-    positive = finite[finite > 0]
-    out = np.zeros(volume.shape, dtype=np.float32)
-    if positive.size == 0:
-        return out
-    low, high = np.percentile(positive, [1.0, 99.5])
-    clipped = np.clip(volume, low, high)
-    valid = np.isfinite(clipped)
-    centered = clipped - float(np.median(clipped[valid]))
-    denom = max(float(np.percentile(np.abs(centered[valid]), 95.0)), 1.0)
-    out[valid] = centered[valid] / denom
-    return out
+    return phase_metrics.robust_normalize(volume)
 
 
 def estimate_tile_shift_zyx_px(
@@ -149,13 +143,7 @@ def estimate_tile_shift_zyx_px_gpu(fixed: np.ndarray, moving: np.ndarray) -> tup
 
 
 def corrcoef_on_mask(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) -> float | None:
-    if int(mask.sum()) < 8:
-        return None
-    a = fixed[mask].astype(np.float64)
-    b = moving[mask].astype(np.float64)
-    if float(np.std(a)) == 0.0 or float(np.std(b)) == 0.0:
-        return None
-    return float(np.corrcoef(a, b)[0, 1])
+    return phase_metrics.corrcoef_on_mask(fixed, moving, mask)
 
 
 def shifted_overlap_mask(shape: tuple[int, ...], shift: np.ndarray) -> np.ndarray:
@@ -247,8 +235,20 @@ def patch_quality_rejection_reasons(
     reasons = []
     if corr_after < PATCH_MIN_CORR_AFTER:
         reasons.append("corr_after_below_threshold")
-    if corr_after - corr_before < PATCH_MIN_CORR_IMPROVEMENT:
+
+    gradient_before = finite_float(details.get("gradient_component_ncc_before"))
+    gradient_after = finite_float(details.get("gradient_component_ncc_after"))
+    if np.isfinite(gradient_before) and np.isfinite(gradient_after):
+        if (
+            gradient_after < PATCH_MIN_GRADIENT_COMPONENT_NCC_AFTER_FOR_ZERO_RESIDUAL
+            and float(np.linalg.norm(residual_shift_px)) < PATCH_ZERO_RESIDUAL_NORM_PX
+        ):
+            reasons.append("weak_gradient_component_ncc_zero_residual")
+        if gradient_after - gradient_before < PATCH_MIN_CORR_IMPROVEMENT - 1e-6:
+            reasons.append("gradient_component_ncc_improvement_below_threshold")
+    elif corr_after - corr_before < PATCH_MIN_CORR_IMPROVEMENT:
         reasons.append("corr_improvement_below_threshold")
+
     if np.any(np.abs(residual_shift_px) >= PATCH_MAX_RESIDUAL_FRACTION * np.asarray(patch_shape_zyx, dtype=np.float64)):
         reasons.append("residual_near_periodic_wrap")
     return reasons
@@ -314,11 +314,150 @@ def read_tile_patch(
             close()
 
 
-def tiff_series_level_count(path: Path) -> int:
-    import tifffile
+def _slice_from_json(value: list[int]) -> slice:
+    if len(value) != 2:
+        raise ValueError(f"Expected [start, stop] slice record, got {value!r}")
+    return slice(int(value[0]), int(value[1]))
 
-    with tifffile.TiffFile(path) as tif:
-        return len(tif.series[0].levels)
+
+def _safe_stem(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).removesuffix(".ome.tif")
+
+
+def _robust_uint8(image: np.ndarray) -> np.ndarray:
+    finite = image[np.isfinite(image)]
+    if finite.size == 0:
+        return np.zeros(image.shape, dtype=np.uint8)
+    low, high = np.percentile(finite, [1.0, 99.5])
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        high = float(np.max(finite))
+        low = float(np.min(finite))
+    if high <= low:
+        return np.zeros(image.shape, dtype=np.uint8)
+    scaled = np.clip((image - low) / (high - low), 0.0, 1.0)
+    return (scaled * 255.0).astype(np.uint8)
+
+
+def _center_plane_uint8(volume: np.ndarray) -> np.ndarray:
+    center_z = int(volume.shape[0] // 2)
+    return _robust_uint8(np.asarray(volume[center_z], dtype=np.float32))
+
+
+def _rgb_overlay(fixed_plane: np.ndarray, moving_plane: np.ndarray) -> np.ndarray:
+    red = _robust_uint8(moving_plane)
+    green = _robust_uint8(fixed_plane)
+    blue = np.zeros_like(red)
+    return np.stack([red, green, blue], axis=-1)
+
+
+def write_tile_phase_contact_sheets(
+    *,
+    rows: list[TilePhaseRow],
+    reference_tiles: list[rough_legacy.TileRecord],
+    output_dir: Path,
+    reference_channel: int,
+    max_panel_size: int = 192,
+) -> list[Path]:
+    """Render per-tile QC sheets from recorded tile-phase patch measurements."""
+    from PIL import Image, ImageDraw
+    from scipy import ndimage
+
+    contact_dir = output_dir / "contact_sheets"
+    contact_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    reference_tiles_by_name = {tile.tile: tile for tile in reference_tiles}
+    for row in rows:
+        patch_details = row.get("patch_details")
+        if not isinstance(patch_details, dict):
+            continue
+        patches = [
+            patch
+            for patch in patch_details.get("patches", [])
+            if patch.get("fixed_slices_zyx")
+            and patch.get("moving_slices_zyx")
+            and patch.get("residual_shift_px_zyx") is not None
+        ]
+        if not patches:
+            continue
+        reference_path = row.get("reference_path")
+        moving_path = row.get("moving_path")
+        if not isinstance(reference_path, str) or not isinstance(moving_path, str):
+            continue
+        reference_name = row.get("reference_tile")
+        reference_tile = reference_tiles_by_name.get(str(reference_name))
+        if reference_tile is None:
+            continue
+        moving_tile = make_moving_tile_record(reference_tile, Path(moving_path))
+
+        row_images: list[Image.Image] = []
+        for patch in patches:
+            fixed_slices = tuple(_slice_from_json(value) for value in patch["fixed_slices_zyx"])
+            moving_slices = tuple(_slice_from_json(value) for value in patch["moving_slices_zyx"])
+            residual_shift = np.asarray(patch["residual_shift_px_zyx"], dtype=np.float32)
+            fixed_patch = read_tile_patch(reference_tile, channel=reference_channel, slices_zyx=fixed_slices)
+            moving_patch = read_tile_patch(moving_tile, channel=0, slices_zyx=moving_slices)
+            shifted_moving = ndimage.shift(
+                moving_patch,
+                shift=residual_shift,
+                order=1,
+                mode="constant",
+                cval=0.0,
+                prefilter=False,
+            )
+            fixed_plane = np.asarray(fixed_patch[fixed_patch.shape[0] // 2], dtype=np.float32)
+            shifted_plane = np.asarray(shifted_moving[shifted_moving.shape[0] // 2], dtype=np.float32)
+            panels = [
+                Image.fromarray(_center_plane_uint8(fixed_patch)).convert("RGB"),
+                Image.fromarray(_center_plane_uint8(moving_patch)).convert("RGB"),
+                Image.fromarray(_center_plane_uint8(shifted_moving)).convert("RGB"),
+                Image.fromarray(_rgb_overlay(fixed_plane, shifted_plane)).convert("RGB"),
+            ]
+            if max_panel_size > 0:
+                panels = [
+                    panel.resize(
+                        (
+                            max(1, int(round(panel.width * min(max_panel_size / panel.width, max_panel_size / panel.height, 1.0)))),
+                            max(1, int(round(panel.height * min(max_panel_size / panel.width, max_panel_size / panel.height, 1.0)))),
+                        ),
+                        Image.Resampling.BILINEAR,
+                    )
+                    for panel in panels
+                ]
+            label_height = 40
+            gap = 6
+            width = sum(panel.width for panel in panels) + gap * (len(panels) - 1)
+            height = max(panel.height for panel in panels) + label_height
+            canvas = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(canvas)
+            status = patch.get("reason") or patch.get("status") or "patch"
+            label = (
+                f"p{int(patch.get('patch_index', -1)):03d} {status} "
+                f"corr={patch.get('corr_after')} shift={np.round(residual_shift, 2).tolist()}"
+            )
+            draw.text((4, 4), label, fill=(0, 0, 0))
+            draw.text((4, 20), "488 fixed | 405 seed | 405 shifted | overlay 405 red / 488 green", fill=(0, 0, 0))
+            x = 0
+            for panel in panels:
+                canvas.paste(panel, (x, label_height))
+                x += panel.width + gap
+            row_images.append(canvas)
+
+        if not row_images:
+            continue
+        gap = 8
+        width = max(image.width for image in row_images)
+        height = sum(image.height for image in row_images) + gap * (len(row_images) - 1)
+        sheet = Image.new("RGB", (width, height), "white")
+        y = 0
+        for image in row_images:
+            sheet.paste(image, (0, y))
+            y += image.height + gap
+        output_path = contact_dir / f"{_safe_stem(str(row['tile']))}_cross_channel_patch_contact_sheet.png"
+        sheet.save(output_path)
+        written.append(output_path)
+    index_path = contact_dir / "contact_sheets.json"
+    index_path.write_text(json.dumps([str(path.resolve()) for path in written], indent=2) + "\n")
+    return written
 
 
 def sampled_tile_volume_from_subifd(
@@ -513,6 +652,42 @@ def select_inlier_patch_measurements(
     return inliers, np.median(total_shifts[inliers], axis=0)
 
 
+def _patch_xy_key(row: Mapping[str, Any]) -> tuple[int, int] | None:
+    fixed_slices = row.get("fixed_slices_zyx")
+    if not isinstance(fixed_slices, list) or len(fixed_slices) != 3:
+        return None
+    try:
+        return int(fixed_slices[1][0]), int(fixed_slices[2][0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _inlier_patch_indices(accepted_patch_indices: list[int], inlier_mask: np.ndarray) -> set[int]:
+    return {
+        int(patch_index)
+        for patch_index, is_inlier in zip(accepted_patch_indices, inlier_mask, strict=True)
+        if bool(is_inlier)
+    }
+
+
+def patch_inliers_have_xy_diversity(
+    patch_rows: list[dict[str, Any]],
+    accepted_patch_indices: list[int],
+    inlier_mask: np.ndarray,
+    *,
+    min_unique_xy: int = 2,
+) -> bool:
+    inlier_indices = _inlier_patch_indices(accepted_patch_indices, inlier_mask)
+    keys = {
+        key
+        for row in patch_rows
+        if int(row.get("patch_index", -1)) in inlier_indices
+        for key in [_patch_xy_key(row)]
+        if key is not None
+    }
+    return len(keys) >= min_unique_xy
+
+
 def position_records_by_tile(position_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {record["tile"]: record for record in position_payload["tiles"]}
 
@@ -572,7 +747,7 @@ def tile_phase_cache_key(
     coarse_level: int,
 ) -> dict[str, Any]:
     return {
-        "cache_version": "tile_phase_robust_v2",
+        "cache_version": "tile_phase_robust_v3",
         "reference_position": str(reference_position.resolve()),
         "reference_position_sha256": sha256_file(reference_position),
         "source_tile_fingerprints": tile_phase_source_fingerprints(
@@ -593,7 +768,9 @@ def tile_phase_cache_key(
         "quality_thresholds": {
             "min_corr_after": PATCH_MIN_CORR_AFTER,
             "min_corr_improvement": PATCH_MIN_CORR_IMPROVEMENT,
-            "corr_improvement_metric": "same_shifted_overlap_support",
+            "corr_improvement_metric": "gradient_component_ncc_when_available_else_same_shifted_overlap_support",
+            "min_gradient_component_ncc_after_for_zero_residual": PATCH_MIN_GRADIENT_COMPONENT_NCC_AFTER_FOR_ZERO_RESIDUAL,
+            "zero_residual_norm_px": PATCH_ZERO_RESIDUAL_NORM_PX,
             "max_residual_fraction": PATCH_MAX_RESIDUAL_FRACTION,
             "min_quality_accepted_for_early_stop": PATCH_MIN_QUALITY_ACCEPTED_FOR_EARLY_STOP,
             "summary_corr_source": "inlier_patch_median",
@@ -632,24 +809,36 @@ def _direct_accepted_status(details: Mapping[str, Any]) -> Literal["direct_accep
 
 
 def load_tile_phase_cache(cache_path: Path, cache_key: dict[str, Any]) -> dict[str, TilePhaseAcceptedRow]:
-    if not cache_path.exists():
-        return {}
-    payload = json.loads(cache_path.read_text())
-    if payload.get("cache_key") != cache_key:
-        return {}
-    return {
-        row["tile"]: row
-        for row in (_validate_tile_phase_accepted_row(row) for row in payload.get("measurements", []))
-    }
+    return _load_tile_phase_cache_rows(
+        cache_path,
+        cache_key,
+        row_key="measurements",
+        validate_row=_validate_tile_phase_accepted_row,
+    )
 
 
 def load_tile_phase_attempt_cache(cache_path: Path, cache_key: dict[str, Any]) -> dict[str, TilePhaseRow]:
+    return _load_tile_phase_cache_rows(
+        cache_path,
+        cache_key,
+        row_key="attempts",
+        validate_row=_validate_tile_phase_row,
+    )
+
+
+def _load_tile_phase_cache_rows(
+    cache_path: Path,
+    cache_key: dict[str, Any],
+    *,
+    row_key: str,
+    validate_row,
+):
     if not cache_path.exists():
         return {}
     payload = json.loads(cache_path.read_text())
     if payload.get("cache_key") != cache_key:
         return {}
-    return {row["tile"]: row for row in (_validate_tile_phase_row(row) for row in payload.get("attempts", []))}
+    return {row["tile"]: row for row in (validate_row(row) for row in payload.get(row_key, []))}
 
 
 def phase_cache_keys_match(stored_key: dict[str, Any], current_key: dict[str, Any]) -> bool:
@@ -1193,6 +1382,33 @@ def measure_patch_tile_shift(
                 "std": float(np.nanstd(moving_patch)),
             },
         )
+        for detail_key in (
+            "patch_optimizer",
+            "phasecorr_method",
+            "phasecorr_fft_highpass_sigma_zyx",
+            "phasecorr_spatial_highpass_sigma",
+            "phase_candidate_shift_px_zyx",
+            "phase_candidate_corr_after",
+            "gradient_component_ncc_before",
+            "gradient_component_ncc_phase_after",
+            "gradient_component_ncc_after",
+            "selected_residual",
+            "simpleitk_mattes_status",
+            "simpleitk_mattes_error",
+            "simpleitk_mattes_optimizer",
+            "simpleitk_mattes_bins",
+            "simpleitk_mattes_sampling_fraction",
+            "simpleitk_mattes_metric_value",
+            "simpleitk_mattes_stop",
+            "simpleitk_mattes_iterations",
+            "simpleitk_mattes_residual_transform_parameters_xyz_px",
+            "mattes_residual_shift_px_zyx",
+            "simpleitk_mattes_mip_gradient_component_ncc",
+            "corr_before_full_support",
+            "corr_valid_overlap_fraction",
+        ):
+            if detail_key in details:
+                row[detail_key] = details[detail_key]
         if rejection_reasons:
             row.update(status="rejected", reason="quality_threshold", rejection_reasons=rejection_reasons)
             patch_rows.append(row)
@@ -1210,8 +1426,11 @@ def measure_patch_tile_shift(
                 final_shift_px = None
                 inlier_mask = None
             else:
-                early_stop_after_patch = patch_index
-                break
+                if patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+                    early_stop_after_patch = patch_index
+                    break
+                final_shift_px = None
+                inlier_mask = None
 
     if early_stop_after_patch is not None:
         for skipped_index, candidate in enumerate(candidates[early_stop_after_patch + 1 :], start=early_stop_after_patch + 1):
@@ -1273,6 +1492,10 @@ def measure_patch_tile_shift(
             inlier_mask, final_shift_px = select_inlier_patch_measurements(total_shifts, min_inliers=min_inliers)
         except ValueError as exc:
             raise TilePhaseMeasurementError(str(exc), details=failed_direct_details()) from exc
+    if not patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+        details = failed_direct_details()
+        details["spatial_diversity_error"] = "inlier patch shifts came from fewer than 2 XY windows"
+        raise TilePhaseMeasurementError("Inlier patch shifts came from fewer than 2 XY windows", details=details)
     inlier_patch_indices = {
         int(patch_index)
         for patch_index, is_inlier in zip(accepted_patch_indices, inlier_mask, strict=True)
@@ -1414,8 +1637,11 @@ def rescore_cached_patch_attempt(
                 final_shift_px = None
                 inlier_mask = None
             else:
-                early_stop_after_patch = int(row["patch_index"])
-                break
+                if patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+                    early_stop_after_patch = int(row["patch_index"])
+                    break
+                final_shift_px = None
+                inlier_mask = None
 
     if early_stop_after_patch is not None:
         for patch in cached_patches:
@@ -1456,6 +1682,11 @@ def rescore_cached_patch_attempt(
         except ValueError as exc:
             details["measurement_status"] = "direct_failed"
             raise TilePhaseMeasurementError(str(exc), details=details) from exc
+    if not patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+        details["measurement_status"] = "direct_failed"
+        details["n_inliers"] = int(np.count_nonzero(inlier_mask))
+        details["spatial_diversity_error"] = "inlier patch shifts came from fewer than 2 XY windows"
+        raise TilePhaseMeasurementError("Inlier patch shifts came from fewer than 2 XY windows", details=details)
 
     inlier_patch_indices = {
         patch_index
@@ -1796,6 +2027,16 @@ def align_tiles_to_reference(
     summary_path = output_dir / "tile_phase_alignment.json"
     summary["summary_path"] = str(summary_path.resolve())
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    if patch_shape_zyx is not None:
+        contact_sheet_paths = write_tile_phase_contact_sheets(
+            rows=rows,
+            reference_tiles=reference_tiles,
+            output_dir=output_dir,
+            reference_channel=reference_channel,
+        )
+        summary["contact_sheets"] = [str(path.resolve()) for path in contact_sheet_paths]
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"wrote {len(contact_sheet_paths)} tile-phase contact sheets to {output_dir / 'contact_sheets'}", flush=True)
     if output_registration is not None and reference_registration_input is not None:
         adapt_registration_from_reference(
             reference_registration_input=reference_registration_input,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
@@ -23,6 +24,41 @@ def channel_output_paths(output: Path, channels: list[int]) -> list[Path]:
     return [channel_output_path(output, channel) for channel in channels]
 
 
+def _load_basic_sampling_manifest(flatfield_dir: Path) -> dict:
+    manifests = sorted(flatfield_dir.glob("*-sampling.json"))
+    if len(manifests) != 1:
+        raise ValueError(
+            f"{flatfield_dir} must contain exactly one BaSiC *-sampling.json manifest; "
+            f"found {len(manifests)}"
+        )
+    with manifests[0].open() as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{manifests[0]} must contain a JSON object")
+    return manifest
+
+
+def validate_source_view_flatfields(flatfield_dirs_by_source_view: dict[str, Path]) -> None:
+    for view, flatfield_dir in flatfield_dirs_by_source_view.items():
+        if "pooled" in flatfield_dir.name.lower():
+            raise ValueError(
+                f"source_view={view} uses pooled BaSiC directory {flatfield_dir}; "
+                "use a separate sorted BaSiC profile for each source view"
+            )
+        manifest = _load_basic_sampling_manifest(flatfield_dir)
+        if manifest.get("sort_intensity") is not True:
+            raise ValueError(
+                f"source_view={view} BaSiC manifest in {flatfield_dir} was not built "
+                "with sort_intensity=true"
+            )
+        input_dirs = manifest.get("input_dirs")
+        if not isinstance(input_dirs, list) or len(input_dirs) != 1:
+            raise ValueError(
+                f"source_view={view} BaSiC manifest in {flatfield_dir} must record "
+                "exactly one input_dir; pooled L/R profiles are not allowed"
+            )
+
+
 def fuse_tiles(
     *,
     input_dir: Path,
@@ -30,6 +66,7 @@ def fuse_tiles(
     registration_input: Path,
     output: Path,
     channels: list[int] | None = None,
+    fusion_level: int = 0,
     fusion_weight_mode: str = "content-preibisch-coarse",
     batch_size: int = 4,
     basic_cache_tiles: int = 64,
@@ -47,12 +84,15 @@ def fuse_tiles(
         str(output),
         "--fusion-weight-mode",
         fusion_weight_mode,
+        "--fusion-level",
+        str(fusion_level),
         "--batch-size",
         str(batch_size),
         "--basic-cache-tiles",
         str(basic_cache_tiles),
     ]
     if flatfield_dirs_by_source_view is not None:
+        validate_source_view_flatfields(flatfield_dirs_by_source_view)
         for view, flatfield_dir in flatfield_dirs_by_source_view.items():
             args.extend(["--flatfield-dir-by-source-view", f"{view}={flatfield_dir}"])
     if basic_cache_disk_dir is not None:

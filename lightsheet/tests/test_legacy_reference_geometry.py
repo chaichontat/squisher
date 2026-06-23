@@ -19,7 +19,7 @@ def affine_param(z: float = 0.0, y: float = 0.0, x: float = 0.0) -> xr.DataArray
     )
 
 
-def tile(index: int) -> stitch.TileMetadata:
+def tile(index: int, *, source_view: str | None = None) -> stitch.TileMetadata:
     return stitch.TileMetadata(
         path=Path(f"tile_{index}.ome.tif"),
         shape=(1, 64, 100, 100),
@@ -35,6 +35,7 @@ def tile(index: int) -> stitch.TileMetadata:
                 channel_names=("ch0",),
             ),
         ),
+        source_view=source_view,
     )
 
 
@@ -217,6 +218,111 @@ def test_reference_geometry_solver_options_define_reference_prior_contract() -> 
 def test_reference_geometry_solver_options_reject_negative_prior() -> None:
     with pytest.raises(ValueError, match="must be non-negative"):
         stitch.reference_geometry_solver_options("penalized-xy", -0.01)
+
+
+def test_axis_aligned_pairs_skip_cross_source_view_discontinuities() -> None:
+    tiles = [
+        tile(0, source_view="L"),
+        tile(1, source_view="L"),
+        tile(0, source_view="R"),
+        tile(1, source_view="R"),
+    ]
+    tiles[2] = stitch.replace_tile_stage_transform(
+        tiles[2],
+        translation={"z": 0.0, "y": 0.0, "x": 0.0},
+        stage_scale=None,
+        source_view="R",
+    )
+    tiles[3] = stitch.replace_tile_stage_transform(
+        tiles[3],
+        translation={"z": 0.0, "y": 80.0, "x": 0.0},
+        stage_scale=None,
+        source_view="R",
+    )
+
+    pairs = stitch.axis_aligned_registration_pairs(tiles)
+
+    assert pairs == [(0, 1), (2, 3)]
+
+
+def test_reference_prior_refinement_starts_from_loaded_registration() -> None:
+    loaded = [affine_param(10.0, 20.0, 30.0)]
+    reference = [affine_param(1.0, 2.0, 3.0)]
+
+    start, source = stitch.refinement_start_params(
+        loaded,
+        reference,
+        reference_geometry_mode="penalized-xy",
+    )
+
+    assert start is loaded
+    assert source == "registration"
+
+
+def test_reference_params_are_only_fallback_when_no_registration_exists() -> None:
+    reference = [affine_param(1.0, 2.0, 3.0)]
+
+    start, source = stitch.refinement_start_params(
+        None,
+        reference,
+        reference_geometry_mode="penalized-xy",
+    )
+
+    assert start is reference
+    assert source == "reference"
+
+
+def test_rigid_initial_alignment_reduces_reference_drift() -> None:
+    params = [
+        affine_param(0.0, 0.0, 0.0),
+        affine_param(0.0, 10.0, 0.0),
+        affine_param(0.0, 0.0, 10.0),
+    ]
+    reference = [
+        affine_param(5.0, 20.0, -3.0),
+        affine_param(5.0, 30.0, -3.0),
+        affine_param(5.0, 20.0, 7.0),
+    ]
+
+    aligned, summary = stitch.align_params_to_reference(
+        params,
+        reference,
+        method="rigid",
+    )
+
+    assert summary["method"] == "rigid"
+    np.testing.assert_allclose(
+        np.asarray([stitch.affine_translation_zyx(param) for param in aligned]),
+        np.asarray([stitch.affine_translation_zyx(param) for param in reference]),
+        atol=1e-9,
+    )
+    assert summary["drift_after_um"]["y"]["max_abs"] < 1e-9
+    assert summary["drift_after_um"]["x"]["max_abs"] < 1e-9
+
+
+def test_refinement_alignment_returns_persistable_summary() -> None:
+    params = [
+        affine_param(0.0, 0.0, 0.0),
+        affine_param(0.0, 10.0, 0.0),
+        affine_param(0.0, 0.0, 10.0),
+    ]
+    reference = [
+        affine_param(1.0, 20.0, -5.0),
+        affine_param(1.0, 30.0, -5.0),
+        affine_param(1.0, 20.0, 5.0),
+    ]
+
+    aligned, summary = stitch.align_refinement_start_to_reference(
+        params,
+        reference,
+        method="rigid",
+        source="registration",
+    )
+
+    assert aligned is not params
+    assert summary is not None
+    assert summary["method"] == "rigid"
+    assert summary["drift_before_um"]["y"]["p95_abs"] > summary["drift_after_um"]["y"]["p95_abs"]
 
 
 def test_combined_channel_constraint_averages_track_measurements_without_row_duplication() -> None:

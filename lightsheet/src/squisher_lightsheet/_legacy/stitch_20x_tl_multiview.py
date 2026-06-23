@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import copy
 from datetime import datetime
 import hashlib
@@ -23,11 +23,15 @@ import time
 import sys
 import threading
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from squisher_lightsheet.parsing import parse_source_view_path_entry
+from squisher_lightsheet import pyramid as pyramid_core
+from squisher_lightsheet import seams as seam_core
+from squisher_lightsheet.tiff import tiff_series_level_count
 from zarr.abc.codec import ArrayBytesCodec
 
 
@@ -43,6 +47,16 @@ REGISTERED_TRANSFORM_KEY = "translation_registered"
 FUSION_BACKEND = "cupy"
 DEFAULT_REGISTRATION_READ_CHUNK_Z = 128
 PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
+DEFAULT_REGISTRATION_PAIR_MODE = "package"
+DEFAULT_COARSE_REG_RES_LEVELS = (2,)
+MVS_GROUPWISE_RESOLUTION_METHOD = "global_optimization"
+MVS_GROUPWISE_TRANSFORM = "rigid"
+MVS_POST_QUALITY_THRESHOLD = 0.25
+NATIVE_REG3D_LIB_DIR = Path("/home/chaichontat/microImageLib/bin/linux")
+NATIVE_REG3D_WRAPPER_DIR = Path("/home/chaichontat/nvme/lightsheet/231-Ptprz1")
+NATIVE_REG3D_RIGID_METHOD = 2
+NATIVE_REG3D_MAX_ITERATIONS = 300
+NATIVE_REG3D_FTOL = 1e-4
 NGFF_VERSION = "0.5"
 ZSTD_LEVEL = 0
 DEFAULT_JPEGXR_LEVEL = 0.7
@@ -58,10 +72,6 @@ class FilesystemProgressSnapshot:
     dirs: int = 0
     bytes: int = 0
     newest_mtime: float | None = None
-
-
-class ProfileFusionStop(RuntimeError):
-    """Internal stop signal for bounded fusion profiling runs."""
 
 
 @contextmanager
@@ -165,46 +175,6 @@ def temporary_basic_disk_cache_dir(base_dir: Path | None, output: Path):
         yield Path(cache_dir)
 
 
-def make_profile_limited_batch_func(
-    max_chunks: int,
-    process_batch_func: Any,
-    *,
-    skip_chunks: int = 0,
-    log_func=None,
-):
-    state = {"processed": 0, "skipped": 0}
-    logger = log if log_func is None else log_func
-
-    def process_profile_limited_batch(func, block_ids, n_jobs=4, backend="threading"):
-        block_ids = list(block_ids)
-        if state["skipped"] < skip_chunks:
-            remaining_skip = skip_chunks - state["skipped"]
-            skipped_now = min(remaining_skip, len(block_ids))
-            state["skipped"] += skipped_now
-            block_ids = block_ids[skipped_now:]
-            if state["skipped"] >= skip_chunks:
-                logger(f"Profile fusion chunk skip complete: {state['skipped']}/{skip_chunks}")
-            if not block_ids:
-                return
-        remaining = max_chunks - state["processed"]
-        if remaining <= 0:
-            raise ProfileFusionStop
-        selected_block_ids = block_ids[:remaining]
-        if selected_block_ids:
-            process_batch_func(
-                func,
-                selected_block_ids,
-                n_jobs=n_jobs,
-                backend=backend,
-            )
-            state["processed"] += len(selected_block_ids)
-            logger(f"Profile fusion chunk limit: {state['processed']}/{max_chunks}")
-        if state["processed"] >= max_chunks:
-            raise ProfileFusionStop
-
-    return process_profile_limited_batch
-
-
 def normalize_or_uniform_valid(weights, valid, xp):
     totals = xp.sum(weights, axis=0, keepdims=True)
     zero_quality = (totals <= 0.0) & xp.any(valid, axis=0, keepdims=True)
@@ -264,7 +234,7 @@ def coarse_preibisch_content_weights(
     weights = weights[crop]
 
     valid_full = (blending_weights > 1e-7) & ~xp.isnan(transformed_views)
-    weights = xp.where(valid_full, weights, 0.0)
+    weights = xp.where(valid_full, weights * blending_weights, 0.0)
     weights = normalize_or_uniform_valid(weights, valid_full, xp)
     if softmax_exponent > 1.0:
         eps = xp.asarray(1e-12, dtype=weights.dtype)
@@ -654,67 +624,10 @@ class TileMetadata:
     source_view: str | None = None
 
 
-@dataclass(frozen=True)
-class RobustBoundarySettings:
-    patch_shape_zyx: tuple[int, int, int] = (64, 512, 512)
-    max_patches_per_edge: int = 12
-    min_nonzero_fraction: float = 0.05
-    min_std: float = 1e-3
-    content_mask_percentile: float = 60.0
-    min_content_fraction: float = 0.002
-    min_content_voxels: int = 4096
-    min_correlation: float = 0.60
-    min_improvement: float = 0.02
-    min_stable_correlation: float = 0.75
-    max_stable_shift_zyx: tuple[float, float, float] = (1.0, 2.0, 2.0)
-    max_correction_zyx: tuple[float, float, float] = (16.0, 96.0, 96.0)
-    max_final_residual_zyx: tuple[float, float, float] = (4.0, 8.0, 8.0)
-    huber_delta: float = 4.0
-    irls_iterations: int = 5
-    reference_xy_prior_weight: float = 0.01
-
-
-@dataclass(frozen=True)
-class TileBounds:
-    start_zyx: tuple[float, float, float]
-    stop_zyx: tuple[float, float, float]
-
-
-@dataclass(frozen=True)
-class BoundaryPatchSpec:
-    pair: tuple[int, int]
-    axis: str
-    patch_index: int
-    fixed_slices: tuple[slice, slice, slice]
-    moving_slices: tuple[slice, slice, slice]
-    overlap_start_zyx: tuple[int, int, int]
-    overlap_shape_zyx: tuple[int, int, int]
-
-
-@dataclass(frozen=True)
-class BoundaryConstraint:
-    fixed: int
-    moving: int
-    pair: tuple[int, int]
-    axis: str
-    patch_index: int
-    shift_zyx: tuple[float, float, float]
-    weight: float
-    correlation_before: float
-    correlation_after: float
-    improvement: float
-    fixed_nonzero_fraction: float
-    moving_nonzero_fraction: float
-    fixed_std: float
-    moving_std: float
-    accepted: bool
-    fixed_content_fraction: float = 0.0
-    moving_content_fraction: float = 0.0
-    reject_reason: str | None = None
-    final_residual_zyx: tuple[float, float, float] | None = None
-    fixed_slices: tuple[slice, slice, slice] | None = None
-    moving_slices: tuple[slice, slice, slice] | None = None
-    source_label: str | None = None
+RobustBoundarySettings = seam_core.RobustBoundarySettings
+TileBounds = seam_core.TileBounds
+BoundaryPatchSpec = seam_core.BoundaryPatchSpec
+BoundaryConstraint = seam_core.BoundaryConstraint
 
 
 @dataclass(frozen=True)
@@ -745,6 +658,7 @@ class RobustBoundaryRefinementResult:
     output_dir: Path
     summary: dict[str, Any]
     reference_geometry: ReferenceGeometryConstraint | None = None
+    reference_initial_alignment: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -958,6 +872,138 @@ def parse_ome_metadata(path: Path) -> TileMetadata:
     )
 
 
+def has_cached_tile_metadata(record: dict[str, Any]) -> bool:
+    return (
+        "shape" in record
+        and "axes" in record
+        and ("spacing_um" in record or "spacing" in record)
+        and "channels" in record
+    )
+
+
+def track_metadata_from_payload(record: dict[str, Any]) -> TrackMetadata:
+    return TrackMetadata(
+        slug=str(record["slug"]),
+        track_id=str(record["track_id"]),
+        channels=tuple(int(channel) for channel in record["channels"]),
+        channel_names=tuple(str(name) for name in record["channel_names"]),
+    )
+
+
+def cached_metadata_record_to_tile(
+    record: dict[str, Any],
+    *,
+    path: Path,
+    translation: dict[str, float] | None = None,
+    stage_scale: dict[str, float] | None = None,
+    source_view: str | None = None,
+) -> TileMetadata:
+    channels = tuple(str(channel) for channel in record["channels"])
+    raw_tracks = record.get("tracks")
+    if isinstance(raw_tracks, list) and raw_tracks:
+        tracks = tuple(track_metadata_from_payload(track) for track in raw_tracks)
+    else:
+        tracks = (
+            TrackMetadata(
+                slug="track0",
+                track_id="all",
+                channels=tuple(range(len(channels))),
+                channel_names=channels,
+            ),
+        )
+    spacing = record.get("spacing_um", record.get("spacing"))
+    if not isinstance(spacing, dict) or any(dim not in spacing for dim in ("z", "y", "x")):
+        raise ValueError(f"cached tile metadata for {path} is missing spacing_um z/y/x")
+    if translation is None:
+        translation = record.get("translation_um", record.get("stage_translation_um"))
+    if not isinstance(translation, dict) or any(dim not in translation for dim in ("z", "y", "x")):
+        raise ValueError(f"cached tile metadata for {path} is missing translation_um z/y/x")
+    if stage_scale is None:
+        stage_scale = record.get("scale_um", record.get("stage_scale_um"))
+    if stage_scale is not None and (
+        not isinstance(stage_scale, dict) or any(dim not in stage_scale for dim in ("z", "y", "x"))
+    ):
+        raise ValueError(f"cached tile metadata for {path} has invalid scale_um/stage_scale_um")
+    if source_view is None:
+        source_view = record.get("source_view", record.get("side"))
+    if source_view is not None and not isinstance(source_view, str):
+        raise ValueError(f"cached tile metadata for {path} has invalid source_view")
+    return TileMetadata(
+        path=path,
+        shape=tuple(int(value) for value in record["shape"]),
+        axes=str(record["axes"]),
+        spacing={dim: float(spacing[dim]) for dim in ("z", "y", "x")},
+        translation={dim: float(translation[dim]) for dim in ("z", "y", "x")},
+        channels=channels,
+        tracks=tracks,
+        stage_scale=(
+            {dim: float(stage_scale[dim]) for dim in ("z", "y", "x")}
+            if stage_scale is not None
+            else None
+        ),
+        source_view=source_view,
+    )
+
+
+def tile_metadata_cache_candidates(
+    input_dir: Path,
+    *,
+    position_input: Path | None = None,
+    registration_input: Path | None = None,
+) -> list[Path]:
+    candidates = []
+    if registration_input is not None:
+        candidates.append(registration_input)
+    if position_input is not None:
+        candidates.append(position_input)
+    candidates.extend(sorted(input_dir.glob("*cached-metadata*.json")))
+    candidates.extend(sorted(input_dir.parent.glob("*cached-metadata*.json")))
+    return list(dict.fromkeys(candidates))
+
+
+def load_cached_metadata_by_tile(candidates: list[Path]) -> dict[str, dict[str, Any]]:
+    by_tile: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        payload = json.loads(candidate.read_text())
+        records = payload.get("tiles") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or not has_cached_tile_metadata(record):
+                continue
+            tile_name = record.get("tile")
+            if not isinstance(tile_name, str) or not tile_name:
+                raw_path = record.get("path")
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                tile_name = Path(raw_path).name
+            by_tile.setdefault(tile_name, record)
+    return by_tile
+
+
+def clone_tile_metadata(
+    template: TileMetadata,
+    *,
+    path: Path,
+    translation: dict[str, float],
+    stage_scale: dict[str, float] | None,
+    source_view: str | None,
+) -> TileMetadata:
+    return replace(
+        template,
+        path=path,
+        translation={dim: float(translation[dim]) for dim in ("z", "y", "x")},
+        stage_scale=(
+            {dim: float(stage_scale[dim]) for dim in ("z", "y", "x")}
+            if stage_scale is not None
+            else None
+        ),
+        source_view=source_view,
+    )
+
+
 def read_tiles_metadata(input_dir: Path) -> list[TileMetadata]:
     tile_paths = sorted(input_dir.glob("*.ome.tif"))
     if not tile_paths:
@@ -1052,13 +1098,6 @@ def _shape_zyx_from_axes(axes: str, shape: tuple[int, ...]) -> tuple[int, int, i
 
 def tile_shape_zyx(tile: TileMetadata) -> tuple[int, int, int]:
     return _shape_zyx_from_axes(tile.axes, tile.shape)
-
-
-def tiff_series_level_count(path: Path) -> int:
-    import tifffile
-
-    with tifffile.TiffFile(path) as tif:
-        return len(tif.series[0].levels)
 
 
 def fusion_source_level_for_tile(tile: TileMetadata, requested_level: int) -> tuple[int, int]:
@@ -1171,7 +1210,32 @@ def flip_spatial_array_for_stage_scale(array: Any, tile: TileMetadata, *, has_ch
         return da.from_zarr(array)[tuple(slices)]
 
 
-def read_position_input_tiles(position_input: Path) -> list[TileMetadata]:
+def resolve_position_tile_path(
+    raw_path: str,
+    *,
+    position_input: Path,
+    input_dir: Path | None,
+) -> Path:
+    tile_path = Path(raw_path)
+    candidates = []
+    if input_dir is not None:
+        candidates.append(input_dir / tile_path.name)
+    candidates.append(tile_path if tile_path.is_absolute() else position_input.parent / tile_path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        f"{position_input} references missing tile {raw_path!r}; checked "
+        f"{[str(candidate) for candidate in candidates]}"
+    )
+
+
+def read_position_input_tiles(
+    position_input: Path,
+    *,
+    input_dir: Path | None = None,
+    registration_input: Path | None = None,
+) -> list[TileMetadata]:
     payload = json.loads(position_input.read_text())
     if payload.get("units") != "micrometer":
         raise ValueError(f"{position_input} must declare units='micrometer'")
@@ -1179,23 +1243,26 @@ def read_position_input_tiles(position_input: Path) -> list[TileMetadata]:
     if not isinstance(records, list) or not records:
         raise ValueError(f"{position_input} must contain a non-empty tiles list")
 
+    cached_by_tile = load_cached_metadata_by_tile(
+        tile_metadata_cache_candidates(
+            input_dir or position_input.parent,
+            position_input=position_input,
+            registration_input=registration_input,
+        )
+    )
     tiles: list[TileMetadata] = []
     seen_paths: set[Path] = set()
+    template_tile: TileMetadata | None = None
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             raise ValueError(f"{position_input} tile record {index} must be an object")
         raw_path = record.get("path")
-        if raw_path is None:
+        if not isinstance(raw_path, str) or not raw_path:
             raise ValueError(f"{position_input} tile record {index} is missing path")
-        tile_path = Path(raw_path)
-        if not tile_path.is_absolute():
-            tile_path = position_input.parent / tile_path
-        tile_path = tile_path.resolve()
+        tile_path = resolve_position_tile_path(raw_path, position_input=position_input, input_dir=input_dir)
         if tile_path in seen_paths:
             raise ValueError(f"{position_input} lists duplicate tile path {tile_path}")
         seen_paths.add(tile_path)
-        if not tile_path.exists():
-            raise FileNotFoundError(f"{position_input} references missing tile {tile_path}")
 
         translation = record.get("translation_um")
         if not isinstance(translation, dict) or any(dim not in translation for dim in ("z", "y", "x")):
@@ -1208,14 +1275,34 @@ def read_position_input_tiles(position_input: Path) -> list[TileMetadata]:
         source_view = record.get("side")
         if source_view is not None and not isinstance(source_view, str):
             raise ValueError(f"{position_input} tile record {index} side must be a string")
-        tiles.append(
-            replace_tile_stage_transform(
-                parse_ome_metadata(tile_path),
+
+        cached = cached_by_tile.get(tile_path.name)
+        if cached is not None:
+            tile = cached_metadata_record_to_tile(
+                cached,
+                path=tile_path,
                 translation=translation,
                 stage_scale=stage_scale,
                 source_view=source_view,
             )
-        )
+        elif template_tile is None:
+            template_tile = parse_ome_metadata(tile_path)
+            tile = clone_tile_metadata(
+                template_tile,
+                path=tile_path,
+                translation=translation,
+                stage_scale=stage_scale,
+                source_view=source_view,
+            )
+        else:
+            tile = clone_tile_metadata(
+                template_tile,
+                path=tile_path,
+                translation=translation,
+                stage_scale=stage_scale,
+                source_view=source_view,
+            )
+        tiles.append(tile)
 
     validate_tiles_metadata(tiles, require_same_shape=False, require_same_spacing=False)
     return tiles
@@ -1260,8 +1347,12 @@ def read_registration_input_tiles(registration_input: Path) -> list[TileMetadata
     if not isinstance(records, list) or not records:
         raise ValueError(f"{registration_input} must contain a non-empty tiles list")
 
+    cached_by_tile = load_cached_metadata_by_tile(
+        tile_metadata_cache_candidates(input_dir, registration_input=registration_input)
+    )
     tiles: list[TileMetadata] = []
     seen_paths: set[Path] = set()
+    template_tile: TileMetadata | None = None
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             raise ValueError(f"{registration_input} tile record {index} must be an object")
@@ -1281,14 +1372,33 @@ def read_registration_input_tiles(registration_input: Path) -> list[TileMetadata
         if source_view is not None and not isinstance(source_view, str):
             raise ValueError(f"{registration_input} tile record {index} source_view must be a string")
 
-        tiles.append(
-            replace_tile_stage_transform(
-                parse_ome_metadata(tile_path),
+        cached = cached_by_tile.get(tile_path.name)
+        if cached is not None:
+            tile = cached_metadata_record_to_tile(
+                cached,
+                path=tile_path,
                 translation=translation,
                 stage_scale=stage_scale,
                 source_view=source_view,
             )
-        )
+        elif template_tile is None:
+            template_tile = parse_ome_metadata(tile_path)
+            tile = clone_tile_metadata(
+                template_tile,
+                path=tile_path,
+                translation=translation,
+                stage_scale=stage_scale,
+                source_view=source_view,
+            )
+        else:
+            tile = clone_tile_metadata(
+                template_tile,
+                path=tile_path,
+                translation=translation,
+                stage_scale=stage_scale,
+                source_view=source_view,
+            )
+        tiles.append(tile)
 
     validate_tiles_metadata(tiles, require_same_shape=False, require_same_spacing=False)
     return tiles
@@ -1348,7 +1458,9 @@ def axis_aligned_registration_pairs(tiles: list[TileMetadata]) -> list[tuple[int
                 and right.source_view is not None
                 and left.source_view != right.source_view
             )
-            if cross_view_pair or min(dy, dx) <= axis_tolerance:
+            if cross_view_pair:
+                continue
+            if min(dy, dx) <= axis_tolerance:
                 pairs.append((left_index, right_index))
 
     if not pairs:
@@ -1379,6 +1491,48 @@ def spanning_tree_registration_pairs(tiles: list[TileMetadata]) -> list[tuple[in
         missing = sorted(set(range(len(tiles))) - seen)
         raise ValueError(f"Axis-aligned registration graph is disconnected; missing tiles: {missing}")
     return tree
+
+
+def registration_pairs_from_file(path: Path, tiles: list[TileMetadata]) -> list[tuple[int, int]]:
+    payload = json.loads(path.read_text())
+    raw_pairs = payload["pairs"] if isinstance(payload, dict) else payload
+    if not isinstance(raw_pairs, list):
+        raise ValueError(f"{path} must contain a list of pairs or an object with a 'pairs' list")
+
+    index_by_tile = {tile.path.name: index for index, tile in enumerate(tiles)}
+    pairs: list[tuple[int, int]] = []
+    for pair_index, raw_pair in enumerate(raw_pairs):
+        if isinstance(raw_pair, dict):
+            left = raw_pair.get("source_tile", raw_pair.get("source"))
+            right = raw_pair.get("target_tile", raw_pair.get("target"))
+        elif isinstance(raw_pair, list | tuple) and len(raw_pair) == 2:
+            left, right = raw_pair
+        else:
+            raise ValueError(f"{path} pair {pair_index} must be a 2-item list or object")
+
+        if isinstance(left, str):
+            if left not in index_by_tile:
+                raise ValueError(f"{path} pair {pair_index} references unknown tile {left!r}")
+            left_index = index_by_tile[left]
+        else:
+            left_index = int(left)
+        if isinstance(right, str):
+            if right not in index_by_tile:
+                raise ValueError(f"{path} pair {pair_index} references unknown tile {right!r}")
+            right_index = index_by_tile[right]
+        else:
+            right_index = int(right)
+
+        if left_index == right_index:
+            raise ValueError(f"{path} pair {pair_index} has identical endpoints: {left_index}")
+        if not (0 <= left_index < len(tiles)) or not (0 <= right_index < len(tiles)):
+            raise ValueError(f"{path} pair {pair_index} has out-of-range endpoints: {(left_index, right_index)}")
+        pairs.append(tuple(sorted((left_index, right_index))))
+
+    deduped = sorted(set(pairs))
+    if not deduped:
+        raise ValueError(f"{path} did not contain any registration pairs")
+    return deduped
 
 
 def require_cuda_for_robust_boundary() -> None:
@@ -1421,26 +1575,15 @@ def tile_registered_bounds_zyx(tile: TileMetadata, param: Any | None = None) -> 
 
 
 def boundary_axis_for_pair(bounds_a: TileBounds, bounds_b: TileBounds) -> str:
-    centers_a = tuple((bounds_a.start_zyx[index] + bounds_a.stop_zyx[index]) / 2 for index in range(3))
-    centers_b = tuple((bounds_b.start_zyx[index] + bounds_b.stop_zyx[index]) / 2 for index in range(3))
-    deltas = [abs(centers_a[index] - centers_b[index]) for index in range(3)]
-    return ("z", "y", "x")[int(max(range(3), key=lambda index: deltas[index]))]
+    return seam_core.boundary_axis_for_pair(bounds_a, bounds_b)
 
 
 def clipped_slice(start: int, size: int, limit: int) -> slice:
-    start = max(0, min(start, limit))
-    stop = max(start, min(start + size, limit))
-    return slice(start, stop)
+    return seam_core.clipped_slice(start, size, limit)
 
 
 def evenly_spaced_starts(start: int, stop: int, size: int, count: int) -> list[int]:
-    if stop <= start:
-        return []
-    span = stop - start
-    if span <= size or count <= 1:
-        return [start]
-    last = stop - size
-    return [int(round(start + (last - start) * index / (count - 1))) for index in range(count)]
+    return seam_core.evenly_spaced_starts(start, stop, size, count)
 
 
 def local_slices_for_world_patch(
@@ -1449,19 +1592,16 @@ def local_slices_for_world_patch(
     world_start_zyx: tuple[int, int, int],
     patch_shape_zyx: tuple[int, int, int],
 ) -> tuple[slice, slice, slice]:
-    limits = tile_shape_zyx(tile)
-    starts = [
-        int(round(world_start_zyx[index] - bounds.start_zyx[index]))
-        for index in range(3)
-    ]
-    return tuple(
-        clipped_slice(starts[index], patch_shape_zyx[index], limits[index])
-        for index in range(3)
+    return seam_core.local_slices_for_world_patch(
+        tile_shape_zyx=tile_shape_zyx(tile),
+        bounds=bounds,
+        world_start_zyx=world_start_zyx,
+        patch_shape_zyx=patch_shape_zyx,
     )
 
 
 def slice_shape(slices: tuple[slice, slice, slice]) -> tuple[int, int, int]:
-    return tuple(int(slc.stop or 0) - int(slc.start or 0) for slc in slices)
+    return seam_core.slice_shape(slices)
 
 
 def sample_boundary_patches(
@@ -1474,89 +1614,12 @@ def sample_boundary_patches(
         tile_registered_bounds_zyx(tile, None if params is None else params[index])
         for index, tile in enumerate(tiles)
     ]
-    patch_specs: list[BoundaryPatchSpec] = []
-
-    for fixed, moving in pairs:
-        fixed_bounds = bounds[fixed]
-        moving_bounds = bounds[moving]
-        overlap_start = tuple(
-            int(math.ceil(max(fixed_bounds.start_zyx[index], moving_bounds.start_zyx[index])))
-            for index in range(3)
-        )
-        overlap_stop = tuple(
-            int(math.floor(min(fixed_bounds.stop_zyx[index], moving_bounds.stop_zyx[index])))
-            for index in range(3)
-        )
-        overlap_shape = tuple(overlap_stop[index] - overlap_start[index] for index in range(3))
-        if any(size <= 0 for size in overlap_shape):
-            continue
-
-        patch_shape = tuple(
-            min(settings.patch_shape_zyx[index], overlap_shape[index])
-            for index in range(3)
-        )
-        axis = boundary_axis_for_pair(fixed_bounds, moving_bounds)
-        varying_axes = [index for index, dim in enumerate(("z", "y", "x")) if dim != axis]
-        counts = {index: 1 for index in range(3)}
-        if settings.max_patches_per_edge > 1:
-            first_axis = varying_axes[0]
-            second_axis = varying_axes[1]
-            counts[first_axis] = max(1, int(math.floor(math.sqrt(settings.max_patches_per_edge))))
-            counts[second_axis] = max(1, settings.max_patches_per_edge // counts[first_axis])
-
-        starts_by_axis = []
-        for index in range(3):
-            starts_by_axis.append(
-                evenly_spaced_starts(
-                    overlap_start[index],
-                    overlap_stop[index],
-                    patch_shape[index],
-                    counts[index],
-                )
-            )
-
-        import itertools
-
-        for patch_index, patch_start in enumerate(itertools.product(*starts_by_axis)):
-            fixed_slices = local_slices_for_world_patch(
-                tiles[fixed],
-                fixed_bounds,
-                tuple(patch_start),
-                patch_shape,
-            )
-            moving_slices = local_slices_for_world_patch(
-                tiles[moving],
-                moving_bounds,
-                tuple(patch_start),
-                patch_shape,
-            )
-            shared_shape = tuple(
-                min(slice_shape(fixed_slices)[index], slice_shape(moving_slices)[index])
-                for index in range(3)
-            )
-            if any(size <= 1 for size in shared_shape):
-                continue
-            fixed_slices = tuple(
-                slice(fixed_slices[index].start, fixed_slices[index].start + shared_shape[index])
-                for index in range(3)
-            )
-            moving_slices = tuple(
-                slice(moving_slices[index].start, moving_slices[index].start + shared_shape[index])
-                for index in range(3)
-            )
-            patch_specs.append(
-                BoundaryPatchSpec(
-                    pair=(fixed, moving),
-                    axis=axis,
-                    patch_index=patch_index,
-                    fixed_slices=fixed_slices,
-                    moving_slices=moving_slices,
-                    overlap_start_zyx=tuple(int(value) for value in patch_start),
-                    overlap_shape_zyx=shared_shape,
-                )
-            )
-
-    return patch_specs
+    return seam_core.sample_boundary_patches_from_bounds(
+        tile_shapes_zyx=[tile_shape_zyx(tile) for tile in tiles],
+        bounds=bounds,
+        pairs=pairs,
+        settings=settings,
+    )
 
 
 def phase_correlation_shift_gpu(fixed: Any, moving: Any) -> tuple[tuple[float, float, float], float]:
@@ -1573,23 +1636,11 @@ def quantize_phase_shift(
     *,
     upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
 ) -> float:
-    if upsample_factor <= 1:
-        quantized = float(round(shift))
-    else:
-        quantized = round(float(shift) * upsample_factor) / float(upsample_factor)
-    return 0.0 if quantized == 0.0 else quantized
+    return seam_core.quantize_phase_shift(shift, upsample_factor=upsample_factor)
 
 
 def quadratic_subpixel_peak_offset(left: float, center: float, right: float) -> float:
-    if not all(math.isfinite(value) for value in (left, center, right)):
-        return 0.0
-    denominator = left - 2.0 * center + right
-    if abs(denominator) < 1e-12:
-        return 0.0
-    offset = 0.5 * (left - right) / denominator
-    if not math.isfinite(offset):
-        return 0.0
-    return min(0.5, max(-0.5, float(offset)))
+    return seam_core.quadratic_subpixel_peak_offset(left, center, right)
 
 
 def refined_phase_shift_from_samples(
@@ -1601,10 +1652,14 @@ def refined_phase_shift_from_samples(
     *,
     upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
 ) -> float:
-    refined = float(peak_index) + quadratic_subpixel_peak_offset(left, center, right)
-    if refined > float(size) / 2.0:
-        refined -= float(size)
-    return quantize_phase_shift(refined, upsample_factor=upsample_factor)
+    return seam_core.refined_phase_shift_from_samples(
+        peak_index,
+        size,
+        left,
+        center,
+        right,
+        upsample_factor=upsample_factor,
+    )
 
 
 def upsampled_dft_gpu(
@@ -1613,19 +1668,12 @@ def upsampled_dft_gpu(
     upsample_factor: int,
     axis_offsets: list[float],
 ) -> Any:
-    import cupy as cp
-
-    if len(axis_offsets) != data.ndim:
-        raise ValueError("axis_offsets must match data dimensionality")
-    float_dtype = data.real.dtype
-    im2pi = 1j * 2.0 * math.pi
-    for n_items, axis_offset in zip(data.shape[::-1], axis_offsets[::-1], strict=True):
-        sample_positions = cp.arange(upsampled_region_size, dtype=float_dtype) - float(axis_offset)
-        frequencies = cp.fft.fftfreq(n_items, d=float(upsample_factor)).astype(float_dtype, copy=False)
-        kernel = cp.exp((-im2pi * sample_positions[:, None]) * frequencies[None, :])
-        kernel = kernel.astype(data.dtype, copy=False)
-        data = cp.tensordot(kernel, data, axes=(1, -1))
-    return data
+    return seam_core.upsampled_dft_gpu(
+        data,
+        upsampled_region_size,
+        upsample_factor,
+        axis_offsets,
+    )
 
 
 def refined_phase_shifts_gpu(
@@ -1634,76 +1682,23 @@ def refined_phase_shifts_gpu(
     *,
     upsample_factor: int,
 ) -> tuple[float, ...]:
-    import cupy as cp
-
-    shape = tuple(int(value) for value in image_product.shape)
-    shifts = []
-    for index, size in zip(peak_index, shape, strict=True):
-        shift = float(index)
-        if index > size // 2:
-            shift -= float(size)
-        shifts.append(shift)
-
-    if upsample_factor <= 1:
-        return tuple(quantize_phase_shift(shift, upsample_factor=1) for shift in shifts)
-
-    shifts = [
-        quantize_phase_shift(shift, upsample_factor=upsample_factor)
-        for shift in shifts
-    ]
-    upsampled_region_size = int(math.ceil(float(upsample_factor) * 1.5))
-    dftshift = int(math.trunc(upsampled_region_size / 2.0))
-    sample_region_offset = [
-        float(dftshift) - shift * float(upsample_factor)
-        for shift in shifts
-    ]
-    refined = upsampled_dft_gpu(
-        image_product.conj(),
-        upsampled_region_size,
-        upsample_factor,
-        sample_region_offset,
-    ).conj()
-    refined_peak = tuple(
-        int(value)
-        for value in cp.unravel_index(cp.argmax(cp.abs(refined)), refined.shape)
+    return seam_core.refined_phase_shifts_gpu(
+        image_product,
+        peak_index,
+        upsample_factor=upsample_factor,
     )
-    output = []
-    for shift, maximum, size in zip(shifts, refined_peak, shape, strict=True):
-        refined_shift = shift + (float(maximum) - float(dftshift)) / float(upsample_factor)
-        if size == 1:
-            refined_shift = 0.0
-        output.append(quantize_phase_shift(refined_shift, upsample_factor=upsample_factor))
-    return tuple(output)
 
 
 def content_mask_gpu_array(values_gpu: Any, settings: RobustBoundarySettings) -> Any:
-    import cupy as cp
-
-    finite_mask = cp.isfinite(values_gpu)
-    positive = values_gpu[finite_mask & (values_gpu > 0)]
-    if int(positive.size) < settings.min_content_voxels:
-        return cp.zeros(values_gpu.shape, dtype=cp.bool_)
-    threshold = cp.percentile(positive, settings.content_mask_percentile)
-    return finite_mask & (values_gpu > threshold)
+    return seam_core.content_mask_gpu_array(values_gpu, settings)
 
 
 def mask_fraction_gpu_array(mask_gpu: Any) -> float:
-    import cupy as cp
-
-    if mask_gpu.size == 0:
-        return 0.0
-    return float((cp.count_nonzero(mask_gpu) / mask_gpu.size).get())
+    return seam_core.mask_fraction_gpu_array(mask_gpu)
 
 
 def masked_centered_array(values_gpu: Any, mask_gpu: Any, min_voxels: int) -> Any:
-    import cupy as cp
-
-    centered = cp.zeros_like(values_gpu, dtype=cp.float32)
-    if int(cp.count_nonzero(mask_gpu).get()) < min_voxels:
-        return centered
-    masked_values = values_gpu[mask_gpu]
-    centered[mask_gpu] = masked_values - cp.mean(masked_values)
-    return centered
+    return seam_core.masked_centered_array(values_gpu, mask_gpu, min_voxels)
 
 
 def phase_correlation_shift_gpu_arrays(
@@ -1715,26 +1710,14 @@ def phase_correlation_shift_gpu_arrays(
     min_mask_voxels: int = 2,
     upsample_factor: int = PHASE_CORRELATION_UPSAMPLE_FACTOR,
 ) -> tuple[tuple[float, float, float], float]:
-    import cupy as cp
-
-    if fixed_mask_gpu is not None and moving_mask_gpu is not None:
-        fixed_gpu = masked_centered_array(fixed_gpu, fixed_mask_gpu, min_mask_voxels)
-        moving_gpu = masked_centered_array(moving_gpu, moving_mask_gpu, min_mask_voxels)
-    else:
-        fixed_gpu = fixed_gpu - cp.mean(fixed_gpu)
-        moving_gpu = moving_gpu - cp.mean(moving_gpu)
-    cross_power = cp.fft.fftn(fixed_gpu) * cp.conj(cp.fft.fftn(moving_gpu))
-    magnitude = cp.abs(cross_power)
-    cross_power = cross_power / cp.maximum(magnitude, cp.finfo(cp.float32).eps)
-    corr = cp.real(cp.fft.ifftn(cross_power))
-    peak_index = tuple(int(value) for value in cp.unravel_index(cp.argmax(corr), corr.shape))
-    peak = float(corr[peak_index].get())
-    shifts = refined_phase_shifts_gpu(
-        cross_power,
-        peak_index,
+    return seam_core.phase_correlation_shift_gpu_arrays(
+        fixed_gpu,
+        moving_gpu,
+        fixed_mask_gpu,
+        moving_mask_gpu,
+        min_mask_voxels=min_mask_voxels,
         upsample_factor=upsample_factor,
     )
-    return (shifts[0], shifts[1], shifts[2]), peak
 
 
 def cupy_pairwise_phase_correlation_registration(
@@ -1764,99 +1747,75 @@ def cupy_pairwise_phase_correlation_registration(
     }
 
 
-def pairwise_registration_function(*, use_gpu: bool) -> Any:
-    from multiview_stitcher import registration
+def native_rigid_pairwise_registration(
+    fixed_data: Any,
+    moving_data: Any,
+    **_kwargs: Any,
+) -> dict[str, Any]:
+    """Multiview-stitcher rigid pairwise registration backed by microImageLib reg_3dgpu."""
+    from multiview_stitcher import param_utils
 
-    return cupy_pairwise_phase_correlation_registration if use_gpu else registration.phase_correlation_registration
+    if str(NATIVE_REG3D_WRAPPER_DIR) not in sys.path:
+        sys.path.insert(0, str(NATIVE_REG3D_WRAPPER_DIR))
+    from native_reg3dgpu import _run_reg_3dgpu
+
+    fixed = np.asarray(fixed_data.data, dtype=np.float32)
+    moving = np.asarray(moving_data.data, dtype=np.float32)
+    finite = np.isfinite(fixed) & np.isfinite(moving)
+    if int(np.count_nonzero(finite)) < 8:
+        return {
+            "affine_matrix": param_utils.affine_from_translation([0.0] * fixed.ndim),
+            "quality": float("nan"),
+        }
+
+    fixed = np.ascontiguousarray(np.where(np.isfinite(fixed), fixed, 0.0), dtype=np.float32)
+    moving = np.ascontiguousarray(np.where(np.isfinite(moving), moving, 0.0), dtype=np.float32)
+    result = _run_reg_3dgpu(
+        fixed,
+        moving,
+        aff_method=NATIVE_REG3D_RIGID_METHOD,
+        lib_dir=NATIVE_REG3D_LIB_DIR,
+        ftol=NATIVE_REG3D_FTOL,
+        max_iterations=NATIVE_REG3D_MAX_ITERATIONS,
+        device=0,
+        tmx_only=True,
+    )
+    if result.return_code != 0:
+        raise RuntimeError(
+            "microImageLib reg_3dgpu "
+            f"method {NATIVE_REG3D_RIGID_METHOD} failed with return code {result.return_code}"
+        )
+
+    affine = np.eye(fixed.ndim + 1, dtype=np.float64)
+    affine[: fixed.ndim, : fixed.ndim] = np.asarray(result.matrix_zyx, dtype=np.float64)
+    affine[: fixed.ndim, fixed.ndim] = np.asarray(result.offset_zyx, dtype=np.float64)
+    return {
+        "affine_matrix": affine,
+        "quality": float(result.records[3]),
+    }
 
 
 def integer_shift_slices(
     shape: tuple[int, ...],
     shift_zyx: tuple[float, float, float],
 ) -> tuple[tuple[slice, ...], tuple[slice, ...]] | None:
-    source_slices = []
-    destination_slices = []
-    for size, shift in zip(shape, shift_zyx, strict=True):
-        rounded = int(round(shift))
-        if abs(rounded) >= size:
-            return None
-        if rounded > 0:
-            source_slices.append(slice(0, size - rounded))
-            destination_slices.append(slice(rounded, size))
-        elif rounded < 0:
-            source_slices.append(slice(-rounded, size))
-            destination_slices.append(slice(0, size + rounded))
-        else:
-            source_slices.append(slice(None))
-            destination_slices.append(slice(None))
-    return tuple(source_slices), tuple(destination_slices)
+    return seam_core.integer_shift_slices(shape, shift_zyx)
 
 
 def is_integer_shift(shift_zyx: tuple[float, float, float]) -> bool:
-    return all(abs(float(shift) - round(float(shift))) < 1e-6 for shift in shift_zyx)
+    return seam_core.is_integer_shift(shift_zyx)
 
 
 def shift_array_gpu_array(source: Any, shift_zyx: tuple[float, float, float]) -> Any:
-    import cupy as cp
-
-    if not is_integer_shift(shift_zyx):
-        import cupyx.scipy.ndimage as cpx_ndimage
-
-        is_bool = source.dtype == cp.bool_
-        return cpx_ndimage.shift(
-            source,
-            shift=shift_zyx,
-            order=0 if is_bool else 1,
-            mode="constant",
-            cval=0 if is_bool else 0.0,
-            prefilter=False,
-        )
-
-    shifted = cp.zeros_like(source)
-    slices = integer_shift_slices(tuple(source.shape), shift_zyx)
-    if slices is None:
-        return shifted
-    source_slices, destination_slices = slices
-    shifted[destination_slices] = source[source_slices]
-    return shifted
+    return seam_core.shift_array_gpu_array(source, shift_zyx)
 
 
 def shift_array_cpu(array: Any, shift_zyx: tuple[float, float, float]) -> Any:
-    import numpy as np
-
-    source = np.asarray(array)
-    if not is_integer_shift(shift_zyx):
-        import scipy.ndimage as scipy_ndimage
-
-        is_bool = source.dtype == np.bool_
-        return scipy_ndimage.shift(
-            source,
-            shift=shift_zyx,
-            order=0 if is_bool else 1,
-            mode="constant",
-            cval=0 if is_bool else 0.0,
-            prefilter=False,
-        )
-
-    shifted = np.zeros_like(source)
-    slices = integer_shift_slices(tuple(source.shape), shift_zyx)
-    if slices is None:
-        return shifted
-    source_slices, destination_slices = slices
-    shifted[destination_slices] = source[source_slices]
-    return shifted
+    return seam_core.shift_array_cpu(array, shift_zyx)
 
 
 def patch_support_stats_gpu(values_gpu: Any) -> tuple[float, float]:
-    import cupy as cp
-
-    finite_mask = cp.isfinite(values_gpu)
-    finite_count = int(cp.count_nonzero(finite_mask).get())
-    if finite_count == 0:
-        return 0.0, 0.0
-    finite = values_gpu[finite_mask]
-    nonzero_fraction = float((cp.count_nonzero(finite) / finite_count).get())
-    return nonzero_fraction, float(cp.std(finite).get())
+    return seam_core.patch_support_stats_gpu(values_gpu)
 
 
 def normalized_cross_correlation_gpu_arrays(
@@ -1866,23 +1825,12 @@ def normalized_cross_correlation_gpu_arrays(
     *,
     min_voxels: int = 2,
 ) -> float:
-    import cupy as cp
-
-    finite_mask = cp.isfinite(fixed_gpu) & cp.isfinite(moving_gpu)
-    if mask_gpu is not None:
-        finite_mask &= mask_gpu
-    if int(cp.count_nonzero(finite_mask).get()) < min_voxels:
-        return float("nan")
-    fixed_values = fixed_gpu[finite_mask]
-    moving_values = moving_gpu[finite_mask]
-    fixed_values = fixed_values - cp.mean(fixed_values)
-    moving_values = moving_values - cp.mean(moving_values)
-    denominator = cp.sqrt(
-        cp.sum(fixed_values * fixed_values) * cp.sum(moving_values * moving_values)
+    return seam_core.normalized_cross_correlation_gpu_arrays(
+        fixed_gpu,
+        moving_gpu,
+        mask_gpu,
+        min_voxels=min_voxels,
     )
-    if float(denominator.get()) == 0.0:
-        return float("nan")
-    return float((cp.sum(fixed_values * moving_values) / denominator).get())
 
 
 def evaluate_boundary_patch_gpu(
@@ -1898,62 +1846,11 @@ def evaluate_boundary_patch_gpu(
     float,
     float,
 ]:
-    import numpy as np
-    import cupy as cp
-
-    fixed_gpu = cp.asarray(np.asarray(fixed_patch, dtype=np.float32))
-    moving_gpu = cp.asarray(np.asarray(moving_patch, dtype=np.float32))
-    fixed_support = patch_support_stats_gpu(fixed_gpu)
-    moving_support = patch_support_stats_gpu(moving_gpu)
-    fixed_content_mask = content_mask_gpu_array(fixed_gpu, settings)
-    moving_content_mask = content_mask_gpu_array(moving_gpu, settings)
-    fixed_content = mask_fraction_gpu_array(fixed_content_mask)
-    moving_content = mask_fraction_gpu_array(moving_content_mask)
-    content_overlap_mask = fixed_content_mask & moving_content_mask
-    corr_before = normalized_cross_correlation_gpu_arrays(
-        fixed_gpu,
-        moving_gpu,
-        content_overlap_mask,
-        min_voxels=settings.min_content_voxels,
-    )
-    if (
-        fixed_support[0] < settings.min_nonzero_fraction
-        or moving_support[0] < settings.min_nonzero_fraction
-        or fixed_support[1] < settings.min_std
-        or moving_support[1] < settings.min_std
-        or fixed_content < settings.min_content_fraction
-        or moving_content < settings.min_content_fraction
-    ):
-        return fixed_support, moving_support, (fixed_content, moving_content), corr_before, (0.0, 0.0, 0.0), float("nan"), corr_before
-    shift, peak = phase_correlation_shift_gpu_arrays(
-        fixed_gpu,
-        moving_gpu,
-        fixed_content_mask,
-        moving_content_mask,
-        min_mask_voxels=settings.min_content_voxels,
-    )
-    shifted = shift_array_gpu_array(moving_gpu, shift)
-    shifted_moving_content_mask = shift_array_gpu_array(moving_content_mask, shift)
-    shifted_content_overlap_mask = fixed_content_mask & shifted_moving_content_mask
-    corr_after = normalized_cross_correlation_gpu_arrays(
-        fixed_gpu,
-        shifted,
-        shifted_content_overlap_mask,
-        min_voxels=settings.min_content_voxels,
-    )
-    return fixed_support, moving_support, (fixed_content, moving_content), corr_before, shift, peak, corr_after
+    return seam_core.evaluate_boundary_patch_gpu(fixed_patch, moving_patch, settings)
 
 
 def read_native_patch(array: Any, axes: str, channel: int, slices_zyx: tuple[slice, slice, slice]) -> Any:
-    import numpy as np
-
-    if axes == "CZYX":
-        return np.asarray(array[(channel, *slices_zyx)])
-    if axes == "ZYX":
-        if channel != 0:
-            raise ValueError(f"Channel {channel} out of range for single-channel ZYX tile")
-        return np.asarray(array[slices_zyx])
-    raise ValueError(f"Expected CZYX or ZYX axes, got {axes}")
+    return seam_core.read_native_patch(array, axes, channel, slices_zyx)
 
 
 def is_stable_aligned_patch(
@@ -1961,14 +1858,7 @@ def is_stable_aligned_patch(
     shift_zyx: tuple[float, float, float],
     settings: RobustBoundarySettings,
 ) -> bool:
-    return (
-        math.isfinite(corr_before)
-        and corr_before >= settings.min_stable_correlation
-        and all(
-            abs(shift_zyx[index]) <= settings.max_stable_shift_zyx[index]
-            for index in range(3)
-        )
-    )
+    return seam_core.is_stable_aligned_patch(corr_before, shift_zyx, settings)
 
 
 def accepted_boundary_weight(
@@ -1980,13 +1870,14 @@ def accepted_boundary_weight(
     stable_alignment: bool,
     settings: RobustBoundarySettings,
 ) -> float:
-    support = min(fixed_content, moving_content)
-    peak_weight = max(0.0, peak) if math.isfinite(peak) else 1.0
-    if stable_alignment:
-        evidence = settings.min_improvement
-    else:
-        evidence = max(0.0, improvement)
-    return evidence * support * peak_weight
+    return seam_core.accepted_boundary_weight(
+        improvement=improvement,
+        fixed_content=fixed_content,
+        moving_content=moving_content,
+        peak=peak,
+        stable_alignment=stable_alignment,
+        settings=settings,
+    )
 
 
 def boundary_constraint_from_evaluation(
@@ -2004,74 +1895,38 @@ def boundary_constraint_from_evaluation(
     shift: tuple[float, float, float],
     peak: float,
     corr_after: float,
+    gradient_before: float,
+    gradient_after: float,
     settings: RobustBoundarySettings,
     source_label: str | None = None,
 ) -> BoundaryConstraint:
-    fixed_nonzero, fixed_std = fixed_support
-    moving_nonzero, moving_std = moving_support
-    reject_reason = None
-    if fixed_nonzero < settings.min_nonzero_fraction or moving_nonzero < settings.min_nonzero_fraction:
-        reject_reason = "low_nonzero_fraction"
-    elif fixed_std < settings.min_std or moving_std < settings.min_std:
-        reject_reason = "low_texture"
-    elif fixed_content < settings.min_content_fraction or moving_content < settings.min_content_fraction:
-        reject_reason = "low_content"
-
-    stable_alignment = False
-    if reject_reason is None:
-        improvement = corr_after - corr_before if math.isfinite(corr_before) else corr_after
-        stable_alignment = is_stable_aligned_patch(corr_before, shift, settings)
-        if stable_alignment and (
-            not math.isfinite(improvement)
-            or improvement < settings.min_improvement
-        ):
-            shift = (0.0, 0.0, 0.0)
-            corr_after = corr_before
-            improvement = 0.0
-        elif not math.isfinite(corr_after) or corr_after < settings.min_correlation:
-            reject_reason = "weak_correlation"
-        elif not math.isfinite(improvement) or improvement < settings.min_improvement:
-            reject_reason = "weak_improvement"
-    else:
-        improvement = 0.0
-
-    if reject_reason is None:
-        weight = accepted_boundary_weight(
-            improvement=improvement,
-            fixed_content=fixed_content,
-            moving_content=moving_content,
-            peak=peak,
-            stable_alignment=stable_alignment,
-            settings=settings,
-        )
-        if weight <= 0:
-            reject_reason = "zero_weight"
-    else:
-        weight = 0.0
-
-    return BoundaryConstraint(
-        fixed=fixed_index,
-        moving=moving_index,
-        pair=spec.pair,
-        axis=spec.axis,
-        patch_index=spec.patch_index,
-        shift_zyx=shift,
-        weight=weight,
-        correlation_before=corr_before,
-        correlation_after=corr_after,
-        improvement=improvement,
-        fixed_nonzero_fraction=fixed_nonzero,
-        moving_nonzero_fraction=moving_nonzero,
-        fixed_std=fixed_std,
-        moving_std=moving_std,
-        accepted=reject_reason is None,
-        fixed_content_fraction=fixed_content,
-        moving_content_fraction=moving_content,
-        reject_reason=reject_reason,
+    return seam_core.boundary_constraint_from_evaluation(
+        spec=spec,
+        fixed_index=fixed_index,
+        moving_index=moving_index,
         fixed_slices=fixed_slices,
         moving_slices=moving_slices,
+        fixed_support=fixed_support,
+        moving_support=moving_support,
+        fixed_content=fixed_content,
+        moving_content=moving_content,
+        corr_before=corr_before,
+        shift=shift,
+        peak=peak,
+        corr_after=corr_after,
+        gradient_before=gradient_before,
+        gradient_after=gradient_after,
+        settings=settings,
         source_label=source_label,
     )
+
+
+def center_z_patch_slices(slices_zyx: tuple[slice, slice, slice]) -> tuple[slice, slice, slice]:
+    z_slice = slices_zyx[0]
+    z_start = int(z_slice.start or 0)
+    z_stop = int(z_slice.stop or z_start)
+    z_center = z_start + max(0, z_stop - z_start - 1) // 2
+    return (slice(z_center, z_center + 1), slices_zyx[1], slices_zyx[2])
 
 
 def evaluate_boundary_patch_constraint(
@@ -2084,6 +1939,35 @@ def evaluate_boundary_patch_constraint(
     source_label: str | None = None,
 ) -> BoundaryConstraint:
     fixed_index, moving_index = spec.pair
+    fixed_center_patch = read_native_patch(
+        arrays[fixed_index],
+        tiles[fixed_index].axes,
+        channel,
+        center_z_patch_slices(spec.fixed_slices),
+    )
+    moving_center_patch = read_native_patch(
+        arrays[moving_index],
+        tiles[moving_index].axes,
+        channel,
+        center_z_patch_slices(spec.moving_slices),
+    )
+    prefilter_reason, fixed_center_stats, moving_center_stats = seam_core.center_z_content_prefilter_reason(
+        fixed_center_patch,
+        moving_center_patch,
+        settings,
+    )
+    if prefilter_reason is not None:
+        return seam_core.boundary_constraint_from_prefilter_rejection(
+            spec=spec,
+            fixed_index=fixed_index,
+            moving_index=moving_index,
+            fixed_slices=spec.fixed_slices,
+            moving_slices=spec.moving_slices,
+            fixed_stats=fixed_center_stats,
+            moving_stats=moving_center_stats,
+            reject_reason=prefilter_reason,
+            source_label=source_label,
+        )
     fixed_patch = read_native_patch(
         arrays[fixed_index],
         tiles[fixed_index].axes,
@@ -2105,7 +1989,12 @@ def evaluate_boundary_patch_constraint(
         peak,
         corr_after,
     ) = evaluate_boundary_patch_gpu(fixed_patch, moving_patch, settings)
-    return boundary_constraint_from_evaluation(
+    gradient_before, gradient_after = seam_core.center_z_gradient_component_ncc_after_shift(
+        fixed_patch,
+        moving_patch,
+        shift,
+    )
+    constraint = boundary_constraint_from_evaluation(
         spec=spec,
         fixed_index=fixed_index,
         moving_index=moving_index,
@@ -2119,9 +2008,96 @@ def evaluate_boundary_patch_constraint(
         shift=shift,
         peak=peak,
         corr_after=corr_after,
+        gradient_before=gradient_before,
+        gradient_after=gradient_after,
         settings=settings,
         source_label=source_label,
     )
+    return replace(
+        constraint,
+        fixed_center_z_p99=fixed_center_stats["p99"],
+        moving_center_z_p99=moving_center_stats["p99"],
+        fixed_center_z_std=fixed_center_stats["std"],
+        moving_center_z_std=moving_center_stats["std"],
+    )
+
+
+def edge_has_enough_inliers(
+    constraints: list[BoundaryConstraint],
+    settings: RobustBoundarySettings,
+) -> tuple[bool, list[BoundaryConstraint]]:
+    updated = seam_core.mark_boundary_inliers_by_edge(constraints, settings)
+    inlier_count = sum(constraint.edge_status == "inlier_cluster" for constraint in updated)
+    return inlier_count >= settings.min_inlier_patches_per_edge, updated
+
+
+def grouped_patch_specs_by_edge(
+    patch_specs: list[BoundaryPatchSpec],
+) -> list[tuple[tuple[tuple[int, int], str], list[BoundaryPatchSpec]]]:
+    grouped: OrderedDict[tuple[tuple[int, int], str], list[BoundaryPatchSpec]] = OrderedDict()
+    for spec in patch_specs:
+        grouped.setdefault((spec.pair, spec.axis), []).append(spec)
+    return list(grouped.items())
+
+
+def evaluate_boundary_edge_constraints(
+    *,
+    arrays: list[Any],
+    tiles: list[TileMetadata],
+    channel: int,
+    edge_index: int,
+    total_edges: int,
+    pair: tuple[int, int],
+    axis: str,
+    edge_specs: list[BoundaryPatchSpec],
+    settings: RobustBoundarySettings,
+) -> tuple[int, list[BoundaryConstraint], list[str]]:
+    edge_constraints: list[BoundaryConstraint] = []
+    stopped_reason = "exhausted_candidates"
+    for edge_spec_index, spec in enumerate(edge_specs, start=1):
+        constraint = evaluate_boundary_patch_constraint(
+            arrays=arrays,
+            tiles=tiles,
+            channel=channel,
+            spec=spec,
+            settings=settings,
+        )
+        edge_constraints.append(constraint)
+        if constraint.accepted:
+            enough, updated_edge_constraints = edge_has_enough_inliers(edge_constraints, settings)
+            if enough:
+                edge_constraints = updated_edge_constraints
+                stopped_reason = "enough_inlier_patches"
+                break
+
+        raw_accepted = sum(item.accepted for item in edge_constraints)
+        remaining = len(edge_specs) - edge_spec_index
+        if raw_accepted + remaining < settings.min_inlier_patches_per_edge:
+            stopped_reason = "not_enough_remaining_candidates"
+            break
+
+    if stopped_reason != "enough_inlier_patches":
+        edge_constraints = seam_core.mark_boundary_inliers_by_edge(edge_constraints, settings)
+    accepted_count = sum(item.accepted for item in edge_constraints)
+    reject_reasons = Counter(item.reject_reason for item in edge_constraints if not item.accepted)
+    log_lines = [
+        "Boundary edge "
+        f"{edge_index}/{total_edges} pair={pair} axis={axis} "
+        f"evaluated={len(edge_constraints)}/{len(edge_specs)} "
+        f"accepted={accepted_count} stop={stopped_reason} "
+        f"rejects={dict(reject_reasons)}"
+    ]
+    if edge_constraints:
+        constraint = edge_constraints[-1]
+        log_lines.append(
+            "Boundary patch "
+            f"pair={constraint.pair} axis={constraint.axis} patch={constraint.patch_index} "
+            f"shift_zyx={tuple(round(value, 3) for value in constraint.shift_zyx)} "
+            f"corr={constraint.correlation_before:.3f}->{constraint.correlation_after:.3f} "
+            f"center_z_grad={constraint.gradient_component_ncc_before}->{constraint.gradient_component_ncc_after} "
+            f"{'accepted' if constraint.accepted else 'rejected=' + str(constraint.reject_reason)}"
+        )
+    return edge_index, edge_constraints, log_lines
 
 
 def finite_weighted_average(values: list[float], weights: np.ndarray) -> float:
@@ -2190,6 +2166,33 @@ def combine_channel_boundary_constraints(
         [constraint.improvement for constraint in accepted],
         metric_weights,
     )
+    gradient_before = finite_weighted_average(
+        [
+            constraint.gradient_component_ncc_before
+            if constraint.gradient_component_ncc_before is not None
+            else float("nan")
+            for constraint in accepted
+        ],
+        metric_weights,
+    )
+    gradient_after = finite_weighted_average(
+        [
+            constraint.gradient_component_ncc_after
+            if constraint.gradient_component_ncc_after is not None
+            else float("nan")
+            for constraint in accepted
+        ],
+        metric_weights,
+    )
+    gradient_improvement = finite_weighted_average(
+        [
+            constraint.gradient_component_ncc_improvement
+            if constraint.gradient_component_ncc_improvement is not None
+            else float("nan")
+            for constraint in accepted
+        ],
+        metric_weights,
+    )
     return BoundaryConstraint(
         fixed=first.fixed,
         moving=first.moving,
@@ -2226,6 +2229,47 @@ def combine_channel_boundary_constraints(
             [constraint.moving_content_fraction for constraint in accepted],
             metric_weights,
         ),
+        gradient_component_ncc_before=None if not math.isfinite(gradient_before) else gradient_before,
+        gradient_component_ncc_after=None if not math.isfinite(gradient_after) else gradient_after,
+        gradient_component_ncc_improvement=(
+            None if not math.isfinite(gradient_improvement) else gradient_improvement
+        ),
+        fixed_center_z_p99=finite_weighted_average(
+            [
+                constraint.fixed_center_z_p99
+                if constraint.fixed_center_z_p99 is not None
+                else float("nan")
+                for constraint in accepted
+            ],
+            metric_weights,
+        ),
+        moving_center_z_p99=finite_weighted_average(
+            [
+                constraint.moving_center_z_p99
+                if constraint.moving_center_z_p99 is not None
+                else float("nan")
+                for constraint in accepted
+            ],
+            metric_weights,
+        ),
+        fixed_center_z_std=finite_weighted_average(
+            [
+                constraint.fixed_center_z_std
+                if constraint.fixed_center_z_std is not None
+                else float("nan")
+                for constraint in accepted
+            ],
+            metric_weights,
+        ),
+        moving_center_z_std=finite_weighted_average(
+            [
+                constraint.moving_center_z_std
+                if constraint.moving_center_z_std is not None
+                else float("nan")
+                for constraint in accepted
+            ],
+            metric_weights,
+        ),
         reject_reason=None if combined_weight > 0.0 else "zero_weight",
         fixed_slices=first.fixed_slices,
         moving_slices=first.moving_slices,
@@ -2248,23 +2292,52 @@ def build_boundary_constraints(
             arrays.append(array)
             stores.append(store)
 
-        for spec_index, spec in enumerate(patch_specs, start=1):
-            constraint = evaluate_boundary_patch_constraint(
-                arrays=arrays,
-                tiles=tiles,
-                channel=channel,
-                spec=spec,
-                settings=settings,
-            )
-            constraints.append(constraint)
-            if spec_index <= 3 or spec_index % 25 == 0 or spec_index == len(patch_specs):
-                log(
-                    "Boundary patch "
-                    f"{spec_index}/{len(patch_specs)} pair={spec.pair} axis={spec.axis} "
-                    f"shift_zyx={tuple(round(value, 3) for value in constraint.shift_zyx)} "
-                    f"corr={constraint.correlation_before:.3f}->{constraint.correlation_after:.3f} "
-                    f"{'accepted' if constraint.accepted else 'rejected=' + str(constraint.reject_reason)}"
+        edge_groups = grouped_patch_specs_by_edge(patch_specs)
+        edge_results: dict[int, list[BoundaryConstraint]] = {}
+        workers = max(1, int(settings.boundary_edge_workers))
+        if workers == 1:
+            for edge_index, ((pair, axis), edge_specs) in enumerate(edge_groups, start=1):
+                result_index, edge_constraints, log_lines = evaluate_boundary_edge_constraints(
+                    arrays=arrays,
+                    tiles=tiles,
+                    channel=channel,
+                    edge_index=edge_index,
+                    total_edges=len(edge_groups),
+                    pair=pair,
+                    axis=axis,
+                    edge_specs=edge_specs,
+                    settings=settings,
                 )
+                edge_results[result_index] = edge_constraints
+                for line in log_lines:
+                    log(line)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            log(f"Evaluating robust boundary edges with {workers} worker thread(s)")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        evaluate_boundary_edge_constraints,
+                        arrays=arrays,
+                        tiles=tiles,
+                        channel=channel,
+                        edge_index=edge_index,
+                        total_edges=len(edge_groups),
+                        pair=pair,
+                        axis=axis,
+                        edge_specs=edge_specs,
+                        settings=settings,
+                    )
+                    for edge_index, ((pair, axis), edge_specs) in enumerate(edge_groups, start=1)
+                ]
+                for future in as_completed(futures):
+                    result_index, edge_constraints, log_lines = future.result()
+                    edge_results[result_index] = edge_constraints
+                    for line in log_lines:
+                        log(line)
+        for edge_index in range(1, len(edge_groups) + 1):
+            constraints.extend(edge_results.get(edge_index, []))
     finally:
         close_stores(stores)
     return constraints
@@ -2289,32 +2362,65 @@ def build_combined_boundary_constraints(
             arrays.append(array)
             stores.append(store)
 
-        for spec_index, spec in enumerate(patch_specs, start=1):
-            channel_constraints = [
-                evaluate_boundary_patch_constraint(
-                    arrays=arrays,
-                    tiles=tiles,
-                    channel=channel,
-                    spec=spec,
+        edge_groups = grouped_patch_specs_by_edge(patch_specs)
+        for edge_index, ((pair, axis), edge_specs) in enumerate(edge_groups, start=1):
+            edge_constraints: list[BoundaryConstraint] = []
+            stopped_reason = "exhausted_candidates"
+            last_channel_constraints: list[BoundaryConstraint] = []
+            for edge_spec_index, spec in enumerate(edge_specs, start=1):
+                channel_constraints = [
+                    evaluate_boundary_patch_constraint(
+                        arrays=arrays,
+                        tiles=tiles,
+                        channel=channel,
+                        spec=spec,
+                        settings=settings,
+                        source_label=f"channel{channel}",
+                    )
+                    for channel in channels
+                ]
+                last_channel_constraints = channel_constraints
+                constraint = combine_channel_boundary_constraints(
+                    channel_constraints,
+                    source_label=source_label,
                     settings=settings,
-                    source_label=f"channel{channel}",
                 )
-                for channel in channels
-            ]
-            constraint = combine_channel_boundary_constraints(
-                channel_constraints,
-                source_label=source_label,
-                settings=settings,
+                edge_constraints.append(constraint)
+                if constraint.accepted:
+                    enough, updated_edge_constraints = edge_has_enough_inliers(edge_constraints, settings)
+                    if enough:
+                        edge_constraints = updated_edge_constraints
+                        stopped_reason = "enough_inlier_patches"
+                        break
+
+                raw_accepted = sum(item.accepted for item in edge_constraints)
+                remaining = len(edge_specs) - edge_spec_index
+                if raw_accepted + remaining < settings.min_inlier_patches_per_edge:
+                    stopped_reason = "not_enough_remaining_candidates"
+                    break
+
+            if stopped_reason != "enough_inlier_patches":
+                edge_constraints = seam_core.mark_boundary_inliers_by_edge(edge_constraints, settings)
+            constraints.extend(edge_constraints)
+            accepted_count = sum(item.accepted for item in edge_constraints)
+            reject_reasons = Counter(item.reject_reason for item in edge_constraints if not item.accepted)
+            log(
+                "Combined boundary edge "
+                f"{edge_index}/{len(edge_groups)} pair={pair} axis={axis} "
+                f"evaluated={len(edge_constraints)}/{len(edge_specs)} "
+                f"accepted={accepted_count} stop={stopped_reason} "
+                f"rejects={dict(reject_reasons)}"
             )
-            constraints.append(constraint)
-            if spec_index <= 3 or spec_index % 25 == 0 or spec_index == len(patch_specs):
-                accepted_channels = sum(item.accepted for item in channel_constraints)
+            if edge_constraints:
+                constraint = edge_constraints[-1]
+                accepted_channels = sum(item.accepted for item in last_channel_constraints)
                 log(
                     "Combined boundary patch "
-                    f"{spec_index}/{len(patch_specs)} pair={spec.pair} axis={spec.axis} "
+                    f"pair={constraint.pair} axis={constraint.axis} patch={constraint.patch_index} "
                     f"channels={channels} accepted_channels={accepted_channels}/{len(channels)} "
                     f"shift_zyx={tuple(round(value, 3) for value in constraint.shift_zyx)} "
                     f"corr={constraint.correlation_before:.3f}->{constraint.correlation_after:.3f} "
+                    f"center_z_grad={constraint.gradient_component_ncc_before}->{constraint.gradient_component_ncc_after} "
                     f"{'accepted' if constraint.accepted else 'rejected=' + str(constraint.reject_reason)}"
                 )
     finally:
@@ -2641,6 +2747,157 @@ def solve_tile_corrections_with_residual_rejection(
     raise RuntimeError("Robust boundary residual rejection did not converge")
 
 
+def seam_graph_edge_quality(constraints: list[BoundaryConstraint]) -> float:
+    values = [
+        constraint.gradient_component_ncc_after
+        for constraint in constraints
+        if constraint.gradient_component_ncc_after is not None
+        and math.isfinite(constraint.gradient_component_ncc_after)
+    ]
+    if values:
+        quality = float(np.median(values))
+    else:
+        weights = [max(float(constraint.weight), 0.0) for constraint in constraints]
+        quality = float(np.median(weights)) if weights else 0.01
+    if any(constraint.edge_status == "downweighted_no_inlier_cluster" for constraint in constraints):
+        quality *= 0.25
+    return min(0.99, max(0.01, quality))
+
+
+def seam_graph_bbox_for_constraints(
+    constraints: list[BoundaryConstraint],
+    spacing_zyx: tuple[float, float, float],
+) -> Any:
+    import xarray as xr
+
+    starts = []
+    stops = []
+    for constraint in constraints:
+        slices = constraint.fixed_slices
+        if slices is None:
+            continue
+        starts.append([float(slc.start or 0) * spacing_zyx[index] for index, slc in enumerate(slices)])
+        stops.append([float(slc.stop or 0) * spacing_zyx[index] for index, slc in enumerate(slices)])
+    if not starts:
+        starts = [[0.0, 0.0, 0.0]]
+        stops = [[spacing_zyx[0], spacing_zyx[1], spacing_zyx[2]]]
+    lower = np.min(np.asarray(starts, dtype=float), axis=0)
+    upper = np.max(np.asarray(stops, dtype=float), axis=0)
+    upper = np.maximum(upper, lower + np.asarray(spacing_zyx, dtype=float))
+    return xr.DataArray(np.stack([lower, upper], axis=0))
+
+
+def solve_tile_corrections_with_multiview_stitcher(
+    tiles: list[TileMetadata],
+    constraints: list[BoundaryConstraint],
+    settings: RobustBoundarySettings,
+) -> tuple[list[tuple[float, float, float]], list[BoundaryConstraint], int]:
+    import networkx as nx
+    from multiview_stitcher import param_resolution, param_utils
+
+    spacing_zyx = tuple(float(tiles[0].spacing[dim]) for dim in ("z", "y", "x"))
+    graph = nx.Graph()
+    for tile_index, tile in enumerate(tiles):
+        graph.add_node(
+            tile_index,
+            stack_props={
+                "shape": {dim: int(tile_shape_zyx(tile)[index]) for index, dim in enumerate(("z", "y", "x"))},
+                "spacing": {dim: float(tile.spacing[dim]) for dim in ("z", "y", "x")},
+                "origin": {dim: 0.0 for dim in ("z", "y", "x")},
+            },
+        )
+
+    grouped: dict[tuple[tuple[int, int], str], list[BoundaryConstraint]] = {}
+    for constraint in constraints:
+        if constraint.accepted:
+            grouped.setdefault((constraint.pair, constraint.axis), []).append(constraint)
+
+    edge_count = 0
+    for (pair, axis), edge_constraints in grouped.items():
+        fixed, moving = pair
+        shifts_px = np.asarray([constraint.shift_zyx for constraint in edge_constraints], dtype=float)
+        weights = np.asarray([max(float(constraint.weight), 1e-6) for constraint in edge_constraints], dtype=float)
+        if any(constraint.edge_status == "inlier_cluster" for constraint in edge_constraints):
+            selected = [
+                constraint
+                for constraint in edge_constraints
+                if constraint.edge_status == "inlier_cluster"
+            ]
+            shifts_px = np.asarray([constraint.shift_zyx for constraint in selected], dtype=float)
+            weights = np.asarray([max(float(constraint.weight), 1e-6) for constraint in selected], dtype=float)
+            edge_constraints = selected
+        shift_px = np.average(shifts_px, axis=0, weights=weights)
+        shift_um = shift_px * np.asarray(spacing_zyx, dtype=float)
+        graph.add_edge(
+            fixed,
+            moving,
+            transform=param_utils.affine_from_translation(-shift_um),
+            quality=seam_graph_edge_quality(edge_constraints),
+            overlap=1.0,
+            bbox=seam_graph_bbox_for_constraints(edge_constraints, spacing_zyx),
+            axis=axis,
+            measured_shift_zyx_px=tuple(float(value) for value in shift_px),
+        )
+        edge_count += 1
+
+    corrections = np.zeros((len(tiles), 3), dtype=float)
+    if edge_count == 0:
+        return [tuple(float(value) for value in row) for row in corrections], constraints, 0
+
+    anchor_tile = int(max(graph.nodes, key=lambda node: sum(graph.edges[edge]["quality"] for edge in graph.edges(node))))
+    params, info = param_resolution.groupwise_resolution(
+        graph,
+        method="global_optimization",
+        transform="translation",
+        reference_view=anchor_tile,
+        abs_tol=max(float(tiles[0].spacing[dim]) for dim in ("z", "y", "x")) * 8.0,
+        rel_tol=1e-4,
+        max_iter=500,
+    )
+    for tile_index, param in params.items():
+        correction_um = np.asarray(param_utils.translation_from_affine(np.asarray(param)), dtype=float)
+        corrections[int(tile_index)] = correction_um / np.asarray(spacing_zyx, dtype=float)
+
+    used_edges = {
+        tuple(edge)
+        for edges in (info.get("used_edges") or {}).values()
+        for edge in edges
+    }
+    if not used_edges:
+        used_edges = {tuple(sorted(edge)) for edge in graph.edges}
+
+    updated = []
+    for constraint in constraints:
+        if not constraint.accepted:
+            updated.append(constraint)
+            continue
+        edge = tuple(sorted(constraint.pair))
+        if edge in used_edges:
+            updated.append(constraint)
+        else:
+            updated.append(
+                replace(
+                    constraint,
+                    accepted=False,
+                    weight=0.0,
+                    reject_reason="multiview_stitcher_edge_pruned",
+                )
+            )
+
+    updated = annotate_final_residuals(
+        updated,
+        [tuple(float(value) for value in row) for row in corrections],
+        settings,
+        connected_tiles=None,
+        reject_axes=set(),
+    )
+    log(
+        "Multiview-stitcher seam optimization "
+        f"graph_edges={edge_count}, used_edges={len(used_edges)}, anchor_tile={anchor_tile}"
+    )
+    return [tuple(float(value) for value in row) for row in corrections], updated, anchor_tile
+
+
 def apply_corrections_to_params(
     params: list[Any],
     corrections_zyx: list[tuple[float, float, float]],
@@ -2664,6 +2921,96 @@ def set_affine_translation_um(
     for index, value in enumerate(translation_zyx_um):
         updated.data[index_prefix + (index, 3)] = float(value)
     return updated
+
+
+def affine_matrix_zyx(param: Any) -> np.ndarray:
+    data = np.asarray(param.data if hasattr(param, "data") else param, dtype=float)
+    while data.ndim > 2:
+        data = data[0]
+    if data.shape[0] < 4 or data.shape[1] < 4:
+        raise ValueError(f"Expected affine matrix with at least 4 rows and columns, got {data.shape}")
+    return np.asarray(data[:4, :4], dtype=float)
+
+
+def set_affine_matrix_zyx(param: Any, matrix: np.ndarray) -> Any:
+    updated = param.copy(deep=True)
+    index_prefix = (0,) * (updated.data.ndim - 2)
+    updated.data[index_prefix + (slice(0, 4), slice(0, 4))] = np.asarray(matrix, dtype=float)
+    return updated
+
+
+def fit_global_translation_to_reference(
+    params: list[Any],
+    reference_params: list[Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    translations = np.asarray([affine_translation_zyx(param) for param in params], dtype=float)
+    references = np.asarray([affine_translation_zyx(param) for param in reference_params], dtype=float)
+    delta = np.median(references - translations, axis=0)
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, 3] = delta
+    summary = {
+        "method": "translation",
+        "translation_zyx_um": [float(value) for value in delta],
+    }
+    return matrix, summary
+
+
+def fit_global_rigid_to_reference(
+    params: list[Any],
+    reference_params: list[Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    translations = np.asarray([affine_translation_zyx(param) for param in params], dtype=float)
+    references = np.asarray([affine_translation_zyx(param) for param in reference_params], dtype=float)
+    if len(translations) < 3:
+        matrix, summary = fit_global_translation_to_reference(params, reference_params)
+        summary["method"] = "translation_fallback_for_lt3_tiles"
+        return matrix, summary
+
+    moving_center = translations.mean(axis=0)
+    reference_center = references.mean(axis=0)
+    moving_centered = translations - moving_center
+    reference_centered = references - reference_center
+    covariance = moving_centered.T @ reference_centered
+    u_matrix, _singular_values, vt_matrix = np.linalg.svd(covariance)
+    rotation = vt_matrix.T @ u_matrix.T
+    if np.linalg.det(rotation) < 0:
+        vt_matrix[-1, :] *= -1
+        rotation = vt_matrix.T @ u_matrix.T
+    offset = reference_center - rotation @ moving_center
+
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = offset
+    summary = {
+        "method": "rigid",
+        "translation_zyx_um": [float(value) for value in offset],
+        "rotation_matrix_zyx": rotation.tolist(),
+        "determinant": float(np.linalg.det(rotation)),
+    }
+    return matrix, summary
+
+
+def align_params_to_reference(
+    params: list[Any],
+    reference_params: list[Any],
+    *,
+    method: str,
+) -> tuple[list[Any], dict[str, Any]]:
+    if method not in {"translation", "rigid"}:
+        raise ValueError(f"Unsupported reference initial alignment method: {method}")
+    if len(params) != len(reference_params):
+        raise ValueError("Reference initial alignment requires matching parameter counts")
+    matrix, summary = (
+        fit_global_translation_to_reference(params, reference_params)
+        if method == "translation"
+        else fit_global_rigid_to_reference(params, reference_params)
+    )
+    aligned = [set_affine_matrix_zyx(param, matrix @ affine_matrix_zyx(param)) for param in params]
+    before = reference_drift_summary_um(params, reference_params)
+    after = reference_drift_summary_um(aligned, reference_params)
+    summary["drift_before_um"] = before
+    summary["drift_after_um"] = after
+    return aligned, summary
 
 
 def apply_reference_fixed_axes(
@@ -2800,6 +3147,46 @@ def write_reference_geometry_qc(
     }
     for filename in ("reference_drift.json", "shared_geometry_constraint_summary.json"):
         (output_dir / filename).write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def refinement_start_params(
+    params: list[Any] | None,
+    reference_params: list[Any] | None,
+    *,
+    reference_geometry_mode: str | None,
+) -> tuple[list[Any], str]:
+    if params is not None:
+        return params, "registration"
+    if reference_params is not None and reference_geometry_mode in {"full-xyz", "penalized-xy"}:
+        return reference_params, "reference"
+    raise RuntimeError("Refinement start parameters were not initialized")
+
+
+def align_refinement_start_to_reference(
+    params: list[Any],
+    reference_params: list[Any] | None,
+    *,
+    method: str,
+    source: str,
+) -> tuple[list[Any], dict[str, Any] | None]:
+    if method == "none" or reference_params is None or source == "reference":
+        return params, None
+    aligned, summary = align_params_to_reference(
+        params,
+        reference_params,
+        method=method,
+    )
+    log(
+        "Reference initial alignment "
+        f"method={summary['method']} "
+        f"drift_before_yx_p95_um=("
+        f"{summary['drift_before_um']['y']['p95_abs']:.3f}, "
+        f"{summary['drift_before_um']['x']['p95_abs']:.3f}) "
+        f"drift_after_yx_p95_um=("
+        f"{summary['drift_after_um']['y']['p95_abs']:.3f}, "
+        f"{summary['drift_after_um']['x']['p95_abs']:.3f})"
+    )
+    return aligned, summary
 
 
 def set_msims_affine_transform(msims: list[Any], params: list[Any], transform_key: str) -> None:
@@ -2977,6 +3364,14 @@ def constraint_payload(constraint: BoundaryConstraint) -> dict[str, Any]:
         "moving_std": constraint.moving_std,
         "fixed_content_fraction": constraint.fixed_content_fraction,
         "moving_content_fraction": constraint.moving_content_fraction,
+        "gradient_component_ncc_before": constraint.gradient_component_ncc_before,
+        "gradient_component_ncc_after": constraint.gradient_component_ncc_after,
+        "gradient_component_ncc_improvement": constraint.gradient_component_ncc_improvement,
+        "fixed_center_z_p99": constraint.fixed_center_z_p99,
+        "moving_center_z_p99": constraint.moving_center_z_p99,
+        "fixed_center_z_std": constraint.fixed_center_z_std,
+        "moving_center_z_std": constraint.moving_center_z_std,
+        "edge_status": constraint.edge_status,
         "accepted": constraint.accepted,
         "reject_reason": constraint.reject_reason,
         "final_residual_zyx": (
@@ -3359,6 +3754,54 @@ def write_robust_boundary_qc(
     log(f"Wrote robust boundary residual QC: {residuals_path}")
 
 
+def write_boundary_measurement_snapshot(
+    output_dir: Path,
+    tiles: list[TileMetadata],
+    params: list[Any],
+    *,
+    channel: int,
+    settings: RobustBoundarySettings,
+    pairs: list[tuple[int, int]],
+    patch_specs: list[BoundaryPatchSpec],
+    constraints: list[BoundaryConstraint],
+    source_label: str | None = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    measurements_path = output_dir / "boundary_measurements_before_optimization.jsonl"
+    with measurements_path.open("w") as stream:
+        for constraint in constraints:
+            stream.write(json.dumps(constraint_payload(constraint)) + "\n")
+
+    accepted_count = sum(constraint.accepted for constraint in constraints)
+    weak_count = sum(
+        constraint.edge_status == "downweighted_no_inlier_cluster"
+        for constraint in constraints
+    )
+    metadata = {
+        "channel": int(channel),
+        "source_label": source_label,
+        "settings": asdict(settings),
+        "pair_count": len(pairs),
+        "patch_spec_count": len(patch_specs),
+        "measured_constraint_count": len(constraints),
+        "accepted_constraint_count": accepted_count,
+        "downweighted_no_inlier_cluster_count": weak_count,
+        "measurements_jsonl": str(measurements_path.resolve()),
+        "tiles": [
+            {
+                "index": index,
+                "path": str(tile.path),
+                "name": tile.path.name,
+                "initial_translation_zyx_um": list(affine_translation_zyx(param)),
+            }
+            for index, (tile, param) in enumerate(zip(tiles, params, strict=True))
+        ],
+    }
+    metadata_path = output_dir / "boundary_measurements_before_optimization.meta.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    log(f"Wrote pre-optimization boundary measurements: {measurements_path}")
+
+
 def refine_registration_with_robust_boundaries(
     tiles: list[TileMetadata],
     params: list[Any],
@@ -3385,13 +3828,26 @@ def refine_registration_with_robust_boundaries(
     constraints = build_boundary_constraints(tiles, channel, patch_specs, settings)
     if source_label is not None:
         constraints = [replace(constraint, source_label=source_label) for constraint in constraints]
-    corrections_zyx, constraints, anchor_tile = solve_tile_corrections_with_residual_rejection(
+    write_boundary_measurement_snapshot(
+        output_dir,
+        tiles,
+        params,
+        channel=channel,
+        settings=settings,
+        pairs=pairs,
+        patch_specs=patch_specs,
+        constraints=constraints,
+        source_label=source_label,
+    )
+    if fixed_reference_axes or reference_prior_weights_zyx or residual_reject_axes:
+        log(
+            "Ignoring custom robust-boundary correction-solver options because "
+            "seams are resolved with multiview-stitcher global optimization"
+        )
+    corrections_zyx, constraints, anchor_tile = solve_tile_corrections_with_multiview_stitcher(
         tiles,
         constraints,
         settings,
-        fixed_axes=fixed_reference_axes,
-        reference_prior_weights_zyx=reference_prior_weights_zyx,
-        residual_reject_axes=residual_reject_axes,
     )
     corrected_params = apply_corrections_to_params(params, corrections_zyx, tiles[0].spacing)
     reference_geometry = None
@@ -3491,8 +3947,6 @@ def print_plan(
     selected_channels: tuple[int, ...] | None,
     register_only: bool,
     register: bool,
-    fusion_compressor: str,
-    jpegxr_level: float,
     registration_pair_mode: str,
     registration_binning: tuple[int, int, int] | None,
     reg_res_level: int | None,
@@ -3509,17 +3963,10 @@ def print_plan(
     if not register_only:
         log(f"Output zarr base: {output}")
         log(f"Fusion backend: {FUSION_BACKEND}")
-        if fusion_compressor == "jpegxr":
-            log(
-                "Fusion output format: "
-                f"OME-NGFF {NGFF_VERSION} / Zarr v3, JPEG-XR level "
-                f"{compression_level(jpegxr_level):.3f} after GPU fusion"
-            )
-        else:
-            log(
-                "Fusion output format: "
-                f"OME-NGFF {NGFF_VERSION} / Zarr v3, zstd level {ZSTD_LEVEL}"
-            )
+        log(
+            "Fusion output format: "
+            f"OME-NGFF {NGFF_VERSION} / Zarr v3, zstd level {ZSTD_LEVEL}"
+        )
     if register or register_only:
         log(f"Registration binning (z, y, x): {registration_binning or 'auto'}")
         log(f"Registration resolution level: {reg_res_level if reg_res_level is not None else 'auto'}")
@@ -3562,9 +4009,37 @@ def open_tile_array(tile: TileMetadata, *, source_level: int = 0):
     import tifffile
     import zarr
 
+    start = time.perf_counter()
     store = tifffile.imread(tile.path, aszarr=True, level=source_level)
     zarray = zarr.open(store, mode="r")
+    log(
+        "Opened TIFF as zarr-backed array: "
+        f"tile={tile.path.name}, level={source_level}, "
+        f"shape={tuple(int(value) for value in zarray.shape)}, "
+        f"chunks={tuple(int(value) for value in zarray.chunks)}, "
+        f"dtype={zarray.dtype}, elapsed={time.perf_counter() - start:.3f}s"
+    )
     return zarray, store
+
+
+def open_fusion_tile_array(
+    tile: TileMetadata,
+    channel: int,
+    *,
+    source_level: int = 0,
+):
+    zarray, store = open_tile_array(tile, source_level=source_level)
+    axes = tile.axes
+    shape = tuple(int(value) for value in zarray.shape)
+    if axes == "ZYX" and channel != 0:
+        raise ValueError(f"Channel {channel} out of range for single-channel ZYX tile {tile.path}")
+    if axes == "CZYX":
+        channel_count = int(shape[0])
+        if not 0 <= channel < channel_count:
+            raise ValueError(f"Channel {channel} out of range for CZYX tile {tile.path}")
+    if axes not in {"ZYX", "CZYX"}:
+        raise ValueError(f"Expected CZYX or ZYX axes in {tile.path}, got {axes}")
+    return zarray, store, axes, shape
 
 
 def open_registration_tile_array(
@@ -3652,24 +4127,41 @@ def build_registration_msims(
 def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: int = 0):
     from multiview_stitcher import spatial_image_utils as si_utils
 
+    start = time.perf_counter()
     sims = []
     stores = []
     source_tiles = []
     channel_labels = channel_labels_for_tiles(tiles)
     source_level_counts: Counter[tuple[int, int]] = Counter()
 
-    for tile in tiles:
+    log(
+        "Fusion sim build start: "
+        f"tiles={len(tiles)}, channel={channel}, requested_level={fusion_level}"
+    )
+    for tile_index, tile in enumerate(tiles, start=1):
+        tile_start = time.perf_counter()
         source_level, available_levels = fusion_source_level_for_tile(tile, fusion_level)
-        array, store = open_tile_array(tile, source_level=source_level)
+        log(
+            "Fusion sim tile start: "
+            f"{tile_index}/{len(tiles)}, tile={tile.path.name}, "
+            f"requested_level={fusion_level}, source_level={source_level}, "
+            f"available_levels={available_levels}, axes={tile.axes}, "
+            f"metadata_shape={tile.shape}"
+        )
+        array, store, source_axes, source_shape = open_fusion_tile_array(
+            tile,
+            channel,
+            source_level=source_level,
+        )
         stores.append(store)
         source_level_counts[(source_level, available_levels)] += 1
         source_tile = fusion_tile_for_source_array(
             tile,
-            tuple(int(value) for value in array.shape),
+            source_shape,
             source_level=source_level,
         )
         source_tiles.append(source_tile)
-        if tile.axes == "ZYX":
+        if source_axes == "ZYX":
             array = flip_spatial_array_for_stage_scale(array, source_tile, has_channel_axis=False)
             dims = ["z", "y", "x"]
         else:
@@ -3691,6 +4183,15 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
         if tile.source_view is not None:
             selected.attrs["source_view"] = tile.source_view
         sims.append(selected)
+        elapsed = time.perf_counter() - tile_start
+        total_elapsed = time.perf_counter() - start
+        log(
+            "Fusion sim tile done: "
+            f"{tile_index}/{len(tiles)}, tile={tile.path.name}, "
+            f"dims={selected.dims}, shape={tuple(int(value) for value in selected.shape)}, "
+            f"zarr_backed={si_utils.is_xarray_zarr_backed(selected)}, "
+            f"tile_elapsed={elapsed:.3f}s, total_elapsed={total_elapsed:.3f}s"
+        )
 
     return sims, stores, channel_labels[channel], source_level_counts, source_tiles
 
@@ -3841,7 +4342,7 @@ def load_inverse_flatfield(flatfield_dir: Path, channel: int, tile_shape: tuple[
 def load_fusion_inverse_flatfields(
     tiles: list[TileMetadata],
     *,
-    flatfield_dir: Path,
+    flatfield_dir: Path | None,
     flatfield_dirs_by_source_view: dict[str, Path] | None = None,
     channel: int,
 ):
@@ -3889,6 +4390,8 @@ def load_fusion_inverse_flatfields(
             )
         return inverse_by_view
 
+    if flatfield_dir is None:
+        raise ValueError("Pooled BaSiC correction requires --flatfield-dir")
     inverse, source, pre_scale, scale_source = load_inverse_flatfield(flatfield_dir, channel, tiles[0].shape)
     log(f"Fusing channel {channel} with pooled BaSiC flatfield {source}")
     if scale_source is None:
@@ -3938,6 +4441,46 @@ def _copy_selected_attrs(selected: Any, sim: Any, extra_attr_keys: tuple[str, ..
     for key in extra_attr_keys:
         if key in sim.attrs:
             selected.attrs[key] = sim.attrs[key]
+
+
+def select_sim_coords_without_deepcopy(
+    sim: Any,
+    sel_dict: dict[str, Any],
+    *,
+    extra_attr_keys: tuple[str, ...] = (),
+):
+    if not sel_dict:
+        return sim
+
+    selected = sim.sel(sel_dict)
+    _copy_selected_attrs(selected, sim, extra_attr_keys)
+    selected.attrs["transforms"] = {}
+    for transform_key, transform in sim.attrs["transforms"].items():
+        for dim, values in sel_dict.items():
+            if dim in transform.dims:
+                transform = transform.sel({dim: values})
+        selected.attrs["transforms"][transform_key] = transform
+    return selected
+
+
+@contextmanager
+def zarr_safe_fusion_selection(extra_attr_keys: tuple[str, ...] = ()):
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    original_sim_sel_coords = si_utils.sim_sel_coords
+
+    def zarr_safe_sim_sel_coords(sim, sel_dict):
+        return select_sim_coords_without_deepcopy(
+            sim,
+            sel_dict,
+            extra_attr_keys=extra_attr_keys,
+        )
+
+    si_utils.sim_sel_coords = zarr_safe_sim_sel_coords
+    try:
+        yield
+    finally:
+        si_utils.sim_sel_coords = original_sim_sel_coords
 
 
 def _basic_slice_offsets(info: dict[str, Any], overlap_bb: dict[str, Any], dims: tuple[str, ...]) -> dict[str, int]:
@@ -4078,21 +4621,14 @@ def basic_corrected_zarr_reads(
         return info
 
     def zarr_safe_sim_sel_coords(sim, sel_dict):
-        if not sel_dict:
-            return sim
-
-        selected = sim.sel(sel_dict)
         extra_attr_keys = dataset_attr_keys
         if cache_key_attr is not None:
             extra_attr_keys = dataset_attr_keys + (cache_key_attr,)
-        _copy_selected_attrs(selected, sim, extra_attr_keys)
-        selected.attrs["transforms"] = {}
-        for transform_key, transform in sim.attrs["transforms"].items():
-            for dim, values in sel_dict.items():
-                if dim in transform.dims:
-                    transform = transform.sel({dim: values})
-            selected.attrs["transforms"][transform_key] = transform
-        return selected
+        return select_sim_coords_without_deepcopy(
+            sim,
+            sel_dict,
+            extra_attr_keys=extra_attr_keys,
+        )
 
     def corrected_tile_cache_entry(
         info: dict[str, Any],
@@ -4290,6 +4826,13 @@ def close_stores(stores: list[Any]) -> None:
         close = getattr(store, "close", None)
         if close is not None:
             close()
+
+
+def clear_cupy_memory_pool() -> None:
+    import cupy as cp
+
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
 def registration_source_channel(
@@ -4598,11 +5141,14 @@ def batched_pairwise_registration(*, dask_num_workers: int | None = None):
                 for pair in batch_edges
             ]
             log(f"Computing pairwise registration batch {batch_index}/{len(batches)}")
-            if dask_num_workers is None:
-                params += compute(params_xds)[0]
-            else:
-                params += compute(params_xds, scheduler="threads", num_workers=dask_num_workers)[0]
-            log(f"Finished pairwise registration batch {batch_index}/{len(batches)}")
+            try:
+                if dask_num_workers is None:
+                    params += compute(params_xds)[0]
+                else:
+                    params += compute(params_xds, scheduler="threads", num_workers=dask_num_workers)[0]
+                log(f"Finished pairwise registration batch {batch_index}/{len(batches)}")
+            finally:
+                clear_cupy_memory_pool()
 
         for index, pair in enumerate(edges):
             g_reg_computed.edges[pair]["transform"] = params[index]["transform"]
@@ -4904,6 +5450,12 @@ def save_registration_params(
         records.append(
             {
                 "tile": tile.path.name,
+                "path": str(tile.path),
+                "shape": list(tile.shape),
+                "axes": tile.axes,
+                "spacing_um": tile.spacing,
+                "channels": list(tile.channels),
+                "tracks": [asdict(track) for track in tile.tracks],
                 "source_view": tile.source_view,
                 "stage_translation_um": tile.translation,
                 "stage_scale_um": tile_stage_scale(tile),
@@ -4921,7 +5473,7 @@ def save_registration_params(
     payload = {
         "input_dir": str(tiles[0].path.parent),
         "metadata_transform_key": TRANSFORM_KEY,
-        "registered_transform_key": REGISTERED_TRANSFORM_KEY,
+        "registered_transform_key": "registered_affine",
         "spacing_um": tiles[0].spacing,
         "metrics": registration_metrics_payload(registration_result),
         "tiles": records,
@@ -4936,7 +5488,7 @@ def save_registration_params(
             "summary": robust_refinement.summary,
             "final_residual_warning": residual_warning,
             "corrections_zyx_px": robust_refinement.corrections_zyx,
-        }
+            }
         if robust_refinement.reference_geometry is not None:
             payload["reference_geometry_constraint"] = {
                 "mode": robust_refinement.reference_geometry.mode,
@@ -4952,6 +5504,8 @@ def save_registration_params(
                     else None
                 ),
             }
+        if robust_refinement.reference_initial_alignment is not None:
+            payload["reference_initial_alignment"] = robust_refinement.reference_initial_alignment
     if isinstance(registration_result, dict) and "hierarchical_coarse_registration" in registration_result:
         payload["hierarchical_coarse_registration"] = registration_result["hierarchical_coarse_registration"]
     if pre_stitch_tile_rotation is not None:
@@ -5006,10 +5560,6 @@ def fusion_output_spacing(base_spacing: dict[str, float], fusion_level: int) -> 
     return {dim: float(value) * factor for dim, value in base_spacing.items()}
 
 
-def compression_level(value: float) -> float:
-    return value / 100 if value > 1 else value
-
-
 def zarr_v3_array_creation_kwargs(dims: tuple[str, ...]) -> dict[str, Any]:
     from zarr.codecs import BytesCodec, ZstdCodec
 
@@ -5017,6 +5567,30 @@ def zarr_v3_array_creation_kwargs(dims: tuple[str, ...]) -> dict[str, Any]:
         "dimension_names": dims,
         "codecs": [BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
     }
+
+
+def validate_written_scale0(output_zarr_url: str | Path | None, sim: Any) -> None:
+    if output_zarr_url is None:
+        raise ValueError("Cannot validate package OME-Zarr write without output_zarr_url")
+
+    import zarr
+
+    output = Path(output_zarr_url)
+    array = zarr.open_array(str(output / "0"), mode="r")
+    expected_shape = tuple(int(size) for size in sim.shape)
+    actual_shape = tuple(int(size) for size in array.shape)
+    if actual_shape != expected_shape:
+        raise ValueError(
+            f"{output} scale-0 shape mismatch after package OME-Zarr write: "
+            f"{actual_shape} != {expected_shape}"
+        )
+    dimension_names = tuple(array.metadata.dimension_names or ())
+    expected_dims = tuple(str(dim) for dim in sim.dims)
+    if dimension_names and dimension_names != expected_dims:
+        raise ValueError(
+            f"{output} scale-0 dimension names mismatch after package OME-Zarr write: "
+            f"{dimension_names} != {expected_dims}"
+        )
 
 
 @contextmanager
@@ -5034,6 +5608,8 @@ def single_scale_fusion_output():
         try:
             return original_write(sim, *args, **kwargs)
         except np.exceptions.AxisError as exc:
+            output_zarr_url = kwargs.get("output_zarr_url") or (args[0] if args else None)
+            validate_written_scale0(output_zarr_url, sim)
             log(
                 "Skipping package OMERO channel-window metadata after single-scale "
                 f"temporary fusion write: {exc}"
@@ -5061,6 +5637,7 @@ def spatial_chunks_for_package_pyramid():
             return original_write(sim, *args, **kwargs)
         except np.exceptions.AxisError as exc:
             output_zarr_url = kwargs.get("output_zarr_url") or args[0]
+            validate_written_scale0(output_zarr_url, sim)
             repair_ome_metadata_axes(Path(output_zarr_url))
             log(f"Skipping package OMERO channel-window metadata after OME-Zarr write: {exc}")
             return sim
@@ -5095,119 +5672,17 @@ def spatial_chunks_for_package_pyramid():
         ngff_utils.write_and_return_downsampled_sim = original_write_level
 
 
-def jpegxr_plane_chunk_shape(shape: tuple[int, ...], chunks: tuple[int, ...]) -> tuple[int, ...]:
-    if len(shape) != len(chunks):
-        raise ValueError(f"Shape/chunk dimensionality mismatch: shape={shape}, chunks={chunks}")
-    return tuple(1 if axis < len(shape) - 2 else min(chunks[axis], shape[axis]) for axis in range(len(shape)))
-
-
-def chunk_slices(shape: tuple[int, ...], chunks: tuple[int, ...]):
-    ranges = [
-        range(0, int(size), int(chunk_size))
-        for size, chunk_size in zip(shape, chunks, strict=True)
-    ]
-    import itertools
-
-    for starts in itertools.product(*ranges):
-        yield tuple(
-            slice(start, min(start + chunk_size, size))
-            for start, size, chunk_size in zip(starts, shape, chunks, strict=True)
-        )
-
-
-def chunk_count(shape: tuple[int, ...], chunks: tuple[int, ...]) -> int:
-    count = 1
-    for size, chunk_size in zip(shape, chunks, strict=True):
-        count *= (int(size) + int(chunk_size) - 1) // int(chunk_size)
-    return count
-
-
-def pyramid_relative_factors(shape: tuple[int, ...], dims: tuple[str, ...]) -> dict[str, int]:
-    factors = {}
-    for dim, size in zip(dims, shape, strict=True):
-        if dim in {"z", "y", "x"} and int(size) // 2 > 100:
-            factors[dim] = 2
-        else:
-            factors[dim] = 1
-    return factors
-
-
-def downsample_mean_preserve_dtype(array, *, dims: tuple[str, ...], factors: dict[str, int]):
-    import dask.array as da
-    import numpy as np
-
-    def mean_dtype(block, **kwargs):
-        return np.mean(block, **kwargs).astype(block.dtype)
-
-    axes = {
-        axis: factors[dim]
-        for axis, dim in enumerate(dims)
-        if factors[dim] > 1
-    }
-    return da.coarsen(mean_dtype, array, axes=axes, trim_excess=True)
-
-
-def level_coordinate_transformations(
-    base_transforms: list[dict[str, Any]],
-    axes: list[dict[str, Any]],
-    abs_factors: dict[str, int],
-) -> list[dict[str, Any]]:
-    transforms = copy.deepcopy(base_transforms)
-    for transform in transforms:
-        if transform.get("type") != "scale":
-            continue
-        transform["scale"] = [
-            float(value) * abs_factors.get(axis["name"], 1)
-            for value, axis in zip(transform["scale"], axes, strict=True)
-        ]
-    return transforms
-
-
-def write_jpegxr_level(
-    array,
-    destination: Path,
-    *,
-    dataset_path: str,
-    dimension_names: tuple[str, ...],
-    source_chunks: tuple[int, ...],
-    jpegxr_level: float,
-) -> None:
-    import numpy as np
-    import zarr
-
-    shape = tuple(int(size) for size in array.shape)
-    output_chunks = jpegxr_plane_chunk_shape(shape, source_chunks)
-    destination_array_path = destination / dataset_path
-    destination_array_path.parent.mkdir(parents=True, exist_ok=True)
-    destination_array = zarr.open(
-        str(destination_array_path),
-        mode="w",
-        shape=shape,
-        chunks=output_chunks,
-        dtype=array.dtype,
-        zarr_format=3,
-        dimension_names=dimension_names,
-        codecs=[JpegxrZarrV3Codec(level=jpegxr_level)],
-    )
-
-    n_chunks = chunk_count(shape, output_chunks)
-    log(
-        f"JPEG-XR recompress level {dataset_path}: "
-        f"shape={shape}, source_chunks={source_chunks}, output_chunks={output_chunks}, "
-        f"chunks={n_chunks}"
-    )
-    for chunk_index, selection in enumerate(chunk_slices(shape, output_chunks), start=1):
-        destination_array[selection] = np.asarray(array[selection])
-        if chunk_index <= 3 or chunk_index % 1000 == 0 or chunk_index == n_chunks:
-            log(
-                f"JPEG-XR recompress level {dataset_path}: "
-                f"{chunk_index}/{n_chunks} chunk(s)"
-            )
+chunk_slices = pyramid_core.chunk_slices
+chunk_count = pyramid_core.chunk_count
+ceil_div = pyramid_core.ceil_div
+pyramid_relative_factors = pyramid_core.pyramid_relative_factors
+level_coordinate_transformations = pyramid_core.level_coordinate_transformations
 
 
 def block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     import cupy as cp
 
+    dtype = np.dtype(dtype)
     block_gpu = cp.asarray(block)
     reshape = []
     mean_axes = []
@@ -5225,6 +5700,9 @@ def block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np
     reduced = block_gpu.reshape(tuple(reshape))
     if mean_axes:
         reduced = cp.mean(reduced, axis=tuple(mean_axes), dtype=cp.float32)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        reduced = cp.clip(cp.rint(reduced), info.min, info.max)
     return cp.asnumpy(reduced.astype(dtype, copy=False))
 
 
@@ -5244,8 +5722,8 @@ def write_zstd_downsampled_level(
         for size, factor in zip(source_array.shape, factor_tuple, strict=True)
     )
     output_chunks = tuple(
-        min(int(chunk), int(size))
-        for chunk, size in zip(source_array.chunks, shape, strict=True)
+        min(max(int(chunk) // factor, 1), int(size))
+        for chunk, factor, size in zip(source_array.chunks, factor_tuple, shape, strict=True)
     )
     destination_array_path = destination / dataset_path
     destination_array_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5364,96 +5842,6 @@ def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
     repair_ome_metadata_axes(output)
 
 
-def recompress_ome_zarr_to_jpegxr(
-    source: Path,
-    destination: Path,
-    *,
-    jpegxr_level: float,
-) -> None:
-    import zarr
-
-    register_jpegxr_zarr_v3_codec()
-    normalized_level = compression_level(jpegxr_level)
-    source_group = zarr.open_group(str(source), mode="r", zarr_format=3)
-    source_attrs = source_group.attrs.asdict()
-    destination_group = zarr.open_group(str(destination), mode="w", zarr_format=3)
-
-    ome_attrs = source_attrs.get("ome") or {}
-    multiscales = ome_attrs.get("multiscales") or []
-    if not multiscales:
-        raise ValueError(f"{source} does not contain OME multiscales metadata")
-
-    datasets = multiscales[0].get("datasets") or []
-    if not datasets:
-        raise ValueError(f"{source} OME multiscales metadata does not list datasets")
-
-    import dask.array as da
-
-    source_array = zarr.open_array(str(source / "0"), mode="r", zarr_format=3)
-    dimension_names = tuple(source_array.metadata.dimension_names or ())
-    if not dimension_names:
-        dimension_names = tuple(f"dim_{axis}" for axis in range(len(source_array.shape)))
-    source_chunks = tuple(int(size) for size in source_array.chunks)
-    arrays = [da.from_zarr(str(source / "0"))]
-    abs_factors = [{dim: 1 for dim in dimension_names}]
-
-    while True:
-        factors = pyramid_relative_factors(
-            tuple(int(size) for size in arrays[-1].shape),
-            dimension_names,
-        )
-        if not any(factor > 1 for factor in factors.values()):
-            break
-        arrays.append(
-            downsample_mean_preserve_dtype(
-                arrays[-1],
-                dims=dimension_names,
-                factors=factors,
-            )
-        )
-        abs_factors.append(
-            {
-                dim: abs_factors[-1][dim] * factors[dim]
-                for dim in dimension_names
-            }
-        )
-
-    log(
-        "Recompressing completed fusion pyramid to JPEG-XR "
-        f"level={normalized_level:.3f}, levels={len(arrays)}"
-    )
-
-    base_multiscale = copy.deepcopy(multiscales[0])
-    axes = base_multiscale.get("axes") or [{"name": dim} for dim in dimension_names]
-    base_transforms = datasets[0].get("coordinateTransformations") or []
-    base_multiscale["datasets"] = [
-        {
-            "path": str(level_index),
-            "coordinateTransformations": level_coordinate_transformations(
-                base_transforms,
-                axes,
-                factors,
-            ),
-        }
-        for level_index, factors in enumerate(abs_factors)
-    ]
-    final_ome_attrs = copy.deepcopy(ome_attrs)
-    final_ome_attrs["multiscales"] = [base_multiscale]
-    destination_attrs = copy.deepcopy(source_attrs)
-    destination_attrs["ome"] = final_ome_attrs
-    destination_group.attrs.update(destination_attrs)
-
-    for level_index, array in enumerate(arrays):
-        write_jpegxr_level(
-            array,
-            destination,
-            dataset_path=str(level_index),
-            dimension_names=dimension_names,
-            source_chunks=source_chunks,
-            jpegxr_level=normalized_level,
-        )
-
-
 def ome_zarr_group_metadata_path(output: Path) -> Path:
     zarr_json_path = output / "zarr.json"
     if zarr_json_path.exists():
@@ -5476,6 +5864,23 @@ def read_ome_zarr_group_metadata(output: Path) -> dict[str, Any]:
     if metadata_path.name == "zarr.json":
         return payload.get("attributes", {}).get("ome", {})
     return payload
+
+
+def read_ome_zarr_group_attrs(output: Path) -> dict[str, Any]:
+    metadata_path = ome_zarr_group_metadata_path(output)
+    if not metadata_path.exists():
+        return {}
+    payload = json.loads(metadata_path.read_text() or "{}")
+    if metadata_path.name == "zarr.json":
+        return payload.get("attributes", {})
+    return payload
+
+
+def mark_ome_zarr_complete(output: Path) -> None:
+    import zarr
+
+    group = zarr.open_group(str(output), mode="a", zarr_format=3)
+    group.attrs["squisher_complete"] = True
 
 
 def repair_ome_metadata_axes(output: Path) -> None:
@@ -5653,6 +6058,10 @@ def ome_zarr_has_multiscales_metadata(output: Path) -> bool:
     return any(dataset.get("path") == "0" for dataset in datasets)
 
 
+def ome_zarr_is_complete(output: Path) -> bool:
+    return ome_zarr_has_multiscales_metadata(output) and read_ome_zarr_group_attrs(output).get("squisher_complete") is True
+
+
 def raise_if_nonempty_output_dir(path: Path, label: str) -> None:
     if not path.exists():
         return
@@ -5663,8 +6072,13 @@ def raise_if_nonempty_output_dir(path: Path, label: str) -> None:
 
 
 def output_exists_error(output: Path) -> FileExistsError:
-    if ome_zarr_has_multiscales_metadata(output):
+    if ome_zarr_is_complete(output):
         return FileExistsError(f"{output} already exists; move it before rerunning")
+    if ome_zarr_has_multiscales_metadata(output):
+        return FileExistsError(
+            f"{output} contains OME-Zarr metadata but no squisher_complete marker. "
+            "This may be a partial interrupted write; move it before rerunning."
+        )
     if ome_zarr_scale0_array_path(output).exists():
         actual_chunks, expected_chunks = ome_zarr_scale0_chunk_status(output)
         return FileExistsError(
@@ -5756,6 +6170,18 @@ def resolve_coarse_reg_res_levels(args: argparse.Namespace, reg_res_level: int |
     return levels
 
 
+def mvs_groupwise_resolution_kwargs(transform: str = MVS_GROUPWISE_TRANSFORM) -> dict[str, Any]:
+    if MVS_GROUPWISE_RESOLUTION_METHOD == "shortest_paths":
+        return {}
+    if transform not in {"translation", "rigid"}:
+        raise ValueError(f"Unsupported MVS groupwise transform: {transform}")
+    return {"transform": transform}
+
+
+def mvs_post_quality_filter_enabled() -> bool:
+    return MVS_POST_QUALITY_THRESHOLD is not None
+
+
 def preflight_track_run_outputs(
     args: argparse.Namespace,
     tiles: list[TileMetadata],
@@ -5832,6 +6258,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reference-initial-alignment",
+        choices=("none", "translation", "rigid"),
+        default="none",
+        help=(
+            "Before reference-constrained seam refinement, globally align loaded/coarse "
+            "registration params to --reference-registration-input. Use rigid for the "
+            "independent-channel-registration -> 488-frame alignment workflow."
+        ),
+    )
+    parser.add_argument(
         "--shared-geometry-tracks",
         type=parse_track_slug_list,
         help=(
@@ -5853,7 +6289,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Directory containing exported BaSiC *-chN-flatfield.tif files. "
-            "Defaults to INPUT_DIR/basic_nz25_pooled."
+            "Omit to fuse already-corrected inputs without BaSiC correction."
         ),
     )
     parser.add_argument(
@@ -5876,11 +6312,35 @@ def parse_args() -> argparse.Namespace:
         help="Run registration and write registration parameters, but do not fuse.",
     )
     parser.add_argument(
+        "--registration-pair-mode",
+        choices=("package", "axis-aligned", "spanning-tree", "robust-boundary"),
+        default=DEFAULT_REGISTRATION_PAIR_MODE,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--registration-pair-file",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--coarse-reg-res-levels",
+        type=int,
+        nargs="+",
+        default=DEFAULT_COARSE_REG_RES_LEVELS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--groupwise-transform",
+        choices=("translation", "rigid"),
+        default=MVS_GROUPWISE_TRANSFORM,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--output-chunksize",
         type=int,
         nargs=3,
         metavar=("Z", "Y", "X"),
-        default=(32, 1024, 1024),
+        default=(8, 1024, 1024),
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -6000,6 +6460,11 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--per-chunk-cupy-cleanup",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -6014,19 +6479,14 @@ def parse_args() -> argparse.Namespace:
         reg_channel_index=0,
         registration_binning=None,
         reg_res_level=4,
-        coarse_reg_res_levels=None,
+        coarse_reg_res_levels=DEFAULT_COARSE_REG_RES_LEVELS,
         auto_reg_res_level=False,
         n_parallel_pairwise_regs=None,
         dask_num_workers=32,
         registration_read_chunk_z=DEFAULT_REGISTRATION_READ_CHUNK_Z,
-        registration_pair_mode="robust-boundary",
-        gpu_pairwise_phase_correlation=False,
+        registration_pair_mode=DEFAULT_REGISTRATION_PAIR_MODE,
         robust_boundary_qc_dir=None,
         skip_registration_plots=True,
-        fusion_compressor="zstd",
-        jpegxr_level=DEFAULT_JPEGXR_LEVEL,
-        profile_max_fusion_chunks=None,
-        profile_skip_fusion_chunks=0,
         per_chunk_cupy_cleanup=False,
     )
     return parser.parse_args()
@@ -6045,18 +6505,7 @@ def parse_batch_size(value: str) -> int | str:
 
 
 def parse_source_view_flatfield_dir(value: str) -> tuple[str, Path]:
-    if "=" not in value:
-        raise argparse.ArgumentTypeError(
-            "Expected source-view flatfield entry as VIEW=DIR, "
-            f"got {value!r}"
-        )
-    view, path = value.split("=", 1)
-    view = view.strip()
-    if not view:
-        raise argparse.ArgumentTypeError(f"Missing source-view name in {value!r}")
-    if not path:
-        raise argparse.ArgumentTypeError(f"Missing flatfield directory in {value!r}")
-    return view, Path(path)
+    return parse_source_view_path_entry(value, error_factory=argparse.ArgumentTypeError)
 
 
 def parse_track_slug_list(value: str) -> tuple[str, ...]:
@@ -6079,39 +6528,29 @@ def parse_positive_int(value: str) -> int:
 
 
 def parse_nonnegative_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("value must be a non-negative integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be a non-negative integer")
-    return parsed
+    return parse_nonnegative_number(
+        value,
+        cast=int,
+        error_message="value must be a non-negative integer",
+    )
 
 
 def parse_nonnegative_float(value: str) -> float:
+    return parse_nonnegative_number(
+        value,
+        cast=float,
+        error_message="value must be a non-negative number",
+    )
+
+
+def parse_nonnegative_number(value: str, *, cast, error_message: str):
     try:
-        parsed = float(value)
+        parsed = cast(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("value must be a non-negative number") from exc
+        raise argparse.ArgumentTypeError(error_message) from exc
     if parsed < 0:
-        raise argparse.ArgumentTypeError("value must be a non-negative number")
+        raise argparse.ArgumentTypeError(error_message)
     return parsed
-
-
-def parse_jpegxr_level(value: str) -> float:
-    try:
-        level = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("JPEG-XR level must be a number in [0, 100]") from exc
-    if level < 0 or level > 100:
-        raise argparse.ArgumentTypeError("JPEG-XR level must be in [0, 100]")
-    return level
-
-
-def ceil_div(numerator: int | float, denominator: int | float) -> int:
-    numerator_int = int(numerator)
-    denominator_int = int(denominator)
-    return (numerator_int + denominator_int - 1) // denominator_int
 
 
 def resolve_fusion_batch_size(
@@ -6191,7 +6630,7 @@ def run_stitch_once(
     registration_output: Path,
     registration_plots_dir: Path,
     robust_boundary_qc_dir: Path,
-    flatfield_dir: Path,
+    flatfield_dir: Path | None,
     flatfield_dirs_by_source_view: dict[str, Path] | None,
     selected_channels: tuple[int, ...] | None,
     registration_input: Path | None,
@@ -6199,7 +6638,10 @@ def run_stitch_once(
     source_label: str | None = None,
 ) -> int:
     log(f"Input directory: {input_dir}")
-    log(f"Flatfield directory: {flatfield_dir}")
+    if flatfield_dir is None and not flatfield_dirs_by_source_view:
+        log("Flatfield correction: disabled")
+    elif flatfield_dir is not None:
+        log(f"Flatfield directory: {flatfield_dir}")
     if flatfield_dirs_by_source_view:
         log(f"Flatfield directories by source_view: {flatfield_dirs_by_source_view}")
     log(f"Registration output path: {registration_output}")
@@ -6230,7 +6672,7 @@ def run_stitch_once(
     skip_registration_plots = getattr(args, "skip_registration_plots", False)
     if should_register and args.registration_pair_mode == "robust-boundary" and not args.dry_run:
         require_cuda_for_robust_boundary()
-    if should_register and args.gpu_pairwise_phase_correlation and not args.dry_run:
+    if should_register and not args.dry_run:
         require_cuda_for_robust_boundary()
 
     n_parallel_pairwise_regs = resolve_pairwise_registration_jobs(args)
@@ -6248,8 +6690,6 @@ def run_stitch_once(
         selected_channels,
         args.register_only,
         should_register,
-        args.fusion_compressor,
-        args.jpegxr_level,
         args.registration_pair_mode,
         tuple(args.registration_binning) if args.registration_binning is not None else None,
         reg_res_level,
@@ -6283,12 +6723,7 @@ def run_stitch_once(
     from multiview_stitcher import spatial_image_utils as si_utils
     log("Imported multiview-stitcher fusion/registration modules")
     log(f"Fusion batch settings: n_batch={args.batch_size}, threaded_jobs={args.batch_jobs}")
-    log(f"Final fusion compressor: {args.fusion_compressor}")
-    if args.fusion_compressor == "jpegxr":
-        log(
-            "JPEG-XR output will be written after GPU fusion from temporary zstd chunks "
-            f"with level={compression_level(args.jpegxr_level):.3f}"
-        )
+    log(f"Final fusion compressor: zstd level {ZSTD_LEVEL}")
 
     transform_key = TRANSFORM_KEY
     params = None
@@ -6331,17 +6766,28 @@ def run_stitch_once(
     if should_refine_registration_input(args, registration_input):
         if params is None:
             raise RuntimeError("Loaded registration params were not initialized")
-        refinement_start_params = (
-            reference_params
-            if reference_params is not None and args.reference_geometry_mode in {"full-xyz", "penalized-xy"}
-            else params
+        refinement_start, refinement_start_source = refinement_start_params(
+            params,
+            reference_params,
+            reference_geometry_mode=args.reference_geometry_mode,
         )
-        if refinement_start_params is reference_params:
+        if refinement_start_source == "reference":
             log(f"Robust boundary refinement starts from reference geometry mode={args.reference_geometry_mode}")
+        elif reference_params is not None and args.reference_geometry_mode != "none":
+            log(
+                "Robust boundary refinement starts from loaded registration "
+                f"with reference geometry prior mode={args.reference_geometry_mode}"
+            )
+        refinement_start, reference_initial_alignment = align_refinement_start_to_reference(
+            refinement_start,
+            reference_params,
+            method=args.reference_initial_alignment,
+            source=refinement_start_source,
+        )
         with heartbeat("robust boundary refinement"):
             robust_refinement = refine_registration_with_robust_boundaries(
                 tiles,
-                refinement_start_params,
+                refinement_start,
                 channel=reg_source_channel,
                 output_dir=robust_boundary_qc_dir,
                 settings=RobustBoundarySettings(),
@@ -6353,6 +6799,10 @@ def run_stitch_once(
                 reference_geometry_mode=args.reference_geometry_mode,
                 source_label=source_label,
             )
+        robust_refinement = replace(
+            robust_refinement,
+            reference_initial_alignment=reference_initial_alignment,
+        )
         params = robust_refinement.params
         log_transform_translation_summary("Robust-boundary refined registration", params)
         save_registration_params(
@@ -6367,7 +6817,11 @@ def run_stitch_once(
     if should_run_coarse:
         registration_pairs = None
         pre_registration_pruning_method = "alternating_pattern"
-        if args.registration_pair_mode in {"axis-aligned", "robust-boundary"}:
+        if args.registration_pair_file is not None:
+            registration_pairs = registration_pairs_from_file(args.registration_pair_file.resolve(), tiles)
+            pre_registration_pruning_method = None
+            log(f"Using {len(registration_pairs)} explicit registration pairs from {args.registration_pair_file.resolve()}")
+        elif args.registration_pair_mode in {"axis-aligned", "robust-boundary"}:
             registration_pairs = axis_aligned_registration_pairs(tiles)
             pre_registration_pruning_method = None
             log(f"Using {len(registration_pairs)} explicit axis-aligned registration pairs")
@@ -6377,35 +6831,71 @@ def run_stitch_once(
             log(f"Using {len(registration_pairs)} explicit spanning-tree registration pairs")
         else:
             log("Using multiview-stitcher package pair graph and pruning")
-        log("Building registration multiscale inputs")
-        registration_source_level, registration_available_levels, registration_level_offset = registration_source_level_for_tiles(
-            tiles,
-            coarse_reg_res_levels,
-            registration_binning,
-        )
-        log(
-            "Registration TIFF source level: "
-            f"level{registration_source_level}/available{registration_available_levels}; "
-            f"registration level offset={registration_level_offset}"
-        )
-        reg_msims, reg_stores, reg_channel_label = build_registration_msims(
-            tiles,
-            reg_source_channel,
-            read_chunk_z=registration_read_chunk_z,
-            source_level=registration_source_level,
-        )
+        log("Building registration multiscale inputs per hierarchy stage")
         initial_transform_key = TRANSFORM_KEY
-        pairwise_reg_func = pairwise_registration_function(use_gpu=args.gpu_pairwise_phase_correlation)
+        pairwise_reg_func = (
+            cupy_pairwise_phase_correlation_registration
+            if args.groupwise_transform == "translation"
+            else native_rigid_pairwise_registration
+        )
         log(
             "Pairwise registration function: "
-            f"{pairwise_reg_func.__name__}; gpu={args.gpu_pairwise_phase_correlation}"
+            f"{pairwise_reg_func.__name__}; gpu=True"
         )
+        groupwise_resolution_kwargs = mvs_groupwise_resolution_kwargs(args.groupwise_transform)
+        post_quality_filter = mvs_post_quality_filter_enabled()
+        log(
+            "MVS groupwise resolver: "
+            f"{MVS_GROUPWISE_RESOLUTION_METHOD} "
+            f"kwargs={groupwise_resolution_kwargs}; "
+            f"post_quality_filter={post_quality_filter}"
+            + (
+                f" threshold={MVS_POST_QUALITY_THRESHOLD}"
+                if post_quality_filter
+                else ""
+            )
+        )
+        reg_msims = None
+        reg_stores = []
+        reg_channel_label = None
+        stage_source_records = []
+        plot_reg_res_level = reg_res_level
         try:
             full_params = None
             registration_result = None
-            current_transform_key = initial_transform_key
             with batched_pairwise_registration(dask_num_workers=dask_num_workers), dask_progress("registration.register"):
                 for stage_index, stage_reg_res_level in enumerate(coarse_reg_res_levels):
+                    if reg_stores:
+                        close_stores(reg_stores)
+                        reg_stores = []
+                        log("Closed previous registration stage TIFF stores")
+                    stage_source_level, stage_available_levels, stage_level_offset = registration_source_level_for_tiles(
+                        tiles,
+                        (stage_reg_res_level,),
+                        registration_binning,
+                    )
+                    stage_source_records.append(
+                        {
+                            "stage": stage_index,
+                            "reg_res_level": stage_reg_res_level,
+                            "source_level": stage_source_level,
+                            "available_levels": stage_available_levels,
+                            "registration_level_offset": stage_level_offset,
+                        }
+                    )
+                    log(
+                        "Registration TIFF source level for stage "
+                        f"{stage_index + 1}/{len(coarse_reg_res_levels)}: "
+                        f"level{stage_source_level}/available{stage_available_levels}; "
+                        f"registration level offset={stage_level_offset}"
+                    )
+                    reg_msims, reg_stores, reg_channel_label = build_registration_msims(
+                        tiles,
+                        reg_source_channel,
+                        read_chunk_z=registration_read_chunk_z,
+                        source_level=stage_source_level,
+                    )
+                    current_transform_key = initial_transform_key
                     if full_params is not None:
                         current_transform_key = f"{REGISTERED_TRANSFORM_KEY}_hierarchical_input_{stage_index}"
                         set_msims_affine_transform(reg_msims, full_params, current_transform_key)
@@ -6414,14 +6904,25 @@ def run_stitch_once(
                         stage_transform_key = REGISTERED_TRANSFORM_KEY
                     effective_stage_reg_res_level = effective_registration_level(
                         stage_reg_res_level,
-                        registration_level_offset,
+                        stage_level_offset,
                     )
+                    plot_reg_res_level = effective_stage_reg_res_level
                     log(
                         "Starting registration.register "
                         f"stage {stage_index + 1}/{len(coarse_reg_res_levels)} "
                         f"at reg_res_level={stage_reg_res_level} "
                         f"(effective={effective_stage_reg_res_level})"
                     )
+                    stage_n_parallel_pairwise_regs = (
+                        1
+                        if effective_stage_reg_res_level == 0
+                        else n_parallel_pairwise_regs
+                    )
+                    if stage_n_parallel_pairwise_regs != n_parallel_pairwise_regs:
+                        log(
+                            "Limiting pairwise registration batch size for effective level 0: "
+                            f"{n_parallel_pairwise_regs} -> {stage_n_parallel_pairwise_regs}"
+                        )
                     with heartbeat(f"registration.register level {stage_reg_res_level}"):
                         registration_result = registration.register(
                             reg_msims,
@@ -6430,10 +6931,18 @@ def run_stitch_once(
                             new_transform_key=stage_transform_key,
                             registration_binning=registration_binning,
                             reg_res_level=effective_stage_reg_res_level,
-                            n_parallel_pairwise_regs=n_parallel_pairwise_regs,
+                            n_parallel_pairwise_regs=stage_n_parallel_pairwise_regs,
                             pairs=registration_pairs,
                             pairwise_reg_func=pairwise_reg_func,
                             pre_registration_pruning_method=pre_registration_pruning_method,
+                            groupwise_resolution_method=MVS_GROUPWISE_RESOLUTION_METHOD,
+                            groupwise_resolution_kwargs=groupwise_resolution_kwargs,
+                            post_registration_do_quality_filter=post_quality_filter,
+                            post_registration_quality_threshold=(
+                                MVS_POST_QUALITY_THRESHOLD
+                                if post_quality_filter
+                                else 0.2
+                            ),
                             return_dict=True,
                         )
                     log(
@@ -6443,7 +6952,7 @@ def run_stitch_once(
                         f"(effective={effective_stage_reg_res_level})"
                     )
                     full_params = msim_full_transforms(reg_msims, stage_transform_key)
-            if registration_result is None or full_params is None:
+            if registration_result is None or full_params is None or reg_msims is None:
                 raise RuntimeError("Registration did not produce parameters")
             params = full_params_relative_to_stage(reg_msims, full_params)
             log_transform_translation_summary("Coarse registration", params)
@@ -6452,22 +6961,34 @@ def run_stitch_once(
                 "params": params,
                 "hierarchical_coarse_registration": {
                     "reg_res_levels": list(coarse_reg_res_levels),
+                    "stage_sources": stage_source_records,
                 },
             }
             transform_key = REGISTERED_TRANSFORM_KEY
             robust_refinement = None
             if args.registration_pair_mode == "robust-boundary":
-                refinement_start_params = (
-                    reference_params
-                    if reference_params is not None and args.reference_geometry_mode in {"full-xyz", "penalized-xy"}
-                    else params
+                refinement_start, refinement_start_source = refinement_start_params(
+                    params,
+                    reference_params,
+                    reference_geometry_mode=args.reference_geometry_mode,
                 )
-                if refinement_start_params is reference_params:
+                if refinement_start_source == "reference":
                     log(f"Robust boundary refinement starts from reference geometry mode={args.reference_geometry_mode}")
+                elif reference_params is not None and args.reference_geometry_mode != "none":
+                    log(
+                        "Robust boundary refinement starts from coarse registration "
+                        f"with reference geometry prior mode={args.reference_geometry_mode}"
+                    )
+                refinement_start, reference_initial_alignment = align_refinement_start_to_reference(
+                    refinement_start,
+                    reference_params,
+                    method=args.reference_initial_alignment,
+                    source=refinement_start_source,
+                )
                 with heartbeat("robust boundary refinement"):
                     robust_refinement = refine_registration_with_robust_boundaries(
                         tiles,
-                        refinement_start_params,
+                        refinement_start,
                         channel=reg_source_channel,
                         output_dir=robust_boundary_qc_dir,
                         settings=RobustBoundarySettings(),
@@ -6478,6 +6999,10 @@ def run_stitch_once(
                         residual_reject_axes=residual_reject_axes,
                         reference_geometry_mode=args.reference_geometry_mode,
                         source_label=source_label,
+                    )
+                robust_refinement = replace(
+                    robust_refinement,
+                    reference_initial_alignment=reference_initial_alignment,
                 )
                 params = robust_refinement.params
                 log_transform_translation_summary("Robust-boundary registration", params)
@@ -6495,7 +7020,7 @@ def run_stitch_once(
                     reg_msims,
                     registration_plots_dir,
                     reg_channel_label=reg_channel_label,
-                    reg_res_level=reg_res_level,
+                    reg_res_level=plot_reg_res_level,
                     n_parallel_pairwise_regs=n_parallel_pairwise_regs,
                     registration_pairs=registration_pairs,
                 )
@@ -6547,32 +7072,29 @@ def run_stitch_once(
             log(f"Checking channel output path does not already exist: {channel_output}")
             raise_if_output_exists(channel_output)
 
-            fusion_output = channel_output
-            recompressed_output = None
-            if args.fusion_compressor == "jpegxr":
-                temp_workspace = tempfile.TemporaryDirectory(
-                    prefix=f".{channel_output.name}.fusion-",
-                    dir=channel_output.parent,
-                )
-                temp_root = Path(temp_workspace.name)
-                fusion_output = temp_root / "fusion-zstd.ome.zarr"
-                recompressed_output = temp_root / "fusion-jpegxr.ome.zarr"
-                log(
-                    "Channel "
-                    f"{channel} will fuse to temporary zstd output {fusion_output} "
-                    f"before JPEG-XR z-plane recompression to {channel_output}"
-                )
-
-            inverse_flatfield = load_fusion_inverse_flatfields(
-                source_tiles,
-                flatfield_dir=flatfield_dir,
-                flatfield_dirs_by_source_view=flatfield_dirs_by_source_view or None,
-                channel=channel,
+            temp_workspace = tempfile.TemporaryDirectory(
+                prefix=f".{channel_output.name}.fusion-",
+                dir=channel_output.parent,
             )
-            if isinstance(inverse_flatfield, dict):
-                log(f"Resolved source-view BaSiC corrections for channel {channel}")
+            temp_root = Path(temp_workspace.name)
+            fusion_output = temp_root / channel_output.name
+            log(f"Channel {channel} will fuse to temporary output {fusion_output}")
+
+            inverse_flatfield = None
+            apply_flatfield = flatfield_dir is not None or bool(flatfield_dirs_by_source_view)
+            if apply_flatfield:
+                inverse_flatfield = load_fusion_inverse_flatfields(
+                    source_tiles,
+                    flatfield_dir=flatfield_dir,
+                    flatfield_dirs_by_source_view=flatfield_dirs_by_source_view or None,
+                    channel=channel,
+                )
+                if isinstance(inverse_flatfield, dict):
+                    log(f"Resolved source-view BaSiC corrections for channel {channel}")
+                else:
+                    log(f"Resolved pooled BaSiC correction for channel {channel}")
             else:
-                log(f"Resolved pooled BaSiC correction for channel {channel}")
+                log(f"Fusion flatfield correction disabled for channel {channel}")
             resolved_chunksize = process_output_chunksize(sims, output_chunksize)
             log(f"Resolved fusion output chunksize: {resolved_chunksize}")
             resolved_batch_size = resolve_fusion_batch_size(
@@ -6595,34 +7117,31 @@ def run_stitch_once(
                 log("Fusion weights: geometric border/valid-support weights only")
             else:
                 log(f"Fusion weights: {args.fusion_weight_mode} quality weights {weights_func_kwargs}")
-            log(
-                "BaSiC cache settings: "
-                f"tile_cache_size={args.basic_cache_tiles}, "
-                f"tile_cache_max_gib={args.basic_cache_max_gib}, "
-                f"tile_cache_disk_root={args.basic_cache_disk_dir or fusion_output.parent}, "
-                f"tile_cache_z_chunk={args.basic_cache_z_chunk}"
-            )
+            if apply_flatfield:
+                log(
+                    "BaSiC cache settings: "
+                    f"tile_cache_size={args.basic_cache_tiles}, "
+                    f"tile_cache_max_gib={args.basic_cache_max_gib}, "
+                    f"tile_cache_disk_root={args.basic_cache_disk_dir or fusion_output.parent}, "
+                    f"tile_cache_z_chunk={args.basic_cache_z_chunk}"
+                )
             batch_func = misc_utils.process_batch_using_joblib
             batch_func_kwargs = {
                 "n_jobs": args.batch_jobs,
                 "backend": "threading",
             }
-            if args.profile_max_fusion_chunks is not None:
-                batch_func = make_profile_limited_batch_func(
-                    args.profile_max_fusion_chunks,
-                    misc_utils.process_batch_using_joblib,
-                    skip_chunks=args.profile_skip_fusion_chunks,
-                )
-                log(
-                    "Profiling fusion is bounded to "
-                    f"{args.profile_max_fusion_chunks} output chunk(s) "
-                    f"after skipping {args.profile_skip_fusion_chunks}"
-                )
             if args.per_chunk_cupy_cleanup:
                 log("Fusion uses per-chunk CuPy cleanup")
             else:
                 log("Fusion defers CuPy cleanup until the fusion context exits")
             log(f"Fusion blending widths (physical units): {blending_widths}")
+            import dask
+
+            dask_chunk_size_bytes = int(
+                math.prod(int(value) for value in resolved_chunksize.values())
+                * np.dtype(sims[0].dtype).itemsize
+            )
+            log(f"Dask array.chunk-size for Zarr writes: {dask_chunk_size_bytes} bytes")
             log(f"Entering multiview-stitcher fusion.fuse streaming write to {fusion_output}")
             if args.fusion_progress_log_seconds > 0:
                 fusion_progress_context = filesystem_progress(
@@ -6633,85 +7152,78 @@ def run_stitch_once(
             else:
                 fusion_progress_context = nullcontext()
                 log("Filesystem progress logging for fusion output is disabled")
-            fusion_output_context = single_scale_fusion_output()
-            with (
-                temporary_basic_disk_cache_dir(args.basic_cache_disk_dir, fusion_output) as basic_cache_disk_dir,
-                basic_corrected_zarr_reads(
-                    inverse_flatfield,
-                    dataset_info_key="source_view" if isinstance(inverse_flatfield, dict) else None,
-                    dataset_attr_keys=("source_view",) if isinstance(inverse_flatfield, dict) else (),
-                    cache_key_attr="basic_tile_cache_key",
-                    tile_cache_size=args.basic_cache_tiles,
-                    tile_cache_max_bytes=(
-                        None
-                        if args.basic_cache_max_gib is None
-                        else int(args.basic_cache_max_gib * 1024**3)
-                    ),
-                    tile_cache_disk_dir=basic_cache_disk_dir,
-                    tile_cache_z_chunk=args.basic_cache_z_chunk,
-                ),
-                cupy_cleanup_context(args.per_chunk_cupy_cleanup),
-                spatial_chunks_for_package_pyramid(),
-                fusion_output_context,
-                fusion_progress_context,
-            ):
+            with ExitStack() as stack:
+                stack.enter_context(
+                    zarr_safe_fusion_selection(
+                        extra_attr_keys=("source_view", "basic_tile_cache_key")
+                    )
+                )
+                if apply_flatfield:
+                    basic_cache_disk_dir = stack.enter_context(
+                        temporary_basic_disk_cache_dir(args.basic_cache_disk_dir, fusion_output)
+                    )
+                    stack.enter_context(
+                        basic_corrected_zarr_reads(
+                            inverse_flatfield,
+                            dataset_info_key="source_view" if isinstance(inverse_flatfield, dict) else None,
+                            dataset_attr_keys=("source_view",) if isinstance(inverse_flatfield, dict) else (),
+                            cache_key_attr="basic_tile_cache_key",
+                            tile_cache_size=args.basic_cache_tiles,
+                            tile_cache_max_bytes=(
+                                None
+                                if args.basic_cache_max_gib is None
+                                else int(args.basic_cache_max_gib * 1024**3)
+                            ),
+                            tile_cache_disk_dir=basic_cache_disk_dir,
+                            tile_cache_z_chunk=args.basic_cache_z_chunk,
+                        )
+                    )
+                stack.enter_context(cupy_cleanup_context(args.per_chunk_cupy_cleanup))
+                stack.enter_context(spatial_chunks_for_package_pyramid())
+                stack.enter_context(single_scale_fusion_output())
+                stack.enter_context(fusion_progress_context)
+                stack.enter_context(dask.config.set({"array.chunk-size": dask_chunk_size_bytes}))
                 with heartbeat(f"fusion.fuse channel {channel}"):
-                    try:
-                        fusion.fuse(
-                            images=sims,
-                            transform_key=transform_key,
-                            output_spacing=output_spacing,
-                            output_zarr_url=str(fusion_output),
-                            output_chunksize=output_chunksize,
-                            blending_widths=blending_widths,
-                            weights_func=weights_func,
-                            weights_func_kwargs=weights_func_kwargs,
-                            zarr_options={
-                                "ome_zarr": True,
-                                "ngff_version": NGFF_VERSION,
-                                "overwrite": False,
-                                "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(
-                                    tuple(sims[0].dims)
-                                ),
-                            },
-                            batch_options={
-                                "n_batch": resolved_batch_size,
-                                "batch_func": batch_func,
-                                "batch_func_kwargs": batch_func_kwargs,
-                            },
-                            backend=FUSION_BACKEND,
-                        )
-                    except ProfileFusionStop:
-                        log(
-                            "Stopped bounded profiling fusion after "
-                            f"{args.profile_max_fusion_chunks} output chunk(s)"
-                        )
-                        return 0
+                    fusion.fuse(
+                        images=sims,
+                        transform_key=transform_key,
+                        output_spacing=output_spacing,
+                        output_zarr_url=str(fusion_output),
+                        output_chunksize=output_chunksize,
+                        blending_widths=blending_widths,
+                        weights_func=weights_func,
+                        weights_func_kwargs=weights_func_kwargs,
+                        zarr_options={
+                            "ome_zarr": True,
+                            "ngff_version": NGFF_VERSION,
+                            "overwrite": False,
+                            "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(
+                                tuple(sims[0].dims)
+                            ),
+                        },
+                        batch_options={
+                            "n_batch": resolved_batch_size,
+                            "batch_func": batch_func,
+                            "batch_func_kwargs": batch_func_kwargs,
+                        },
+                        backend=FUSION_BACKEND,
+                    )
             log(f"Finished multiview-stitcher fusion.fuse scale0 write for channel {channel}")
             log(
                 "Fusion scale0 output after package write: "
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
             )
-            if args.fusion_compressor == "jpegxr":
-                if recompressed_output is None:
-                    raise RuntimeError("JPEG-XR recompression output was not initialized")
-                with heartbeat(f"JPEG-XR z-plane recompression channel {channel}"):
-                    recompress_ome_zarr_to_jpegxr(
-                        fusion_output,
-                        recompressed_output,
-                        jpegxr_level=args.jpegxr_level,
-                    )
-                if channel_output.exists():
-                    raise FileExistsError(f"{channel_output} appeared during JPEG-XR recompression")
-                recompressed_output.rename(channel_output)
-                log(f"Moved completed JPEG-XR output to {channel_output}")
-            else:
-                with heartbeat(f"completed Zarr pyramid channel {channel}"):
-                    build_ome_zarr_pyramid_from_scale0(fusion_output)
-                log(
-                    "Fusion output after completed-Zarr pyramid write: "
-                    f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
-                )
+            with heartbeat(f"completed Zarr pyramid channel {channel}"):
+                build_ome_zarr_pyramid_from_scale0(fusion_output)
+            mark_ome_zarr_complete(fusion_output)
+            log(
+                "Fusion output after completed-Zarr pyramid write: "
+                f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
+            )
+            if channel_output.exists():
+                raise FileExistsError(f"{channel_output} appeared during fusion")
+            fusion_output.rename(channel_output)
+            log(f"Moved completed fusion output to {channel_output}")
         finally:
             if temp_workspace is not None:
                 temp_workspace.cleanup()
@@ -6774,7 +7286,8 @@ def run_shared_reference_geometry_registration(
 
     require_cuda_for_robust_boundary()
     log(f"Input directory: {input_dir}")
-    log(f"Flatfield directory: {flatfield_dir}")
+    if flatfield_dir is not None:
+        log(f"Flatfield directory: {flatfield_dir}")
     log(f"Loading shared reference registration params from {reference_registration_input.resolve()}")
     reference_params = load_registration_params(reference_registration_input.resolve(), tiles)
     log_transform_translation_summary("Shared reference registration", reference_params)
@@ -6905,11 +7418,7 @@ def main() -> int:
         if args.robust_boundary_qc_dir is not None
         else input_dir / "robust-boundary-qc"
     )
-    flatfield_dir = (
-        args.flatfield_dir.resolve()
-        if args.flatfield_dir is not None
-        else input_dir / "basic_nz25_pooled"
-    )
+    flatfield_dir = args.flatfield_dir.resolve() if args.flatfield_dir is not None else None
     flatfield_source_views = [view for view, _path in args.flatfield_dir_by_source_view]
     duplicate_flatfield_views = sorted(
         view
@@ -6927,7 +7436,11 @@ def main() -> int:
     }
     position_input = args.position_input.resolve() if args.position_input is not None else None
     if position_input is not None:
-        tiles = read_position_input_tiles(position_input)
+        tiles = read_position_input_tiles(
+            position_input,
+            input_dir=input_dir,
+            registration_input=registration_input,
+        )
         log(f"Read position-input metadata: {position_input}")
     elif registration_input is not None:
         tiles = read_registration_input_tiles(registration_input)

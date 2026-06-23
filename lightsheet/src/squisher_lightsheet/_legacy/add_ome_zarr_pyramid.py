@@ -14,6 +14,12 @@ from typing import Any
 import cupy as cp
 from cucim.skimage.measure import block_reduce
 import numpy as np
+from squisher_lightsheet.pyramid import (
+    chunk_count,
+    chunk_slices,
+    level_coordinate_transformations,
+    pyramid_relative_factors,
+)
 import zarr
 from zarr.codecs import BytesCodec, ZstdCodec
 
@@ -23,31 +29,6 @@ ZSTD_LEVEL = 0
 
 def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
-
-
-def ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
-
-
-def chunk_count(shape: tuple[int, ...], chunks: tuple[int, ...]) -> int:
-    count = 1
-    for size, chunk_size in zip(shape, chunks, strict=True):
-        count *= ceil_div(int(size), int(chunk_size))
-    return count
-
-
-def chunk_slices(shape: tuple[int, ...], chunks: tuple[int, ...]):
-    import itertools
-
-    ranges = [
-        range(0, int(size), int(chunk_size))
-        for size, chunk_size in zip(shape, chunks, strict=True)
-    ]
-    for starts in itertools.product(*ranges):
-        yield tuple(
-            slice(start, min(start + chunk_size, size))
-            for start, size, chunk_size in zip(starts, shape, chunks, strict=True)
-        )
 
 
 def root_metadata_path(path: Path) -> Path:
@@ -72,34 +53,8 @@ def write_root_payload(path: Path, payload: dict[str, Any]) -> None:
     root_metadata_path(path).write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def pyramid_relative_factors(shape: tuple[int, ...], dims: tuple[str, ...]) -> dict[str, int]:
-    factors = {}
-    for dim, size in zip(dims, shape, strict=True):
-        if dim in {"z", "y", "x"} and int(size) // 2 > 100:
-            factors[dim] = 2
-        else:
-            factors[dim] = 1
-    return factors
-
-
 def output_shape(shape: tuple[int, ...], dims: tuple[str, ...], factors: dict[str, int]) -> tuple[int, ...]:
     return tuple(int(size) // int(factors[dim]) for size, dim in zip(shape, dims, strict=True))
-
-
-def level_coordinate_transformations(
-    base_transforms: list[dict[str, Any]],
-    axes: list[dict[str, Any]],
-    abs_factors: dict[str, int],
-) -> list[dict[str, Any]]:
-    transforms = copy.deepcopy(base_transforms)
-    for transform in transforms:
-        if transform.get("type") != "scale":
-            continue
-        transform["scale"] = [
-            float(value) * abs_factors.get(axis["name"], 1)
-            for value, axis in zip(transform["scale"], axes, strict=True)
-        ]
-    return transforms
 
 
 def reduced_chunk(source: zarr.Array, selection: tuple[slice, ...], factors: tuple[int, ...]) -> np.ndarray:
@@ -111,8 +66,9 @@ def reduced_chunk(source: zarr.Array, selection: tuple[slice, ...], factors: tup
     reduced = block_reduce(source_data, block_size=factors, func=cp.mean)
     dtype = np.dtype(source.dtype)
     if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
         reduced = cp.rint(reduced)
-        reduced = cp.clip(reduced, 0, np.iinfo(dtype).max)
+        reduced = cp.clip(reduced, info.min, info.max)
     return cp.asnumpy(reduced.astype(dtype, copy=False))
 
 
