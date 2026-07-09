@@ -6,6 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+from loguru import logger
+import numpy as np
+
 from squisher_lightsheet.channel_optimization import optimize_405_to_488_translation_mapping
 from squisher_lightsheet.legacy_runner import command_text
 from squisher_lightsheet.mvs_seams import (
@@ -14,8 +17,6 @@ from squisher_lightsheet.mvs_seams import (
     recover_anchor_shifts_from_mvs_seams,
 )
 from squisher_lightsheet.qc import render_registration_qc
-
-import numpy as np
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,9 @@ def _run_script(script_dir: Path, script_name: str, args: list[str], *, dry_run:
     command = [sys.executable, str(script_dir / script_name), *args]
     text = command_text(command)
     if dry_run:
-        print(f"DRY RUN not executed: {text}", flush=True)
+        logger.info("DRY RUN not executed: {}", text)
         return text
-    print(text, flush=True)
+    logger.info(text)
     subprocess.run(command, check=True)
     return text
 
@@ -112,7 +113,7 @@ def recover_405_488_mvs_seam_anchors(
         f"output_dir={output_dir})"
     )
     if dry_run:
-        print(f"DRY RUN not executed: {summary}", flush=True)
+        logger.info("DRY RUN not executed: {}", summary)
         return summary
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +132,7 @@ def recover_405_488_mvs_seam_anchors(
         mvs_registration=mvs_payload,
         spacing_um_zyx=spacing_um,
         min_quality=min_quality,
-        used_edges_only=True,
+        used_edges_only=False,
     )
     rows = []
     for record in mvs_payload["tiles"]:
@@ -231,7 +232,7 @@ def optimize_405_to_488_translations(
         f"level={qc_level})"
     )
     if dry_run:
-        print(f"DRY RUN not executed: {summary}", flush=True)
+        logger.info("DRY RUN not executed: {}", summary)
         return summary
     qc_dir = qc_output_dir or output_registration.parent / "registration-qc"
     optimize_405_to_488_translation_mapping(

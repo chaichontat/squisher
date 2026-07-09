@@ -15,9 +15,11 @@ import copy
 from datetime import datetime
 import hashlib
 import io
+from itertools import product
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 import sys
@@ -27,9 +29,11 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 import numpy as np
 from squisher_lightsheet.parsing import parse_source_view_path_entry
 from squisher_lightsheet import pyramid as pyramid_core
+from squisher_lightsheet import qc as qc_core
 from squisher_lightsheet import seams as seam_core
 from squisher_lightsheet.tiff import tiff_series_level_count
 from zarr.abc.codec import ArrayBytesCodec
@@ -38,6 +42,7 @@ from zarr.abc.codec import ArrayBytesCodec
 try:
     profile
 except NameError:
+
     def profile(func):
         return func
 
@@ -46,11 +51,15 @@ TRANSFORM_KEY = "stage_metadata"
 REGISTERED_TRANSFORM_KEY = "translation_registered"
 FUSION_BACKEND = "cupy"
 DEFAULT_REGISTRATION_READ_CHUNK_Z = 128
+DEFAULT_IN_MEMORY_CACHE_MAX_GIB = 64.0
+DEFAULT_REGISTRATION_CACHE_MAX_GIB = DEFAULT_IN_MEMORY_CACHE_MAX_GIB
+DEFAULT_BASIC_CACHE_MAX_GIB = DEFAULT_IN_MEMORY_CACHE_MAX_GIB
+DEFAULT_N_PARALLEL_PAIRWISE_REGS = 1
 PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
-DEFAULT_REGISTRATION_PAIR_MODE = "package"
-DEFAULT_COARSE_REG_RES_LEVELS = (2,)
+DEFAULT_REGISTRATION_PAIR_MODE = "axis-aligned"
+DEFAULT_COARSE_REG_RES_LEVELS = (0,)
 MVS_GROUPWISE_RESOLUTION_METHOD = "global_optimization"
-MVS_GROUPWISE_TRANSFORM = "rigid"
+MVS_GROUPWISE_TRANSFORM = "translation"
 MVS_POST_QUALITY_THRESHOLD = 0.25
 NATIVE_REG3D_LIB_DIR = Path("/home/chaichontat/microImageLib/bin/linux")
 NATIVE_REG3D_WRAPPER_DIR = Path("/home/chaichontat/nvme/lightsheet/231-Ptprz1")
@@ -62,7 +71,9 @@ ZSTD_LEVEL = 0
 DEFAULT_JPEGXR_LEVEL = 0.7
 JPEGXR_CODEC_NAME = "fishtools.jpegxr"
 _JPEGXR_CODEC_REGISTERED = False
-_LOG_FILE: Path | None = None
+_LOG_FILE_SINK_ID: int | None = None
+_FUSION_VIEW_CANDIDATE_PLAN_PATHS: dict[str, str] = {}
+_MVS_VIEW_CANDIDATE_PLANS: dict[str, dict[tuple[int, ...], list[int]]] = {}
 
 
 @dataclass(frozen=True)
@@ -85,9 +96,7 @@ def cupy_cleanup_context(per_chunk_cleanup: bool):
     def skip_cupy_cleanup():
         return False
 
-    originals: list[tuple[Any, str, Any]] = [
-        (misc_utils, "clear_cupy_memory", misc_utils.clear_cupy_memory)
-    ]
+    originals: list[tuple[Any, str, Any]] = [(misc_utils, "clear_cupy_memory", misc_utils.clear_cupy_memory)]
     try:
         from multiview_stitcher import weights
 
@@ -104,6 +113,31 @@ def cupy_cleanup_context(per_chunk_cleanup: bool):
         originals[0][2]()
         for module, name, original in originals:
             setattr(module, name, original)
+
+
+@contextmanager
+def inplace_mvs_normalize_weights_context():
+    from multiview_stitcher import weights as mvs_weights
+
+    original = mvs_weights.normalize_weights
+
+    def normalize_weights_inplace(weights):
+        try:
+            import cupy as cp
+        except ImportError:  # pragma: no cover - depends on runtime environment
+            cp = None
+
+        xp = cp if cp is not None and isinstance(weights, cp.ndarray) else np
+        wsum = xp.nansum(weights, axis=0)
+        xp.copyto(wsum, 1, where=wsum == 0)
+        xp.divide(weights, wsum, out=weights)
+        return weights
+
+    try:
+        mvs_weights.normalize_weights = normalize_weights_inplace
+        yield
+    finally:
+        mvs_weights.normalize_weights = original
 
 
 def basic_array_fingerprint(array: np.ndarray) -> str:
@@ -178,9 +212,13 @@ def temporary_basic_disk_cache_dir(base_dir: Path | None, output: Path):
 def normalize_or_uniform_valid(weights, valid, xp):
     totals = xp.sum(weights, axis=0, keepdims=True)
     zero_quality = (totals <= 0.0) & xp.any(valid, axis=0, keepdims=True)
-    weights = xp.where(zero_quality & valid, 1.0, weights)
+    xp.copyto(weights, 1.0, where=zero_quality & valid)
     totals = xp.sum(weights, axis=0, keepdims=True)
-    return xp.where(totals > 0.0, weights / totals, 0.0)
+    nonzero = totals > 0.0
+    totals = xp.where(nonzero, totals, 1.0)
+    xp.divide(weights, totals, out=weights)
+    xp.multiply(weights, nonzero, out=weights)
+    return weights
 
 
 def coarse_preibisch_content_weights(
@@ -233,17 +271,23 @@ def coarse_preibisch_content_weights(
     crop = (slice(None),) + tuple(slice(0, size) for size in transformed_views.shape[1:])
     weights = weights[crop]
 
-    valid_full = (blending_weights > 1e-7) & ~xp.isnan(transformed_views)
-    weights = xp.where(valid_full, weights * blending_weights, 0.0)
+    valid_full = blending_weights > 1e-7
+    xp.logical_and(valid_full, ~xp.isnan(transformed_views), out=valid_full)
+    xp.multiply(weights, blending_weights, out=weights)
+    xp.multiply(weights, valid_full, out=weights)
     weights = normalize_or_uniform_valid(weights, valid_full, xp)
     if softmax_exponent > 1.0:
         eps = xp.asarray(1e-12, dtype=weights.dtype)
-        weights = xp.where(valid_full, xp.power(xp.maximum(weights, eps), float(softmax_exponent)), 0.0)
+        xp.maximum(weights, eps, out=weights)
+        xp.power(weights, float(softmax_exponent), out=weights)
+        xp.multiply(weights, valid_full, out=weights)
         weights = normalize_or_uniform_valid(weights, valid_full, xp)
     return weights.astype(xp.float32, copy=False)
 
 
-def fusion_weight_config(args: argparse.Namespace, resolved_chunksize: dict[str, int]) -> tuple[Any | None, dict[str, Any] | None]:
+def fusion_weight_config(
+    args: argparse.Namespace, resolved_chunksize: dict[str, int]
+) -> tuple[Any | None, dict[str, Any] | None]:
     if args.fusion_weight_mode == "geometric":
         return None, None
 
@@ -255,9 +299,7 @@ def fusion_weight_config(args: argparse.Namespace, resolved_chunksize: dict[str,
         if args.content_dct_exponent <= 0.0:
             raise ValueError("--content-dct-exponent must be positive")
         otf_support_fraction = (
-            None
-            if args.content_dct_otf_support_fraction < 0.0
-            else float(args.content_dct_otf_support_fraction)
+            None if args.content_dct_otf_support_fraction < 0.0 else float(args.content_dct_otf_support_fraction)
         )
         return fusion_core.weights.content_based_dct, {
             "dct_size": int(args.content_dct_size),
@@ -375,20 +417,24 @@ def register_jpegxr_zarr_v3_codec() -> None:
 
 
 def configure_log_file(path: Path | None) -> None:
-    global _LOG_FILE
-    _LOG_FILE = path.resolve() if path is not None else None
-    if _LOG_FILE is not None:
-        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _LOG_FILE.write_text("")
+    global _LOG_FILE_SINK_ID
+    if _LOG_FILE_SINK_ID is not None:
+        logger.remove(_LOG_FILE_SINK_ID)
+        _LOG_FILE_SINK_ID = None
+    log_file = path.resolve() if path is not None else None
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        _LOG_FILE_SINK_ID = logger.add(
+            log_file,
+            mode="w",
+            enqueue=True,
+            level="INFO",
+            format="[{time:YYYY-MM-DD HH:mm:ss}] {message}",
+        )
 
 
 def log(message: str) -> None:
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-    print(line, flush=True)
-    if _LOG_FILE is not None:
-        with _LOG_FILE.open("a") as handle:
-            handle.write(line + "\n")
-            handle.flush()
+    logger.info(message)
 
 
 def current_rss_gb() -> float | None:
@@ -400,6 +446,27 @@ def current_rss_gb() -> float | None:
         if line.startswith("VmRSS:"):
             return int(line.split()[1]) / 1024 / 1024
     return None
+
+
+def current_io_bytes() -> dict[str, int]:
+    io_path = Path("/proc/self/io")
+    if not io_path.exists():
+        return {}
+
+    values: dict[str, int] = {}
+    for line in io_path.read_text().splitlines():
+        key, raw_value = line.split(":", maxsplit=1)
+        if key in {"read_bytes", "write_bytes", "rchar", "wchar"}:
+            values[key] = int(raw_value.strip())
+    return values
+
+
+def format_io_delta(start: dict[str, int], end: dict[str, int]) -> str:
+    parts = []
+    for key in ("read_bytes", "write_bytes", "rchar", "wchar"):
+        if key in start and key in end:
+            parts.append(f"{key}={format_bytes(end[key] - start[key])}")
+    return ", ".join(parts) if parts else "unavailable"
 
 
 def format_bytes(size: int) -> str:
@@ -580,14 +647,8 @@ def dask_progress(label: str, *, every_seconds: int = 10):
                 total_tasks = self.total_tasks
                 started_tasks = self.started_tasks
                 finished_tasks = self.finished_tasks
-                running = ", ".join(
-                    f"{family}={count}"
-                    for family, count in self.running_families.most_common(5)
-                )
-                completed = ", ".join(
-                    f"{family}={count}"
-                    for family, count in self.completed_families.most_common(5)
-                )
+                running = ", ".join(f"{family}={count}" for family, count in self.running_families.most_common(5))
+                completed = ", ".join(f"{family}={count}" for family, count in self.completed_families.most_common(5))
             elapsed = time.monotonic() - self.started_at
             percent = 100 * finished_tasks / total_tasks if total_tasks else 0.0
             rss_gb = current_rss_gb()
@@ -756,9 +817,7 @@ def parse_track_metadata(
             ),
         )
 
-    channel_index_by_zeiss_id = {
-        zeiss_id: index for index, zeiss_id in enumerate(zeiss_channel_ids[:channel_count])
-    }
+    channel_index_by_zeiss_id = {zeiss_id: index for index, zeiss_id in enumerate(zeiss_channel_ids[:channel_count])}
     tracks: list[TrackMetadata] = []
     assigned_channels: set[int] = set()
     for index, track_elem in enumerate(elem for elem in root.iter() if local_name(elem.tag) == "Track"):
@@ -811,7 +870,136 @@ def parse_track_metadata(
     return tuple(tracks)
 
 
+def is_ome_zarr_path(path: Path) -> bool:
+    return path.is_dir() and (path.name.endswith(".zarr") or (path / "zarr.json").exists() or (path / ".zgroup").exists())
+
+
+def _ome_zarr_dataset_paths(group: Any) -> list[str]:
+    attrs = dict(group.attrs)
+    multiscales = attrs.get("multiscales")
+    if isinstance(multiscales, list) and multiscales:
+        datasets = multiscales[0].get("datasets")
+        if isinstance(datasets, list):
+            paths = [record.get("path") for record in datasets if isinstance(record, dict)]
+            paths = [str(path) for path in paths if isinstance(path, str) and path]
+            if paths:
+                return paths
+
+    def sort_key(value: str) -> tuple[int, int | str]:
+        return (0, int(value)) if value.isdigit() else (1, value)
+
+    return sorted((str(key) for key in group.keys()), key=sort_key)
+
+
+def _ome_zarr_level_count(path: Path) -> int:
+    import zarr
+
+    group = zarr.open_group(str(path), mode="r")
+    return len(_ome_zarr_dataset_paths(group))
+
+
+def _open_ome_zarr_level_array(path: Path, *, source_level: int = 0):
+    import zarr
+
+    group = zarr.open_group(str(path), mode="r")
+    dataset_paths = _ome_zarr_dataset_paths(group)
+    if not dataset_paths:
+        raise ValueError(f"{path} does not contain any OME-Zarr datasets")
+    if source_level < 0 or source_level >= len(dataset_paths):
+        raise ValueError(f"{path} has {len(dataset_paths)} OME-Zarr level(s), cannot open level {source_level}")
+    return group[dataset_paths[source_level]]
+
+
+def _ome_zarr_axes(group: Any, array: Any) -> str:
+    raw_dims = array.attrs.get("_ARRAY_DIMENSIONS")
+    if isinstance(raw_dims, list) and raw_dims:
+        names = [str(dim).lower() for dim in raw_dims]
+    else:
+        names = []
+        multiscales = dict(group.attrs).get("multiscales")
+        if isinstance(multiscales, list) and multiscales:
+            raw_axes = multiscales[0].get("axes")
+            if isinstance(raw_axes, list):
+                for axis in raw_axes:
+                    if isinstance(axis, dict) and isinstance(axis.get("name"), str):
+                        names.append(axis["name"].lower())
+    axes = "".join(name.upper() for name in names)
+    if axes not in {"ZYX", "CZYX"}:
+        raise ValueError(f"Expected OME-Zarr axes ZYX or CZYX, got {axes or names!r}")
+    return axes
+
+
+def _ome_zarr_scale_translation(
+    group: Any,
+    dataset_index: int,
+    axes: str,
+) -> tuple[dict[str, float], dict[str, float], bool]:
+    axis_names = [axis.lower() for axis in axes]
+    spacing = {"z": 1.0, "y": 1.0, "x": 1.0}
+    translation = {"z": 0.0, "y": 0.0, "x": 0.0}
+    has_scale = False
+    multiscales = dict(group.attrs).get("multiscales")
+    if not isinstance(multiscales, list) or not multiscales:
+        return spacing, translation, has_scale
+    datasets = multiscales[0].get("datasets")
+    if not isinstance(datasets, list) or dataset_index >= len(datasets):
+        return spacing, translation, has_scale
+    dataset = datasets[dataset_index]
+    if not isinstance(dataset, dict):
+        return spacing, translation, has_scale
+    transforms = dataset.get("coordinateTransformations", [])
+    if not isinstance(transforms, list):
+        return spacing, translation, has_scale
+    for transform in transforms:
+        if not isinstance(transform, dict):
+            continue
+        transform_type = transform.get("type")
+        values = transform.get(transform_type) if transform_type in {"scale", "translation"} else None
+        if not isinstance(values, list) or len(values) != len(axis_names):
+            continue
+        target = spacing if transform_type == "scale" else translation
+        for dim in ("z", "y", "x"):
+            if dim in axis_names:
+                target[dim] = float(values[axis_names.index(dim)])
+        has_scale |= transform_type == "scale"
+    return spacing, translation, has_scale
+
+
+def parse_ome_zarr_metadata(path: Path) -> TileMetadata:
+    import zarr
+
+    group = zarr.open_group(str(path), mode="r")
+    dataset_paths = _ome_zarr_dataset_paths(group)
+    if not dataset_paths:
+        raise ValueError(f"{path} does not contain any OME-Zarr datasets")
+    array = group[dataset_paths[0]]
+    axes = _ome_zarr_axes(group, array)
+    shape = tuple(int(value) for value in array.shape)
+    channel_count = normalized_czyx_shape(axes, shape)[0]
+    channels = tuple(str(index) for index in range(channel_count))
+    spacing, translation, _has_scale = _ome_zarr_scale_translation(group, 0, axes)
+    return TileMetadata(
+        path=path,
+        shape=shape,
+        axes=axes,
+        spacing=spacing,
+        translation=translation,
+        channels=channels,
+        tracks=(
+            TrackMetadata(
+                slug="track0",
+                track_id="all",
+                channels=tuple(range(channel_count)),
+                channel_names=channels,
+            ),
+        ),
+    )
+
+
 def parse_ome_metadata(path: Path) -> TileMetadata:
+    if is_ome_zarr_path(path):
+        return parse_ome_zarr_metadata(path)
+
     import tifffile
 
     with tifffile.TiffFile(path) as tif:
@@ -936,11 +1124,7 @@ def cached_metadata_record_to_tile(
         translation={dim: float(translation[dim]) for dim in ("z", "y", "x")},
         channels=channels,
         tracks=tracks,
-        stage_scale=(
-            {dim: float(stage_scale[dim]) for dim in ("z", "y", "x")}
-            if stage_scale is not None
-            else None
-        ),
+        stage_scale=({dim: float(stage_scale[dim]) for dim in ("z", "y", "x")} if stage_scale is not None else None),
         source_view=source_view,
     )
 
@@ -989,17 +1173,15 @@ def clone_tile_metadata(
     path: Path,
     translation: dict[str, float],
     stage_scale: dict[str, float] | None,
-    source_view: str | None,
+    spacing: dict[str, float] | None = None,
+    source_view: str | None = None,
 ) -> TileMetadata:
     return replace(
         template,
         path=path,
+        spacing=template.spacing if spacing is None else {dim: float(spacing[dim]) for dim in ("z", "y", "x")},
         translation={dim: float(translation[dim]) for dim in ("z", "y", "x")},
-        stage_scale=(
-            {dim: float(stage_scale[dim]) for dim in ("z", "y", "x")}
-            if stage_scale is not None
-            else None
-        ),
+        stage_scale=({dim: float(stage_scale[dim]) for dim in ("z", "y", "x")} if stage_scale is not None else None),
         source_view=source_view,
     )
 
@@ -1019,6 +1201,7 @@ def validate_tiles_metadata(
     *,
     require_same_shape: bool,
     require_same_spacing: bool = True,
+    require_same_yx_when_variable: bool = True,
 ) -> None:
     if not tiles:
         raise ValueError("Expected at least one tile")
@@ -1039,10 +1222,9 @@ def validate_tiles_metadata(
         c_yx_shapes = {(tile.shape[0], tile.shape[2], tile.shape[3]) for tile in tiles}
     else:
         c_yx_shapes = {(1, tile.shape[1], tile.shape[2]) for tile in tiles}
-    if not require_same_shape and len(c_yx_shapes) != 1:
+    if not require_same_shape and require_same_yx_when_variable and len(c_yx_shapes) != 1:
         raise ValueError(
-            "Expected position-file tiles to have the same channel/y/x shape; "
-            f"found {sorted(c_yx_shapes)}"
+            f"Expected position-file tiles to have the same channel/y/x shape; found {sorted(c_yx_shapes)}"
         )
     if require_same_spacing and len(spacings) != 1:
         raise ValueError("Expected all tiles to have the same physical spacing")
@@ -1096,6 +1278,14 @@ def _shape_zyx_from_axes(axes: str, shape: tuple[int, ...]) -> tuple[int, int, i
     raise ValueError(f"Expected CZYX or ZYX axes, got {axes}")
 
 
+def source_axes_from_shape(tile_axes: str, source_shape: tuple[int, ...]) -> str:
+    if len(source_shape) == len(tile_axes):
+        return tile_axes
+    if tile_axes == "CZYX" and len(source_shape) == 3:
+        return "ZYX"
+    raise ValueError(f"Expected source shape rank to match {tile_axes} or ZYX, got shape {source_shape}")
+
+
 def tile_shape_zyx(tile: TileMetadata) -> tuple[int, int, int]:
     return _shape_zyx_from_axes(tile.axes, tile.shape)
 
@@ -1106,7 +1296,7 @@ def fusion_source_level_for_tile(tile: TileMetadata, requested_level: int) -> tu
     if requested_level == 0:
         return 0, 1
 
-    available_levels = tiff_series_level_count(tile.path)
+    available_levels = _ome_zarr_level_count(tile.path) if is_ome_zarr_path(tile.path) else tiff_series_level_count(tile.path)
     return min(requested_level, max(0, available_levels - 1)), available_levels
 
 
@@ -1123,14 +1313,15 @@ def registration_source_level_for_tiles(
     requested_level = min(concrete_levels)
     if requested_level <= 0:
         return 0, 1, 0
-    available_level_counts = [tiff_series_level_count(tile.path) for tile in tiles]
-    available_levels = min(available_level_counts)
+    first_tile = tiles[0]
+    available_levels = (
+        _ome_zarr_level_count(first_tile.path) if is_ome_zarr_path(first_tile.path) else tiff_series_level_count(first_tile.path)
+    )
     source_level = min(requested_level, max(0, available_levels - 1))
-    if len(set(available_level_counts)) > 1:
-        log(
-            "Registration TIFF source levels differ across tiles; "
-            f"using common source level {source_level} from min available {available_levels}"
-        )
+    log(
+        "Assuming identical registration TIFF source levels across tiles; "
+        f"using first tile {first_tile.path.name}: level{source_level}/available{available_levels}"
+    )
     return source_level, available_levels, source_level
 
 
@@ -1149,21 +1340,60 @@ def fusion_tile_for_source_array(
     if source_level == 0:
         return tile
 
-    full_shape_zyx = tile_shape_zyx(tile)
-    source_shape_zyx = _shape_zyx_from_axes(tile.axes, tuple(int(value) for value in source_shape))
+    source_axes = source_axes_from_shape(tile.axes, tuple(int(value) for value in source_shape))
+    source_shape_zyx = _shape_zyx_from_axes(source_axes, tuple(int(value) for value in source_shape))
     if any(size <= 0 for size in source_shape_zyx):
         raise ValueError(f"{tile.path} source level {source_level} has invalid shape {source_shape}")
 
     base_stage_scale = tile_stage_scale(tile)
-    scaled_stage_scale = {
-        dim: base_stage_scale[dim] * full_shape_zyx[index] / source_shape_zyx[index]
-        for index, dim in enumerate(("z", "y", "x"))
-    }
+    translation = tile.translation
+    if is_ome_zarr_path(tile.path):
+        import zarr
+
+        group = zarr.open_group(str(tile.path), mode="r")
+        dataset_paths = _ome_zarr_dataset_paths(group)
+        if source_level >= len(dataset_paths):
+            raise ValueError(f"{tile.path} has no OME-Zarr dataset for source level {source_level}")
+        level_axes = _ome_zarr_axes(group, group[dataset_paths[source_level]])
+        if level_axes != source_axes:
+            raise ValueError(
+                f"{tile.path} source level {source_level} axes {level_axes} do not match opened array axes {source_axes}"
+            )
+        base_spacing, base_translation, base_has_scale = _ome_zarr_scale_translation(group, 0, tile.axes)
+        level_spacing, level_translation, level_has_scale = _ome_zarr_scale_translation(
+            group,
+            source_level,
+            source_axes,
+        )
+        if not base_has_scale or not level_has_scale:
+            raise ValueError(
+                f"{tile.path} OME-Zarr levels 0 and {source_level} must declare scale coordinateTransformations"
+            )
+        scaled_stage_scale = {}
+        translation = {}
+        for dim in ("z", "y", "x"):
+            if base_spacing[dim] <= 0 or level_spacing[dim] <= 0:
+                raise ValueError(f"{tile.path} OME-Zarr {dim} scale must be positive")
+            physical_per_ngff_unit = abs(base_stage_scale[dim]) / base_spacing[dim]
+            direction = -1.0 if base_stage_scale[dim] < 0 else 1.0
+            scaled_stage_scale[dim] = direction * level_spacing[dim] * physical_per_ngff_unit
+            translation[dim] = (
+                tile.translation[dim]
+                + direction * (level_translation[dim] - base_translation[dim]) * physical_per_ngff_unit
+            )
+    else:
+        full_shape_zyx = tile_shape_zyx(tile)
+        scaled_stage_scale = {
+            dim: base_stage_scale[dim] * full_shape_zyx[index] / source_shape_zyx[index]
+            for index, dim in enumerate(("z", "y", "x"))
+        }
     scaled_spacing = {dim: abs(scaled_stage_scale[dim]) for dim in ("z", "y", "x")}
     return replace(
         tile,
         shape=tuple(int(value) for value in source_shape),
+        axes=source_axes,
         spacing=scaled_spacing,
+        translation=translation,
         stage_scale=scaled_stage_scale,
     )
 
@@ -1185,9 +1415,77 @@ def tile_sim_translation(tile: TileMetadata) -> dict[str, float]:
     return translation
 
 
+def tile_spatial_coords(tile: TileMetadata) -> dict[str, np.ndarray]:
+    scale = tile_sim_scale(tile)
+    translation = tile_sim_translation(tile)
+    shape_zyx = tile_shape_zyx(tile)
+    return {
+        dim: translation[dim] + np.arange(shape_zyx[index], dtype=np.float64) * scale[dim]
+        for index, dim in enumerate(("z", "y", "x"))
+    }
+
+
 def tile_flip_axes_zyx(tile: TileMetadata) -> tuple[bool, bool, bool]:
     stage_scale = tile_stage_scale(tile)
     return tuple(stage_scale[dim] < 0 for dim in ("z", "y", "x"))
+
+
+def fusion_orientation_affine(tile: TileMetadata):
+    """Reflect negatively oriented source axes without wrapping the Zarr array."""
+    from multiview_stitcher import param_utils
+
+    origin = tile_sim_translation(tile)
+    spacing = tile_sim_scale(tile)
+    shape_zyx = tile_shape_zyx(tile)
+    stage_scale = tile_stage_scale(tile)
+    matrix = np.eye(4, dtype=np.float64)
+    for index, dim in enumerate(("z", "y", "x")):
+        if stage_scale[dim] >= 0:
+            continue
+        matrix[index, index] = -1.0
+        matrix[index, 3] = 2.0 * origin[dim] + (shape_zyx[index] - 1) * spacing[dim]
+    return param_utils.affine_to_xaffine(matrix)
+
+
+def reflected_fusion_output_stack_properties(
+    sims: list[Any],
+    *,
+    output_spacing: dict[str, float],
+    transform_key: str,
+) -> dict[str, dict[str, float | int]]:
+    """Bound reflected fusion output using transformed voxel centers."""
+    from multiview_stitcher import mv_graph, spatial_image_utils as si_utils, transformation
+
+    spatial_dims = tuple(si_utils.get_spatial_dims_from_sim(sims[0]))
+    spacing = np.asarray([float(output_spacing[dim]) for dim in spatial_dims], dtype=np.float64)
+    if np.any(spacing <= 0):
+        raise ValueError(f"Fusion output spacing must be positive, got {output_spacing}")
+
+    transformed_vertices = []
+    for sim in sims:
+        vertices = mv_graph.get_vertices_from_stack_props(si_utils.get_stack_properties_from_sim(sim))
+        affine = np.asarray(si_utils.get_affine_from_sim(sim, transform_key=transform_key), dtype=np.float64)
+        expected_shape = (len(spatial_dims) + 1, len(spatial_dims) + 1)
+        if affine.shape != expected_shape:
+            raise ValueError(f"Fusion transform must have shape {expected_shape}, got {affine.shape}")
+        transformed_vertices.append(transformation.transform_pts(vertices, affine))
+
+    vertices = np.concatenate(transformed_vertices, axis=0)
+    lower = np.min(vertices, axis=0)
+    upper = np.max(vertices, axis=0)
+    extent_pixels = (upper - lower) / spacing
+    rounded_extent = np.rint(extent_pixels)
+    extent_pixels = np.where(
+        np.isclose(extent_pixels, rounded_extent, rtol=1e-9, atol=1e-9),
+        rounded_extent,
+        extent_pixels,
+    )
+    shape = np.ceil(extent_pixels).astype(np.int64) + 1
+    return {
+        "origin": {dim: float(lower[index]) for index, dim in enumerate(spatial_dims)},
+        "spacing": {dim: float(spacing[index]) for index, dim in enumerate(spatial_dims)},
+        "shape": {dim: int(shape[index]) for index, dim in enumerate(spatial_dims)},
+    }
 
 
 def flip_spatial_array_for_stage_scale(array: Any, tile: TileMetadata, *, has_channel_axis: bool):
@@ -1225,8 +1523,7 @@ def resolve_position_tile_path(
         if candidate.exists():
             return candidate.resolve()
     raise FileNotFoundError(
-        f"{position_input} references missing tile {raw_path!r}; checked "
-        f"{[str(candidate) for candidate in candidates]}"
+        f"{position_input} references missing tile {raw_path!r}; checked {[str(candidate) for candidate in candidates]}"
     )
 
 
@@ -1285,6 +1582,14 @@ def read_position_input_tiles(
                 stage_scale=stage_scale,
                 source_view=source_view,
             )
+        elif is_ome_zarr_path(tile_path):
+            tile = clone_tile_metadata(
+                parse_ome_metadata(tile_path),
+                path=tile_path,
+                translation=translation,
+                stage_scale=stage_scale,
+                source_view=source_view,
+            )
         elif template_tile is None:
             template_tile = parse_ome_metadata(tile_path)
             tile = clone_tile_metadata(
@@ -1304,7 +1609,12 @@ def read_position_input_tiles(
             )
         tiles.append(tile)
 
-    validate_tiles_metadata(tiles, require_same_shape=False, require_same_spacing=False)
+    validate_tiles_metadata(
+        tiles,
+        require_same_shape=False,
+        require_same_spacing=False,
+        require_same_yx_when_variable=True,
+    )
     return tiles
 
 
@@ -1371,6 +1681,9 @@ def read_registration_input_tiles(registration_input: Path) -> list[TileMetadata
         source_view = record.get("source_view")
         if source_view is not None and not isinstance(source_view, str):
             raise ValueError(f"{registration_input} tile record {index} source_view must be a string")
+        zarr_spacing = (
+            {dim: abs(float(stage_scale[dim])) for dim in ("z", "y", "x")} if is_ome_zarr_path(tile_path) else None
+        )
 
         cached = cached_by_tile.get(tile_path.name)
         if cached is not None:
@@ -1388,6 +1701,7 @@ def read_registration_input_tiles(registration_input: Path) -> list[TileMetadata
                 path=tile_path,
                 translation=translation,
                 stage_scale=stage_scale,
+                spacing=zarr_spacing,
                 source_view=source_view,
             )
         else:
@@ -1396,6 +1710,7 @@ def read_registration_input_tiles(registration_input: Path) -> list[TileMetadata
                 path=tile_path,
                 translation=translation,
                 stage_scale=stage_scale,
+                spacing=zarr_spacing,
                 source_view=source_view,
             )
         tiles.append(tile)
@@ -1454,9 +1769,7 @@ def axis_aligned_registration_pairs(tiles: list[TileMetadata]) -> list[tuple[int
             dy = abs((left_center_y - right_center_y) * left.spacing["y"])
             dx = abs((left_center_x - right_center_x) * left.spacing["x"])
             cross_view_pair = (
-                left.source_view is not None
-                and right.source_view is not None
-                and left.source_view != right.source_view
+                left.source_view is not None and right.source_view is not None and left.source_view != right.source_view
             )
             if cross_view_pair:
                 continue
@@ -1611,8 +1924,7 @@ def sample_boundary_patches(
     settings: RobustBoundarySettings,
 ) -> list[BoundaryPatchSpec]:
     bounds = [
-        tile_registered_bounds_zyx(tile, None if params is None else params[index])
-        for index, tile in enumerate(tiles)
+        tile_registered_bounds_zyx(tile, None if params is None else params[index]) for index, tile in enumerate(tiles)
     ]
     return seam_core.sample_boundary_patches_from_bounds(
         tile_shapes_zyx=[tile_shape_zyx(tile) for tile in tiles],
@@ -1729,22 +2041,32 @@ def cupy_pairwise_phase_correlation_registration(
     import cupy as cp
     from multiview_stitcher import param_utils
 
-    fixed = cp.asarray(np.asarray(fixed_data.data, dtype=np.float32))
-    moving = cp.asarray(np.asarray(moving_data.data, dtype=np.float32))
-    finite = cp.isfinite(fixed) & cp.isfinite(moving)
-    if int(cp.count_nonzero(finite).get()) < 8:
-        return {
-            "affine_matrix": param_utils.affine_from_translation([0.0] * fixed.ndim),
-            "quality": float("nan"),
-        }
-
-    fixed = cp.where(cp.isfinite(fixed), fixed, 0.0)
-    moving = cp.where(cp.isfinite(moving), moving, 0.0)
-    shift, peak = phase_correlation_shift_gpu_arrays(fixed, moving)
-    return {
-        "affine_matrix": param_utils.affine_from_translation(list(shift)),
-        "quality": float(peak),
-    }
+    fixed = None
+    moving = None
+    finite = None
+    try:
+        fixed = cp.asarray(np.asarray(fixed_data.data, dtype=np.float32))
+        moving = cp.asarray(np.asarray(moving_data.data, dtype=np.float32))
+        finite = cp.isfinite(fixed) & cp.isfinite(moving)
+        if int(cp.count_nonzero(finite).get()) < 8:
+            result = {
+                "affine_matrix": param_utils.affine_from_translation([0.0] * fixed.ndim),
+                "quality": float("nan"),
+            }
+        else:
+            fixed = cp.where(cp.isfinite(fixed), fixed, 0.0)
+            moving = cp.where(cp.isfinite(moving), moving, 0.0)
+            shift, peak = phase_correlation_shift_gpu_arrays(fixed, moving)
+            result = {
+                "affine_matrix": param_utils.affine_from_translation(list(shift)),
+                "quality": float(peak),
+            }
+    finally:
+        del fixed, moving, finite
+        cp.fft.config.get_plan_cache().clear()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    return result
 
 
 def native_rigid_pairwise_registration(
@@ -1782,8 +2104,7 @@ def native_rigid_pairwise_registration(
     )
     if result.return_code != 0:
         raise RuntimeError(
-            "microImageLib reg_3dgpu "
-            f"method {NATIVE_REG3D_RIGID_METHOD} failed with return code {result.return_code}"
+            f"microImageLib reg_3dgpu method {NATIVE_REG3D_RIGID_METHOD} failed with return code {result.return_code}"
         )
 
     affine = np.eye(fixed.ndim + 1, dtype=np.float64)
@@ -2125,9 +2446,7 @@ def combine_channel_boundary_constraints(
         best = max(
             constraints,
             key=lambda constraint: (
-                constraint.correlation_after
-                if math.isfinite(constraint.correlation_after)
-                else float("-inf")
+                constraint.correlation_after if math.isfinite(constraint.correlation_after) else float("-inf")
             ),
         )
         return replace(
@@ -2142,10 +2461,7 @@ def combine_channel_boundary_constraints(
     if float(np.sum(weights)) <= 0.0:
         weights = np.ones(len(accepted), dtype=float)
     shifts = np.asarray([constraint.shift_zyx for constraint in accepted], dtype=float)
-    combined_shift = tuple(
-        quantize_phase_shift(float(value))
-        for value in np.average(shifts, axis=0, weights=weights)
-    )
+    combined_shift = tuple(quantize_phase_shift(float(value)) for value in np.average(shifts, axis=0, weights=weights))
     disagreement = np.max(np.abs(shifts - np.asarray(combined_shift, dtype=float)), axis=0)
     residual_scale = np.asarray(settings.max_final_residual_zyx, dtype=float)
     normalized_disagreement = float(np.max(disagreement / residual_scale))
@@ -2231,41 +2547,31 @@ def combine_channel_boundary_constraints(
         ),
         gradient_component_ncc_before=None if not math.isfinite(gradient_before) else gradient_before,
         gradient_component_ncc_after=None if not math.isfinite(gradient_after) else gradient_after,
-        gradient_component_ncc_improvement=(
-            None if not math.isfinite(gradient_improvement) else gradient_improvement
-        ),
+        gradient_component_ncc_improvement=(None if not math.isfinite(gradient_improvement) else gradient_improvement),
         fixed_center_z_p99=finite_weighted_average(
             [
-                constraint.fixed_center_z_p99
-                if constraint.fixed_center_z_p99 is not None
-                else float("nan")
+                constraint.fixed_center_z_p99 if constraint.fixed_center_z_p99 is not None else float("nan")
                 for constraint in accepted
             ],
             metric_weights,
         ),
         moving_center_z_p99=finite_weighted_average(
             [
-                constraint.moving_center_z_p99
-                if constraint.moving_center_z_p99 is not None
-                else float("nan")
+                constraint.moving_center_z_p99 if constraint.moving_center_z_p99 is not None else float("nan")
                 for constraint in accepted
             ],
             metric_weights,
         ),
         fixed_center_z_std=finite_weighted_average(
             [
-                constraint.fixed_center_z_std
-                if constraint.fixed_center_z_std is not None
-                else float("nan")
+                constraint.fixed_center_z_std if constraint.fixed_center_z_std is not None else float("nan")
                 for constraint in accepted
             ],
             metric_weights,
         ),
         moving_center_z_std=finite_weighted_average(
             [
-                constraint.moving_center_z_std
-                if constraint.moving_center_z_std is not None
-                else float("nan")
+                constraint.moving_center_z_std if constraint.moving_center_z_std is not None else float("nan")
                 for constraint in accepted
             ],
             metric_weights,
@@ -2443,10 +2749,7 @@ def choose_anchor_tile(tiles: list[TileMetadata], constraints: list[BoundaryCons
         bounds = tile_registered_bounds_zyx(tile)
         centers.append(tuple((bounds.start_zyx[index] + bounds.stop_zyx[index]) / 2 for index in range(3)))
     mosaic_center = tuple(sum(center[index] for center in centers) / len(centers) for index in range(3))
-    distances = [
-        sum((center[index] - mosaic_center[index]) ** 2 for index in range(3))
-        for center in centers
-    ]
+    distances = [sum((center[index] - mosaic_center[index]) ** 2 for index in range(3)) for center in centers]
     return int(min(range(len(tiles)), key=lambda index: distances[index]))
 
 
@@ -2483,7 +2786,7 @@ def solve_tile_corrections_zyx(
     fixed_axes: set[str] | None = None,
     reference_prior_weights_zyx: tuple[float, float, float] | None = None,
 ) -> list[tuple[float, float, float]]:
-    import numpy as np
+    """Solve constrained tile translations with one robust weight per seam patch."""
     from scipy.optimize import lsq_linear
 
     axis_to_index = {"z": 0, "y": 1, "x": 2}
@@ -2501,10 +2804,7 @@ def solve_tile_corrections_zyx(
         return [tuple(float(value) for value in row) for row in corrections]
 
     clamp = np.asarray(settings.max_correction_zyx, dtype=float)
-    prior_weights = np.asarray(
-        reference_prior_weights_zyx or (0.0, 0.0, 0.0),
-        dtype=float,
-    )
+    prior_weights = np.asarray(reference_prior_weights_zyx or (0.0, 0.0, 0.0), dtype=float)
     if np.any(prior_weights < 0.0):
         raise ValueError("Reference prior weights must be non-negative")
 
@@ -2523,23 +2823,11 @@ def solve_tile_corrections_zyx(
         dtype=np.intp,
         count=n_constraints,
     )
-    measured_shifts = np.asarray(
-        [constraint.shift_zyx for constraint in accepted],
-        dtype=float,
-    )
-    base_edge_weights = np.asarray(
-        [max(constraint.weight, 1e-6) for constraint in accepted],
-        dtype=float,
-    )
+    measured_shifts = np.asarray([constraint.shift_zyx for constraint in accepted], dtype=float)
+    base_edge_weights = np.asarray([max(constraint.weight, 1e-6) for constraint in accepted], dtype=float)
     edge_weights = base_edge_weights.copy()
 
-    # Each dimension has the same edge rows, but dimensions with an absolute
-    # prior include every tile as a variable. This avoids giving the selected
-    # anchor an unintended infinite-precision prior in y/x.
-    dimension_systems: dict[
-        int,
-        tuple[np.ndarray, np.ndarray, dict[int, int], np.ndarray],
-    ] = {}
+    dimension_systems: dict[int, tuple[np.ndarray, np.ndarray, dict[int, int], np.ndarray]] = {}
     design_cache: dict[bool, tuple[np.ndarray, dict[int, int]]] = {}
     sorted_connected_tiles = sorted(connected_tiles)
     for dim in active_dims:
@@ -2553,9 +2841,7 @@ def solve_tile_corrections_zyx(
             )
             if not variable_tiles:
                 continue
-            variable_index = {
-                tile: index for index, tile in enumerate(variable_tiles)
-            }
+            variable_index = {tile: index for index, tile in enumerate(variable_tiles)}
             edge_a = np.zeros((n_constraints, len(variable_tiles)), dtype=float)
             for row_index, constraint in enumerate(accepted):
                 moving_index = variable_index.get(constraint.moving)
@@ -2575,32 +2861,21 @@ def solve_tile_corrections_zyx(
 
         edge_b = measured_shifts[:, dim]
         if has_absolute_prior:
-            b = np.concatenate(
-                (edge_b, np.zeros(len(variable_index), dtype=float))
-            )
-            prior_row_weights = np.full(
-                len(variable_index),
-                prior_weights[dim],
-                dtype=float,
-            )
+            b = np.concatenate((edge_b, np.zeros(len(variable_index), dtype=float)))
+            prior_row_weights = np.full(len(variable_index), prior_weights[dim], dtype=float)
         else:
             b = edge_b
             prior_row_weights = np.empty(0, dtype=float)
-
         dimension_systems[dim] = (a, b, variable_index, prior_row_weights)
 
     if not dimension_systems:
         return [tuple(float(value) for value in row) for row in corrections]
 
-    # Preserve the existing scalar Huber control while respecting the existing
-    # anisotropic residual thresholds. With the defaults this is (4, 8, 8) px.
     max_residual = np.asarray(settings.max_final_residual_zyx, dtype=float)
     if np.any(max_residual <= 0.0):
         raise ValueError("Final residual thresholds must be positive")
     z_scale = max(max_residual[0], np.finfo(float).eps)
-    huber_delta_zyx = max_residual * (
-        max(float(settings.huber_delta), np.finfo(float).eps) / z_scale
-    )
+    huber_delta_zyx = max_residual * (max(float(settings.huber_delta), np.finfo(float).eps) / z_scale)
     solved_dims = sorted(dimension_systems)
 
     for _ in range(max(1, settings.irls_iterations)):
@@ -2620,25 +2895,16 @@ def solve_tile_corrections_zyx(
             )
             if not result.success:
                 raise RuntimeError(
-                    f"Tile correction solve failed for axis {('z', 'y', 'x')[dim]}: "
-                    f"{result.message}"
+                    f"Tile correction solve failed for axis {('z', 'y', 'x')[dim]}: {result.message}"
                 )
-            solution = np.asarray(result.x, dtype=float)
             for tile, index in variable_index.items():
-                corrections[tile, dim] = solution[index]
+                corrections[tile, dim] = float(result.x[index])
             if prior_weights[dim] <= 0.0:
                 corrections[anchor_tile, dim] = 0.0
 
-        # One robust inlier weight per patch vector. A gross mismatch in any
-        # solved axis downweights that patch in z/y/x together.
-        residuals = (
-            corrections[moving_tile_indices]
-            - corrections[fixed_tile_indices]
-            - measured_shifts
-        )
+        residuals = corrections[moving_tile_indices] - corrections[fixed_tile_indices] - measured_shifts
         normalized = np.abs(residuals[:, solved_dims]) / huber_delta_zyx[solved_dims]
-        robust_scale = np.maximum(1.0, np.max(normalized, axis=1))
-        next_edge_weights = base_edge_weights / robust_scale
+        next_edge_weights = base_edge_weights / np.maximum(1.0, np.max(normalized, axis=1))
         if np.allclose(next_edge_weights, edge_weights, rtol=1e-3, atol=1e-12):
             break
         edge_weights = next_edge_weights
@@ -2673,14 +2939,10 @@ def annotate_final_residuals(
         disconnected = (
             connected_tiles is not None
             and constraint.accepted
-            and (
-                constraint.fixed not in connected_tiles
-                or constraint.moving not in connected_tiles
-            )
+            and (constraint.fixed not in connected_tiles or constraint.moving not in connected_tiles)
         )
         high_residual = constraint.accepted and any(
-            abs(residual[index]) > max_residual[index]
-            for index in reject_dim_indices
+            abs(residual[index]) > max_residual[index] for index in reject_dim_indices
         )
         reject = disconnected or high_residual
         if disconnected:
@@ -2709,42 +2971,58 @@ def solve_tile_corrections_with_residual_rejection(
     reference_prior_weights_zyx: tuple[float, float, float] | None = None,
     residual_reject_axes: set[str] | None = None,
 ) -> tuple[list[tuple[float, float, float]], list[BoundaryConstraint], int]:
-    n_tiles = len(tiles)
     current = constraints
-    anchor_tile = choose_anchor_tile(tiles, current)
     hard_reject_axes = (
-        set(residual_reject_axes)
-        if residual_reject_axes is not None
-        else {"z", "y", "x"} - (fixed_axes or set())
+        set(residual_reject_axes) if residual_reject_axes is not None else {"z", "y", "x"} - (fixed_axes or set())
     )
+    if fixed_axes is not None or reference_prior_weights_zyx is not None:
+        anchor_tile = choose_anchor_tile(tiles, current)
+        for _ in range(len(constraints) + len(tiles) + 1):
+            connected_tiles = anchor_connected_tiles(len(tiles), current, anchor_tile)
+            corrections_zyx = solve_tile_corrections_zyx(
+                len(tiles),
+                current,
+                settings,
+                anchor_tile,
+                fixed_axes=fixed_axes,
+                reference_prior_weights_zyx=reference_prior_weights_zyx,
+            )
+            updated = annotate_final_residuals(
+                current,
+                corrections_zyx,
+                settings,
+                connected_tiles,
+                reject_axes=hard_reject_axes,
+            )
+            next_anchor_tile = choose_anchor_tile(tiles, updated)
+            if all(
+                before.accepted == after.accepted
+                for before, after in zip(current, updated, strict=True)
+            ) and next_anchor_tile == anchor_tile:
+                return corrections_zyx, updated, anchor_tile
+            current = updated
+            anchor_tile = next_anchor_tile
+        raise RuntimeError("Constrained residual rejection did not converge")
 
-    for _ in range(len(constraints) + n_tiles + 1):
-        connected_tiles = anchor_connected_tiles(n_tiles, current, anchor_tile)
-        corrections_zyx = solve_tile_corrections_zyx(
-            n_tiles,
+    for _ in range(len(constraints) + len(tiles) + 1):
+        corrections_zyx, mvs_annotated, anchor_tile = solve_tile_corrections_with_multiview_stitcher(
+            tiles,
             current,
             settings,
-            anchor_tile,
-            fixed_axes=fixed_axes,
-            reference_prior_weights_zyx=reference_prior_weights_zyx,
         )
+        connected_tiles = anchor_connected_tiles(len(tiles), mvs_annotated, anchor_tile)
         updated = annotate_final_residuals(
-            current,
+            mvs_annotated,
             corrections_zyx,
             settings,
             connected_tiles,
             reject_axes=hard_reject_axes,
         )
-        next_anchor_tile = choose_anchor_tile(tiles, updated)
-        if all(
-            before.accepted == after.accepted
-            for before, after in zip(current, updated, strict=True)
-        ) and next_anchor_tile == anchor_tile:
+        if all(before.accepted == after.accepted for before, after in zip(current, updated, strict=True)):
             return corrections_zyx, updated, anchor_tile
         current = updated
-        anchor_tile = next_anchor_tile
 
-    raise RuntimeError("Robust boundary residual rejection did not converge")
+    raise RuntimeError("Multiview-stitcher residual rejection did not converge")
 
 
 def seam_graph_edge_quality(constraints: list[BoundaryConstraint]) -> float:
@@ -2818,11 +3096,7 @@ def solve_tile_corrections_with_multiview_stitcher(
         shifts_px = np.asarray([constraint.shift_zyx for constraint in edge_constraints], dtype=float)
         weights = np.asarray([max(float(constraint.weight), 1e-6) for constraint in edge_constraints], dtype=float)
         if any(constraint.edge_status == "inlier_cluster" for constraint in edge_constraints):
-            selected = [
-                constraint
-                for constraint in edge_constraints
-                if constraint.edge_status == "inlier_cluster"
-            ]
+            selected = [constraint for constraint in edge_constraints if constraint.edge_status == "inlier_cluster"]
             shifts_px = np.asarray([constraint.shift_zyx for constraint in selected], dtype=float)
             weights = np.asarray([max(float(constraint.weight), 1e-6) for constraint in selected], dtype=float)
             edge_constraints = selected
@@ -2844,7 +3118,9 @@ def solve_tile_corrections_with_multiview_stitcher(
     if edge_count == 0:
         return [tuple(float(value) for value in row) for row in corrections], constraints, 0
 
-    anchor_tile = int(max(graph.nodes, key=lambda node: sum(graph.edges[edge]["quality"] for edge in graph.edges(node))))
+    anchor_tile = int(
+        max(graph.nodes, key=lambda node: sum(graph.edges[edge]["quality"] for edge in graph.edges(node)))
+    )
     params, info = param_resolution.groupwise_resolution(
         graph,
         method="global_optimization",
@@ -2858,11 +3134,7 @@ def solve_tile_corrections_with_multiview_stitcher(
         correction_um = np.asarray(param_utils.translation_from_affine(np.asarray(param)), dtype=float)
         corrections[int(tile_index)] = correction_um / np.asarray(spacing_zyx, dtype=float)
 
-    used_edges = {
-        tuple(edge)
-        for edges in (info.get("used_edges") or {}).values()
-        for edge in edges
-    }
+    used_edges = {tuple(edge) for edges in (info.get("used_edges") or {}).values() for edge in edges}
     if not used_edges:
         used_edges = {tuple(sorted(edge)) for edge in graph.edges}
 
@@ -3257,7 +3529,9 @@ def clamp_relative_affine_translations(
     clamped = []
     for index, param in enumerate(params):
         reference_data = (
-            np.asarray(reference_params[index].data if hasattr(reference_params[index], "data") else reference_params[index])
+            np.asarray(
+                reference_params[index].data if hasattr(reference_params[index], "data") else reference_params[index]
+            )
             if reference_params is not None
             else None
         )
@@ -3375,9 +3649,7 @@ def constraint_payload(constraint: BoundaryConstraint) -> dict[str, Any]:
         "accepted": constraint.accepted,
         "reject_reason": constraint.reject_reason,
         "final_residual_zyx": (
-            list(constraint.final_residual_zyx)
-            if constraint.final_residual_zyx is not None
-            else None
+            list(constraint.final_residual_zyx) if constraint.final_residual_zyx is not None else None
         ),
         "fixed_slices_zyx": slices_payload(constraint.fixed_slices),
         "moving_slices_zyx": slices_payload(constraint.moving_slices),
@@ -3396,10 +3668,7 @@ def robust_summary(
         math.sqrt(sum((constraint.final_residual_zyx or (0.0, 0.0, 0.0))[index] ** 2 for index in range(3)))
         for constraint in accepted
     ]
-    correction_norms = [
-        math.sqrt(sum(value * value for value in correction))
-        for correction in corrections_zyx
-    ]
+    correction_norms = [math.sqrt(sum(value * value for value in correction)) for correction in corrections_zyx]
     return {
         "total_patches": len(constraints),
         "accepted_patches": len(accepted),
@@ -3407,15 +3676,12 @@ def robust_summary(
         "median_accepted_residual_px": float(np.median(residual_norms)) if residual_norms else None,
         "p95_accepted_residual_px": float(np.percentile(residual_norms, 95)) if residual_norms else None,
         "max_correction_px": float(max(correction_norms)) if correction_norms else 0.0,
-        "reject_reasons": dict(Counter(
-            constraint.reject_reason
-            for constraint in constraints
-            if constraint.reject_reason is not None
-        )),
-        "constraint_status_counts": dict(Counter(
-            "accepted" if constraint.accepted else "rejected"
-            for constraint in constraints
-        )),
+        "reject_reasons": dict(
+            Counter(constraint.reject_reason for constraint in constraints if constraint.reject_reason is not None)
+        ),
+        "constraint_status_counts": dict(
+            Counter("accepted" if constraint.accepted else "rejected" for constraint in constraints)
+        ),
     }
 
 
@@ -3431,7 +3697,7 @@ def registered_bounds_um(tile: TileMetadata, param: Any) -> tuple[np.ndarray, np
 
 def preview_spacing_zyx_um(tile: TileMetadata, level: int) -> np.ndarray:
     base_spacing = np.asarray([tile.spacing[dim] for dim in ("z", "y", "x")], dtype=np.float64)
-    return base_spacing * (2**int(level))
+    return base_spacing * (2 ** int(level))
 
 
 def source_sampling_steps_zyx(tile: TileMetadata, target_spacing_zyx_um: np.ndarray) -> tuple[int, int, int]:
@@ -3477,7 +3743,9 @@ def read_registered_center_z_plane(
         array = da.from_zarr(zarray)
         if source_tile.axes == "CZYX":
             if channel < 0 or channel >= source_tile.shape[0]:
-                raise ValueError(f"Channel {channel} is outside {source_tile.path} channel count {source_tile.shape[0]}")
+                raise ValueError(
+                    f"Channel {channel} is outside {source_tile.path} channel count {source_tile.shape[0]}"
+                )
             plane = array[channel, source_z, y_slice, x_slice]
         elif source_tile.axes == "ZYX":
             if channel != 0:
@@ -3596,7 +3864,9 @@ def write_registered_center_z_preview(
                 "global_max_zyx_um": global_max.tolist(),
                 "target_spacing_zyx_um": target_spacing_zyx_um.tolist(),
                 "level_shape_zyx": [int(value) for value in shape_zyx],
-                "placed_tile_count": int(np.count_nonzero([row.get("intersects_center_z", False) for row in tile_rows])),
+                "placed_tile_count": int(
+                    np.count_nonzero([row.get("intersects_center_z", False) for row in tile_rows])
+                ),
                 "tiles": tile_rows,
                 "image": str(image_path.resolve()),
             },
@@ -3672,8 +3942,7 @@ def write_registered_center_z_reference_overlay(
     rgb[..., 1] = scale_thumbnail_uint8(moving_canvas)
 
     image_path = output_dir / (
-        f"level{level}_registered_centerZ_overlay_refCh{reference_channel}_red_"
-        f"ch{moving_channel}_green.png"
+        f"level{level}_registered_centerZ_overlay_refCh{reference_channel}_red_ch{moving_channel}_green.png"
     )
     Image.fromarray(rgb).save(image_path)
     summary_path = image_path.with_suffix(".json")
@@ -3773,10 +4042,7 @@ def write_boundary_measurement_snapshot(
             stream.write(json.dumps(constraint_payload(constraint)) + "\n")
 
     accepted_count = sum(constraint.accepted for constraint in constraints)
-    weak_count = sum(
-        constraint.edge_status == "downweighted_no_inlier_cluster"
-        for constraint in constraints
-    )
+    weak_count = sum(constraint.edge_status == "downweighted_no_inlier_cluster" for constraint in constraints)
     metadata = {
         "channel": int(channel),
         "source_label": source_label,
@@ -3821,10 +4087,7 @@ def refine_registration_with_robust_boundaries(
     require_cuda_for_robust_boundary()
     pairs = axis_aligned_registration_pairs(tiles)
     patch_specs = sample_boundary_patches(tiles, params, pairs, settings)
-    log(
-        "Robust boundary refinement sampled "
-        f"{len(patch_specs)} patch(es) from {len(pairs)} axis-aligned edge(s)"
-    )
+    log(f"Robust boundary refinement sampled {len(patch_specs)} patch(es) from {len(pairs)} axis-aligned edge(s)")
     constraints = build_boundary_constraints(tiles, channel, patch_specs, settings)
     if source_label is not None:
         constraints = [replace(constraint, source_label=source_label) for constraint in constraints]
@@ -3857,10 +4120,7 @@ def refine_registration_with_robust_boundaries(
         if reference_input is None:
             raise ValueError("reference_input is required when reference_params are provided")
         reference_geometry = reference_geometry_constraint(
-            mode=(
-                reference_geometry_mode
-                or ("fixed-xy" if fixed_reference_axes == {"y", "x"} else "fixed-axes")
-            ),
+            mode=(reference_geometry_mode or ("fixed-xy" if fixed_reference_axes == {"y", "x"} else "fixed-axes")),
             reference_input=reference_input,
             fixed_axes=fixed_reference_axes or set(),
             params=corrected_params,
@@ -3907,16 +4167,19 @@ def narrow_fusion_blending_widths(
     *,
     default_width_voxels_zyx: tuple[float, float, float] = (64.0, 64.0, 64.0),
     max_overlap_fraction: float = 0.25,
+    overlap_quantile: float = 0.05,
 ) -> dict[str, float]:
     """Return multiview-stitcher blending widths in physical z/y/x units.
 
     The package expects physical widths. Choose widths in voxels first so
     anisotropic z/y/x spacing still blends over the same number of pixels.
+    Virtual chunk fusion can produce sub-voxel sliver overlaps at chunk or
+    tile corners; use a low quantile so one sliver does not collapse the global
+    ramp width.
     """
     pairs = axis_aligned_registration_pairs(tiles)
     bounds = [
-        tile_registered_bounds_zyx(tile, None if params is None else params[index])
-        for index, tile in enumerate(tiles)
+        tile_registered_bounds_zyx(tile, None if params is None else params[index]) for index, tile in enumerate(tiles)
     ]
     positive_overlaps: dict[str, list[float]] = {"z": [], "y": [], "x": []}
     for left, right in pairs:
@@ -3931,7 +4194,9 @@ def narrow_fusion_blending_widths(
     widths = {}
     for dim_index, dim in enumerate(("z", "y", "x")):
         if positive_overlaps[dim]:
-            width_px = min(default_width_voxels_zyx[dim_index], max_overlap_fraction * min(positive_overlaps[dim]))
+            overlaps = np.asarray(positive_overlaps[dim], dtype=np.float64)
+            overlap_px = float(np.quantile(overlaps, overlap_quantile))
+            width_px = min(default_width_voxels_zyx[dim_index], max_overlap_fraction * overlap_px)
         else:
             width_px = default_width_voxels_zyx[dim_index]
         widths[dim] = width_px * tiles[0].spacing[dim]
@@ -3953,6 +4218,7 @@ def print_plan(
     n_parallel_pairwise_regs: int | None,
     dask_num_workers: int | None,
     registration_read_chunk_z: int,
+    registration_cache_max_gib: float | None,
 ) -> None:
     first = tiles[0]
     channel_count = tile_channel_count(first) if selected_channels is None else len(selected_channels)
@@ -3963,16 +4229,17 @@ def print_plan(
     if not register_only:
         log(f"Output zarr base: {output}")
         log(f"Fusion backend: {FUSION_BACKEND}")
-        log(
-            "Fusion output format: "
-            f"OME-NGFF {NGFF_VERSION} / Zarr v3, zstd level {ZSTD_LEVEL}"
-        )
+        log(f"Fusion output format: OME-NGFF {NGFF_VERSION} / Zarr v3, zstd level {ZSTD_LEVEL}")
     if register or register_only:
         log(f"Registration binning (z, y, x): {registration_binning or 'auto'}")
         log(f"Registration resolution level: {reg_res_level if reg_res_level is not None else 'auto'}")
         log(f"Registration read chunk z: {registration_read_chunk_z}")
         log(f"Pairwise jobs: {n_parallel_pairwise_regs or 'auto'}")
         log(f"Dask registration workers: {dask_num_workers or 'default'}")
+        if registration_cache_max_gib is not None and registration_cache_max_gib > 0:
+            log(f"Registration Dask cache: max={registration_cache_max_gib:g} GiB")
+        else:
+            log("Registration Dask cache: disabled")
         log(f"Registration pair mode: {registration_pair_mode}")
         log(f"Registration metric plots: {registration_plots_dir}")
         if registration_pair_mode == "robust-boundary":
@@ -4006,15 +4273,27 @@ def channel_labels_for_tiles(tiles: list[TileMetadata]) -> list[str]:
 
 
 def open_tile_array(tile: TileMetadata, *, source_level: int = 0):
-    import tifffile
     import zarr
 
     start = time.perf_counter()
+    if is_ome_zarr_path(tile.path):
+        zarray = _open_ome_zarr_level_array(tile.path, source_level=source_level)
+        log(
+            "Opened OME-Zarr array: "
+            f"tile={tile.path.name}, source={tile.path.name}, level={source_level}, "
+            f"shape={tuple(int(value) for value in zarray.shape)}, "
+            f"chunks={tuple(int(value) for value in zarray.chunks)}, "
+            f"dtype={zarray.dtype}, elapsed={time.perf_counter() - start:.3f}s"
+        )
+        return zarray, None
+
+    import tifffile
+
     store = tifffile.imread(tile.path, aszarr=True, level=source_level)
     zarray = zarr.open(store, mode="r")
     log(
         "Opened TIFF as zarr-backed array: "
-        f"tile={tile.path.name}, level={source_level}, "
+        f"tile={tile.path.name}, source={tile.path.name}, level={source_level}, "
         f"shape={tuple(int(value) for value in zarray.shape)}, "
         f"chunks={tuple(int(value) for value in zarray.chunks)}, "
         f"dtype={zarray.dtype}, elapsed={time.perf_counter() - start:.3f}s"
@@ -4050,15 +4329,12 @@ def open_registration_tile_array(
     source_level: int = 0,
 ):
     import dask.array as da
-    import tifffile
-    import zarr
 
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
-    zarray = zarr.open(store, mode="r")
+    zarray, store = open_tile_array(tile, source_level=source_level)
     zarr_chunks = tuple(int(chunk) for chunk in zarray.chunks)
     source_shape = tuple(int(value) for value in zarray.shape)
     source_tile = fusion_tile_for_source_array(tile, source_shape, source_level=source_level)
-    if tile.axes == "CZYX":
+    if source_tile.axes == "CZYX":
         read_chunks = (
             1,
             min(read_chunk_z, source_tile.shape[1]),
@@ -4066,7 +4342,7 @@ def open_registration_tile_array(
             zarr_chunks[3],
         )
         return da.from_zarr(zarray, chunks=read_chunks)[channel : channel + 1, :, :, :], store, source_tile
-    if tile.axes == "ZYX":
+    if source_tile.axes == "ZYX":
         if channel != 0:
             raise ValueError(f"Channel {channel} out of range for single-channel ZYX tile {tile.path}")
         read_chunks = (
@@ -4075,7 +4351,7 @@ def open_registration_tile_array(
             zarr_chunks[2],
         )
         return da.from_zarr(zarray, chunks=read_chunks)[None, :, :, :], store, source_tile
-    raise ValueError(f"Expected CZYX or ZYX axes in {tile.path}, got {tile.axes}")
+    raise ValueError(f"Expected CZYX or ZYX axes in {tile.path}, got {source_tile.axes}")
 
 
 def build_registration_msims(
@@ -4105,10 +4381,7 @@ def build_registration_msims(
                 f"c={array.chunks[0]}, z_max={max(array.chunks[1])}, "
                 f"y={array.chunks[2]}, x={array.chunks[3]}"
             )
-            log(
-                "Registration source tile shape/spacing: "
-                f"shape={source_tile.shape}, spacing={source_tile.spacing}"
-            )
+            log(f"Registration source tile shape/spacing: shape={source_tile.shape}, spacing={source_tile.spacing}")
         stores.append(store)
         array = flip_spatial_array_for_stage_scale(array, source_tile, has_channel_axis=True)
         sim = si_utils.get_sim_from_array(
@@ -4134,10 +4407,7 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
     channel_labels = channel_labels_for_tiles(tiles)
     source_level_counts: Counter[tuple[int, int]] = Counter()
 
-    log(
-        "Fusion sim build start: "
-        f"tiles={len(tiles)}, channel={channel}, requested_level={fusion_level}"
-    )
+    log(f"Fusion sim build start: tiles={len(tiles)}, channel={channel}, requested_level={fusion_level}")
     for tile_index, tile in enumerate(tiles, start=1):
         tile_start = time.perf_counter()
         source_level, available_levels = fusion_source_level_for_tile(tile, fusion_level)
@@ -4162,10 +4432,8 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
         )
         source_tiles.append(source_tile)
         if source_axes == "ZYX":
-            array = flip_spatial_array_for_stage_scale(array, source_tile, has_channel_axis=False)
             dims = ["z", "y", "x"]
         else:
-            array = flip_spatial_array_for_stage_scale(array, source_tile, has_channel_axis=True)
             dims = ["c", "z", "y", "x"]
         sim = si_utils.get_sim_from_array(
             array,
@@ -4175,10 +4443,22 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
             transform_key=TRANSFORM_KEY,
             c_coords=channel_labels,
         )
+        stage_scale = tile_stage_scale(source_tile)
+        flip_axes = tuple(dim for dim in ("z", "y", "x") if stage_scale[dim] < 0)
+        if flip_axes:
+            si_utils.set_sim_affine(
+                sim,
+                xaffine=fusion_orientation_affine(source_tile),
+                transform_key=TRANSFORM_KEY,
+            )
         # Scalar selection preserves the original TIFF channel index in
         # multiview-stitcher's zarr-backed serializer. Drop singleton t too:
         # the package otherwise deep-copies TIFF stores while iterating over t.
         selected = sim.isel(c=channel, t=0)
+        if flip_axes and not si_utils.is_xarray_zarr_backed(selected):
+            raise RuntimeError(
+                f"Fusion tile {tile.path} requires {flip_axes} reflection but lost direct Zarr backing"
+            )
         selected.attrs["basic_tile_cache_key"] = f"{tile.path.resolve()}::ch{channel}"
         if tile.source_view is not None:
             selected.attrs["source_view"] = tile.source_view
@@ -4189,7 +4469,7 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
             "Fusion sim tile done: "
             f"{tile_index}/{len(tiles)}, tile={tile.path.name}, "
             f"dims={selected.dims}, shape={tuple(int(value) for value in selected.shape)}, "
-            f"zarr_backed={si_utils.is_xarray_zarr_backed(selected)}, "
+            f"flip_axes={flip_axes or 'none'}, zarr_backed={si_utils.is_xarray_zarr_backed(selected)}, "
             f"tile_elapsed={elapsed:.3f}s, total_elapsed={total_elapsed:.3f}s"
         )
 
@@ -4356,10 +4636,7 @@ def load_fusion_inverse_flatfields(
         source_views = sorted({tile.source_view for tile in tiles if tile.source_view is not None})
         missing = [view for view in source_views if view not in flatfield_dirs_by_source_view]
         if missing:
-            raise ValueError(
-                "Missing --flatfield-dir-by-source-view entries for source_view(s): "
-                f"{missing}"
-            )
+            raise ValueError(f"Missing --flatfield-dir-by-source-view entries for source_view(s): {missing}")
 
         inverse_by_view = {}
         for view in source_views:
@@ -4377,10 +4654,7 @@ def load_fusion_inverse_flatfields(
                     f"{pre_scale:.9g} (no corrected-max JSON found)"
                 )
             else:
-                log(
-                    f"BaSiC pre-scale for channel {channel} source_view={view}: "
-                    f"{pre_scale:.9g} from {scale_source}"
-                )
+                log(f"BaSiC pre-scale for channel {channel} source_view={view}: {pre_scale:.9g} from {scale_source}")
             log(
                 "Normalized inverse flatfield stats: "
                 f"source_view={view}, "
@@ -4483,6 +4757,81 @@ def zarr_safe_fusion_selection(extra_attr_keys: tuple[str, ...] = ()):
         si_utils.sim_sel_coords = original_sim_sel_coords
 
 
+@contextmanager
+def profile_zarr_slice_materialization(*, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    import time
+
+    import numpy as np
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    original_deserialize = si_utils.deserialize_zarr_backed_sim
+    lock = threading.Lock()
+    stats = {
+        "requests": 0,
+        "requested_bytes": 0,
+        "materialized_bytes": 0,
+        "elapsed_seconds": 0.0,
+    }
+
+    def profiled_deserialize(
+        info,
+        reconstruct_slice=False,
+        overlap_bb=None,
+        sim_coord_dict=None,
+    ):
+        start = time.perf_counter()
+        sim = original_deserialize(
+            info,
+            reconstruct_slice=reconstruct_slice,
+            overlap_bb=overlap_bb,
+            sim_coord_dict=sim_coord_dict,
+        )
+        elapsed = time.perf_counter() - start
+        if not reconstruct_slice:
+            return sim
+
+        materialized_bytes = int(getattr(sim.data, "nbytes", 0))
+        requested_bytes = materialized_bytes
+        requested_shape = None
+        if overlap_bb is not None:
+            requested_shape = tuple(int(overlap_bb["shape"][dim]) for dim in sim.dims if dim in {"z", "y", "x"})
+            if requested_shape:
+                requested_bytes = int(np.prod(requested_shape) * np.dtype(sim.dtype).itemsize)
+
+        with lock:
+            stats["requests"] += 1
+            stats["requested_bytes"] += requested_bytes
+            stats["materialized_bytes"] += materialized_bytes
+            stats["elapsed_seconds"] += elapsed
+            count = stats["requests"]
+            should_log = count <= 5 or count % 100 == 0
+        if should_log:
+            log(
+                "Profile zarr slice materialized: "
+                f"request={count}, requested_shape={requested_shape}, "
+                f"actual_shape={tuple(sim.shape)}, requested={format_bytes(requested_bytes)}, "
+                f"materialized={format_bytes(materialized_bytes)}, elapsed={elapsed:.3f}s"
+            )
+        return sim
+
+    si_utils.deserialize_zarr_backed_sim = profiled_deserialize
+    try:
+        yield
+    finally:
+        si_utils.deserialize_zarr_backed_sim = original_deserialize
+        log(
+            "Profile zarr slice materialization summary: "
+            f"requests={stats['requests']}, "
+            f"requested={format_bytes(stats['requested_bytes'])}, "
+            f"materialized={format_bytes(stats['materialized_bytes'])}, "
+            f"elapsed={stats['elapsed_seconds']:.3f}s"
+        )
+
+
 def _basic_slice_offsets(info: dict[str, Any], overlap_bb: dict[str, Any], dims: tuple[str, ...]) -> dict[str, int]:
     offsets = {}
     for dim in dims:
@@ -4496,11 +4845,13 @@ def _basic_slice_shape(overlap_bb: dict[str, Any], dims: tuple[str, ...]) -> dic
     return {dim: int(overlap_bb["shape"][dim]) for dim in dims if dim in {"z", "y", "x"}}
 
 
-def _basic_cache_request_sim(
+def _cached_slice_request_sim(
     cached: dict[str, Any],
     info: dict[str, Any],
     overlap_bb: dict[str, Any],
     si_utils: Any,
+    *,
+    message_prefix: str,
 ):
     from multiview_stitcher import param_utils
 
@@ -4518,7 +4869,7 @@ def _basic_cache_request_sim(
             clipped_stop = min(axis_size, stop)
             if clipped_start >= clipped_stop:
                 raise ValueError(
-                    f"BaSiC tile cache entry does not cover requested {dim} slice: "
+                    f"{message_prefix} entry does not cover requested {dim} slice: "
                     f"request={offsets[dim]}:{offsets[dim] + shape[dim]}, "
                     f"cache_offset={cached_offsets.get(dim, 0)}, "
                     f"cache_shape={cached['data'].shape}"
@@ -4542,6 +4893,89 @@ def _basic_cache_request_sim(
         transform_key=si_utils.DEFAULT_TRANSFORM_KEY,
     )
     return sim
+
+
+def _basic_cache_request_sim(
+    cached: dict[str, Any],
+    info: dict[str, Any],
+    overlap_bb: dict[str, Any],
+    si_utils: Any,
+):
+    return _cached_slice_request_sim(
+        cached,
+        info,
+        overlap_bb,
+        si_utils,
+        message_prefix="BaSiC tile cache",
+    )
+
+
+class BoundedMemoryCache:
+    def __init__(self, *, max_bytes: int | None = None, max_entries: int | None = None) -> None:
+        self.data: OrderedDict[Any, Any] = OrderedDict()
+        self.nbytes: dict[Any, int] = {}
+        self.max_bytes = max_bytes
+        self.max_entries = max_entries
+        self.total_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.loaded_bytes = 0
+
+    def get(self, key: Any) -> Any:
+        if key not in self.data:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self.data.move_to_end(key)
+        return self.data[key]
+
+    def put(self, key: Any, value: Any, *, cost: float | None = None, nbytes: int) -> None:
+        del cost
+        value_nbytes = int(nbytes)
+        if key in self.data:
+            self.total_bytes -= self.nbytes.pop(key, 0)
+        self.data[key] = value
+        self.data.move_to_end(key)
+        self.nbytes[key] = value_nbytes
+        self.total_bytes += value_nbytes
+        self.loaded_bytes += value_nbytes
+        self._evict_until_within_limits()
+
+    def _evict_until_within_limits(self) -> None:
+        while self.data and (
+            (self.max_entries is not None and len(self.data) > self.max_entries)
+            or (
+                self.max_bytes is not None
+                and len(self.data) > 1
+                and self.total_bytes > self.max_bytes
+            )
+        ):
+            key, _value = self.data.popitem(last=False)
+            self.total_bytes -= self.nbytes.pop(key, 0)
+            self.evictions += 1
+
+
+@contextmanager
+def dask_compute_cache(*, label: str, max_bytes: int | None):
+    if max_bytes is None or max_bytes <= 0:
+        yield
+        return
+
+    from dask.cache import Cache
+
+    cache_backend = BoundedMemoryCache(max_bytes=max_bytes)
+    with Cache(cache_backend):
+        try:
+            yield
+        finally:
+            log(
+                f"{label} Dask cache summary: "
+                f"entries={len(cache_backend.data)}, "
+                f"evictions={cache_backend.evictions}, "
+                f"current={format_bytes(int(cache_backend.total_bytes))}, "
+                f"max={format_bytes(int(max_bytes))}"
+            )
 
 
 @profile
@@ -4572,38 +5006,27 @@ def basic_corrected_zarr_reads(
     original_deserialize = si_utils.deserialize_zarr_backed_sim
     original_serialize = si_utils.serialize_zarr_backed_sim
     original_sim_sel_coords = si_utils.sim_sel_coords
-    inverse_gpu = {
-        dataset: cp.asarray(inverse, dtype=cp.float32)
-        for dataset, inverse in inverse_by_dataset.items()
-    }
+    inverse_gpu = {dataset: cp.asarray(inverse, dtype=cp.float32) for dataset, inverse in inverse_by_dataset.items()}
     flatfield_fingerprints = {
-        dataset: basic_array_fingerprint(np.asarray(inverse))
-        for dataset, inverse in inverse_by_dataset.items()
+        dataset: basic_array_fingerprint(np.asarray(inverse)) for dataset, inverse in inverse_by_dataset.items()
     }
     state = {"corrected_slices": 0}
-    tile_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
-    cache_stats = {
-        "hits": 0,
-        "misses": 0,
-        "disk_hits": 0,
-        "evictions": 0,
-        "loaded_bytes": 0,
-        "current_bytes": 0,
-    }
+    tile_cache = BoundedMemoryCache(max_bytes=tile_cache_max_bytes, max_entries=tile_cache_size)
+    cache_stats = {"disk_hits": 0}
     cache_lock = threading.RLock()
 
     def log_basic_cache_summary(*, event: str, key: str) -> None:
-        total_requests = cache_stats["hits"] + cache_stats["misses"]
+        total_requests = tile_cache.hits + tile_cache.misses
         if total_requests <= 3 or total_requests % 100 == 0:
             log(
                 "BaSiC tile-slab cache "
-                f"{event}: requests={total_requests}, hits={cache_stats['hits']}, "
-                f"misses={cache_stats['misses']}, disk_hits={cache_stats['disk_hits']}, "
-                f"evictions={cache_stats['evictions']}, "
-                f"entries={len(tile_cache)}/{tile_cache_size}, "
+                f"{event}: requests={total_requests}, hits={tile_cache.hits}, "
+                f"misses={tile_cache.misses}, disk_hits={cache_stats['disk_hits']}, "
+                f"evictions={tile_cache.evictions}, "
+                f"entries={len(tile_cache.data)}/{tile_cache_size}, "
                 f"max={format_bytes(tile_cache_max_bytes) if tile_cache_max_bytes is not None else 'none'}, "
-                f"current={format_bytes(cache_stats['current_bytes'])}, "
-                f"loaded_total={format_bytes(cache_stats['loaded_bytes'])}, "
+                f"current={format_bytes(tile_cache.total_bytes)}, "
+                f"loaded_total={format_bytes(tile_cache.loaded_bytes)}, "
                 f"key={key}"
             )
 
@@ -4613,11 +5036,7 @@ def basic_corrected_zarr_reads(
             info[dataset_info_key] = sim.attrs.get(dataset_info_key)
         if cache_key_attr is not None:
             info["_basic_cache_key"] = sim.attrs.get(cache_key_attr)
-        info["_basic_cache_spatial_shape"] = {
-            dim: int(sim.sizes[dim])
-            for dim in sim.dims
-            if dim in {"z", "y", "x"}
-        }
+        info["_basic_cache_spatial_shape"] = {dim: int(sim.sizes[dim]) for dim in sim.dims if dim in {"z", "y", "x"}}
         return info
 
     def zarr_safe_sim_sel_coords(sim, sel_dict):
@@ -4669,24 +5088,16 @@ def basic_corrected_zarr_reads(
                 f"Invalid BaSiC tile cache z slab for {base_cache_key}: "
                 f"request_z={request_z0}:{request_z1}, tile_z={z_total}"
             )
-        cache_key = (
-            f"{base_cache_key}::basic{flatfield_fingerprints[dataset]}::"
-            f"z{slab_z0}:{slab_z1}"
-        )
+        cache_key = f"{base_cache_key}::basic{flatfield_fingerprints[dataset]}::z{slab_z0}:{slab_z1}"
 
         with cache_lock:
             cached = tile_cache.get(cache_key)
             if cached is not None:
-                tile_cache.move_to_end(cache_key)
-                cache_stats["hits"] += 1
                 log_basic_cache_summary(event="hit", key=cache_key)
                 return cached
 
-            cache_stats["misses"] += 1
             cached = (
-                None
-                if tile_cache_disk_dir is None
-                else read_basic_disk_cache_entry(tile_cache_disk_dir, cache_key)
+                None if tile_cache_disk_dir is None else read_basic_disk_cache_entry(tile_cache_disk_dir, cache_key)
             )
             if cached is not None:
                 cache_stats["disk_hits"] += 1
@@ -4725,21 +5136,7 @@ def basic_corrected_zarr_reads(
                     write_basic_disk_cache_entry(tile_cache_disk_dir, cache_key, cached)
             cached_bytes = int(cached["data"].nbytes)
             cached["bytes"] = cached_bytes
-            tile_cache[cache_key] = cached
-            tile_cache.move_to_end(cache_key)
-            cache_stats["loaded_bytes"] += cached_bytes
-            cache_stats["current_bytes"] += cached_bytes
-            while (
-                len(tile_cache) > tile_cache_size
-                or (
-                    tile_cache_max_bytes is not None
-                    and len(tile_cache) > 1
-                    and cache_stats["current_bytes"] > tile_cache_max_bytes
-                )
-            ):
-                _evicted_key, evicted = tile_cache.popitem(last=False)
-                cache_stats["evictions"] += 1
-                cache_stats["current_bytes"] -= int(evicted.get("bytes", 0))
+            tile_cache.put(cache_key, cached, nbytes=cached_bytes)
             log_basic_cache_summary(event="miss-loaded", key=cache_key)
             return cached
 
@@ -4887,11 +5284,7 @@ def _iter_edge_residual_values(edge_residuals: Any):
 def registration_residual_warning_payload(registration_result: Any) -> dict[str, Any] | None:
     if not isinstance(registration_result, dict):
         return None
-    edge_residuals = (
-        registration_result.get("groupwise_resolution", {})
-        .get("metrics", {})
-        .get("edge_residuals")
-    )
+    edge_residuals = registration_result.get("groupwise_resolution", {}).get("metrics", {}).get("edge_residuals")
     residual_records = []
     for edge_key, residual in _iter_edge_residual_values(edge_residuals):
         residual_array = np.asarray(residual, dtype=np.float64)
@@ -4950,16 +5343,10 @@ def robust_boundary_residual_warning_payload(
     )
     axis_to_index = {"z": 0, "y": 1, "x": 2}
     if robust_refinement.reference_geometry is not None:
-        warning_axes = {"z", "y", "x"} - set(
-            robust_refinement.reference_geometry.fixed_axes
-        )
+        warning_axes = {"z", "y", "x"} - set(robust_refinement.reference_geometry.fixed_axes)
     else:
         warning_axes = {"z", "y", "x"}
-    warning_indices = [
-        axis_to_index[axis]
-        for axis in ("z", "y", "x")
-        if axis in warning_axes
-    ]
+    warning_indices = [axis_to_index[axis] for axis in ("z", "y", "x") if axis in warning_axes]
     if not warning_indices:
         return None
 
@@ -4974,16 +5361,12 @@ def robust_boundary_residual_warning_payload(
                 {
                     "edge": f"{constraint.pair}",
                     "residual_um": residual_um,
-                    "axes": [
-                        axis for axis in ("z", "y", "x") if axis in warning_axes
-                    ],
+                    "axes": [axis for axis in ("z", "y", "x") if axis in warning_axes],
                 }
             )
     warning = residual_warning_from_records(residual_records)
     if warning is not None:
-        warning["axes"] = [
-            axis for axis in ("z", "y", "x") if axis in warning_axes
-        ]
+        warning["axes"] = [axis for axis in ("z", "y", "x") if axis in warning_axes]
     return warning
 
 
@@ -5053,10 +5436,7 @@ def has_registration_overlap(
         sim_pair.append(msi_utils.get_sim_from_msim(msims[tile_index], scale=scale_key))
 
     if registration_binning is not None and max(registration_binning.values()) > 1:
-        sim_pair = [
-            sim.coarsen(registration_binning, boundary="trim").mean().astype(sim.dtype)
-            for sim in sim_pair
-        ]
+        sim_pair = [sim.coarsen(registration_binning, boundary="trim").mean().astype(sim.dtype) for sim in sim_pair]
 
     stack_props = [
         spatial_image_utils.get_stack_properties_from_sim(
@@ -5090,7 +5470,7 @@ def batched_pairwise_registration(*, dask_num_workers: int | None = None):
     def compute_pairwise_registrations_batched(
         msims,
         g_reg,
-        n_parallel_pairwise_regs=None,
+        n_parallel_pairwise_regs=DEFAULT_N_PARALLEL_PAIRWISE_REGS,
         **register_kwargs,
     ):
         g_reg_computed = g_reg.copy()
@@ -5101,11 +5481,7 @@ def batched_pairwise_registration(*, dask_num_workers: int | None = None):
             "registration_binning": register_kwargs.get("registration_binning"),
             "overlap_tolerance": register_kwargs.get("overlap_tolerance"),
         }
-        valid_edges = [
-            edge
-            for edge in edges
-            if has_registration_overlap(msims, edge, **overlap_kwargs)
-        ]
+        valid_edges = [edge for edge in edges if has_registration_overlap(msims, edge, **overlap_kwargs)]
         skipped_edges = sorted(set(edges) - set(valid_edges))
         if skipped_edges:
             log(
@@ -5121,10 +5497,7 @@ def batched_pairwise_registration(*, dask_num_workers: int | None = None):
         if n_parallel_pairwise_regs is None:
             n_parallel_pairwise_regs = 1 if msi_utils.get_ndim(msims[0]) == 3 else len(edges)
         batch_size = len(edges) if n_parallel_pairwise_regs <= 0 else n_parallel_pairwise_regs
-        batches = [
-            edges[start : start + batch_size]
-            for start in range(0, len(edges), batch_size)
-        ]
+        batches = [edges[start : start + batch_size] for start in range(0, len(edges), batch_size)]
 
         params = []
         for batch_index, batch_edges in enumerate(batches, start=1):
@@ -5193,9 +5566,7 @@ def selected_metric_sim(msim: Any, scale_key: str, metric_channel: str | None) -
     if "t" in sim.dims:
         selection["t"] = sim.coords["t"].values[0]
     if "c" in sim.dims:
-        selection["c"] = (
-            sim.coords["c"].values[0] if metric_channel is None else metric_channel
-        )
+        selection["c"] = sim.coords["c"].values[0] if metric_channel is None else metric_channel
     if selection:
         sim = spatial_image_utils.sim_sel_coords(sim, selection)
     return sim
@@ -5211,12 +5582,8 @@ def cupy_normalized_cross_correlation(
 
     import cupy as cp
 
-    fixed_data = (
-        fixed_sim.data.compute() if hasattr(fixed_sim.data, "compute") else fixed_sim.data
-    )
-    moving_data = (
-        moving_sim.data.compute() if hasattr(moving_sim.data, "compute") else moving_sim.data
-    )
+    fixed_data = fixed_sim.data.compute() if hasattr(fixed_sim.data, "compute") else fixed_sim.data
+    moving_data = moving_sim.data.compute() if hasattr(moving_sim.data, "compute") else moving_sim.data
     fixed = cp.asarray(np.asarray(fixed_data, dtype=np.float32))
     moving = cp.asarray(np.asarray(moving_data, dtype=np.float32))
     halfspace_mask = cp.asarray(mv_graph.get_mask_from_halfspace(fixed_sim, halfspace_eqs))
@@ -5229,9 +5596,7 @@ def cupy_normalized_cross_correlation(
     moving_values = moving[finite_mask]
     fixed_values = fixed_values - cp.mean(fixed_values)
     moving_values = moving_values - cp.mean(moving_values)
-    denominator = cp.sqrt(
-        cp.sum(fixed_values * fixed_values) * cp.sum(moving_values * moving_values)
-    )
+    denominator = cp.sqrt(cp.sum(fixed_values * fixed_values) * cp.sum(moving_values * moving_values))
     if float(denominator.get()) == 0.0:
         return float("nan")
     return float((cp.sum(fixed_values * moving_values) / denominator).get())
@@ -5259,10 +5624,7 @@ def cupy_tile_pair_image_metrics_for_plot(
     )
     ndim = len(spatial_dims)
     scale_key = f"scale{input_res_level or 0}"
-    sims_t0 = [
-        selected_metric_sim(msim, scale_key, metric_channel)
-        for msim in msims
-    ]
+    sims_t0 = [selected_metric_sim(msim, scale_key, metric_channel) for msim in msims]
     g_metrics = metrics._build_metrics_graph(
         msims,
         sims_t0,
@@ -5309,20 +5671,12 @@ def cupy_tile_pair_image_metrics_for_plot(
         shape = {
             dim: max(
                 1,
-                int(
-                    np.floor(
-                        (upper_intrinsic[idim] - lower_intrinsic[idim])
-                        / spacing[dim]
-                        + 1
-                    )
-                ),
+                int(np.floor((upper_intrinsic[idim] - lower_intrinsic[idim]) / spacing[dim] + 1)),
             )
             for idim, dim in enumerate(spatial_dims)
         }
         output_stack_properties = {
-            "origin": {
-                dim: float(lower_intrinsic[idim]) for idim, dim in enumerate(spatial_dims)
-            },
+            "origin": {dim: float(lower_intrinsic[idim]) for idim, dim in enumerate(spatial_dims)},
             "spacing": {dim: float(spacing[dim]) for dim in spatial_dims},
             "shape": {dim: int(shape[dim]) for dim in spatial_dims},
         }
@@ -5364,8 +5718,7 @@ def cupy_tile_pair_image_metrics_for_plot(
             edge_nccs.append(f"{transform_key}:ncc={ncc:.4f}")
         log(
             f"GPU metrics edge {edge_index}/{len(g_metrics.edges())} "
-            f"({fixed_idx}, {moving_idx}), shape={tuple(shape[dim] for dim in spatial_dims)}: "
-            + ", ".join(edge_nccs)
+            f"({fixed_idx}, {moving_idx}), shape={tuple(shape[dim] for dim in spatial_dims)}: " + ", ".join(edge_nccs)
         )
 
     summary = {}
@@ -5461,10 +5814,7 @@ def save_registration_params(
                 "stage_scale_um": tile_stage_scale(tile),
                 "registered_affine": {
                     "dims": list(param.dims),
-                    "coords": {
-                        name: param.coords[name].values.tolist()
-                        for name in param.coords
-                    },
+                    "coords": {name: param.coords[name].values.tolist() for name in param.coords},
                     "matrix": param.data.tolist(),
                 },
             }
@@ -5488,7 +5838,7 @@ def save_registration_params(
             "summary": robust_refinement.summary,
             "final_residual_warning": residual_warning,
             "corrections_zyx_px": robust_refinement.corrections_zyx,
-            }
+        }
         if robust_refinement.reference_geometry is not None:
             payload["reference_geometry_constraint"] = {
                 "mode": robust_refinement.reference_geometry.mode,
@@ -5536,11 +5886,7 @@ def load_registration_params(path: Path, tiles: list[TileMetadata]):
 
 
 def spatial_affine_param(param):
-    indexer = {
-        dim: 0
-        for dim in param.dims
-        if dim not in {"x_in", "x_out"} and param.sizes[dim] == 1
-    }
+    indexer = {dim: 0 for dim in param.dims if dim not in {"x_in", "x_out"} and param.sizes[dim] == 1}
     if indexer:
         return param.isel(indexer, drop=True)
     return param
@@ -5560,12 +5906,966 @@ def fusion_output_spacing(base_spacing: dict[str, float], fusion_level: int) -> 
     return {dim: float(value) * factor for dim, value in base_spacing.items()}
 
 
+def output_stack_properties_from_ome_zarr_template(template: Path, output_spacing: dict[str, float]) -> dict[str, dict[str, float | int]]:
+    import zarr
+
+    group = zarr.open_group(str(template), mode="r")
+    try:
+        scale0 = group["0"]
+    except KeyError as exc:
+        raise ValueError(f"{template} does not contain OME-Zarr scale '0'") from exc
+
+    ome = group.attrs.get("ome")
+    if not isinstance(ome, dict):
+        raise ValueError(f"{template} root attrs do not contain NGFF 0.5 'ome' metadata")
+    multiscales = ome.get("multiscales")
+    if not isinstance(multiscales, list) or not multiscales:
+        raise ValueError(f"{template} root attrs do not contain an OME multiscales entry")
+    axes = multiscales[0].get("axes")
+    if not isinstance(axes, list):
+        raise ValueError(f"{template} OME multiscales entry does not contain axes")
+    dims = [axis.get("name") for axis in axes]
+    if dims != ["z", "y", "x"]:
+        raise ValueError(f"{template} scale-0 template must have z/y/x axes, got {dims}")
+
+    datasets = multiscales[0].get("datasets")
+    if not isinstance(datasets, list):
+        raise ValueError(f"{template} OME multiscales entry does not contain datasets")
+    scale0_dataset = next((dataset for dataset in datasets if dataset.get("path") == "0"), None)
+    if not isinstance(scale0_dataset, dict):
+        raise ValueError(f"{template} OME multiscales entry does not describe dataset path '0'")
+
+    translation: dict[str, float] | None = None
+    scale: dict[str, float] | None = None
+    transforms = scale0_dataset.get("coordinateTransformations")
+    if isinstance(transforms, list):
+        for transform in transforms:
+            if not isinstance(transform, dict):
+                continue
+            values = transform.get("translation") if transform.get("type") == "translation" else transform.get("scale")
+            if not isinstance(values, list) or len(values) != len(dims):
+                continue
+            if transform.get("type") == "translation":
+                translation = dict(zip(dims, (float(value) for value in values), strict=True))
+            elif transform.get("type") == "scale":
+                scale = dict(zip(dims, (float(value) for value in values), strict=True))
+
+    if translation is None:
+        raise ValueError(f"{template} scale-0 metadata does not contain a translation transform")
+    if scale is not None:
+        for dim in dims:
+            if not np.isclose(scale[dim], output_spacing[dim]):
+                raise ValueError(
+                    f"{template} scale-0 {dim} spacing {scale[dim]} does not match requested fusion spacing "
+                    f"{output_spacing[dim]}"
+                )
+
+    return {
+        "origin": translation,
+        "spacing": {dim: float(output_spacing[dim]) for dim in dims},
+        "shape": dict(zip(dims, (int(size) for size in scale0.shape), strict=True)),
+    }
+
+
+def transformed_source_block_ids(
+    sims: list[Any],
+    *,
+    transform_key: str,
+    output_stack_properties: dict[str, dict[str, float | int]],
+    output_chunksize: dict[str, int],
+    blending_widths: dict[str, float] | None,
+) -> set[tuple[int, int, int]]:
+    """Return output z/y/x chunks that can receive data from registered sources."""
+    spatial_dims = ("z", "y", "x")
+    output_origin = {dim: float(output_stack_properties["origin"][dim]) for dim in spatial_dims}
+    output_spacing = {dim: float(output_stack_properties["spacing"][dim]) for dim in spatial_dims}
+    output_shape = {dim: int(output_stack_properties["shape"][dim]) for dim in spatial_dims}
+    nblocks = {
+        dim: int(math.ceil(output_shape[dim] / int(output_chunksize[dim])))
+        for dim in spatial_dims
+    }
+    pad_phys = {dim: float((blending_widths or {}).get(dim, 0.0)) for dim in spatial_dims}
+    block_ids: set[tuple[int, int, int]] = set()
+
+    for sim in sims:
+        affine = spatial_affine_param(sim.attrs["transforms"][transform_key])
+        matrix = np.asarray(
+            affine.sel(x_out=list(spatial_dims) + ["1"], x_in=list(spatial_dims) + ["1"]).values,
+            dtype=np.float64,
+        )
+        source_bounds: list[tuple[float, float]] = []
+        for dim in spatial_dims:
+            coord = np.asarray(sim.coords[dim].values, dtype=np.float64)
+            if coord.size == 0:
+                raise ValueError(f"Cannot cull fusion blocks for empty {dim} coordinate")
+            step = abs(float(coord[1] - coord[0])) if coord.size > 1 else output_spacing[dim]
+            lo = min(float(coord[0]), float(coord[-1])) - 0.5 * step
+            hi = max(float(coord[0]), float(coord[-1])) + 0.5 * step
+            source_bounds.append((lo, hi))
+
+        corners = np.array(
+            [
+                [z, y, x, 1.0]
+                for z in source_bounds[0]
+                for y in source_bounds[1]
+                for x in source_bounds[2]
+            ],
+            dtype=np.float64,
+        )
+        transformed = corners @ matrix.T
+        mins = transformed[:, :3].min(axis=0)
+        maxs = transformed[:, :3].max(axis=0)
+
+        ranges = []
+        for index, dim in enumerate(spatial_dims):
+            chunk_um = output_chunksize[dim] * output_spacing[dim]
+            lo = mins[index] - pad_phys[dim]
+            hi = maxs[index] + pad_phys[dim]
+            start = max(0, int(math.floor((lo - output_origin[dim]) / chunk_um)))
+            stop = min(nblocks[dim] - 1, int(math.floor((hi - output_origin[dim]) / chunk_um)))
+            if stop < 0 or start >= nblocks[dim]:
+                ranges = []
+                break
+            ranges.append(range(start, stop + 1))
+        if not ranges:
+            continue
+        for z_block in ranges[0]:
+            for y_block in ranges[1]:
+                for x_block in ranges[2]:
+                    block_ids.add((z_block, y_block, x_block))
+
+    return block_ids
+
+
+def required_fusion_overlap_pixels(
+    *,
+    spatial_dims: tuple[str, ...],
+    output_chunksize: dict[str, int],
+    weights_func: Any | None,
+    weights_func_kwargs: dict[str, Any] | None,
+    fusion_func: Any | None,
+    fusion_func_kwargs: dict[str, Any] | None,
+) -> dict[str, int]:
+    from dask.utils import has_keyword
+
+    overlap = {dim: 0 for dim in spatial_dims}
+    for func, func_kwargs in ((weights_func, weights_func_kwargs), (fusion_func, fusion_func_kwargs)):
+        if func is None or not hasattr(func, "required_overlap"):
+            continue
+        kwargs = dict(func_kwargs or {})
+        if has_keyword(func, "output_chunksize"):
+            kwargs.setdefault("output_chunksize", output_chunksize)
+        curr_overlap = func.required_overlap(kwargs)
+        if not isinstance(curr_overlap, dict):
+            curr_overlap = {dim: curr_overlap for dim in spatial_dims}
+        overlap = {dim: max(int(overlap[dim]), int(curr_overlap[dim])) for dim in spatial_dims}
+    return overlap
+
+
+def direct_fusion_view_candidate_plan(
+    sims: list[Any],
+    *,
+    transform_key: str,
+    output_stack_properties: dict[str, dict[str, float | int]],
+    output_chunksize: dict[str, int],
+    weights_func: Any | None,
+    weights_func_kwargs: dict[str, Any] | None,
+    fusion_func: Any | None,
+    fusion_func_kwargs: dict[str, Any] | None,
+    interpolation_order: int,
+) -> tuple[dict[tuple[int, int, int], list[int]], dict[str, Any]]:
+    """Plan physically possible source views for each direct-Zarr output block.
+
+    This mirrors the conservative chunk-view planning in multiview-stitcher's
+    zarr-backed fusion path. It is a zero-contribution filter only: no ranking,
+    no top-k selection, and no overlap-volume threshold.
+    """
+
+    import xarray as xr
+    from dask.array.core import normalize_chunks
+    from multiview_stitcher import mv_graph, transformation
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    spatial_dims = tuple(si_utils.get_spatial_dims_from_sim(sims[0]))
+    if spatial_dims != ("z", "y", "x"):
+        raise ValueError(f"Direct fusion view culling currently expects spatial dims ('z','y','x'), got {spatial_dims}")
+
+    params = [si_utils.get_affine_from_sim(sim, transform_key=transform_key) for sim in sims]
+    nsdims = tuple(si_utils.get_nonspatial_dims_from_sim(sims[0]))
+    params_coord_dict: dict[str, Any] = {}
+    for dim in nsdims:
+        if dim not in params[0].dims:
+            continue
+        coord = sims[0].coords[dim]
+        if len(coord) != 1:
+            raise ValueError(
+                "Direct fusion view culling does not support transform parameters varying over "
+                f"non-spatial dimension {dim!r}; rerun with --disable-view-candidate-culling"
+            )
+        params_coord_dict[dim] = coord.values[0]
+    sparams = [param.sel(params_coord_dict) if params_coord_dict else param for param in params]
+
+    output_chunksize = {dim: int(output_chunksize[dim]) for dim in spatial_dims}
+    output_shape = {dim: int(output_stack_properties["shape"][dim]) for dim in spatial_dims}
+    output_spacing = {dim: float(output_stack_properties["spacing"][dim]) for dim in spatial_dims}
+    output_origin = {dim: float(output_stack_properties["origin"][dim]) for dim in spatial_dims}
+
+    overlap_in_pixels = required_fusion_overlap_pixels(
+        spatial_dims=spatial_dims,
+        output_chunksize=output_chunksize,
+        weights_func=weights_func,
+        weights_func_kwargs=weights_func_kwargs,
+        fusion_func=fusion_func,
+        fusion_func_kwargs=fusion_func_kwargs,
+    )
+
+    output_chunk_bbs, block_indices = mv_graph.get_chunk_bbs(
+        {"origin": output_origin, "spacing": output_spacing, "shape": output_shape},
+        output_chunksize,
+    )
+    output_chunk_bbs_with_overlap = [
+        output_chunk_bb
+        | {
+            "origin": {
+                dim: output_chunk_bb["origin"][dim] - overlap_in_pixels[dim] * output_spacing[dim]
+                for dim in spatial_dims
+            }
+        }
+        | {
+            "shape": {
+                dim: int(output_chunk_bb["shape"][dim]) + 2 * overlap_in_pixels[dim]
+                for dim in spatial_dims
+            }
+        }
+        for output_chunk_bb in output_chunk_bbs
+    ]
+    views_bb = [si_utils.get_stack_properties_from_sim(sim) for sim in sims]
+
+    fix_dims: list[str] = []
+    tol = 1e-12
+    for dim in spatial_dims:
+        other_dims = [other_dim for other_dim in spatial_dims if other_dim != dim]
+        dim_is_fixed = True
+        for iview, param in enumerate(sparams):
+            if abs(float(param.sel(x_in=dim, x_out=dim)) - 1.0) > tol:
+                dim_is_fixed = False
+                break
+            if any(abs(float(param.sel(x_in=dim, x_out=other_dim))) > tol for other_dim in other_dims):
+                dim_is_fixed = False
+                break
+            if any(abs(float(param.sel(x_in=other_dim, x_out=dim))) > tol for other_dim in other_dims):
+                dim_is_fixed = False
+                break
+            if abs(output_spacing[dim] - float(views_bb[iview]["spacing"][dim])) > tol:
+                dim_is_fixed = False
+                break
+            offset = abs(float(output_origin[dim] - param.sel(x_in=dim, x_out="1")))
+            if output_spacing[dim] > 0 and offset % output_spacing[dim] > tol:
+                dim_is_fixed = False
+                break
+        if dim_is_fixed:
+            fix_dims.append(dim)
+
+    inv_sparams = [
+        xr.DataArray(
+            np.linalg.inv(np.asarray(param.data, dtype=np.float64)),
+            dims=param.dims,
+            coords=param.coords,
+        )
+        for param in sparams
+    ]
+
+    normalized_chunks = normalize_chunks(
+        chunks=tuple(output_chunksize[dim] for dim in spatial_dims),
+        shape=tuple(output_shape[dim] for dim in spatial_dims),
+    )
+    n_blocks_per_dim = [len(chunks) for chunks in normalized_chunks]
+    uniform_chunks = [int(chunks[0]) for chunks in normalized_chunks]
+    osp_origin = np.asarray([output_origin[dim] for dim in spatial_dims], dtype=np.float64)
+    osp_spacing = np.asarray([output_spacing[dim] for dim in spatial_dims], dtype=np.float64)
+    additional_extent_pixels = np.asarray(
+        [0.0 if dim in fix_dims else float(interpolation_order) for dim in spatial_dims],
+        dtype=np.float64,
+    )
+    padding_phys = additional_extent_pixels * osp_spacing + np.asarray(
+        [overlap_in_pixels[dim] for dim in spatial_dims],
+        dtype=np.float64,
+    ) * osp_spacing
+
+    chunk_to_tiles: dict[tuple[int, int, int], list[int]] = {}
+    for iview, view_bb in enumerate(views_bb):
+        tile_corners_output = transformation.transform_pts(
+            mv_graph.get_vertices_from_stack_props(view_bb),
+            np.asarray(sparams[iview].data, dtype=np.float64),
+        )
+        aabb_min = np.min(tile_corners_output, axis=0) - padding_phys
+        aabb_max = np.max(tile_corners_output, axis=0) + padding_phys
+        idx_ranges = []
+        skip = False
+        for idim in range(len(spatial_dims)):
+            chunk_size_phys = uniform_chunks[idim] * osp_spacing[idim]
+            first = max(0, int(math.floor((aabb_min[idim] - osp_origin[idim]) / chunk_size_phys)))
+            last = min(
+                n_blocks_per_dim[idim] - 1,
+                int(math.floor((aabb_max[idim] - osp_origin[idim]) / chunk_size_phys)),
+            )
+            if first > last:
+                skip = True
+                break
+            idx_ranges.append(range(first, last + 1))
+        if skip:
+            continue
+        for chunk_index in product(*idx_ranges):
+            chunk_to_tiles.setdefault(tuple(int(value) for value in chunk_index), []).append(iview)
+
+    additional_extent = {dim: 0 if dim in fix_dims else int(interpolation_order) for dim in spatial_dims}
+    candidate_map: dict[tuple[int, int, int], list[int]] = {}
+    for output_chunk_bb_with_overlap, block_index in zip(output_chunk_bbs_with_overlap, block_indices, strict=True):
+        block_key = tuple(int(value) for value in block_index)
+        candidates: list[int] = []
+        for iview in chunk_to_tiles.get(block_key, []):
+            overlap = mv_graph.get_overlap_for_bbs(
+                target_bb=output_chunk_bb_with_overlap,
+                query_bbs=[views_bb[iview]],
+                param=inv_sparams[iview],
+                additional_extent_in_pixels=additional_extent,
+                param_is_inverse=True,
+            )
+            if overlap[0] is not None:
+                candidates.append(int(iview))
+        if candidates:
+            candidate_map[block_key] = sorted(candidates)
+
+    counts = np.asarray([len(values) for values in candidate_map.values()], dtype=np.int64)
+    summary = {
+        "enabled": True,
+        "spatial_dims": list(spatial_dims),
+        "fix_dims": list(fix_dims),
+        "overlap_in_pixels": {dim: int(overlap_in_pixels[dim]) for dim in spatial_dims},
+        "total_output_blocks": int(math.prod(n_blocks_per_dim)),
+        "planned_blocks": int(len(candidate_map)),
+        "zero_candidate_blocks": int(math.prod(n_blocks_per_dim) - len(candidate_map)),
+        "candidate_min": int(counts.min()) if counts.size else 0,
+        "candidate_median": float(np.median(counts)) if counts.size else 0.0,
+        "candidate_p95": float(np.percentile(counts, 95)) if counts.size else 0.0,
+        "candidate_max": int(counts.max()) if counts.size else 0,
+        "high_count_blocks": [
+            {"block": list(block), "count": int(len(indices))}
+            for block, indices in sorted(candidate_map.items(), key=lambda item: (-len(item[1]), item[0]))[:8]
+        ],
+    }
+    return candidate_map, summary
+
+
+def write_direct_fusion_view_candidate_plan(
+    path: Path,
+    candidate_map: dict[tuple[int, int, int], list[int]],
+    summary: dict[str, Any],
+) -> None:
+    payload = {
+        "version": 1,
+        "summary": summary,
+        "candidate_view_indices_by_spatial_block": {
+            ",".join(str(int(value)) for value in block): [int(index) for index in indices]
+            for block, indices in sorted(candidate_map.items())
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, separators=(",", ":")))
+    os.replace(tmp_path, path)
+
+
+def load_direct_fusion_view_candidate_plan(path: str) -> dict[tuple[int, ...], list[int]]:
+    plan = _MVS_VIEW_CANDIDATE_PLANS.get(path)
+    if plan is not None:
+        return plan
+    payload = json.loads(Path(path).read_text())
+    raw_plan = payload.get("candidate_view_indices_by_spatial_block", {})
+    plan = {
+        tuple(int(part) for part in key.split(",")): [int(index) for index in value]
+        for key, value in raw_plan.items()
+    }
+    _MVS_VIEW_CANDIDATE_PLANS[path] = plan
+    return plan
+
+
+def normalize_fusion_overlap_pixels(
+    overlap_in_pixels: int | dict[str, int] | None,
+    *,
+    spatial_dims: tuple[str, ...],
+    output_chunksize: dict[str, int],
+    weights_func: Any | None,
+    weights_func_kwargs: dict[str, Any] | None,
+    fusion_func: Any | None,
+    fusion_func_kwargs: dict[str, Any] | None,
+) -> dict[str, int]:
+    if overlap_in_pixels is None:
+        return required_fusion_overlap_pixels(
+            spatial_dims=spatial_dims,
+            output_chunksize=output_chunksize,
+            weights_func=weights_func,
+            weights_func_kwargs=weights_func_kwargs,
+            fusion_func=fusion_func,
+            fusion_func_kwargs=fusion_func_kwargs,
+        )
+    if isinstance(overlap_in_pixels, dict):
+        return {dim: int(overlap_in_pixels[dim]) for dim in spatial_dims}
+    return {dim: int(overlap_in_pixels) for dim in spatial_dims}
+
+
+def required_fusion_source_shrinkage(
+    *,
+    weights_func: Any | None,
+    weights_func_kwargs: dict[str, Any] | None,
+    fusion_func: Any | None,
+    fusion_func_kwargs: dict[str, Any] | None,
+) -> int:
+    shrink_distance = 0
+    for func, func_kwargs in ((weights_func, weights_func_kwargs), (fusion_func, fusion_func_kwargs)):
+        if func is not None and hasattr(func, "required_source_shrinkage"):
+            shrink_distance = max(int(shrink_distance), int(func.required_source_shrinkage(func_kwargs or {})))
+    return shrink_distance
+
+
+def direct_zarr_block_entry(
+    *,
+    sims: list[Any],
+    transform_key: str,
+    sim_coord_dict: dict[str, Any],
+    block_key: tuple[int, ...],
+    output_stack_properties: dict[str, dict[str, float | int]],
+    output_chunksize: dict[str, int],
+    output_chunk_shape: dict[str, int],
+    output_chunk_origin: dict[str, float],
+    overlap_in_pixels: dict[str, int],
+    interpolation_order: int,
+) -> tuple[dict[str, Any], dict[str, slice]]:
+    import xarray as xr
+    from multiview_stitcher import mv_graph
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    spatial_dims = tuple(output_stack_properties["shape"].keys())
+    params = [si_utils.get_affine_from_sim(sim, transform_key=transform_key) for sim in sims]
+    params_coord_dict = {dim: value for dim, value in sim_coord_dict.items() if dim in params[0].dims}
+    sparams = [param.sel(params_coord_dict) if params_coord_dict else param for param in params]
+    views_bb = [si_utils.get_stack_properties_from_sim(sim) for sim in sims]
+    output_spacing = {dim: float(output_stack_properties["spacing"][dim]) for dim in spatial_dims}
+    output_bb = {
+        "origin": {dim: float(output_chunk_origin[dim]) for dim in spatial_dims},
+        "spacing": output_spacing,
+        "shape": {dim: int(output_chunk_shape[dim]) for dim in spatial_dims},
+    }
+    output_bb_overlap = output_bb | {
+        "origin": {
+            dim: output_bb["origin"][dim] - int(overlap_in_pixels[dim]) * output_spacing[dim]
+            for dim in spatial_dims
+        }
+    } | {
+        "shape": {
+            dim: output_bb["shape"][dim] + 2 * int(overlap_in_pixels[dim])
+            for dim in spatial_dims
+        }
+    }
+
+    fix_dims: list[str] = []
+    tol = 1e-12
+    for dim in spatial_dims:
+        other_dims = [other_dim for other_dim in spatial_dims if other_dim != dim]
+        dim_is_fixed = True
+        for iview, param in enumerate(sparams):
+            if abs(float(param.sel(x_in=dim, x_out=dim)) - 1.0) > tol:
+                dim_is_fixed = False
+                break
+            if any(abs(float(param.sel(x_in=dim, x_out=other_dim))) > tol for other_dim in other_dims):
+                dim_is_fixed = False
+                break
+            if any(abs(float(param.sel(x_in=other_dim, x_out=dim))) > tol for other_dim in other_dims):
+                dim_is_fixed = False
+                break
+            if abs(output_spacing[dim] - float(views_bb[iview]["spacing"][dim])) > tol:
+                dim_is_fixed = False
+                break
+            offset = abs(float(output_bb["origin"][dim] - param.sel(x_in=dim, x_out="1")))
+            if output_spacing[dim] > 0 and offset % output_spacing[dim] > tol:
+                dim_is_fixed = False
+                break
+        if dim_is_fixed:
+            fix_dims.append(dim)
+
+    additional_extent = {dim: 0 if dim in fix_dims else int(interpolation_order) for dim in spatial_dims}
+    inv_sparams = [
+        xr.DataArray(
+            np.linalg.inv(np.asarray(param.data, dtype=np.float64)),
+            dims=param.dims,
+            coords=param.coords,
+        )
+        for param in sparams
+    ]
+
+    views = []
+    for sim, view_bb, sparam, inv_param in zip(sims, views_bb, sparams, inv_sparams, strict=True):
+        overlap = mv_graph.get_overlap_for_bbs(
+            target_bb=output_bb_overlap,
+            query_bbs=[view_bb],
+            param=inv_param,
+            additional_extent_in_pixels=additional_extent,
+            param_is_inverse=True,
+        )
+        if overlap[0] is None:
+            continue
+        views.append(
+            {
+                "tile_info": si_utils.serialize_zarr_backed_sim(sim),
+                "tile_overlap_bb": overlap[0],
+                "sparam": sparam,
+                "view_bb": view_bb,
+            }
+        )
+
+    entry = {
+        "views": views,
+        "output_bb": output_bb,
+        "output_bb_overlap": output_bb_overlap,
+        "fuse_planewise": "z" in fix_dims and output_bb_overlap["shape"].get("z", 2) == 1,
+        "block_key": tuple(int(value) for value in block_key),
+    }
+    region = {
+        dim: slice(
+            int((output_bb["origin"][dim] - float(output_stack_properties["origin"][dim])) / output_spacing[dim]),
+            int((output_bb["origin"][dim] - float(output_stack_properties["origin"][dim])) / output_spacing[dim])
+            + int(output_bb["shape"][dim]),
+        )
+        for dim in spatial_dims
+    }
+    return entry, region
+
+
+def culling_fusion_batch_func(batch_func, allowed_block_ids: set[tuple[int, int, int]]):
+    allowed = allowed_block_ids
+
+    def process_only_intersecting_blocks(fuse_chunk, batch, **kwargs):
+        kept = [block_id for block_id in batch if tuple(int(value) for value in block_id[-3:]) in allowed]
+        if not kept:
+            return None
+        if batch_func is None:
+            for block_id in kept:
+                fuse_chunk(block_id)
+            return None
+        return batch_func(fuse_chunk, kept, **kwargs)
+
+    return process_only_intersecting_blocks
+
+
+def zarr_chunk_file_path(scale0_path: Path, block_id: Any) -> Path:
+    metadata_path = ome_zarr_array_metadata_path(scale0_path)
+    zarr_format = 3 if metadata_path.name == "zarr.json" else 2
+    coords = tuple(str(int(value)) for value in block_id)
+    if zarr_format == 3:
+        return scale0_path / "c" / Path(*coords)
+    return scale0_path / ".".join(coords)
+
+
+def resume_fusion_batch_func(batch_func, *, scale0_path: Path):
+    state = {"seen": 0, "skipped": 0, "processed": 0}
+
+    def process_only_missing_blocks(fuse_chunk, batch, **kwargs):
+        state["seen"] += 1
+        missing = []
+        skipped_now = 0
+        for block_id in batch:
+            if zarr_chunk_file_path(scale0_path, block_id).is_file():
+                skipped_now += 1
+            else:
+                missing.append(block_id)
+        state["skipped"] += skipped_now
+        state["processed"] += len(missing)
+        if skipped_now and (
+            state["seen"] <= 3 or state["seen"] % 100 == 0 or not missing
+        ):
+            log(
+                "Fusion resume skipped completed output chunk(s): "
+                f"batch={state['seen']}, skipped_now={skipped_now}, "
+                f"skipped_total={state['skipped']}, remaining_in_batch={len(missing)}"
+            )
+        if not missing:
+            return None
+        if batch_func is None:
+            for block_id in missing:
+                fuse_chunk(block_id)
+            return None
+        return batch_func(fuse_chunk, missing, **kwargs)
+
+    return process_only_missing_blocks
+
+
+def fusion_temp_workspace_prefix(channel_output: Path) -> str:
+    return f".{channel_output.name}.fusion-"
+
+
+def fusion_output_from_temp_root(temp_root: Path, channel_output: Path) -> Path:
+    return temp_root / channel_output.name
+
+
+def find_latest_fusion_temp_workspace(channel_output: Path) -> Path | None:
+    prefix = fusion_temp_workspace_prefix(channel_output)
+    candidates = []
+    for path in channel_output.parent.glob(f"{prefix}*"):
+        fusion_output = fusion_output_from_temp_root(path, channel_output)
+        if path.is_dir() and (fusion_output / "0").exists():
+            candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def validate_resumable_scale0_array(
+    array: Any,
+    *,
+    expected_shape: tuple[int, ...],
+    expected_chunks: tuple[int, ...],
+    expected_dtype: Any,
+    scale0_path: Path,
+) -> None:
+    actual_shape = tuple(int(value) for value in array.shape)
+    actual_chunks = tuple(int(value) for value in array.chunks)
+    actual_dtype = np.dtype(array.dtype)
+    if actual_shape != tuple(int(value) for value in expected_shape):
+        raise ValueError(f"{scale0_path} resume shape mismatch: {actual_shape} != {expected_shape}")
+    if actual_chunks != tuple(int(value) for value in expected_chunks):
+        raise ValueError(f"{scale0_path} resume chunk mismatch: {actual_chunks} != {expected_chunks}")
+    if actual_dtype != np.dtype(expected_dtype):
+        raise ValueError(f"{scale0_path} resume dtype mismatch: {actual_dtype} != {np.dtype(expected_dtype)}")
+
+
+@contextmanager
+def resumable_mvs_zarr_create(*, scale0_path: Path, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    from multiview_stitcher import fusion as mvs_fusion
+    import zarr
+
+    fusion_core = sys.modules.get(mvs_fusion.fuse.__module__)
+    if fusion_core is None or not hasattr(fusion_core, "zarr"):
+        yield
+        return
+
+    original_create = fusion_core.zarr.create
+    target = scale0_path.resolve()
+
+    def create_or_open_resumable(*args, **kwargs):
+        raw_store = kwargs.get("store")
+        if raw_store is None and len(args) >= 3:
+            raw_store = args[2]
+        if raw_store is not None and Path(str(raw_store)).resolve() == target and target.exists():
+            array = zarr.open_array(str(target), mode="r+")
+            expected_shape = tuple(kwargs.get("shape", args[0] if args else ()))
+            expected_chunks = tuple(kwargs.get("chunks", ()))
+            expected_dtype = kwargs.get("dtype")
+            validate_resumable_scale0_array(
+                array,
+                expected_shape=expected_shape,
+                expected_chunks=expected_chunks,
+                expected_dtype=expected_dtype,
+                scale0_path=target,
+            )
+            log(f"Resuming existing fusion scale-0 Zarr array: {target}")
+            return array
+        return original_create(*args, **kwargs)
+
+    fusion_core.zarr.create = create_or_open_resumable
+    try:
+        yield
+    finally:
+        fusion_core.zarr.create = original_create
+
+
+def mvs_fuse_chunk_payload(fuse_chunk) -> dict[str, Any] | None:
+    defaults = getattr(fuse_chunk, "__defaults__", None)
+    if getattr(fuse_chunk, "__name__", "") != "fuse_chunk" or defaults is None or len(defaults) != 6:
+        return None
+    osp, ns_shape, nsdims, fuse_kwargs, output_chunksize, output_zarr_array = defaults
+    store_path = getattr(output_zarr_array, "store_path", None)
+    if store_path is None:
+        return None
+    payload = {
+        "output_zarr_url": str(store_path),
+        "output_stack_properties": osp,
+        "ns_shape": ns_shape,
+        "nsdims": tuple(nsdims),
+        "fuse_kwargs": fuse_kwargs,
+        "output_chunksize": output_chunksize,
+    }
+    from urllib.parse import urlparse
+
+    store_path_text = str(store_path)
+    candidate_plan_path = _FUSION_VIEW_CANDIDATE_PLAN_PATHS.get(store_path_text)
+    if candidate_plan_path is None:
+        parsed = urlparse(store_path_text)
+        candidate_plan_path = _FUSION_VIEW_CANDIDATE_PLAN_PATHS.get(parsed.path if parsed.scheme == "file" else store_path_text)
+    if candidate_plan_path is None:
+        candidate_plan_path = _FUSION_VIEW_CANDIDATE_PLAN_PATHS.get(str(Path(store_path_text)))
+    if candidate_plan_path is not None:
+        payload["view_candidate_plan_path"] = candidate_plan_path
+    return payload
+
+
+_MVS_FUSE_CHUNK_WORKER_PAYLOADS: dict[str, dict[str, Any]] = {}
+
+
+def mvs_fuse_chunk_payload_cache_path(payload: dict[str, Any]) -> Path:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(payload["output_zarr_url"]))
+    output_zarr_url = Path(parsed.path if parsed.scheme == "file" else str(payload["output_zarr_url"]))
+    if output_zarr_url.name.isdigit() and output_zarr_url.parent.name.endswith(".zarr"):
+        return output_zarr_url.parent.parent / f".{output_zarr_url.parent.name}.worker-payload.pkl"
+    return output_zarr_url.parent / f".{output_zarr_url.name}.worker-payload.pkl"
+
+
+def write_mvs_fuse_chunk_payload_cache(payload: dict[str, Any]) -> str:
+    from joblib.externals import cloudpickle
+
+    path = mvs_fuse_chunk_payload_cache_path(payload)
+    tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    with tmp_path.open("wb") as handle:
+        cloudpickle.dump(payload, handle)
+    os.replace(tmp_path, path)
+    return str(path)
+
+
+def load_mvs_fuse_chunk_payload(payload_cache_path: str) -> dict[str, Any]:
+    from joblib.externals import cloudpickle
+
+    payload = _MVS_FUSE_CHUNK_WORKER_PAYLOADS.get(payload_cache_path)
+    if payload is None:
+        _MVS_FUSE_CHUNK_WORKER_PAYLOADS.clear()
+        with Path(payload_cache_path).open("rb") as handle:
+            payload = cloudpickle.load(handle)
+        _MVS_FUSE_CHUNK_WORKER_PAYLOADS[payload_cache_path] = payload
+    return payload
+
+
+def run_mvs_fuse_chunk_loky_worker(
+    index: int,
+    block_id,
+    payload_cache_path: str,
+    cuda_devices: tuple[int, ...],
+) -> None:
+    import cupy as cp
+
+    device = int(cuda_devices[index % len(cuda_devices)])
+    max_attempts = 3
+    retry_delay_seconds = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            payload = load_mvs_fuse_chunk_payload(payload_cache_path)
+            return run_mvs_fuse_chunk_loky_worker_once(block_id, payload, device)
+        except cp.cuda.memory.OutOfMemoryError:
+            from multiview_stitcher import misc_utils
+
+            with cp.cuda.Device(device):
+                misc_utils.clear_cupy_memory()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            if attempt == max_attempts:
+                raise
+            print(
+                "Fusion block hit CuPy OOM; retrying after cleanup: "
+                f"block_id={block_id}, local_cuda_device={device}, "
+                f"attempt={attempt}/{max_attempts}, sleep={retry_delay_seconds}s",
+                flush=True,
+            )
+            time.sleep(retry_delay_seconds)
+
+
+def run_mvs_fuse_chunk_loky_worker_batch(
+    block_ids,
+    payload_cache_path: str,
+    cuda_device: int,
+) -> None:
+    for block_id in block_ids:
+        run_mvs_fuse_chunk_loky_worker(0, block_id, payload_cache_path, (int(cuda_device),))
+
+
+def run_mvs_fuse_chunk_loky_worker_once(
+    block_id,
+    payload: dict[str, Any],
+    device: int,
+) -> None:
+    from dask import config as dask_config
+    from dask.array.core import normalize_chunks
+    from multiview_stitcher import misc_utils
+    from multiview_stitcher import spatial_image_utils as si_utils
+    from multiview_stitcher import fusion
+    import zarr
+
+    import cupy as cp
+
+    with cp.cuda.Device(device):
+        output_zarr_array = zarr.open_array(payload["output_zarr_url"], mode="r+")
+        output_chunk_size_bytes = int(
+            math.prod(int(chunk) for chunk in output_zarr_array.chunks)
+            * np.dtype(output_zarr_array.dtype).itemsize
+        )
+        dask_chunk_size_bytes = max(output_chunk_size_bytes * 2, output_chunk_size_bytes + 1)
+        osp = payload["output_stack_properties"]
+        ns_shape = payload["ns_shape"]
+        nsdims = tuple(payload["nsdims"])
+        fuse_kwargs = payload["fuse_kwargs"]
+        output_chunksize = payload["output_chunksize"]
+        sdims = list(osp["shape"].keys())
+
+        normalized_chunks = normalize_chunks(
+            shape=[ns_shape[dim] for dim in nsdims] + [osp["shape"][dim] for dim in sdims],
+            chunks=(1,) * len(nsdims) + tuple(output_chunksize[dim] for dim in sdims),
+        )
+        ns_coord = {dim: block_id[idim] for idim, dim in enumerate(nsdims)}
+        spatial_chunk_ind = block_id[len(nsdims) :]
+        chunk_offset = {
+            sdims[idim]: int(np.sum(normalized_chunks[len(nsdims) + idim][:b])) if b > 0 else 0
+            for idim, b in enumerate(spatial_chunk_ind)
+        }
+        chunk_offset_phys = {
+            dim: chunk_offset[dim] * osp["spacing"][dim] + osp["origin"][dim]
+            for dim in sdims
+        }
+        chunk_shape = {
+            sdims[idim]: normalized_chunks[len(nsdims) + idim][b]
+            for idim, b in enumerate(spatial_chunk_ind)
+        }
+
+        sims = fuse_kwargs.get("images")
+        if sims is None:
+            sims = fuse_kwargs.get("sims")
+        candidate_plan_path = payload.get("view_candidate_plan_path")
+        candidate_indices = None
+        if candidate_plan_path is not None:
+            candidate_plan = load_direct_fusion_view_candidate_plan(str(candidate_plan_path))
+            spatial_block_key = tuple(int(value) for value in block_id[len(nsdims) :])
+            candidate_indices = candidate_plan.get(spatial_block_key)
+            if not candidate_indices:
+                raise ValueError(
+                    "Fusion view-candidate plan has no candidates for a block that reached the worker: "
+                    f"block_id={tuple(int(value) for value in block_id)}, spatial_block_key={spatial_block_key}, "
+                    f"plan_path={candidate_plan_path}"
+                )
+            sims = [sims[int(index)] for index in candidate_indices]
+        use_direct_zarr_block = (
+            candidate_plan_path is not None
+            and all(si_utils.is_xarray_zarr_backed(sim) for sim in sims)
+        )
+        region = tuple(
+            [slice(ns_coord[dim], ns_coord[dim] + 1) for dim in nsdims]
+            + [slice(chunk_offset[dim], chunk_offset[dim] + chunk_shape[dim]) for dim in sdims]
+        )
+        with (
+            inplace_mvs_normalize_weights_context(),
+            dask_config.set({"scheduler": "single-threaded", "array.chunk-size": dask_chunk_size_bytes}),
+        ):
+            if use_direct_zarr_block:
+                from multiview_stitcher.fusion import _core as fusion_core
+
+                sim_coord_dict = {
+                    dim: sims[0].coords[dim].values[int(index)]
+                    for dim, index in ns_coord.items()
+                    if dim in sims[0].coords
+                }
+                overlap_in_pixels = normalize_fusion_overlap_pixels(
+                    fuse_kwargs.get("overlap_in_pixels"),
+                    spatial_dims=tuple(sdims),
+                    output_chunksize=output_chunksize,
+                    weights_func=fuse_kwargs.get("weights_func"),
+                    weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
+                    fusion_func=fuse_kwargs.get("fusion_func"),
+                    fusion_func_kwargs=fuse_kwargs.get("fusion_func_kwargs"),
+                )
+                block_entry, _entry_region = direct_zarr_block_entry(
+                    sims=sims,
+                    transform_key=fuse_kwargs["transform_key"],
+                    sim_coord_dict=sim_coord_dict,
+                    block_key=tuple(int(value) for value in spatial_chunk_ind),
+                    output_stack_properties=osp,
+                    output_chunksize=output_chunksize,
+                    output_chunk_shape=chunk_shape,
+                    output_chunk_origin=chunk_offset_phys,
+                    overlap_in_pixels=overlap_in_pixels,
+                    interpolation_order=int(fuse_kwargs.get("interpolation_order", 1)),
+                )
+                if not block_entry["views"]:
+                    raise ValueError(
+                        "Fusion direct zarr block path found no exact overlapping views for a planned block: "
+                        f"block_id={tuple(int(value) for value in block_id)}, "
+                        f"spatial_block_key={tuple(int(value) for value in spatial_chunk_ind)}, "
+                        f"candidate_count={len(candidate_indices or ())}, plan_path={candidate_plan_path}"
+                    )
+                materialized = fusion_core._fuse_block_zarr_backed(
+                    np.asarray(block_entry, dtype=object),
+                    output_dtype=np.dtype(output_zarr_array.dtype),
+                    sim_coord_dict=sim_coord_dict,
+                    sdims=sdims,
+                    fusion_func=fuse_kwargs.get("fusion_func", fusion_core.weighted_average_fusion),
+                    fusion_func_kwargs=fuse_kwargs.get("fusion_func_kwargs"),
+                    weights_func=fuse_kwargs.get("weights_func"),
+                    weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
+                    overlap_in_pixels=overlap_in_pixels,
+                    interpolation_order=int(fuse_kwargs.get("interpolation_order", 1)),
+                    blending_widths=fuse_kwargs.get("blending_widths"),
+                    shrink_distance=required_fusion_source_shrinkage(
+                        weights_func=fuse_kwargs.get("weights_func"),
+                        weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
+                        fusion_func=fuse_kwargs.get("fusion_func"),
+                        fusion_func_kwargs=fuse_kwargs.get("fusion_func_kwargs"),
+                    ),
+                    backend=fuse_kwargs.get("backend"),
+                )
+            else:
+                sims = [
+                    si_utils.sim_sel_coords(sim, {dim: sim.coords[dim][[ic]] for dim, ic in ns_coord.items()})
+                    for sim in sims
+                ]
+                fused = fusion.fuse(
+                    images=sims,
+                    **{key: value for key, value in fuse_kwargs.items() if key not in {"images", "sims"}},
+                    output_origin={dim: chunk_offset_phys[dim] for dim in sdims},
+                    output_shape={dim: chunk_shape[dim] for dim in sdims},
+                    output_spacing={dim: osp["spacing"][dim] for dim in sdims},
+                ).data
+                materialized = fused.compute(scheduler="single-threaded")
+            if isinstance(materialized, cp.ndarray):
+                materialized = cp.asnumpy(materialized)
+            materialized = np.ascontiguousarray(materialized, dtype=output_zarr_array.dtype)
+            expected_shape = tuple(int(s.stop - s.start) for s in region)
+            if materialized.shape != expected_shape:
+                raise ValueError(
+                    f"Fused block shape {materialized.shape} does not match write region {expected_shape}"
+                )
+            output_zarr_array[region] = materialized
+        misc_utils.clear_cupy_memory()
+
+
 def zarr_v3_array_creation_kwargs(dims: tuple[str, ...]) -> dict[str, Any]:
     from zarr.codecs import BytesCodec, ZstdCodec
 
     return {
         "dimension_names": dims,
         "codecs": [BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
+    }
+
+
+def zarr_v3_sharded_array_creation_kwargs(dims: tuple[str, ...], chunks: tuple[int, ...]) -> dict[str, Any]:
+    from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
+
+    return {
+        "dimension_names": dims,
+        "codecs": [
+            ShardingCodec(
+                chunk_shape=chunks,
+                codecs=[BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
+            )
+        ],
     }
 
 
@@ -5579,17 +6879,26 @@ def validate_written_scale0(output_zarr_url: str | Path | None, sim: Any) -> Non
     array = zarr.open_array(str(output / "0"), mode="r")
     expected_shape = tuple(int(size) for size in sim.shape)
     actual_shape = tuple(int(size) for size in array.shape)
-    if actual_shape != expected_shape:
+    if actual_shape == expected_shape:
+        expected_dimension_names = tuple(str(dim) for dim in sim.dims)
+    elif len(actual_shape) < len(expected_shape):
+        dropped_axes = len(expected_shape) - len(actual_shape)
+        dropped_shape = expected_shape[:dropped_axes]
+        squeezed_shape = expected_shape[dropped_axes:]
+        if not all(size == 1 for size in dropped_shape) or actual_shape != squeezed_shape:
+            raise ValueError(
+                f"{output} scale-0 shape mismatch after package OME-Zarr write: {actual_shape} != {expected_shape}"
+            )
+        expected_dimension_names = tuple(str(dim) for dim in sim.dims[dropped_axes:])
+    else:
         raise ValueError(
-            f"{output} scale-0 shape mismatch after package OME-Zarr write: "
-            f"{actual_shape} != {expected_shape}"
+            f"{output} scale-0 shape mismatch after package OME-Zarr write: {actual_shape} != {expected_shape}"
         )
     dimension_names = tuple(array.metadata.dimension_names or ())
-    expected_dims = tuple(str(dim) for dim in sim.dims)
-    if dimension_names and dimension_names != expected_dims:
+    if dimension_names and dimension_names != expected_dimension_names:
         raise ValueError(
             f"{output} scale-0 dimension names mismatch after package OME-Zarr write: "
-            f"{dimension_names} != {expected_dims}"
+            f"{dimension_names} != {expected_dimension_names}"
         )
 
 
@@ -5610,10 +6919,7 @@ def single_scale_fusion_output():
         except np.exceptions.AxisError as exc:
             output_zarr_url = kwargs.get("output_zarr_url") or (args[0] if args else None)
             validate_written_scale0(output_zarr_url, sim)
-            log(
-                "Skipping package OMERO channel-window metadata after single-scale "
-                f"temporary fusion write: {exc}"
-            )
+            log(f"Skipping package OMERO channel-window metadata after single-scale temporary fusion write: {exc}")
             return sim
 
     ngff_utils.write_sim_to_ome_zarr = write_single_scale_ome_zarr
@@ -5675,6 +6981,8 @@ def spatial_chunks_for_package_pyramid():
 chunk_slices = pyramid_core.chunk_slices
 chunk_count = pyramid_core.chunk_count
 ceil_div = pyramid_core.ceil_div
+downsampled_chunks = pyramid_core.downsampled_chunks
+pyramid_shard_chunks = pyramid_core.pyramid_shard_chunks
 pyramid_relative_factors = pyramid_core.pyramid_relative_factors
 level_coordinate_transformations = pyramid_core.level_coordinate_transformations
 
@@ -5717,33 +7025,30 @@ def write_zstd_downsampled_level(
     import zarr
 
     factor_tuple = tuple(int(factors[dim]) for dim in dimension_names)
-    shape = tuple(
-        int(size) // factor
-        for size, factor in zip(source_array.shape, factor_tuple, strict=True)
-    )
-    output_chunks = tuple(
-        min(max(int(chunk) // factor, 1), int(size))
-        for chunk, factor, size in zip(source_array.chunks, factor_tuple, shape, strict=True)
-    )
+    shape = tuple(int(size) // factor for size, factor in zip(source_array.shape, factor_tuple, strict=True))
+    inner_chunks = downsampled_chunks(tuple(int(chunk) for chunk in source_array.chunks), shape, factor_tuple)
+    source_storage_chunks = tuple(int(chunk) for chunk in (source_array.metadata.shards or source_array.chunks))
+    shard_chunks = pyramid_shard_chunks(source_storage_chunks, shape, inner_chunks)
     destination_array_path = destination / dataset_path
     destination_array_path.parent.mkdir(parents=True, exist_ok=True)
     destination_array = zarr.open(
         str(destination_array_path),
         mode="w",
         shape=shape,
-        chunks=output_chunks,
+        chunks=shard_chunks,
         dtype=source_array.dtype,
         zarr_format=3,
-        dimension_names=dimension_names,
-        codecs=zarr_v3_array_creation_kwargs(dimension_names)["codecs"],
+        **zarr_v3_sharded_array_creation_kwargs(dimension_names, inner_chunks),
     )
 
-    n_chunks = chunk_count(shape, output_chunks)
+    n_chunks = chunk_count(shape, shard_chunks)
+    inner_chunk_count = chunk_count(shape, inner_chunks)
     log(
         f"Writing pyramid level {dataset_path} from completed Zarr level: "
-        f"shape={shape}, factors={factors}, chunks={output_chunks}, chunks_total={n_chunks}"
+        f"shape={shape}, factors={factors}, shard_chunks={shard_chunks}, inner_chunks={inner_chunks}, "
+        f"shards_total={n_chunks}, inner_chunks_total={inner_chunk_count}"
     )
-    for chunk_index, selection in enumerate(chunk_slices(shape, output_chunks), start=1):
+    for chunk_index, selection in enumerate(chunk_slices(shape, shard_chunks), start=1):
         source_selection = tuple(
             slice(
                 part.start * factor,
@@ -5757,10 +7062,7 @@ def write_zstd_downsampled_level(
             np.dtype(source_array.dtype),
         )
         if chunk_index <= 3 or chunk_index % 1000 == 0 or chunk_index == n_chunks:
-            log(
-                f"Writing pyramid level {dataset_path}: "
-                f"{chunk_index}/{n_chunks} chunk(s)"
-            )
+            log(f"Writing pyramid level {dataset_path}: {chunk_index}/{n_chunks} shard(s)")
 
 
 def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
@@ -5793,15 +7095,9 @@ def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
         if not any(factor > 1 for factor in factors.values()):
             break
         level_factors.append(factors)
-        abs_factors.append(
-            {
-                dim: abs_factors[-1][dim] * factors[dim]
-                for dim in dimension_names
-            }
-        )
+        abs_factors.append({dim: abs_factors[-1][dim] * factors[dim] for dim in dimension_names})
         current_shape = tuple(
-            size // int(factors[dim])
-            for size, dim in zip(current_shape, dimension_names, strict=True)
+            size // int(factors[dim]) for size, dim in zip(current_shape, dimension_names, strict=True)
         )
 
     if not level_factors:
@@ -5883,6 +7179,192 @@ def mark_ome_zarr_complete(output: Path) -> None:
     group.attrs["squisher_complete"] = True
 
 
+def cleanup_or_preserve_fusion_workspace(temp_root: Path | None, *, completed: bool) -> None:
+    if temp_root is None:
+        return
+    if completed:
+        shutil.rmtree(temp_root)
+        log(f"Removed fusion temporary workspace {temp_root}")
+        return
+    log(f"Preserving failed fusion temporary workspace {temp_root}")
+
+
+class ProfileFusionStop(RuntimeError):
+    """Internal sentinel used to stop bounded fusion profiling runs."""
+
+
+def profiled_fusion_batch_func(
+    batch_func,
+    *,
+    max_batches: int | None,
+    skip_batches: int,
+):
+    if max_batches is None and skip_batches <= 0:
+        return batch_func
+
+    state = {"seen": 0, "processed": 0}
+
+    def wrapper(func, block_ids, **kwargs):
+        state["seen"] += 1
+        batch_index = state["seen"]
+        block_count = len(block_ids)
+        if batch_index <= skip_batches:
+            log(
+                "Profile fusion batch skip: "
+                f"batch={batch_index}, blocks={block_count}, "
+                f"skip_batches={skip_batches}"
+            )
+            return
+
+        state["processed"] += 1
+        processed_index = state["processed"]
+        log(
+            "Profile fusion batch start: "
+            f"batch={batch_index}, processed={processed_index}, blocks={block_count}"
+        )
+        io_start = current_io_bytes()
+        batch_func(func, block_ids, **kwargs)
+        io_end = current_io_bytes()
+        log(
+            "Profile fusion batch done: "
+            f"batch={batch_index}, processed={processed_index}, blocks={block_count}, "
+            f"rss={current_rss_gb() or float('nan'):.1f} GiB, "
+            f"io_delta=({format_io_delta(io_start, io_end)})"
+        )
+        if max_batches is not None and processed_index >= max_batches:
+            raise ProfileFusionStop(
+                f"stopped after {processed_index} profiled fusion batch(es); "
+                f"seen={batch_index}, blocks_in_last_batch={block_count}"
+            )
+
+    return wrapper
+
+
+def visible_local_cuda_devices() -> tuple[int, ...]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        devices = [part.strip() for part in visible.split(",") if part.strip()]
+        return tuple(range(len(devices)))
+
+    try:
+        import cupy as cp
+    except ImportError:
+        return ()
+    return tuple(range(int(cp.cuda.runtime.getDeviceCount())))
+
+
+def cuda_devices_weighted_by_total_vram(cuda_devices: tuple[int, ...]) -> tuple[int, ...]:
+    if not cuda_devices:
+        return ()
+
+    import cupy as cp
+    from math import gcd
+
+    nominal_totals_gib: list[tuple[int, int]] = []
+    for device in cuda_devices:
+        props = cp.cuda.runtime.getDeviceProperties(int(device))
+        total = int(props["totalGlobalMem"])
+        total_gib = max(1, int(round(total / 1024**3)))
+        nominal_gib = max(1, int(round(total_gib / 8)) * 8)
+        nominal_totals_gib.append((int(device), nominal_gib))
+
+    common_factor = 0
+    for _device, nominal_gib in nominal_totals_gib:
+        common_factor = nominal_gib if common_factor == 0 else gcd(common_factor, nominal_gib)
+
+    return tuple(
+        interleaved_weighted_devices(
+            [(device, max(1, nominal_gib // common_factor)) for device, nominal_gib in nominal_totals_gib]
+        )
+    )
+
+
+def interleaved_weighted_devices(weights: list[tuple[int, int]]) -> list[int]:
+    total_weight = sum(weight for _device, weight in weights)
+    current = {device: 0 for device, _weight in weights}
+    sequence: list[int] = []
+    for _ in range(total_weight):
+        for device, weight in weights:
+            current[device] += weight
+        selected = max(weights, key=lambda item: (current[item[0]], item[1], -item[0]))[0]
+        sequence.append(selected)
+        current[selected] -= total_weight
+    return sequence
+
+
+def format_cuda_device_weights(weighted_devices: tuple[int, ...]) -> str:
+    counts = Counter(weighted_devices)
+    return ", ".join(f"{device}:x{counts[device]}" for device in sorted(counts))
+
+
+_CUDA_BATCH_DEVICE_OFFSET = 0
+
+
+def process_batch_using_joblib_cuda_devices(
+    func,
+    block_ids,
+    *,
+    n_jobs: int = 4,
+    backend: str = "threading",
+    cuda_devices: tuple[int, ...],
+) -> None:
+    if not cuda_devices:
+        raise ValueError("cuda_devices must contain at least one local CUDA device index")
+
+    from joblib import Parallel, delayed
+
+    global _CUDA_BATCH_DEVICE_OFFSET
+    devices = tuple(int(device) for device in cuda_devices)
+    device_offset = _CUDA_BATCH_DEVICE_OFFSET
+    _CUDA_BATCH_DEVICE_OFFSET = (_CUDA_BATCH_DEVICE_OFFSET + len(block_ids)) % len(devices)
+    debug_blocks = int(os.environ.get("SQUISHER_FUSION_DEBUG_BLOCKS", "0"))
+
+    if backend == "loky":
+        payload = mvs_fuse_chunk_payload(func)
+        if payload is None:
+            raise TypeError("loky CUDA fusion requires a picklable multiview-stitcher fuse_chunk payload")
+        payload_cache_path = write_mvs_fuse_chunk_payload_cache(payload)
+        worker_count = min(int(n_jobs), len(devices), len(block_ids))
+        block_groups = [[] for _ in range(worker_count)]
+        for index, block_id in enumerate(block_ids):
+            block_groups[index % worker_count].append(block_id)
+        Parallel(n_jobs=worker_count, backend=backend)(
+            delayed(run_mvs_fuse_chunk_loky_worker_batch)(
+                block_group,
+                payload_cache_path,
+                devices[(device_offset + group_index) % len(devices)],
+            )
+            for group_index, block_group in enumerate(block_groups)
+        )
+        return
+
+    def run_one(index: int, block_id) -> None:
+        import cupy as cp
+
+        device = devices[(device_offset + index) % len(devices)]
+        should_debug = debug_blocks < 0 or index < debug_blocks
+        if should_debug:
+            started = time.perf_counter()
+            log(
+                "Fusion block start: "
+                f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
+                f"thread={threading.get_ident()}"
+            )
+        with cp.cuda.Device(device):
+            func(block_id)
+        if should_debug:
+            elapsed = time.perf_counter() - started
+            log(
+                "Fusion block done: "
+                f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
+                f"thread={threading.get_ident()}, elapsed={elapsed:.3f}s"
+            )
+
+    Parallel(n_jobs=min(int(n_jobs), len(block_ids)), backend=backend)(
+        delayed(run_one)(index, block_id) for index, block_id in enumerate(block_ids)
+    )
+
+
 def repair_ome_metadata_axes(output: Path) -> None:
     metadata_path = ome_zarr_group_metadata_path(output)
     if not metadata_path.exists() or metadata_path.name != "zarr.json":
@@ -5908,11 +7390,7 @@ def repair_ome_metadata_axes(output: Path) -> None:
         return
 
     names = set(dimension_names)
-    axis_indices = [
-        index
-        for index, axis in enumerate(axes)
-        if axis.get("name") in names
-    ]
+    axis_indices = [index for index, axis in enumerate(axes) if axis.get("name") in names]
     if len(axis_indices) != len(dimension_names):
         return
 
@@ -5977,7 +7455,20 @@ def scale_thumbnail_uint8(image) -> Any:
     return np.asarray(np.rint(scaled * 255), dtype=np.uint8)
 
 
-def write_center_z_thumbnail(output: Path, *, max_size: int = 2048) -> Path:
+def write_center_z_thumbnail(
+    output: Path,
+    *,
+    max_size: int = 2048,
+    registration_input: Path | None = None,
+    tile_index_level: int = 2,
+) -> Path:
+    if registration_input is not None:
+        return qc_core.render_fused_tile_index_overlay(
+            fused_zarr=output,
+            registration_input=registration_input,
+            level=tile_index_level,
+        )
+
     import numpy as np
     from PIL import Image
     import zarr
@@ -6032,8 +7523,10 @@ def ome_zarr_scale0_chunk_status(output: Path) -> tuple[int, int]:
             continue
         relative_parts = path.relative_to(scale0).parts
         if zarr_format == 3:
-            if len(relative_parts) > 1 and relative_parts[0] == "c" and all(
-                part.isdigit() for part in relative_parts[1:]
+            if (
+                len(relative_parts) > 1
+                and relative_parts[0] == "c"
+                and all(part.isdigit() for part in relative_parts[1:])
             ):
                 actual += 1
         elif all(part.isdigit() for part in relative_parts):
@@ -6042,10 +7535,7 @@ def ome_zarr_scale0_chunk_status(output: Path) -> tuple[int, int]:
 
 
 def ome_zarr_has_multiscales_metadata(output: Path) -> bool:
-    if (
-        not ome_zarr_group_metadata_path(output).exists()
-        or not ome_zarr_scale0_array_path(output).exists()
-    ):
+    if not ome_zarr_group_metadata_path(output).exists() or not ome_zarr_scale0_array_path(output).exists():
         return False
     payload = read_ome_zarr_group_metadata(output)
     multiscales = payload.get("multiscales") or []
@@ -6059,7 +7549,9 @@ def ome_zarr_has_multiscales_metadata(output: Path) -> bool:
 
 
 def ome_zarr_is_complete(output: Path) -> bool:
-    return ome_zarr_has_multiscales_metadata(output) and read_ome_zarr_group_attrs(output).get("squisher_complete") is True
+    return (
+        ome_zarr_has_multiscales_metadata(output) and read_ome_zarr_group_attrs(output).get("squisher_complete") is True
+    )
 
 
 def raise_if_nonempty_output_dir(path: Path, label: str) -> None:
@@ -6087,8 +7579,7 @@ def output_exists_error(output: Path) -> FileExistsError:
             "interrupted write; move it before rerunning."
         )
     return FileExistsError(
-        f"{output} exists but does not contain OME-Zarr metadata or scale-0 data; "
-        "move it before rerunning"
+        f"{output} exists but does not contain OME-Zarr metadata or scale-0 data; move it before rerunning"
     )
 
 
@@ -6106,11 +7597,7 @@ def channels_to_fuse_for_tiles(
         invalid = [index for index in selected_channels if index < 0 or index >= n_channels]
         if invalid:
             raise ValueError(f"Invalid channel indices for {n_channels} channels: {invalid}")
-    return (
-        tuple(range(tile_channel_count(tiles[0])))
-        if selected_channels is None
-        else selected_channels
-    )
+    return tuple(range(tile_channel_count(tiles[0]))) if selected_channels is None else selected_channels
 
 
 def should_run_registration(
@@ -6141,9 +7628,7 @@ def resolve_pairwise_registration_jobs(args: argparse.Namespace) -> int:
     requested = getattr(args, "n_parallel_pairwise_regs", None)
     if requested is not None:
         return int(requested)
-    if args.registration_pair_mode == "robust-boundary":
-        return 0
-    return 4
+    return DEFAULT_N_PARALLEL_PAIRWISE_REGS
 
 
 def resolve_dask_num_workers(args: argparse.Namespace) -> int | None:
@@ -6178,8 +7663,11 @@ def mvs_groupwise_resolution_kwargs(transform: str = MVS_GROUPWISE_TRANSFORM) ->
     return {"transform": transform}
 
 
-def mvs_post_quality_filter_enabled() -> bool:
-    return MVS_POST_QUALITY_THRESHOLD is not None
+def mvs_post_quality_threshold(args: argparse.Namespace) -> float | None:
+    if getattr(args, "no_mvs_post_quality_filter", False):
+        return None
+    threshold = getattr(args, "mvs_post_quality_threshold", MVS_POST_QUALITY_THRESHOLD)
+    return None if threshold is None else float(threshold)
 
 
 def preflight_track_run_outputs(
@@ -6323,6 +7811,23 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--n-parallel-pairwise-regs",
+        type=parse_nonnegative_int,
+        default=DEFAULT_N_PARALLEL_PAIRWISE_REGS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--dask-num-workers",
+        type=parse_positive_int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--registration-cache-max-gib",
+        type=parse_nonnegative_float,
+        default=DEFAULT_REGISTRATION_CACHE_MAX_GIB,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--coarse-reg-res-levels",
         type=int,
         nargs="+",
@@ -6336,11 +7841,27 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--mvs-post-quality-threshold",
+        type=parse_nonnegative_float,
+        default=MVS_POST_QUALITY_THRESHOLD,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-mvs-post-quality-filter",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--output-chunksize",
         type=int,
         nargs=3,
         metavar=("Z", "Y", "X"),
         default=(8, 1024, 1024),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--output-grid-template",
+        type=Path,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -6359,6 +7880,16 @@ def parse_args() -> argparse.Namespace:
         "--batch-jobs",
         type=int,
         default=16,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--resume-fusion",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--disable-view-candidate-culling",
+        action="store_true",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -6440,6 +7971,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--basic-cache-max-gib",
         type=parse_nonnegative_float,
+        default=DEFAULT_BASIC_CACHE_MAX_GIB,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -6457,6 +7989,17 @@ def parse_args() -> argparse.Namespace:
         "--fusion-progress-log-seconds",
         type=parse_nonnegative_int,
         default=60,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--profile-max-fusion-batches",
+        type=parse_positive_int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--profile-skip-fusion-batches",
+        type=parse_nonnegative_int,
+        default=0,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -6481,15 +8024,24 @@ def parse_args() -> argparse.Namespace:
         reg_res_level=4,
         coarse_reg_res_levels=DEFAULT_COARSE_REG_RES_LEVELS,
         auto_reg_res_level=False,
-        n_parallel_pairwise_regs=None,
+        n_parallel_pairwise_regs=DEFAULT_N_PARALLEL_PAIRWISE_REGS,
         dask_num_workers=32,
         registration_read_chunk_z=DEFAULT_REGISTRATION_READ_CHUNK_Z,
+        registration_cache_max_gib=DEFAULT_REGISTRATION_CACHE_MAX_GIB,
         registration_pair_mode=DEFAULT_REGISTRATION_PAIR_MODE,
         robust_boundary_qc_dir=None,
         skip_registration_plots=True,
         per_chunk_cupy_cleanup=False,
     )
     return parser.parse_args()
+
+
+def validate_profile_fusion_options(args: argparse.Namespace) -> None:
+    if args.profile_skip_fusion_batches and args.profile_max_fusion_batches is None:
+        raise ValueError(
+            "--profile-skip-fusion-batches requires --profile-max-fusion-batches "
+            "so a bounded profiling run cannot skip chunks and still complete the output"
+        )
 
 
 def parse_batch_size(value: str) -> int | str:
@@ -6582,8 +8134,7 @@ def log_tile_run_summary(tiles: list[TileMetadata]) -> None:
     source_views = Counter(tile.source_view or "__none__" for tile in tiles)
     shape_counts = Counter(tile_shape_zyx(tile) for tile in tiles)
     stage_scale_counts = Counter(
-        tuple(round(tile_stage_scale(tile)[dim], 9) for dim in ("z", "y", "x"))
-        for tile in tiles
+        tuple(round(tile_stage_scale(tile)[dim], 9) for dim in ("z", "y", "x")) for tile in tiles
     )
     translation_ranges = {
         dim: (
@@ -6601,8 +8152,7 @@ def log_tile_run_summary(tiles: list[TileMetadata]) -> None:
     log(
         "Tile translation ranges um: "
         + ", ".join(
-            f"{dim}={translation_ranges[dim][0]:.3f}..{translation_ranges[dim][1]:.3f}"
-            for dim in ("z", "y", "x")
+            f"{dim}={translation_ranges[dim][0]:.3f}..{translation_ranges[dim][1]:.3f}" for dim in ("z", "y", "x")
         )
     )
     log(f"Estimated output shape from metadata, before registration: {estimate_output_shape(tiles)}")
@@ -6651,8 +8201,9 @@ def run_stitch_once(
     log(f"Channels to fuse separately: {channels_to_fuse}")
     output_chunksize = output_chunksize_arg(args.output_chunksize)
     log(f"Requested fusion output chunksize: {output_chunksize}")
-    output_spacing = fusion_output_spacing(tiles[0].spacing, args.fusion_level)
-    log(f"Fusion output level: {args.fusion_level}; output spacing: {output_spacing}")
+    nominal_output_spacing = fusion_output_spacing(tiles[0].spacing, args.fusion_level)
+    log(f"Fusion output level: {args.fusion_level}; nominal output spacing: {nominal_output_spacing}")
+    output_grid_template = getattr(args, "output_grid_template", None)
 
     registration_binning = None
     if args.registration_binning is not None:
@@ -6680,6 +8231,10 @@ def run_stitch_once(
     registration_read_chunk_z = int(args.registration_read_chunk_z)
     if registration_read_chunk_z <= 0:
         raise ValueError(f"--registration-read-chunk-z must be positive, got {registration_read_chunk_z}")
+    registration_cache_max_gib = args.registration_cache_max_gib
+    registration_cache_max_bytes = (
+        None if registration_cache_max_gib is None else int(float(registration_cache_max_gib) * 1024**3)
+    )
 
     print_plan(
         tiles,
@@ -6696,6 +8251,7 @@ def run_stitch_once(
         n_parallel_pairwise_regs,
         dask_num_workers,
         registration_read_chunk_z,
+        registration_cache_max_gib,
     )
     if should_run_coarse and len(coarse_reg_res_levels) > 1:
         log(f"Hierarchical coarse registration levels: {coarse_reg_res_levels}")
@@ -6721,6 +8277,7 @@ def run_stitch_once(
     from multiview_stitcher import fusion, misc_utils, registration
     from multiview_stitcher.fusion._core import process_output_chunksize, process_output_stack_properties
     from multiview_stitcher import spatial_image_utils as si_utils
+
     log("Imported multiview-stitcher fusion/registration modules")
     log(f"Fusion batch settings: n_batch={args.batch_size}, threaded_jobs={args.batch_jobs}")
     log(f"Final fusion compressor: zstd level {ZSTD_LEVEL}")
@@ -6820,7 +8377,9 @@ def run_stitch_once(
         if args.registration_pair_file is not None:
             registration_pairs = registration_pairs_from_file(args.registration_pair_file.resolve(), tiles)
             pre_registration_pruning_method = None
-            log(f"Using {len(registration_pairs)} explicit registration pairs from {args.registration_pair_file.resolve()}")
+            log(
+                f"Using {len(registration_pairs)} explicit registration pairs from {args.registration_pair_file.resolve()}"
+            )
         elif args.registration_pair_mode in {"axis-aligned", "robust-boundary"}:
             registration_pairs = axis_aligned_registration_pairs(tiles)
             pre_registration_pruning_method = None
@@ -6838,22 +8397,16 @@ def run_stitch_once(
             if args.groupwise_transform == "translation"
             else native_rigid_pairwise_registration
         )
-        log(
-            "Pairwise registration function: "
-            f"{pairwise_reg_func.__name__}; gpu=True"
-        )
+        log(f"Pairwise registration function: {pairwise_reg_func.__name__}; gpu=True")
         groupwise_resolution_kwargs = mvs_groupwise_resolution_kwargs(args.groupwise_transform)
-        post_quality_filter = mvs_post_quality_filter_enabled()
+        post_quality_threshold = mvs_post_quality_threshold(args)
+        post_quality_filter = post_quality_threshold is not None
         log(
             "MVS groupwise resolver: "
             f"{MVS_GROUPWISE_RESOLUTION_METHOD} "
             f"kwargs={groupwise_resolution_kwargs}; "
             f"post_quality_filter={post_quality_filter}"
-            + (
-                f" threshold={MVS_POST_QUALITY_THRESHOLD}"
-                if post_quality_filter
-                else ""
-            )
+            + (f" threshold={post_quality_threshold}" if post_quality_filter else "")
         )
         reg_msims = None
         reg_stores = []
@@ -6863,16 +8416,22 @@ def run_stitch_once(
         try:
             full_params = None
             registration_result = None
-            with batched_pairwise_registration(dask_num_workers=dask_num_workers), dask_progress("registration.register"):
+            with (
+                batched_pairwise_registration(dask_num_workers=dask_num_workers),
+                dask_compute_cache(label="Registration", max_bytes=registration_cache_max_bytes),
+                dask_progress("registration.register"),
+            ):
                 for stage_index, stage_reg_res_level in enumerate(coarse_reg_res_levels):
                     if reg_stores:
                         close_stores(reg_stores)
                         reg_stores = []
                         log("Closed previous registration stage TIFF stores")
-                    stage_source_level, stage_available_levels, stage_level_offset = registration_source_level_for_tiles(
-                        tiles,
-                        (stage_reg_res_level,),
-                        registration_binning,
+                    stage_source_level, stage_available_levels, stage_level_offset = (
+                        registration_source_level_for_tiles(
+                            tiles,
+                            (stage_reg_res_level,),
+                            registration_binning,
+                        )
                     )
                     stage_source_records.append(
                         {
@@ -6915,7 +8474,7 @@ def run_stitch_once(
                     )
                     stage_n_parallel_pairwise_regs = (
                         1
-                        if effective_stage_reg_res_level == 0
+                        if stage_source_level == 0 and effective_stage_reg_res_level == 0
                         else n_parallel_pairwise_regs
                     )
                     if stage_n_parallel_pairwise_regs != n_parallel_pairwise_regs:
@@ -6938,11 +8497,7 @@ def run_stitch_once(
                             groupwise_resolution_method=MVS_GROUPWISE_RESOLUTION_METHOD,
                             groupwise_resolution_kwargs=groupwise_resolution_kwargs,
                             post_registration_do_quality_filter=post_quality_filter,
-                            post_registration_quality_threshold=(
-                                MVS_POST_QUALITY_THRESHOLD
-                                if post_quality_filter
-                                else 0.2
-                            ),
+                            post_registration_quality_threshold=(post_quality_threshold if post_quality_filter else 0.2),
                             return_dict=True,
                         )
                     log(
@@ -6973,7 +8528,9 @@ def run_stitch_once(
                     reference_geometry_mode=args.reference_geometry_mode,
                 )
                 if refinement_start_source == "reference":
-                    log(f"Robust boundary refinement starts from reference geometry mode={args.reference_geometry_mode}")
+                    log(
+                        f"Robust boundary refinement starts from reference geometry mode={args.reference_geometry_mode}"
+                    )
                 elif reference_params is not None and args.reference_geometry_mode != "none":
                     log(
                         "Robust boundary refinement starts from coarse registration "
@@ -7041,6 +8598,15 @@ def run_stitch_once(
             fusion_level=args.fusion_level,
         )
         zarr_backed_count = sum(si_utils.is_xarray_zarr_backed(sim) for sim in sims)
+        orientation_patterns = Counter(
+            "+".join(
+                dim
+                for dim, should_flip in zip(("z", "y", "x"), tile_flip_axes_zyx(tile), strict=True)
+                if should_flip
+            )
+            or "none"
+            for tile in source_tiles
+        )
         source_level_summary = {
             f"level{source_level}/available{available_levels}": count
             for (source_level, available_levels), count in sorted(source_level_counts.items())
@@ -7050,8 +8616,29 @@ def run_stitch_once(
             f"zarr-backed={zarr_backed_count}/{len(sims)}, dims={sims[0].dims}, "
             f"shape={tuple(sims[0].shape)}"
         )
+        log(f"Fusion source orientation affine patterns: {dict(sorted(orientation_patterns.items()))}")
         log(f"Fusion TIFF source levels: {source_level_summary}")
-        temp_workspace = None
+        output_spacing = {dim: float(source_tiles[0].spacing[dim]) for dim in ("z", "y", "x")}
+        if any(
+            not math.isclose(output_spacing[dim], nominal_output_spacing[dim], rel_tol=1e-9, abs_tol=1e-12)
+            for dim in ("z", "y", "x")
+        ):
+            log(
+                "Fusion output spacing uses actual source-level sampling instead of nominal level spacing: "
+                f"{output_spacing}"
+            )
+        else:
+            log(f"Fusion output spacing: {output_spacing}")
+        template_output_stack_properties = None
+        if output_grid_template is not None:
+            template_output_stack_properties = output_stack_properties_from_ome_zarr_template(
+                output_grid_template,
+                output_spacing,
+            )
+            log(f"Fusion output grid template: {output_grid_template}")
+            log(f"Template output stack properties: {template_output_stack_properties}")
+        temp_root = None
+        fusion_completed = False
         try:
             if params is not None:
                 log(f"Applying {len(params)} registration transforms to channel {channel} sims")
@@ -7063,22 +8650,40 @@ def run_stitch_once(
                         base_transform_key=TRANSFORM_KEY,
                     )
                 log(f"Applied registration transforms to channel {channel} sims")
-            output_stack_properties = process_output_stack_properties(
-                sims,
-                output_spacing=output_spacing,
-                transform_key=transform_key,
-            )
+            has_reflected_sources = any(any(tile_flip_axes_zyx(tile)) for tile in source_tiles)
+            if has_reflected_sources and template_output_stack_properties is None:
+                output_stack_properties = reflected_fusion_output_stack_properties(
+                    sims,
+                    output_spacing=output_spacing,
+                    transform_key=transform_key,
+                )
+            else:
+                output_stack_properties = process_output_stack_properties(
+                    sims,
+                    output_spacing=output_spacing,
+                    output_stack_properties=template_output_stack_properties,
+                    transform_key=transform_key,
+                )
             log(f"Resolved output stack properties: {output_stack_properties}")
             log(f"Checking channel output path does not already exist: {channel_output}")
             raise_if_output_exists(channel_output)
 
-            temp_workspace = tempfile.TemporaryDirectory(
-                prefix=f".{channel_output.name}.fusion-",
-                dir=channel_output.parent,
-            )
-            temp_root = Path(temp_workspace.name)
-            fusion_output = temp_root / channel_output.name
-            log(f"Channel {channel} will fuse to temporary output {fusion_output}")
+            if args.resume_fusion:
+                temp_root = find_latest_fusion_temp_workspace(channel_output)
+                if temp_root is not None:
+                    fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
+                    log(f"Channel {channel} will resume temporary fusion output {fusion_output}")
+                else:
+                    log(f"Channel {channel} has no resumable temporary fusion workspace; starting a new one")
+            if temp_root is None:
+                temp_root = Path(
+                    tempfile.mkdtemp(
+                        prefix=fusion_temp_workspace_prefix(channel_output),
+                        dir=channel_output.parent,
+                    )
+                )
+                fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
+                log(f"Channel {channel} will fuse to temporary output {fusion_output}")
 
             inverse_flatfield = None
             apply_flatfield = flatfield_dir is not None or bool(flatfield_dirs_by_source_view)
@@ -7109,15 +8714,15 @@ def run_stitch_once(
                 default_width_voxels_zyx=tuple(float(value) for value in args.fusion_blend_width_voxels),
                 max_overlap_fraction=args.fusion_blend_max_overlap_fraction,
             )
-            log(
-                "Resolved fusion batch settings: "
-                f"n_batch={resolved_batch_size}, threaded_jobs={args.batch_jobs}"
-            )
+            log(f"Resolved fusion batch settings: n_batch={resolved_batch_size}, threaded_jobs={args.batch_jobs}")
             if weights_func_kwargs is None:
                 log("Fusion weights: geometric border/valid-support weights only")
             else:
                 log(f"Fusion weights: {args.fusion_weight_mode} quality weights {weights_func_kwargs}")
             if apply_flatfield:
+                basic_cache_max_bytes = (
+                    None if args.basic_cache_max_gib is None else int(args.basic_cache_max_gib * 1024**3)
+                )
                 log(
                     "BaSiC cache settings: "
                     f"tile_cache_size={args.basic_cache_tiles}, "
@@ -7125,22 +8730,104 @@ def run_stitch_once(
                     f"tile_cache_disk_root={args.basic_cache_disk_dir or fusion_output.parent}, "
                     f"tile_cache_z_chunk={args.basic_cache_z_chunk}"
                 )
-            batch_func = misc_utils.process_batch_using_joblib
-            batch_func_kwargs = {
-                "n_jobs": args.batch_jobs,
-                "backend": "threading",
-            }
+            local_cuda_devices = visible_local_cuda_devices() if FUSION_BACKEND == "cupy" else ()
+            if local_cuda_devices:
+                weighted_cuda_devices = cuda_devices_weighted_by_total_vram(local_cuda_devices)
+                batch_func = process_batch_using_joblib_cuda_devices
+                batch_func_kwargs = {
+                    "n_jobs": args.batch_jobs,
+                    "backend": "loky",
+                    "cuda_devices": weighted_cuda_devices,
+                }
+                log(
+                    "Fusion CUDA batch executor: "
+                    f"local_cuda_devices={local_cuda_devices}, "
+                    f"weighted_devices={weighted_cuda_devices} ({format_cuda_device_weights(weighted_cuda_devices)}), "
+                    f"process_jobs={args.batch_jobs}, backend=loky"
+                )
+            else:
+                batch_func = misc_utils.process_batch_using_joblib
+                batch_func_kwargs = {
+                    "n_jobs": args.batch_jobs,
+                    "backend": "threading",
+                }
+                log(f"Fusion CPU/thread batch executor: threaded_jobs={args.batch_jobs}")
+            batch_func = profiled_fusion_batch_func(
+                batch_func,
+                max_batches=args.profile_max_fusion_batches,
+                skip_batches=args.profile_skip_fusion_batches,
+            )
+            if args.profile_max_fusion_batches is not None or args.profile_skip_fusion_batches:
+                log(
+                    "Profile bounded fusion enabled: "
+                    f"max_batches={args.profile_max_fusion_batches}, "
+                    f"skip_batches={args.profile_skip_fusion_batches}"
+                )
             if args.per_chunk_cupy_cleanup:
                 log("Fusion uses per-chunk CuPy cleanup")
             else:
                 log("Fusion defers CuPy cleanup until the fusion context exits")
             log(f"Fusion blending widths (physical units): {blending_widths}")
+            if args.disable_view_candidate_culling:
+                log("Fusion per-block view-candidate culling disabled; workers will receive all views")
+                allowed_fusion_blocks = transformed_source_block_ids(
+                    sims,
+                    transform_key=transform_key,
+                    output_stack_properties=output_stack_properties,
+                    output_chunksize=resolved_chunksize,
+                    blending_widths=blending_widths,
+                )
+            else:
+                from multiview_stitcher.fusion import _core as fusion_core
+
+                candidate_map, candidate_summary = direct_fusion_view_candidate_plan(
+                    sims,
+                    transform_key=transform_key,
+                    output_stack_properties=output_stack_properties,
+                    output_chunksize=resolved_chunksize,
+                    weights_func=weights_func,
+                    weights_func_kwargs=weights_func_kwargs,
+                    fusion_func=fusion_core.weighted_average_fusion,
+                    fusion_func_kwargs=None,
+                    interpolation_order=1,
+                )
+                if not candidate_map:
+                    raise ValueError("Fusion view-candidate planner produced no candidate blocks")
+                candidate_plan_path = temp_root / f"{fusion_output.name}.view-candidate-plan.json"
+                write_direct_fusion_view_candidate_plan(candidate_plan_path, candidate_map, candidate_summary)
+                _FUSION_VIEW_CANDIDATE_PLAN_PATHS[str(fusion_output / "0")] = str(candidate_plan_path)
+                allowed_fusion_blocks = set(candidate_map)
+                log(
+                    "Fusion view-candidate culling enabled: "
+                    f"planned_blocks={candidate_summary['planned_blocks']}, "
+                    f"total_output_blocks={candidate_summary['total_output_blocks']}, "
+                    f"candidate_count_min={candidate_summary['candidate_min']}, "
+                    f"median={candidate_summary['candidate_median']:.1f}, "
+                    f"p95={candidate_summary['candidate_p95']:.1f}, "
+                    f"max={candidate_summary['candidate_max']}, "
+                    f"zero_candidate_blocks={candidate_summary['zero_candidate_blocks']}, "
+                    f"plan={candidate_plan_path}"
+                )
+                log(f"Fusion high-count candidate blocks: {candidate_summary['high_count_blocks']}")
+            total_fusion_blocks = math.prod(
+                int(math.ceil(int(output_stack_properties["shape"][dim]) / int(resolved_chunksize[dim])))
+                for dim in ("z", "y", "x")
+            )
+            log(
+                "Fusion block culling: "
+                f"keeping {len(allowed_fusion_blocks)}/{total_fusion_blocks} output blocks "
+                "that intersect registered source support"
+            )
+            batch_func = culling_fusion_batch_func(batch_func, allowed_fusion_blocks)
+            if args.resume_fusion:
+                batch_func = resume_fusion_batch_func(batch_func, scale0_path=fusion_output / "0")
+                log(f"Fusion resume enabled: completed output chunks under {fusion_output / '0'} will be skipped")
             import dask
 
-            dask_chunk_size_bytes = int(
-                math.prod(int(value) for value in resolved_chunksize.values())
-                * np.dtype(sims[0].dtype).itemsize
+            output_chunk_size_bytes = int(
+                math.prod(int(value) for value in resolved_chunksize.values()) * np.dtype(sims[0].dtype).itemsize
             )
+            dask_chunk_size_bytes = max(output_chunk_size_bytes * 2, output_chunk_size_bytes + 1)
             log(f"Dask array.chunk-size for Zarr writes: {dask_chunk_size_bytes} bytes")
             log(f"Entering multiview-stitcher fusion.fuse streaming write to {fusion_output}")
             if args.fusion_progress_log_seconds > 0:
@@ -7155,7 +8842,10 @@ def run_stitch_once(
             with ExitStack() as stack:
                 stack.enter_context(
                     zarr_safe_fusion_selection(
-                        extra_attr_keys=("source_view", "basic_tile_cache_key")
+                        extra_attr_keys=(
+                            "source_view",
+                            "basic_tile_cache_key",
+                        )
                     )
                 )
                 if apply_flatfield:
@@ -7169,45 +8859,51 @@ def run_stitch_once(
                             dataset_attr_keys=("source_view",) if isinstance(inverse_flatfield, dict) else (),
                             cache_key_attr="basic_tile_cache_key",
                             tile_cache_size=args.basic_cache_tiles,
-                            tile_cache_max_bytes=(
-                                None
-                                if args.basic_cache_max_gib is None
-                                else int(args.basic_cache_max_gib * 1024**3)
-                            ),
+                            tile_cache_max_bytes=basic_cache_max_bytes,
                             tile_cache_disk_dir=basic_cache_disk_dir,
                             tile_cache_z_chunk=args.basic_cache_z_chunk,
                         )
                     )
+                stack.enter_context(
+                    profile_zarr_slice_materialization(
+                        enabled=args.profile_max_fusion_batches is not None or args.profile_skip_fusion_batches > 0
+                    )
+                )
                 stack.enter_context(cupy_cleanup_context(args.per_chunk_cupy_cleanup))
+                stack.enter_context(inplace_mvs_normalize_weights_context())
                 stack.enter_context(spatial_chunks_for_package_pyramid())
                 stack.enter_context(single_scale_fusion_output())
+                stack.enter_context(resumable_mvs_zarr_create(scale0_path=fusion_output / "0", enabled=args.resume_fusion))
                 stack.enter_context(fusion_progress_context)
                 stack.enter_context(dask.config.set({"array.chunk-size": dask_chunk_size_bytes}))
-                with heartbeat(f"fusion.fuse channel {channel}"):
-                    fusion.fuse(
-                        images=sims,
-                        transform_key=transform_key,
-                        output_spacing=output_spacing,
-                        output_zarr_url=str(fusion_output),
-                        output_chunksize=output_chunksize,
-                        blending_widths=blending_widths,
-                        weights_func=weights_func,
-                        weights_func_kwargs=weights_func_kwargs,
-                        zarr_options={
-                            "ome_zarr": True,
-                            "ngff_version": NGFF_VERSION,
-                            "overwrite": False,
-                            "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(
-                                tuple(sims[0].dims)
-                            ),
-                        },
-                        batch_options={
-                            "n_batch": resolved_batch_size,
-                            "batch_func": batch_func,
-                            "batch_func_kwargs": batch_func_kwargs,
-                        },
-                        backend=FUSION_BACKEND,
-                    )
+                try:
+                    log("Fusion write path: multiview-stitcher direct chunked OME-Zarr fuser")
+                    with heartbeat(f"fusion direct OME-Zarr write channel {channel}"):
+                        fusion.fuse(
+                            images=sims,
+                            transform_key=transform_key,
+                            output_stack_properties=output_stack_properties,
+                            output_chunksize=resolved_chunksize,
+                            blending_widths=blending_widths,
+                            weights_func=weights_func,
+                            weights_func_kwargs=weights_func_kwargs,
+                            output_zarr_url=str(fusion_output),
+                            zarr_options={
+                                "ome_zarr": True,
+                                "ngff_version": NGFF_VERSION,
+                                "overwrite": False,
+                                "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(tuple(sims[0].dims)),
+                            },
+                            batch_options={
+                                "n_batch": resolved_batch_size,
+                                "batch_func": batch_func,
+                                "batch_func_kwargs": batch_func_kwargs,
+                            },
+                            backend=FUSION_BACKEND,
+                        )
+                except ProfileFusionStop as exc:
+                    log(f"Profile bounded fusion stopped intentionally: {exc}")
+                    return 0
             log(f"Finished multiview-stitcher fusion.fuse scale0 write for channel {channel}")
             log(
                 "Fusion scale0 output after package write: "
@@ -7223,14 +8919,14 @@ def run_stitch_once(
             if channel_output.exists():
                 raise FileExistsError(f"{channel_output} appeared during fusion")
             fusion_output.rename(channel_output)
+            fusion_completed = True
             log(f"Moved completed fusion output to {channel_output}")
         finally:
-            if temp_workspace is not None:
-                temp_workspace.cleanup()
+            cleanup_or_preserve_fusion_workspace(temp_root, completed=fusion_completed)
             close_stores(stores)
             log(f"Closed TIFF stores for channel {channel}")
 
-        thumbnail_path = write_center_z_thumbnail(channel_output)
+        thumbnail_path = write_center_z_thumbnail(channel_output, registration_input=registration_input)
         log(f"Wrote center-z thumbnail {thumbnail_path}")
         log(f"Wrote {channel_output} ({channel_label})")
     return 0
@@ -7299,10 +8995,7 @@ def run_shared_reference_geometry_registration(
         axis_aligned_registration_pairs(tiles),
         settings,
     )
-    log(
-        "Shared robust boundary refinement sampled "
-        f"{len(patch_specs)} combined patch(es)"
-    )
+    log(f"Shared robust boundary refinement sampled {len(patch_specs)} combined patch(es)")
     source_channels: list[int] = []
     for config in configs:
         reg_source_channel = registration_source_channel(
@@ -7395,15 +9088,14 @@ def main() -> int:
         raise ValueError("--fusion-blend-width-voxels values must be positive")
     if not 0.0 < args.fusion_blend_max_overlap_fraction <= 1.0:
         raise ValueError("--fusion-blend-max-overlap-fraction must be in (0, 1]")
+    validate_profile_fusion_options(args)
 
     input_dir = args.input_dir.resolve()
     output = (args.output or input_dir / "fused.ome.zarr").resolve()
     registration_output = (args.registration_output or input_dir / "registration.json").resolve()
     registration_input = args.registration_input.resolve() if args.registration_input is not None else None
     reference_registration_input = (
-        args.reference_registration_input.resolve()
-        if args.reference_registration_input is not None
-        else None
+        args.reference_registration_input.resolve() if args.reference_registration_input is not None else None
     )
     if args.reference_geometry_mode != "none":
         if reference_registration_input is None:
@@ -7420,20 +9112,12 @@ def main() -> int:
     )
     flatfield_dir = args.flatfield_dir.resolve() if args.flatfield_dir is not None else None
     flatfield_source_views = [view for view, _path in args.flatfield_dir_by_source_view]
-    duplicate_flatfield_views = sorted(
-        view
-        for view, count in Counter(flatfield_source_views).items()
-        if count > 1
-    )
+    duplicate_flatfield_views = sorted(view for view, count in Counter(flatfield_source_views).items() if count > 1)
     if duplicate_flatfield_views:
         raise ValueError(
-            "Duplicate --flatfield-dir-by-source-view entries for source_view(s): "
-            f"{duplicate_flatfield_views}"
+            f"Duplicate --flatfield-dir-by-source-view entries for source_view(s): {duplicate_flatfield_views}"
         )
-    flatfield_dirs_by_source_view = {
-        view: path.resolve()
-        for view, path in args.flatfield_dir_by_source_view
-    }
+    flatfield_dirs_by_source_view = {view: path.resolve() for view, path in args.flatfield_dir_by_source_view}
     position_input = args.position_input.resolve() if args.position_input is not None else None
     if position_input is not None:
         tiles = read_position_input_tiles(
@@ -7460,18 +9144,13 @@ def main() -> int:
     else:
         log("Detected a single acquisition track")
     for track in tracks:
-        log(
-            f"Track {track.slug} ({track.track_id}): "
-            f"channels={track.channels}, names={track.channel_names}"
-        )
+        log(f"Track {track.slug} ({track.track_id}): channels={track.channels}, names={track.channel_names}")
 
     track_configs = []
     for track in tracks:
         track_output = insert_track_suffix(output, track.slug) if split_by_track else output
         track_registration_output = (
-            insert_track_suffix(registration_output, track.slug)
-            if split_by_track
-            else registration_output
+            insert_track_suffix(registration_output, track.slug) if split_by_track else registration_output
         )
         track_registration_input = (
             insert_track_suffix(registration_input, track.slug)
@@ -7484,9 +9163,7 @@ def main() -> int:
             else registration_plots_dir
         )
         track_robust_boundary_qc_dir = (
-            track_qc_dir(robust_boundary_qc_dir, track.slug)
-            if split_by_track
-            else robust_boundary_qc_dir
+            track_qc_dir(robust_boundary_qc_dir, track.slug) if split_by_track else robust_boundary_qc_dir
         )
         track_configs.append(
             TrackRunConfig(
@@ -7547,5 +9224,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        logger.exception("ERROR: {}", exc)
         raise

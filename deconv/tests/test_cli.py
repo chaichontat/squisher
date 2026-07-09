@@ -1,27 +1,33 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import tifffile
+import zarr
 from typer.testing import CliRunner
 
 import squisher_deconv.cli as cli
 from squisher_deconv.cli import app
-from squisher_deconv.deconvolution import infer_psf_halo
+from squisher_deconv.deconvolution import infer_psf_halo, infer_psf_halo_many
+from squisher_deconv.planning import output_sidecar_path
 
 
-def test_cli_help_exposes_basic_engine_options_without_fiducials() -> None:
+def test_cli_help_exposes_gpu_options_without_fiducials() -> None:
     runner = CliRunner()
 
     result = runner.invoke(app, ["run", "--help"])
 
     assert result.exit_code == 0
     assert "--basic" in result.output
-    assert "--engine" in result.output
+    assert "--iter" in result.output
+    assert "--engine" not in result.output
     assert "--n-fids" not in result.output
 
 
-def test_gpu_engine_requires_one_basic_profile_per_channel(tmp_path) -> None:
+def test_cli_requires_one_basic_profile_per_channel(tmp_path) -> None:
     runner = CliRunner()
     src = tmp_path / "tile.tif"
     psf = tmp_path / "psf.tif"
@@ -43,29 +49,23 @@ def test_gpu_engine_requires_one_basic_profile_per_channel(tmp_path) -> None:
             "2",
             "--psf",
             str(psf),
+            "--psf",
+            str(psf),
             "--basic",
             str(basic),
-            "--engine",
-            "gpu",
         ],
     )
 
     assert result.exit_code != 0
-    assert "requires exactly 2 --basic profile path" in result.output
+    assert "Expected exactly 2 --basic profile path" in result.output
 
 
-def test_sample_scale_cli_runs_with_explicit_scipy_debug_engine(tmp_path) -> None:
+def test_cli_requires_one_psf_per_channel(tmp_path) -> None:
     runner = CliRunner()
     src = tmp_path / "tile.tif"
     psf = tmp_path / "psf.tif"
-    tifffile.imwrite(
-        src,
-        np.arange(2 * 2 * 3 * 3, dtype=np.uint16).reshape(4, 3, 3),
-        photometric="minisblack",
-    )
-    psf_data = np.zeros((3, 3, 3), dtype=np.float32)
-    psf_data[1, 1, 1] = 1.0
-    tifffile.imwrite(psf, psf_data, photometric="minisblack")
+    tifffile.imwrite(src, np.zeros((2, 3, 3), dtype=np.uint16), photometric="minisblack")
+    tifffile.imwrite(psf, np.ones((3, 3, 3), dtype=np.float32), photometric="minisblack")
 
     result = runner.invoke(
         app,
@@ -80,21 +80,28 @@ def test_sample_scale_cli_runs_with_explicit_scipy_debug_engine(tmp_path) -> Non
             "2",
             "--psf",
             str(psf),
-            "--engine",
-            "scipy",
-            "--halo",
-            "0",
-            "--p-low",
-            "0",
-            "--p-high",
-            "1",
-            "--bins",
-            "4",
         ],
     )
 
-    assert result.exit_code == 0
-    assert (tmp_path / "scale" / "scaling.json").exists()
+    assert result.exit_code != 0
+    assert "Expected exactly 2 --psf path" in result.output
+
+
+def test_deconvolver_factory_passes_iterations_to_gpu_backend(tmp_path) -> None:
+    from squisher_deconv.gpu import CupyDeconvolverFactory
+
+    psf = tmp_path / "psf.tif"
+    basic = tmp_path / "basic.pkl"
+
+    factory = cli._build_deconvolver_factory(
+        basic=[basic],
+        channels=1,
+        psfs=[psf],
+        iterations=3,
+    )
+
+    assert isinstance(factory, CupyDeconvolverFactory)
+    assert factory.iterations == 3
 
 
 def test_infer_psf_halo_uses_psf_z_extent(tmp_path) -> None:
@@ -102,6 +109,15 @@ def test_infer_psf_halo_uses_psf_z_extent(tmp_path) -> None:
     tifffile.imwrite(psf, np.ones((4, 3, 3), dtype=np.float32), photometric="minisblack")
 
     assert infer_psf_halo(psf) == 6
+
+
+def test_infer_psf_halo_many_uses_largest_z_extent(tmp_path) -> None:
+    psf_small = tmp_path / "psf-small.tif"
+    psf_large = tmp_path / "psf-large.tif"
+    tifffile.imwrite(psf_small, np.ones((3, 3, 3), dtype=np.float32), photometric="minisblack")
+    tifffile.imwrite(psf_large, np.ones((5, 3, 3), dtype=np.float32), photometric="minisblack")
+
+    assert infer_psf_halo_many([psf_small, psf_large]) == 8
 
 
 def test_sample_scale_cli_infers_halo_without_eager_deconvolver_init(tmp_path, monkeypatch) -> None:
@@ -114,7 +130,9 @@ def test_sample_scale_cli_infers_halo_without_eager_deconvolver_init(tmp_path, m
 
     def factory_builder(**kwargs):
         def fail_if_initialized(device: int):
-            pytest.fail(f"deconvolver should not be initialized during CLI halo inference for device {device}")
+            pytest.fail(
+                f"deconvolver should not be initialized during CLI halo inference for device {device}"
+            )
 
         return fail_if_initialized
 
@@ -137,8 +155,8 @@ def test_sample_scale_cli_infers_halo_without_eager_deconvolver_init(tmp_path, m
             "1",
             "--psf",
             str(psf),
-            "--engine",
-            "scipy",
+            "--devices",
+            "0",
         ],
     )
 
@@ -166,10 +184,71 @@ def test_run_cli_requires_scaling_for_u16_output(tmp_path) -> None:
             "1",
             "--psf",
             str(psf),
-            "--engine",
-            "scipy",
         ],
     )
 
     assert result.exit_code != 0
     assert "--output-mode u16 requires --scaling" in result.output
+
+
+def test_qc_cli_renders_selected_finished_tiles_without_opening_every_tiff(tmp_path, monkeypatch) -> None:
+    runner = CliRunner()
+    raw_dir = tmp_path / "raw"
+    deconv_dir = raw_dir / "squisher-deconv-run-u16"
+    qc_dir = tmp_path / "qc"
+    raw_dir.mkdir()
+    deconv_dir.mkdir()
+
+    for index in range(4):
+        raw = np.arange(2 * 2 * 4 * 4, dtype=np.uint16).reshape(2, 2, 4, 4) + index
+        deconv = np.arange(4 * 4 * 4, dtype=np.uint16).reshape(4, 4, 4) + index + 1
+        raw_path = raw_dir / f"Image_99.{index:03d}.ome.tif"
+        deconv_path = deconv_dir / f"Image_99.{index:03d}.ome.zarr"
+        tifffile.imwrite(raw_path, raw, photometric="minisblack", metadata={"axes": "CZYX"})
+        root = zarr.open_group(str(deconv_path), mode="w", zarr_format=2)
+        array = root.create_array("0", data=deconv.reshape(2, 2, 4, 4), chunks=(1, 1, 4, 4))
+        array.attrs["_ARRAY_DIMENSIONS"] = ["c", "z", "y", "x"]
+        output_sidecar_path(deconv_path).write_text(json.dumps({"provenance": {"channels": 2}}))
+
+    import squisher_deconv.qc as qc_module
+
+    real_tiff_file = qc_module.tifffile.TiffFile
+    opened: list[str] = []
+
+    def recording_tiff_file(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return real_tiff_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(qc_module.tifffile, "TiffFile", recording_tiff_file)
+
+    result = runner.invoke(
+        app,
+        [
+            "qc",
+            "--raw-dir",
+            str(raw_dir),
+            "--deconv-dir",
+            str(deconv_dir),
+            "--qc-dir",
+            str(qc_dir),
+            "--image-prefix",
+            "Image_99",
+            "--tile-count",
+            "2",
+            "--channel",
+            "1",
+            "--z-plane",
+            "0",
+            "--z-plane",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (qc_dir / "manifest.json").exists()
+    assert len(list(qc_dir.glob("*.before-after.png"))) == 2
+    assert len(opened) == 2
+    assert sorted(opened) == [
+        "Image_99.000.ome.tif",
+        "Image_99.003.ome.tif",
+    ]

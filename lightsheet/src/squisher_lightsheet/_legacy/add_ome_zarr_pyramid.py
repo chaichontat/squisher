@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-from datetime import datetime
 import json
 from pathlib import Path
 import time
@@ -13,22 +12,25 @@ from typing import Any
 
 import cupy as cp
 from cucim.skimage.measure import block_reduce
+from loguru import logger
 import numpy as np
 from squisher_lightsheet.pyramid import (
     chunk_count,
     chunk_slices,
+    downsampled_chunks,
     level_coordinate_transformations,
+    pyramid_shard_chunks,
     pyramid_relative_factors,
 )
 import zarr
-from zarr.codecs import BytesCodec, ZstdCodec
+from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
 
 
 ZSTD_LEVEL = 0
 
 
 def log(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    logger.info(message)
 
 
 def root_metadata_path(path: Path) -> Path:
@@ -83,30 +85,39 @@ def write_pyramid_level(
     source = zarr.open_array(str(root / source_path), mode="r", zarr_format=3)
     factor_tuple = tuple(int(factors[dim]) for dim in dims)
     shape = output_shape(tuple(int(size) for size in source.shape), dims, factors)
-    chunks = tuple(min(int(chunk), size) for chunk, size in zip(source.chunks, shape, strict=True))
+    inner_chunks = downsampled_chunks(tuple(int(chunk) for chunk in source.chunks), shape, factor_tuple)
+    source_storage_chunks = tuple(int(chunk) for chunk in (source.metadata.shards or source.chunks))
+    shard_chunks = pyramid_shard_chunks(source_storage_chunks, shape, inner_chunks)
     destination = zarr.open(
         str(root / destination_path),
         mode="w",
         shape=shape,
-        chunks=chunks,
+        chunks=shard_chunks,
         dtype=source.dtype,
         zarr_format=3,
         dimension_names=dims,
-        codecs=[BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
+        codecs=[
+            ShardingCodec(
+                chunk_shape=inner_chunks,
+                codecs=[BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
+            )
+        ],
     )
 
-    total_chunks = chunk_count(shape, chunks)
+    total_chunks = chunk_count(shape, shard_chunks)
+    total_inner_chunks = chunk_count(shape, inner_chunks)
     started = time.monotonic()
     log(
         f"Writing level {destination_path}: source={source_path}, "
-        f"shape={shape}, chunks={chunks}, factors={factor_tuple}, chunks_total={total_chunks}"
+        f"shape={shape}, shard_chunks={shard_chunks}, inner_chunks={inner_chunks}, factors={factor_tuple}, "
+        f"shards_total={total_chunks}, inner_chunks_total={total_inner_chunks}"
     )
-    for chunk_index, selection in enumerate(chunk_slices(shape, chunks), start=1):
+    for chunk_index, selection in enumerate(chunk_slices(shape, shard_chunks), start=1):
         destination[selection] = reduced_chunk(source, selection, factor_tuple)
         if chunk_index <= 3 or chunk_index % 100 == 0 or chunk_index == total_chunks:
             elapsed = time.monotonic() - started
             log(
-                f"Level {destination_path}: {chunk_index}/{total_chunks} chunks "
+                f"Level {destination_path}: {chunk_index}/{total_chunks} shards "
                 f"({100 * chunk_index / total_chunks:.1f}%), elapsed={elapsed:.0f}s"
             )
     return shape

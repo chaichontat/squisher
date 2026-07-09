@@ -55,7 +55,7 @@ def provenance_payload(
     *,
     channels: int,
     halo: int,
-    psf_path: Path | None,
+    psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
     output_mode: str,
     scaling_path: Path | None,
@@ -67,8 +67,7 @@ def provenance_payload(
         "source": str(source),
         "channels": int(channels),
         "halo": int(halo),
-        "psf": None if psf_path is None else str(psf_path),
-        "psf_sha256": None if psf_path is None else _file_sha256(psf_path),
+        "psfs": file_provenance_records(psf_paths or []),
         "basic_profiles": file_provenance_records(basic_paths or []),
         "output_mode": output_mode,
         "compression_tiff_tag": compression_tiff_tag(output_mode),
@@ -109,7 +108,7 @@ def _file_sha256(path: Path) -> str:
 def dependency_versions() -> dict[str, str]:
     from importlib.metadata import PackageNotFoundError, version
 
-    packages = ("numpy", "tifffile", "imagecodecs", "scipy", "squisher-deconv")
+    packages = ("numpy", "tifffile", "imagecodecs", "squisher-deconv")
     versions: dict[str, str] = {}
     for package in packages:
         try:

@@ -1,0 +1,35 @@
+[project]
+name = "lightsheet-psf"
+version = "0.1.0"
+description = "Empirical lightsheet PSF measurement, shear correction, and radial cleanup workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aicspylibczi>=3.3.1",
+    "astropy>=7.2.0",
+    "matplotlib>=3.10.0",
+    "numpy>=2.4.6",
+    "pandas>=2.3.0",
+    "photutils>=1.12.0,<2",
+    "scipy>=1.16.0",
+    "tifffile>=2026.6.1",
+    "typer>=0.26.5",
+]
+
+[project.scripts]
+lightsheet-psf = "lightsheet_psf.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110

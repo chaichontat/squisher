@@ -37,6 +37,8 @@ CZI_PROGRESS_INTERVAL = 100
 DEFAULT_ZARR_CHUNKS_TCZYX = (1, 1, 1, 4096, 4096)
 DEFAULT_MIN_ZARR_CHUNK_PIXELS = 16 * 1024 * 1024
 DEFAULT_TIFF_PYRAMID_MIN_SIZE = 256
+DEFAULT_TIFF_TILE_SIZE_MAX = 512
+TIFF_TILE_SIZE_MULTIPLE = 16
 OME_ORIGINAL_METADATA_NAMESPACE = "openmicroscopy.org/OriginalMetadata"
 CZI_RAW_METADATA_NAMESPACE = "squisher/czi/raw-metadata"
 CZI_SHARED_METADATA_NAMESPACE = "squisher/czi/shared-metadata"
@@ -76,7 +78,7 @@ def compress_czi_to_ome_tiff(
     level: float,
     out_dir: Path | None = None,
     output_format: str = "ome-tiff",
-    tile_size: int = 512,
+    tile_size: int | None = None,
     zarr_chunks: tuple[int, int, int, int, int] = DEFAULT_ZARR_CHUNKS_TCZYX,
     min_zarr_chunk_pixels: int = DEFAULT_MIN_ZARR_CHUNK_PIXELS,
     zarr_compressor: str = "jpegxr",
@@ -93,8 +95,8 @@ def compress_czi_to_ome_tiff(
     if path.suffix.lower() != ".czi":
         raise ValueError(f"Expected a .czi input file, got {path}")
     _validate_output_format(output_format)
-    if tile_size % 16 != 0:
-        raise ValueError(f"TIFF tile size must be a multiple of 16, got {tile_size}")
+    if tile_size is not None:
+        _validate_tiff_tile_size(tile_size)
     if output_format == "ome-zarr":
         _validate_zarr_chunks(
             zarr_chunks,
@@ -110,7 +112,11 @@ def compress_czi_to_ome_tiff(
     tile_count = len(tiles)
     output_count = tile_count * illumination_count
     output_dir = _czi_output_dir(path, out_dir=out_dir, output_count=output_count)
-    output_jobs = [(tile, illumination) for illumination in illumination_indexes for tile in tiles]
+    output_jobs = [
+        (tile, illumination, _resolve_output_tile_size(output_format, tile_size, tile))
+        for illumination in illumination_indexes
+        for tile in tiles
+    ]
     output_path = _czi_tile_ome_tiff_path if output_format == "ome-tiff" else _czi_tile_ome_zarr_path
     outputs = [
         output_path(
@@ -121,17 +127,28 @@ def compress_czi_to_ome_tiff(
             illumination_count=illumination_count,
             output_dir=output_dir,
         )
-        for tile, illumination in output_jobs
+        for tile, illumination, _effective_tile_size in output_jobs
     ]
+    inferred_tile_sizes = sorted(
+        job_tile_size for _tile, _illumination, job_tile_size in output_jobs if job_tile_size is not None
+    )
+    tile_size_label = "auto" if tile_size is None else str(tile_size)
+    if not inferred_tile_sizes:
+        effective_tile_size_label: int | list[int] | str = "none"
+    elif len(inferred_tile_sizes) == 1:
+        effective_tile_size_label = inferred_tile_sizes[0]
+    else:
+        effective_tile_size_label = inferred_tile_sizes
     logger.info(
-        "Compressing {} tile(s), {} illumination(s) from {} to {} as {} with level={} tile_size={}",
+        "Compressing {} tile(s), {} illumination(s) from {} to {} as {} with level={} tile_size={} effective_tile_size={}",
         tile_count,
         illumination_count,
         path,
         output_dir,
         output_format,
         level,
-        tile_size,
+        tile_size_label,
+        effective_tile_size_label,
     )
     existing = [out for out in outputs if out.exists()]
     if existing and overwrite:
@@ -179,26 +196,33 @@ def compress_czi_to_ome_tiff(
     effective_tile_workers, effective_maxworkers = _effective_czi_workers(
         len(pending_jobs), tile_workers, maxworkers
     )
-    settings = _compression_provenance(
-        path,
-        output_dir=output_dir,
-        output_format=output_format,
-        level=level,
-        tile_size=tile_size,
-        zarr_chunks=zarr_chunks,
-        min_zarr_chunk_pixels=min_zarr_chunk_pixels,
-        zarr_compressor=zarr_compressor,
-        requested_tiff_maxworkers=maxworkers,
-        effective_tiff_maxworkers=effective_maxworkers,
-        requested_tile_workers=tile_workers,
-        effective_tile_workers=effective_tile_workers,
-        overwrite=overwrite,
-        thumbnails=thumbnails,
-        thumbnail_size=thumbnail_size,
-        tile_count=tile_count,
-        plane_count=plane_count,
-        pyramid=tiff_pyramid,
-    )
+    provenance_by_tile_size: dict[int | None, dict[str, str]] = {}
+
+    def provenance_for(effective_tile_size: int | None) -> dict[str, str]:
+        settings = provenance_by_tile_size.get(effective_tile_size)
+        if settings is None:
+            settings = _compression_provenance(
+                path,
+                output_dir=output_dir,
+                output_format=output_format,
+                level=level,
+                tile_size=effective_tile_size,
+                zarr_chunks=zarr_chunks,
+                min_zarr_chunk_pixels=min_zarr_chunk_pixels,
+                zarr_compressor=zarr_compressor,
+                requested_tiff_maxworkers=maxworkers,
+                effective_tiff_maxworkers=effective_maxworkers,
+                requested_tile_workers=tile_workers,
+                effective_tile_workers=effective_tile_workers,
+                overwrite=overwrite,
+                thumbnails=thumbnails,
+                thumbnail_size=thumbnail_size,
+                tile_count=tile_count,
+                plane_count=plane_count,
+                pyramid=tiff_pyramid,
+            )
+            provenance_by_tile_size[effective_tile_size] = settings
+        return settings
     logger.info(
         "Using {} CZI tile worker(s) and {} codec worker(s) per tile",
         effective_tile_workers,
@@ -207,7 +231,7 @@ def compress_czi_to_ome_tiff(
     progress_total = _czi_progress_steps(plane_count) * len(pending_jobs)
     with _progress_bar(progress_total) as progress_callback:
         if effective_tile_workers == 1:
-            for tile, illumination in pending_jobs:
+            for tile, illumination, effective_tile_size in pending_jobs:
                 out = _write_czi_tile(
                     reader,
                     path,
@@ -218,12 +242,12 @@ def compress_czi_to_ome_tiff(
                     output_dir=write_output_dir,
                     output_format=output_format,
                     level=level,
-                    tile_size=tile_size,
+                    tile_size=effective_tile_size,
                     zarr_chunks=zarr_chunks,
                     zarr_compressor=zarr_compressor,
                     maxworkers=effective_maxworkers,
                     dims=dims,
-                    provenance=settings,
+                    provenance=provenance_for(effective_tile_size),
                     progress_callback=progress_callback,
                     pyramid=tiff_pyramid,
                 )
@@ -263,15 +287,15 @@ def compress_czi_to_ome_tiff(
                     output_dir=write_output_dir,
                     output_format=output_format,
                     level=level,
-                    tile_size=tile_size,
+                    tile_size=effective_tile_size,
                     zarr_chunks=zarr_chunks,
                     zarr_compressor=zarr_compressor,
                     maxworkers=effective_maxworkers,
-                    provenance=settings,
+                    provenance=provenance_for(effective_tile_size),
                     progress_queue=progress_queue,
                     pyramid=tiff_pyramid,
                 )
-                for tile, illumination in pending_jobs
+                for tile, illumination, effective_tile_size in pending_jobs
             ]
             for future in as_completed(futures):
                 out = future.result()
@@ -462,7 +486,7 @@ def _write_czi_tile(
     output_dir: Path,
     output_format: str,
     level: float,
-    tile_size: int,
+    tile_size: int | None,
     zarr_chunks: tuple[int, int, int, int, int],
     zarr_compressor: str,
     maxworkers: int,
@@ -491,6 +515,8 @@ def _write_czi_tile(
         )
     if output_format != "ome-tiff":
         raise ValueError(f"Unsupported output format {output_format!r}")
+    if tile_size is None:
+        raise ValueError("OME-TIFF output requires a resolved TIFF tile size")
 
     t_indexes = _czi_dim_indexes(dims, "T")
     c_indexes = _czi_dim_indexes(dims, "C")
@@ -522,10 +548,17 @@ def _write_czi_tile(
         with TiffWriter(write_out, bigtiff=True, mode="x") as writer:
             for t in t_indexes:
                 for c in c_indexes:
-                    for z in z_indexes:
-                        plane = _as_grayscale_plane(
-                            reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z, illumination))[0]
-                        )
+                    stack = _read_czi_stack_zyx(
+                        reader,
+                        dims,
+                        tile,
+                        t=t,
+                        c=c,
+                        illumination=illumination,
+                        z_count=len(z_indexes),
+                    )
+                    for z_offset, z in enumerate(z_indexes):
+                        plane = stack[z_offset]
                         raw_bytes += plane.nbytes
                         writer.write(
                             plane,
@@ -571,6 +604,7 @@ def _write_czi_tile(
                             progress_callback=progress_callback,
                             log_progress=log_status,
                         )
+                    del stack
         _replace_output(write_out, out)
     except BaseException:
         _remove_output_if_exists(write_out)
@@ -629,11 +663,16 @@ def _write_czi_tile_to_ome_zarr(
 
     _remove_output_if_exists(write_out)
     try:
-        first_plane = _as_grayscale_plane(
-            reader.read_image(**_czi_read_kwargs(dims, tile, t_indexes[0], c_indexes[0], z_indexes[0], illumination))[
-                0
-            ]
+        first_stack = _read_czi_stack_zyx(
+            reader,
+            dims,
+            tile,
+            t=t_indexes[0],
+            c=c_indexes[0],
+            illumination=illumination,
+            z_count=len(z_indexes),
         )
+        dtype = first_stack.dtype
         raw_bytes = 0
         subblock_metadata = _czi_subblock_metadata(reader, tile, illumination=illumination if "I" in dims else None)
         root = zarr.open_group(str(write_out), mode="w", zarr_format=2)
@@ -652,7 +691,7 @@ def _write_czi_tile_to_ome_zarr(
             "0",
             shape=ome_shape,
             chunks=effective_chunks,
-            dtype=first_plane.dtype,
+            dtype=dtype,
             compressor=_zarr_numcodecs_compressor(compressor, level),
         )
         array.attrs["_ARRAY_DIMENSIONS"] = ["t", "c", "z", "y", "x"]
@@ -661,26 +700,36 @@ def _write_czi_tile_to_ome_zarr(
         plane_count = _czi_plane_count(dims)
         for t_offset, t in enumerate(t_indexes):
             for c_offset, c in enumerate(c_indexes):
-                for z_offset, z in enumerate(z_indexes):
-                    if plane_index == 0:
-                        plane = first_plane
-                    else:
-                        plane = _as_grayscale_plane(
-                            reader.read_image(**_czi_read_kwargs(dims, tile, t, c, z, illumination))[0]
-                        )
-                    raw_bytes += plane.nbytes
-                    array[t_offset, c_offset, z_offset, :, :] = plane
-                    plane_index += 1
-                    _report_czi_plane_progress(
-                        out,
-                        plane_index=plane_index,
-                        plane_count=plane_count,
+                if t_offset == 0 and c_offset == 0:
+                    stack = first_stack
+                    first_stack = None
+                else:
+                    stack = _read_czi_stack_zyx(
+                        reader,
+                        dims,
+                        tile,
                         t=t,
                         c=c,
-                        z=z,
-                        progress_callback=progress_callback,
-                        log_progress=log_status,
+                        illumination=illumination,
+                        z_count=len(z_indexes),
                     )
+                raw_bytes, plane_index = _write_czi_stack_to_ome_zarr_array(
+                    array,
+                    stack,
+                    t_offset=t_offset,
+                    c_offset=c_offset,
+                    z_indexes=z_indexes,
+                    z_chunk=effective_chunks[2],
+                    raw_bytes=raw_bytes,
+                    plane_index=plane_index,
+                    plane_count=plane_count,
+                    out=out,
+                    t=t,
+                    c=c,
+                    progress_callback=progress_callback,
+                    log_status=log_status,
+                )
+                del stack
         root.attrs["squisher_complete"] = True
         _replace_output(write_out, out)
     except BaseException:
@@ -1265,7 +1314,7 @@ def _write_czi_tile_process(
     output_dir: Path,
     output_format: str,
     level: float,
-    tile_size: int,
+    tile_size: int | None,
     zarr_chunks: tuple[int, int, int, int, int],
     zarr_compressor: str,
     maxworkers: int,
@@ -1348,6 +1397,163 @@ def _czi_read_kwargs(
     elif "S" in dims:
         read_kwargs["S"] = tile["scene"]
     return read_kwargs
+
+
+def _write_czi_stack_to_ome_zarr_array(
+    array: Any,
+    stack: npt.NDArray[Any],
+    *,
+    t_offset: int,
+    c_offset: int,
+    z_indexes: list[int],
+    z_chunk: int,
+    raw_bytes: int,
+    plane_index: int,
+    plane_count: int,
+    out: Path,
+    t: int,
+    c: int,
+    progress_callback: Callable[[int], None] | None,
+    log_status: bool,
+) -> tuple[int, int]:
+    if z_chunk <= 0:
+        raise ValueError(f"OME-Zarr z chunk size must be positive, got {z_chunk}")
+
+    for z_start in range(0, len(z_indexes), z_chunk):
+        z_stop = min(z_start + z_chunk, len(z_indexes))
+        slab = stack[z_start:z_stop]
+        raw_bytes += int(slab.nbytes)
+        array[t_offset, c_offset, z_start:z_stop, :, :] = slab
+        for z in z_indexes[z_start:z_stop]:
+            plane_index += 1
+            _report_czi_plane_progress(
+                out,
+                plane_index=plane_index,
+                plane_count=plane_count,
+                t=t,
+                c=c,
+                z=z,
+                progress_callback=progress_callback,
+                log_progress=log_status,
+            )
+    return raw_bytes, plane_index
+
+
+def _czi_stack_read_kwargs(
+    dims: dict[str, tuple[int, int]],
+    tile: CziTile,
+    *,
+    t: int,
+    c: int,
+    illumination: int,
+) -> dict[str, int]:
+    read_kwargs = {}
+    if "C" in dims:
+        read_kwargs["C"] = c
+    if "T" in dims:
+        read_kwargs["T"] = t
+    if "I" in dims:
+        read_kwargs["I"] = illumination
+    if "mosaic_index" in tile:
+        read_kwargs["M"] = tile["mosaic_index"]
+    elif "S" in dims:
+        read_kwargs["S"] = tile["scene"]
+    return read_kwargs
+
+
+def _read_czi_stack_zyx(
+    reader: Any,
+    dims: dict[str, tuple[int, int]],
+    tile: CziTile,
+    *,
+    t: int,
+    c: int,
+    illumination: int,
+    z_count: int,
+) -> npt.NDArray[Any]:
+    data, shape = reader.read_image(**_czi_stack_read_kwargs(dims, tile, t=t, c=c, illumination=illumination))
+    return _czi_stack_zyx(
+        np.asarray(data),
+        shape,
+        z_count=z_count,
+        height=tile["height"],
+        width=tile["width"],
+    )
+
+
+def _czi_stack_zyx(
+    data: npt.NDArray[Any],
+    shape: Any,
+    *,
+    z_count: int,
+    height: int,
+    width: int,
+) -> npt.NDArray[Any]:
+    if shape is not None:
+        try:
+            axes = [(str(dim), int(size)) for dim, size in shape]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid CZI stack dimension metadata {shape!r}") from exc
+        if len(axes) == data.ndim:
+            return _czi_stack_from_axes(data, axes, z_count=z_count, height=height, width=width)
+        raise ValueError(f"CZI stack metadata has {len(axes)} axes but data has shape {data.shape}")
+
+    squeezed = np.squeeze(data)
+    if squeezed.ndim == 2 and z_count == 1:
+        stack = squeezed[np.newaxis, :, :]
+    elif squeezed.ndim == 3:
+        stack = squeezed
+    else:
+        raise ValueError(f"Expected CZI stack data compatible with ZYX, found shape {data.shape}")
+    return _validate_czi_stack_shape(stack, z_count=z_count, height=height, width=width)
+
+
+def _czi_stack_from_axes(
+    data: npt.NDArray[Any],
+    axes: list[tuple[str, int]],
+    *,
+    z_count: int,
+    height: int,
+    width: int,
+) -> npt.NDArray[Any]:
+    axis_names = [dim for dim, _size in axes]
+    if "Y" not in axis_names or "X" not in axis_names:
+        raise ValueError(f"Expected CZI stack axes to include Y and X, found {axis_names}")
+
+    selectors: list[int | slice] = []
+    retained_axes: list[str] = []
+    for dim, size in axes:
+        if dim in {"Z", "Y", "X"}:
+            selectors.append(slice(None))
+            retained_axes.append(dim)
+        elif size == 1:
+            selectors.append(0)
+        else:
+            raise ValueError(f"Expected singleton CZI stack axis {dim}, found size {size}")
+
+    stack = data[tuple(selectors)]
+    if "Z" not in retained_axes:
+        if z_count != 1:
+            raise ValueError(f"Expected Z axis for {z_count} planes, found axes {axis_names}")
+        stack = np.expand_dims(stack, axis=0)
+        retained_axes = ["Z", *retained_axes]
+
+    order = [retained_axes.index(dim) for dim in ("Z", "Y", "X")]
+    stack = np.transpose(stack, order)
+    return _validate_czi_stack_shape(stack, z_count=z_count, height=height, width=width)
+
+
+def _validate_czi_stack_shape(
+    stack: npt.NDArray[Any],
+    *,
+    z_count: int,
+    height: int,
+    width: int,
+) -> npt.NDArray[Any]:
+    expected = (z_count, height, width)
+    if stack.shape != expected:
+        raise ValueError(f"Expected CZI stack shape {expected}, found {stack.shape}")
+    return stack
 
 
 def _czi_index_kwargs(
@@ -1759,6 +1965,50 @@ def _validate_output_format(output_format: str) -> None:
         raise ValueError(f"Unsupported output format {output_format!r}; expected one of {sorted(OUTPUT_FORMATS)}")
 
 
+def _validate_tiff_tile_size(tile_size: int) -> None:
+    if tile_size % TIFF_TILE_SIZE_MULTIPLE != 0:
+        raise ValueError(
+            f"TIFF tile size must be a multiple of {TIFF_TILE_SIZE_MULTIPLE}, got {tile_size}"
+        )
+
+
+def _resolve_output_tile_size(output_format: str, requested_tile_size: int | None, tile: CziTile) -> int | None:
+    if output_format == "ome-zarr":
+        if requested_tile_size is not None:
+            _validate_tiff_tile_size(requested_tile_size)
+        return requested_tile_size
+    if output_format == "ome-tiff":
+        return _resolve_tiff_tile_size(requested_tile_size, tile)
+    raise ValueError(f"Unsupported output format {output_format!r}")
+
+
+def _resolve_tiff_tile_size(requested_tile_size: int | None, tile: CziTile) -> int:
+    if requested_tile_size is not None:
+        _validate_tiff_tile_size(requested_tile_size)
+        return requested_tile_size
+    return _infer_tiff_tile_size(width=tile["width"], height=tile["height"])
+
+
+def _infer_tiff_tile_size(
+    *,
+    width: int,
+    height: int,
+    max_size: int = DEFAULT_TIFF_TILE_SIZE_MAX,
+) -> int:
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Cannot infer TIFF tile size from non-positive image size {width}x{height}")
+
+    limit = min(width, height, max_size)
+    for candidate in range(limit, TIFF_TILE_SIZE_MULTIPLE - 1, -1):
+        if candidate % TIFF_TILE_SIZE_MULTIPLE == 0 and width % candidate == 0 and height % candidate == 0:
+            return candidate
+
+    raise ValueError(
+        "Cannot infer TIFF tile size for image "
+        f"{width}x{height}: no common divisor <= {max_size} is a multiple of {TIFF_TILE_SIZE_MULTIPLE}"
+    )
+
+
 def _validate_zarr_chunks(
     chunks: tuple[int, int, int, int, int],
     *,
@@ -1864,7 +2114,7 @@ def _compression_provenance(
     output_dir: Path,
     output_format: str,
     level: float,
-    tile_size: int,
+    tile_size: int | None,
     zarr_chunks: tuple[int, int, int, int, int],
     min_zarr_chunk_pixels: int,
     zarr_compressor: str,
@@ -1894,7 +2144,7 @@ def _compression_provenance(
         "squisher.compression_tiff_tag": str(compression_tiff_tag or ""),
         "squisher.compression_level_input": str(level),
         "squisher.compression_level_normalized": str(normalized_level),
-        "squisher.tiff_tile_size": str(tile_size),
+        "squisher.tiff_tile_size": "" if tile_size is None else str(tile_size),
         "squisher.zarr_chunks_tczyx": json.dumps(zarr_chunks),
         "squisher.min_zarr_chunk_pixels": str(min_zarr_chunk_pixels),
         "squisher.zarr_compressor": zarr_compressor,

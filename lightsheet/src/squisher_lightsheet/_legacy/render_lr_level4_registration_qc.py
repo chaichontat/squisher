@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 from squisher_lightsheet import qc as qc_core
-from squisher_lightsheet.tiff import tiff_series_level_count
 
 
 DIMENSIONS = ("z", "y", "x")
@@ -72,6 +71,7 @@ def parse_args(
     parser.add_argument("--slab-half-px", type=int, default=4, help="Half-width of the center-y XZ slab at the sampled level.")
     parser.add_argument("--skip-global-projections", action="store_true")
     parser.add_argument("--full-affine-planes", action="store_true", help="Render QC planes by resampling through the full affine.")
+    parser.add_argument("--center-z-only", action="store_true", help="For --full-affine-planes, render only the center-z XY PNG.")
     return parser.parse_args()
 
 
@@ -211,38 +211,42 @@ def stitch_shape_zyx(tile: Any) -> tuple[int, int, int]:
 
 def sampled_tile(tile: Any, *, channel: int, level: int, stitch: Any) -> np.ndarray:
     import dask.array as da
-    import tifffile
-    import zarr
 
-    source_level = min(int(level), max(0, tiff_series_level_count(tile.path) - 1))
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    source_level, _available_levels = stitch.fusion_source_level_for_tile(tile, int(level))
+    store = None
     try:
-        zarray = zarr.open(store, mode="r")
+        zarray, store = stitch.open_tile_array(tile, source_level=source_level)
+        source_tile = stitch.fusion_tile_for_source_array(
+            tile,
+            tuple(int(value) for value in zarray.shape),
+            source_level=source_level,
+        )
         steps_zyx = remaining_sample_steps(
             tile,
             source_shape=tuple(int(value) for value in zarray.shape),
             target_level_factor=2**int(level),
         )
         array = da.from_zarr(zarray)
-        z_flip, y_flip, x_flip = stitch.tile_flip_axes_zyx(tile)
+        z_flip, y_flip, x_flip = stitch.tile_flip_axes_zyx(source_tile)
         z_slice = slice(None, None, -steps_zyx[0] if z_flip else steps_zyx[0])
         y_slice = slice(None, None, -steps_zyx[1] if y_flip else steps_zyx[1])
         x_slice = slice(None, None, -steps_zyx[2] if x_flip else steps_zyx[2])
-        if tile.axes == "CZYX":
-            if channel < 0 or channel >= tile.shape[0]:
+        if source_tile.axes == "CZYX":
+            if channel < 0 or channel >= source_tile.shape[0]:
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {tile.shape[0]}")
             sampled = array[channel, z_slice, y_slice, x_slice]
-        elif tile.axes == "ZYX":
+        elif source_tile.axes == "ZYX":
             if channel != 0:
                 raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
             sampled = array[z_slice, y_slice, x_slice]
         else:
-            raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
+            raise ValueError(f"Unsupported axes {source_tile.axes!r} in {tile.path}")
         return np.asarray(sampled.compute())
     finally:
-        close = getattr(store, "close", None)
-        if callable(close):
-            close()
+        if store is not None:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
 
 
 def place_max(canvas: np.ndarray, image: np.ndarray, start: tuple[int, int]) -> None:
@@ -492,9 +496,14 @@ def render_full_affine_planes(
     center_z_um: float,
     center_y_um: float,
     z_display_scale: float,
+    center_z_only: bool = False,
 ) -> tuple[list[str], Path, list[dict[str, Any]]]:
     xy_canvases = {side: np.zeros((geometry.shape_zyx[1], geometry.shape_zyx[2]), dtype=np.float32) for side in SIDES}
-    xz_canvases = {side: np.zeros((geometry.shape_zyx[0], geometry.shape_zyx[2]), dtype=np.float32) for side in SIDES}
+    xz_canvases = (
+        None
+        if center_z_only
+        else {side: np.zeros((geometry.shape_zyx[0], geometry.shape_zyx[2]), dtype=np.float32) for side in SIDES}
+    )
     xy_labels: list[OverlayLabel] = []
     xz_labels: list[OverlayLabel] = []
     metadata_rows = []
@@ -515,18 +524,20 @@ def render_full_affine_planes(
         if in_xy:
             place_max(xy_canvases[side], xy, xy_start)
             xy_labels.append(plane_label(tile.path.name, xy_start, xy.shape))
-        xz, xz_start, in_xz = sample_full_affine_plane(
-            block=block,
-            inverse_affine=inverse_affine,
-            geometry=geometry,
-            plane="xz",
-            fixed_um=center_y_um,
-            bounds_min_um=bounds_min_um,
-            bounds_max_um=bounds_max_um,
-        )
-        if in_xz:
-            place_max(xz_canvases[side], xz, xz_start)
-            xz_labels.append(plane_label(tile.path.name, xz_start, xz.shape))
+        in_xz = False
+        if xz_canvases is not None:
+            xz, xz_start, in_xz = sample_full_affine_plane(
+                block=block,
+                inverse_affine=inverse_affine,
+                geometry=geometry,
+                plane="xz",
+                fixed_um=center_y_um,
+                bounds_min_um=bounds_min_um,
+                bounds_max_um=bounds_max_um,
+            )
+            if in_xz:
+                place_max(xz_canvases[side], xz, xz_start)
+                xz_labels.append(plane_label(tile.path.name, xz_start, xz.shape))
         metadata_rows.append(
             {
                 "tile": tile.path.name,
@@ -547,9 +558,15 @@ def render_full_affine_planes(
         )
 
     xy_path = output_dir / f"level{level}_registered_lr_fullAffine_centerZ_xy_yellowOverlay_ch{channel}.png"
+    write_rgb(xy_path, left=xy_canvases["L"], right=xy_canvases["R"], labels=xy_labels)
+    if center_z_only:
+        print(xy_path, flush=True)
+        return [str(xy_path.resolve())], xy_path, metadata_rows
+
+    if xz_canvases is None:
+        raise RuntimeError("XZ canvases were unexpectedly missing")
     xz_iso_path = output_dir / f"level{level}_registered_lr_fullAffine_centerY_xz_isoZ_yellowOverlay_ch{channel}.png"
     xz_raw_path = output_dir / f"level{level}_registered_lr_fullAffine_centerY_xz_rawZ_yellowOverlay_ch{channel}.png"
-    write_rgb(xy_path, left=xy_canvases["L"], right=xy_canvases["R"], labels=xy_labels)
     write_rgb(xz_iso_path, left=xz_canvases["L"], right=xz_canvases["R"], y_scale=z_display_scale, labels=xz_labels)
     write_rgb(xz_raw_path, left=xz_canvases["L"], right=xz_canvases["R"], y_scale=1.0, labels=xz_labels)
     contact_sheet = output_dir / f"level{level}_registered_lr_fullAffine_planes_yellowOverlay_ch{channel}.png"
@@ -571,7 +588,7 @@ def main(
         default_output_dir=default_output_dir,
     )
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
-    if args.skip_global_projections and not args.center_y_xz:
+    if args.skip_global_projections and not args.center_y_xz and not (args.full_affine_planes and args.center_z_only):
         raise ValueError("Nothing to render: remove --skip-global-projections or pass --center-y-xz")
     if args.slab_half_px < 0:
         raise ValueError("--slab-half-px must be non-negative")
@@ -615,6 +632,7 @@ def main(
             center_z_um=center_z_um,
             center_y_um=center_y_um,
             z_display_scale=z_display_scale,
+            center_z_only=bool(args.center_z_only),
         )
         summary = {
             "position_input": str(args.position_input.resolve()),
@@ -622,7 +640,7 @@ def main(
             "channel": args.channel,
             "level": args.level,
             "level_factor": geometry.level_factor,
-            "mode": "full_affine_planes",
+            "mode": "full_affine_center_z" if args.center_z_only else "full_affine_planes",
             "global_min_zyx_um": geometry.global_min_zyx_um.tolist(),
             "global_max_zyx_um": geometry.global_max_zyx_um.tolist(),
             "level_spacing_zyx_um": geometry.level_spacing_zyx_um.tolist(),

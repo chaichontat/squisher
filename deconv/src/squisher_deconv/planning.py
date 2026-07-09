@@ -45,9 +45,26 @@ def output_relative_root(paths: Sequence[Path]) -> Path | None:
 
 def output_path_for(out_dir: Path, source_path: Path, *, relative_root: Path | None) -> Path:
     source_path = Path(source_path)
+    output_name = _ome_zarr_name(source_path)
     if relative_root is not None:
-        return out_dir / source_path.relative_to(relative_root)
-    return out_dir / source_path.name
+        relative_path = source_path.relative_to(relative_root)
+        return out_dir / relative_path.parent / output_name
+    return out_dir / output_name
+
+
+def output_sidecar_path(output_path: Path) -> Path:
+    name = output_path.name
+    if not name.endswith(".ome.zarr"):
+        raise ValueError(f"Expected an OME-Zarr output path, got {output_path}")
+    return output_path.with_name(f"{name.removesuffix('.ome.zarr')}.deconv.json")
+
+
+def _ome_zarr_name(source_path: Path) -> str:
+    name = source_path.name
+    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
+        if name.endswith(suffix):
+            return f"{name.removesuffix(suffix)}.ome.zarr"
+    return f"{source_path.stem}.ome.zarr"
 
 
 def logical_z_count(path: Path, *, channels: int) -> int:

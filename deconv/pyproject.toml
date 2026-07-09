@@ -12,11 +12,17 @@ dependencies = [
     "imagecodecs>=2026.5.10",
     "loguru>=0.7.3",
     "matplotlib>=3.10.0",
+    "numcodecs>=0.16.5",
     "numpy>=2.4.6",
-    "scipy>=1.16.0",
+    "pillow>=12.0.0",
+    "squisher",
     "tifffile>=2026.6.1",
     "typer>=0.26.5",
+    "zarr>=3.1.5",
 ]
+
+[tool.uv.sources]
+squisher = { workspace = true }
 
 [project.scripts]
 squisher-deconv = "squisher_deconv.cli:main"

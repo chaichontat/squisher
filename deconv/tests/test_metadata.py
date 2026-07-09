@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-import threading
-
 import numpy as np
 import pytest
+import zarr
 
 from squisher_deconv.metadata import SourceMetadata, json_dumps_strict
-from squisher_deconv.sink import write_streamed_ome_tiff
+from squisher_deconv.sink import write_streamed_ome_zarr
 from squisher_deconv.source import TiffLogicalSource
 
 
@@ -16,28 +14,12 @@ def test_json_dumps_strict_rejects_non_serializable_values() -> None:
         json_dumps_strict({"bad": object()}, context="Test payload")
 
 
-def test_ome_provenance_serialization_failure_removes_partial_output(tmp_path) -> None:
-    source = TiffLogicalSource(
-        path=tmp_path / "source.tif",
-        channels=1,
-        z_count=1,
-        height=2,
-        width=2,
-        dtype="uint16",
-        metadata=SourceMetadata(
-            shaped_metadata=[],
-            imagej_metadata=None,
-            ome_xml=None,
-            tags={},
-            raw_shape=(1, 2, 2),
-            raw_dtype="uint16",
-            metadata_hash="hash",
-        ),
-    )
-    output = tmp_path / "out.tif"
+def test_ome_zarr_provenance_serialization_failure_removes_partial_output(tmp_path) -> None:
+    source = _source(tmp_path, channels=1, z_count=1, height=2, width=2)
+    output = tmp_path / "out.ome.zarr"
 
-    with pytest.raises(TypeError, match="OME deconvolution provenance must be JSON serializable"):
-        write_streamed_ome_tiff(
+    with pytest.raises(TypeError, match="OME-Zarr deconvolution provenance must be JSON serializable"):
+        write_streamed_ome_zarr(
             output,
             source=source,
             core_plane_chunks=[np.zeros((1, 2, 2), dtype=np.uint16)],
@@ -46,64 +28,50 @@ def test_ome_provenance_serialization_failure_removes_partial_output(tmp_path) -
         )
 
     assert not output.exists()
-    assert not (tmp_path / ".out.tif.partial").exists()
+    assert not (tmp_path / ".out.ome.zarr.partial").exists()
 
 
-def test_streamed_ome_tiff_writes_from_dedicated_thread(tmp_path, monkeypatch) -> None:
-    source = TiffLogicalSource(
+def test_streamed_ome_zarr_writes_czyx_array_with_metadata(tmp_path) -> None:
+    source = _source(tmp_path, channels=2, z_count=2, height=5, width=6)
+    output = tmp_path / "out.ome.zarr"
+    payload = np.arange(2 * 2 * 5 * 6, dtype=np.uint16).reshape(4, 5, 6)
+
+    write_streamed_ome_zarr(
+        output,
+        source=source,
+        core_plane_chunks=[payload],
+        output_mode="u16",
+        provenance={"tool": "test"},
+    )
+
+    root = zarr.open_group(str(output), mode="r")
+    array = root["0"]
+    assert tuple(array.shape) == (2, 2, 5, 6)
+    assert tuple(array.chunks) == (1, 2, 5, 6)
+    assert np.dtype(array.dtype) == np.uint16
+    assert array.attrs["_ARRAY_DIMENSIONS"] == ["c", "z", "y", "x"]
+    assert root.attrs["squisher_complete"] is True
+    assert root.attrs["multiscales"][0]["datasets"][0]["path"] == "0"
+    assert root.attrs["squisher_deconv"]["provenance"] == {"tool": "test"}
+    assert root.attrs["squisher_deconv"]["source_metadata_summary"]["raw_shape"] == [4, 5, 6]
+    np.testing.assert_array_equal(np.moveaxis(array[:], 0, 1).reshape(4, 5, 6), payload)
+
+
+def _source(tmp_path, *, channels: int, z_count: int, height: int, width: int) -> TiffLogicalSource:
+    return TiffLogicalSource(
         path=tmp_path / "source.tif",
-        channels=1,
-        z_count=2,
-        height=2,
-        width=2,
+        channels=channels,
+        z_count=z_count,
+        height=height,
+        width=width,
         dtype="uint16",
         metadata=SourceMetadata(
             shaped_metadata=[],
             imagej_metadata=None,
             ome_xml=None,
             tags={},
-            raw_shape=(2, 2, 2),
+            raw_shape=(z_count * channels, height, width),
             raw_dtype="uint16",
             metadata_hash="hash",
         ),
     )
-    first_write_started = threading.Event()
-    second_chunk_queued = threading.Event()
-    writer_thread_names: list[str] = []
-
-    class BlockingWriter:
-        def __init__(self, path, **kwargs) -> None:
-            self.path = Path(path)
-
-        def __enter__(self):
-            self.path.write_bytes(b"partial")
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        def write(self, plane, **kwargs) -> None:
-            writer_thread_names.append(threading.current_thread().name)
-            if not first_write_started.is_set():
-                first_write_started.set()
-                assert second_chunk_queued.wait(timeout=1)
-
-    monkeypatch.setattr("squisher_deconv.sink.TiffWriter", BlockingWriter)
-
-    def chunks():
-        yield np.ones((1, 2, 2), dtype=np.uint16)
-        assert first_write_started.wait(timeout=1)
-        yield np.ones((1, 2, 2), dtype=np.uint16)
-        second_chunk_queued.set()
-
-    write_streamed_ome_tiff(
-        tmp_path / "out.tif",
-        source=source,
-        core_plane_chunks=chunks(),
-        output_mode="float32",
-        provenance={},
-    )
-
-    assert (tmp_path / "out.tif").exists()
-    assert writer_thread_names
-    assert set(writer_thread_names) == {"squisher-ome-writer"}

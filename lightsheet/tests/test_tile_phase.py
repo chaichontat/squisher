@@ -27,6 +27,25 @@ from squisher_lightsheet.tile_phase import (
 )
 
 
+def _write_test_ome_zarr(path: Path, *, axes: str, levels: list[np.ndarray]) -> None:
+    import zarr
+
+    group = zarr.open_group(str(path), mode="w", zarr_format=3)
+    datasets = []
+    axis_names = [{"name": axis.lower(), "type": "channel" if axis == "C" else "space"} for axis in axes]
+    for index, data in enumerate(levels):
+        chunks = tuple(min(2, int(size)) for size in data.shape)
+        array = group.create_array(
+            str(index),
+            data=data,
+            chunks=chunks,
+            dimension_names=tuple(axis.lower() for axis in axes),
+        )
+        array.attrs["_ARRAY_DIMENSIONS"] = [axis.lower() for axis in axes]
+        datasets.append({"path": str(index), "coordinateTransformations": [{"type": "scale", "scale": [1.0] * len(axes)}]})
+    group.attrs["multiscales"] = [{"version": "0.4", "axes": axis_names, "datasets": datasets}]
+
+
 def test_estimate_tile_shift_zyx_px_recovers_synthetic_translation() -> None:
     z, y, x = np.mgrid[:32, :48, :48]
     fixed = np.exp(-(((z - 16) ** 2) / 12.0 + ((y - 24) ** 2 + (x - 24) ** 2) / 150.0)).astype(np.float32)
@@ -38,6 +57,80 @@ def test_estimate_tile_shift_zyx_px_recovers_synthetic_translation() -> None:
 
     np.testing.assert_allclose(shift, [-2, 4, -5], atol=0.25)
     assert details["corr_after"] > details["corr_before"]
+
+
+def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
+    zyx_path = tmp_path / "Image_14.000.ome.zarr"
+    czyx_path = tmp_path / "Image_10.000.ome.zarr"
+    z, y, x = np.mgrid[:4, :6, :6]
+    zyx_level0 = (z * 100 + y * 10 + x).astype(np.float32)
+    czyx_level0 = np.stack([zyx_level0, zyx_level0 + 1000.0]).astype(np.float32)
+    czyx_level1 = czyx_level0[:, ::2, ::2, ::2]
+    _write_test_ome_zarr(zyx_path, axes="ZYX", levels=[zyx_level0, zyx_level0[::2, ::2, ::2]])
+    _write_test_ome_zarr(czyx_path, axes="CZYX", levels=[czyx_level0, czyx_level1])
+    reference = rough_legacy.TileRecord(
+        tile=zyx_path.name,
+        side="L",
+        path=zyx_path,
+        translation_zyx_um=np.zeros(3),
+        scale_zyx_um=np.ones(3),
+        shape_zyx=np.asarray([4, 6, 6]),
+        axes="ZYX",
+    )
+    moving = rough_legacy.TileRecord(
+        tile=czyx_path.name,
+        side="L",
+        path=czyx_path,
+        translation_zyx_um=np.zeros(3),
+        scale_zyx_um=np.ones(3),
+        shape_zyx=np.asarray([4, 6, 6]),
+        axes="CZYX",
+    )
+
+    fixed_patch = tile_phase_module.read_tile_patch(
+        reference,
+        channel=0,
+        slices_zyx=(slice(1, 3), slice(2, 5), slice(1, 4)),
+    )
+    moving_patch = tile_phase_module.read_tile_patch(
+        moving,
+        channel=1,
+        slices_zyx=(slice(1, 3), slice(2, 5), slice(1, 4)),
+    )
+    moving_from_path = tile_phase_module.make_moving_tile_record(reference, czyx_path)
+    scout, scale_zyx, source_level, available_levels, z_indices_l0 = tile_phase_module.sampled_tile_volume_from_subifd(
+        moving,
+        channel=1,
+        requested_level=1,
+    )
+    position_record = {
+        "tile": zyx_path.name,
+        "path": str(zyx_path),
+        "axes": "ZYX",
+        "shape": [4, 6, 6],
+        "translation_um": {"z": 1.0, "y": 2.0, "x": 3.0},
+    }
+    tile_phase_module._apply_shift_to_position_record(
+        position_record,
+        moving_tile_name=czyx_path.name,
+        moving_path=czyx_path,
+        shift_um=np.asarray([0.5, 1.5, 2.5]),
+    )
+
+    np.testing.assert_array_equal(fixed_patch, zyx_level0[1:3, 2:5, 1:4])
+    np.testing.assert_array_equal(moving_patch, czyx_level0[1, 1:3, 2:5, 1:4])
+    np.testing.assert_array_equal(scout, czyx_level1[1])
+    np.testing.assert_array_equal(scale_zyx, [2.0, 2.0, 2.0])
+    np.testing.assert_array_equal(z_indices_l0, [0, 2])
+    np.testing.assert_array_equal(moving_from_path.shape_zyx, [4, 6, 6])
+    assert moving_from_path.axes == "CZYX"
+    assert position_record["axes"] == "CZYX"
+    assert position_record["shape"] == [2, 4, 6, 6]
+    assert position_record["channels"] == ["0", "1"]
+    assert position_record["tracks"][0]["channels"] == [0, 1]
+    assert position_record["translation_um"] == {"z": 1.5, "y": 3.5, "x": 5.5}
+    assert source_level == 1
+    assert available_levels == 2
 
 
 def test_token_rewrite_resolves_corresponding_405_tile(tmp_path) -> None:
@@ -137,12 +230,12 @@ def test_patch_mode_composes_coarse_seed_and_residual(monkeypatch) -> None:
                 "positive_fraction": 0.5,
             },
             {
-                "fixed_slices": (slice(32, 48), slice(48, 80), slice(48, 80)),
+                "fixed_slices": (slice(32, 48), slice(80, 112), slice(48, 80)),
                 "content_score": 0.9,
                 "positive_fraction": 0.4,
             },
             {
-                "fixed_slices": (slice(40, 56), slice(48, 80), slice(48, 80)),
+                "fixed_slices": (slice(40, 56), slice(48, 80), slice(80, 112)),
                 "content_score": 0.8,
                 "positive_fraction": 0.3,
             },
@@ -171,7 +264,13 @@ def test_patch_mode_composes_coarse_seed_and_residual(monkeypatch) -> None:
     monkeypatch.setattr(
         tile_phase_module,
         "sampled_tile_volume_from_subifd",
-        lambda *_args, **_kwargs: (np.ones((16, 32, 32), dtype=np.float32), np.asarray([4.0, 4.0, 4.0]), 2, 3),
+        lambda *_args, **_kwargs: (
+            np.ones((16, 32, 32), dtype=np.float32),
+            np.asarray([4.0, 4.0, 4.0]),
+            2,
+            3,
+            np.arange(16, dtype=np.int64) * 4,
+        ),
     )
     monkeypatch.setattr(
         tile_phase_module,
@@ -204,6 +303,39 @@ def test_patch_mode_composes_coarse_seed_and_residual(monkeypatch) -> None:
     assert details["early_stop_after_patch"] == 2
     assert details["patches"][0]["moving_slices_zyx"] == [[20, 36], [40, 72], [60, 92]]
     assert details["patches"][3]["reason"] == "skipped_after_enough_inliers"
+
+
+def test_sparse_scout_patch_rows_store_sampled_z_indices(monkeypatch) -> None:
+    fixed = np.ones((32, 240, 240), dtype=np.float32)
+    moving = np.ones_like(fixed)
+    scale = np.asarray([3160.0 / 31.0, 4.0, 4.0])
+    z_indices = np.rint(np.linspace(0, 3160, 32)).astype(np.int64)
+
+    monkeypatch.setattr(
+        tile_phase_module,
+        "estimate_tile_shift_zyx_px_gpu",
+        lambda *_args, **_kwargs: (np.asarray([0.0, 0.0, 0.0]), {"peak": 1.0, "corr_before": 0.2, "corr_after": 0.8}),
+    )
+    shift, details = tile_phase_module.measure_sparse_scout_patch_shift(
+        fixed_coarse=fixed,
+        moving_coarse=moving,
+        fixed_coarse_scale_zyx=scale,
+        fixed_z_indices_l0=z_indices,
+        moving_z_indices_l0=z_indices,
+        coarse_shift_coarse_px=np.zeros(3),
+        coarse_details={"corr_before": 0.1, "corr_after": 0.7},
+        patch_shape_zyx=(96, 320, 320),
+        max_candidate_patches=3,
+        min_inliers=3,
+    )
+
+    np.testing.assert_allclose(shift, [0.0, 0.0, 0.0])
+    patch = details["patches"][0]
+    assert patch["patch_source"] == "sparse_subifd_scout"
+    assert patch["fixed_slices_zyx"][0] == [0, 3161]
+    assert patch["moving_slices_zyx"][0] == [0, 3161]
+    assert patch["fixed_z_indices_l0"] == z_indices.tolist()
+    assert patch["moving_z_indices_l0"] == z_indices.tolist()
 
 
 def test_inlier_selection_returns_cluster_median_and_rejects_outlier() -> None:
@@ -311,6 +443,7 @@ def test_patch_quality_keeps_low_gradient_nonzero_refinement() -> None:
 def test_tile_phase_cli_min_inliers_default_and_floor() -> None:
     parameter = inspect.signature(cli_module.tile_phase_align).parameters["min_inliers"]
     assert parameter.default == 3
+    assert inspect.signature(cli_module.tile_phase_align).parameters["moving_channel"].default == 0
 
     with pytest.raises(ValueError, match="patch-mode min_inliers must be >= 3"):
         align_tiles_to_reference(
@@ -332,6 +465,7 @@ def test_cache_key_changes_when_position_or_tile_stat_changes(tmp_path) -> None:
     kwargs = {
         "reference_position": position,
         "reference_channel": 3,
+        "moving_channel": 0,
         "reference_token": "488514561638",
         "moving_token": "405",
         "level": 0,
@@ -340,6 +474,7 @@ def test_cache_key_changes_when_position_or_tile_stat_changes(tmp_path) -> None:
         "min_inliers": 3,
         "max_candidate_patches": 24,
         "coarse_level": 4,
+        "scout_z_samples": 32,
     }
 
     before = tile_phase_cache_key(**kwargs)
@@ -354,13 +489,13 @@ def test_cache_key_changes_when_position_or_tile_stat_changes(tmp_path) -> None:
 
 def test_phase_cache_key_ignores_quality_metric_only_changes() -> None:
     current = {
-        "cache_version": "tile_phase_robust_v3",
+        "cache_version": "tile_phase_robust_v4",
         "reference_position": "/tmp/positions.json",
         "patch_shape_zyx": [32, 512, 512],
         "quality_thresholds": {"corr_improvement_metric": "same_shifted_overlap_support"},
     }
     stored = {
-        "cache_version": "tile_phase_robust_v3",
+        "cache_version": "tile_phase_robust_v4",
         "reference_position": "/tmp/positions.json",
         "patch_shape_zyx": [32, 512, 512],
         "quality_thresholds": {"min_corr_improvement": 0.0},
@@ -423,11 +558,11 @@ def test_cached_patch_residuals_are_rescored_without_phase_recompute(monkeypatch
             "patch_shape_zyx": [4, 8, 8],
             "patches": [
                 {
-                    "patch_index": index,
-                    "fixed_slices_zyx": [[0, 4], [0, 8], [0, 8]],
-                    "moving_slices_zyx": [[0, 4], [0, 8], [0, 8]],
-                    "residual_shift_px_zyx": [0.0, 0.0, 0.0],
-                    "total_shift_px_zyx": [1.0 + index * 0.1, 2.0, 3.0],
+                        "patch_index": index,
+                        "fixed_slices_zyx": [[0, 4], [index * 2, index * 2 + 8], [0, 8]],
+                        "moving_slices_zyx": [[0, 4], [index * 2, index * 2 + 8], [0, 8]],
+                        "residual_shift_px_zyx": [0.0, 0.0, 0.0],
+                        "total_shift_px_zyx": [1.0 + index * 0.1, 2.0, 3.0],
                 }
                 for index in range(3)
             ],

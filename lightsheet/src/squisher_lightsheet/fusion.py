@@ -11,7 +11,16 @@ coarse_preibisch_content_weights = legacy.coarse_preibisch_content_weights
 temporary_basic_disk_cache_dir = legacy.temporary_basic_disk_cache_dir
 
 
+def canonical_fusion_base_output(output: Path) -> Path:
+    """Return the base OME-Zarr path that yields canonical per-channel outputs."""
+    name = output.name
+    if name.endswith(".ome.zarr") or name.endswith(".zarr"):
+        return output
+    return output / "fused.ome.zarr"
+
+
 def channel_output_path(output: Path, channel: int) -> Path:
+    output = canonical_fusion_base_output(output)
     name = output.name
     if name.endswith(".ome.zarr"):
         return output.with_name(f"{name.removesuffix('.ome.zarr')}.ch{channel}.ome.zarr")
@@ -71,9 +80,12 @@ def fuse_tiles(
     batch_size: int = 4,
     basic_cache_tiles: int = 64,
     basic_cache_disk_dir: Path | None = None,
+    output_chunksize_zyx: tuple[int, int, int] | None = None,
+    output_grid_template: Path | None = None,
     flatfield_dirs_by_source_view: dict[str, Path] | None = None,
     dry_run: bool = False,
 ) -> str:
+    output = canonical_fusion_base_output(output)
     args = [
         str(input_dir),
         "--position-input",
@@ -91,6 +103,10 @@ def fuse_tiles(
         "--basic-cache-tiles",
         str(basic_cache_tiles),
     ]
+    if output_chunksize_zyx is not None:
+        args.extend(["--output-chunksize", *(str(value) for value in output_chunksize_zyx)])
+    if output_grid_template is not None:
+        args.extend(["--output-grid-template", str(output_grid_template)])
     if flatfield_dirs_by_source_view is not None:
         validate_source_view_flatfields(flatfield_dirs_by_source_view)
         for view, flatfield_dir in flatfield_dirs_by_source_view.items():

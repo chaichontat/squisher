@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 from typing import Any, Literal
 
+from loguru import logger
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
@@ -92,7 +93,7 @@ class MattesAnchorParameters:
 
 
 def log(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    logger.info(message)
 
 
 def require_gpu_modules() -> tuple[Any, Any, Any]:
@@ -1120,7 +1121,7 @@ def summarize_site(
             add_total_shift_fields(direct, row)
             results.append(direct)
         for start in starts:
-            print(f"running site={site} block={row['block_index']} start={start['name']}", flush=True)
+            logger.info("running site={} block={} start={}", site, row["block_index"], start["name"])
             result = fit_translation(
                 fixed,
                 moving,

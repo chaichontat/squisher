@@ -6,6 +6,8 @@ import shlex
 import subprocess
 import sys
 
+from loguru import logger
+
 
 LEGACY_DIR = Path(__file__).resolve().parent / "_legacy"
 
@@ -18,9 +20,9 @@ def run_legacy_script(script_name: str, args: list[str], *, dry_run: bool = Fals
     command = [sys.executable, str(LEGACY_DIR / script_name), *args]
     text = command_text(command)
     if dry_run:
-        print(f"DRY RUN not executed: {text}", flush=True)
+        logger.info("DRY RUN not executed: {}", text)
         return text
-    print(text, flush=True)
+    logger.info(text)
     env = os.environ.copy()
     extra_pythonpath = env.pop("SQUISHER_LEGACY_EXTRA_PYTHONPATH", "")
     if extra_pythonpath:

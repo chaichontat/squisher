@@ -15,13 +15,16 @@ from squisher.compression import (
     _block_mean_xy,
     _czi_output_dir,
     _czi_progress_steps,
+    _czi_stack_zyx,
     _czi_subblock_metadata,
+    _infer_tiff_tile_size,
     _progress_bar,
     _report_czi_plane_progress,
     _stitched_preview_path,
     _stitch_tile_preview_images,
     _start_progress_queue_listener,
     _verify_ome_tiff,
+    _write_czi_stack_to_ome_zarr_array,
     _write_czi_tile,
     _write_czi_tile_process,
     compress_czi_to_ome_tiff,
@@ -140,6 +143,21 @@ def test_block_mean_xy_uses_gpu_result_when_available(monkeypatch) -> None:
     np.testing.assert_array_equal(_block_mean_xy(np.zeros((4, 4), dtype=np.uint16), factor=2), np.full((2, 2), 7))
 
 
+def test_czi_stack_zyx_uses_reader_dimension_metadata() -> None:
+    data = np.arange(3 * 4 * 5, dtype=np.uint16).reshape(1, 1, 3, 1, 4, 5)
+
+    stack = _czi_stack_zyx(
+        data,
+        [("T", 1), ("C", 1), ("Z", 3), ("M", 1), ("Y", 4), ("X", 5)],
+        z_count=3,
+        height=4,
+        width=5,
+    )
+
+    assert stack.shape == (3, 4, 5)
+    np.testing.assert_array_equal(stack, data[0, 0, :, 0])
+
+
 def test_compress_czi_writes_tiled_ome_tiff_with_raw_metadata(tmp_path: Path) -> None:
     czi_path = tmp_path / "sample.czi"
     data = np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape((2, 3, 4, 5))
@@ -236,10 +254,18 @@ def test_compress_czi_writes_each_illumination_as_separate_ome_tiff(tmp_path: Pa
 
         def read_image(self, **kwargs):
             assert kwargs["I"] in {0, 1}
-            assert kwargs["Z"] in {0, 1}
-            value = kwargs["I"] * 1000 + kwargs["Z"]
-            plane = np.full((1, 1, 1, 1, 1, 16, 16), value, dtype=np.uint16)
-            return (plane, None)
+            if "Z" in kwargs:
+                assert kwargs["Z"] in {0, 1}
+                value = kwargs["I"] * 1000 + kwargs["Z"]
+                plane = np.full((1, 1, 1, 1, 1, 16, 16), value, dtype=np.uint16)
+                return (plane, None)
+            data = np.stack(
+                [
+                    np.full((16, 16), kwargs["I"] * 1000 + z, dtype=np.uint16)
+                    for z in range(2)
+                ]
+            )
+            return (data, [("Z", 2), ("Y", 16), ("X", 16)])
 
         def read_subblock_metadata(self, unified_xml: bool, **kwargs):
             assert not unified_xml
@@ -625,10 +651,10 @@ def test_compress_czi_keeps_existing_output_when_overwrite_fails(tmp_path: Path,
     out = tmp_path / "sample.ome.tif"
     out.write_bytes(b"existing")
 
-    def fail_grayscale_plane(data):
+    def fail_stack(data, shape, *, z_count, height, width):
         raise RuntimeError("write failed")
 
-    monkeypatch.setattr("squisher.compression._as_grayscale_plane", fail_grayscale_plane)
+    monkeypatch.setattr("squisher.compression._czi_stack_zyx", fail_stack)
 
     with pytest.raises(RuntimeError, match="write failed"):
         compress_czi_to_ome_tiff(czi_path, level=90, tile_size=16, maxworkers=1, overwrite=True)
@@ -813,6 +839,59 @@ def test_czi_progress_steps_count_ceil_plane_blocks() -> None:
     assert _czi_progress_steps(CZI_PROGRESS_INTERVAL * 2) == 2
 
 
+def test_infer_tiff_tile_size_uses_largest_clean_divisor_under_cap() -> None:
+    assert _infer_tiff_tile_size(width=960, height=960) == 480
+    assert _infer_tiff_tile_size(width=960, height=1920) == 480
+    assert _infer_tiff_tile_size(width=512, height=512) == 512
+
+
+def test_compress_czi_infers_tiff_tile_size_from_image_size(tmp_path: Path, monkeypatch) -> None:
+    czi_path = tmp_path / "sample.czi"
+    czi_path.write_bytes(b"fake")
+    captured = {}
+
+    class FakeCziFile:
+        meta = "<ImageDocument />"
+
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def get_dims_shape(self):
+            return [{"X": (0, 960), "Y": (0, 1920), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
+
+    tile = {
+        "index": 0,
+        "scene": 0,
+        "x": 0,
+        "y": 0,
+        "width": 960,
+        "height": 1920,
+        "position_x": 0.0,
+        "position_y": 0.0,
+    }
+
+    @contextmanager
+    def capture_progress(total: int):
+        assert total == 1
+        yield lambda steps: None
+
+    def fake_write_czi_tile(_reader, _path, *, output_dir, tile, tile_size, provenance, **_kwargs):
+        captured["tile_size"] = tile_size
+        captured["provenance_tile_size"] = provenance["squisher.tiff_tile_size"]
+        out = output_dir / "sample.ome.tif"
+        out.write_bytes(b"complete")
+        return out
+
+    monkeypatch.setattr("aicspylibczi.CziFile", FakeCziFile)
+    monkeypatch.setattr("squisher.compression._czi_tiles", lambda path, *, pos_path=None: [tile])
+    monkeypatch.setattr("squisher.compression._progress_bar", capture_progress)
+    monkeypatch.setattr("squisher.compression._write_czi_tile", fake_write_czi_tile)
+
+    assert compress_czi_to_ome_tiff(czi_path, level=90, maxworkers=1, thumbnails=False)
+
+    assert captured == {"tile_size": 480, "provenance_tile_size": "480"}
+
+
 def test_report_czi_plane_progress_advances_every_interval_and_final_plane() -> None:
     advances = []
     plane_count = CZI_PROGRESS_INTERVAL * 2 + 25
@@ -944,8 +1023,10 @@ def test_write_czi_tile_reports_tiff_progress_from_real_writer_loop(tmp_path: Pa
     class FakeReader:
         meta = "<ImageDocument />"
 
-        def read_image(self, **_kwargs):
-            return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
+        def read_image(self, **kwargs):
+            assert "Z" not in kwargs
+            data = np.zeros((CZI_PROGRESS_INTERVAL + 1, 16, 16), dtype=np.uint16)
+            return (data, [("Z", CZI_PROGRESS_INTERVAL + 1), ("Y", 16), ("X", 16)])
 
         def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
             assert not unified_xml
@@ -981,7 +1062,8 @@ def test_write_czi_tile_adds_pyramid_subifds_by_default(tmp_path: Path, monkeypa
     class FakeReader:
         meta = "<ImageDocument />"
 
-        def read_image(self, **_kwargs):
+        def read_image(self, **kwargs):
+            assert "Z" not in kwargs
             data = np.arange(512 * 512, dtype=np.uint16).reshape(1, 1, 1, 1, 1, 512, 512)
             return (data, None)
 
@@ -1039,7 +1121,8 @@ def test_write_czi_tile_can_disable_pyramid_subifds(tmp_path: Path, monkeypatch)
     class FakeReader:
         meta = "<ImageDocument />"
 
-        def read_image(self, **_kwargs):
+        def read_image(self, **kwargs):
+            assert "Z" not in kwargs
             return (np.zeros((1, 1, 1, 1, 1, 512, 512), dtype=np.uint16), None)
 
         def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
@@ -1106,8 +1189,10 @@ def test_write_czi_tile_reports_zarr_progress_from_real_writer_loop(tmp_path: Pa
     class FakeReader:
         meta = "<ImageDocument />"
 
-        def read_image(self, **_kwargs):
-            return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
+        def read_image(self, **kwargs):
+            assert "Z" not in kwargs
+            data = np.zeros((CZI_PROGRESS_INTERVAL + 1, 16, 16), dtype=np.uint16)
+            return (data, [("Z", CZI_PROGRESS_INTERVAL + 1), ("Y", 16), ("X", 16)])
 
         def read_subblock_metadata(self, unified_xml: bool, **_kwargs):
             assert not unified_xml
@@ -1140,6 +1225,40 @@ def test_write_czi_tile_reports_zarr_progress_from_real_writer_loop(tmp_path: Pa
     assert advances == [1, 1]
 
 
+def test_write_czi_stack_to_ome_zarr_array_uses_z_chunk_slabs() -> None:
+    writes = []
+
+    class FakeArray:
+        def __setitem__(self, key, value) -> None:
+            writes.append((key, np.asarray(value).copy()))
+
+    advances = []
+    stack = np.arange(5 * 4 * 3, dtype=np.uint16).reshape((5, 4, 3))
+
+    raw_bytes, plane_index = _write_czi_stack_to_ome_zarr_array(
+        FakeArray(),
+        stack,
+        t_offset=0,
+        c_offset=1,
+        z_indexes=[10, 11, 12, 13, 14],
+        z_chunk=2,
+        raw_bytes=0,
+        plane_index=0,
+        plane_count=5,
+        out=Path("sample.ome.zarr"),
+        t=0,
+        c=1,
+        progress_callback=lambda steps: advances.append(steps),
+        log_status=False,
+    )
+
+    assert raw_bytes == stack.nbytes
+    assert plane_index == 5
+    assert advances == [1]
+    assert [item[0][2] for item in writes] == [slice(0, 2), slice(2, 4), slice(4, 5)]
+    np.testing.assert_array_equal(writes[0][1], stack[0:2])
+
+
 def test_write_czi_tile_process_forwards_real_tile_progress_and_logs(tmp_path: Path, monkeypatch) -> None:
     czi_path = tmp_path / "sample.czi"
     czi_path.write_bytes(b"fake")
@@ -1154,7 +1273,8 @@ def test_write_czi_tile_process_forwards_real_tile_progress_and_logs(tmp_path: P
         def get_dims_shape(self):
             return [{"X": (0, 16), "Y": (0, 16), "Z": (0, 1), "C": (0, 1), "T": (0, 1)}]
 
-        def read_image(self, **_kwargs):
+        def read_image(self, **kwargs):
+            assert "Z" not in kwargs
             return (np.zeros((1, 1, 1, 1, 1, 16, 16), dtype=np.uint16), None)
 
     class FakeTiffWriter:

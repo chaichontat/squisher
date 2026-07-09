@@ -15,9 +15,9 @@ import numpy as np
 
 from squisher_deconv.deconvolution import Deconvolver
 from squisher_deconv.metadata import compression_tiff_tag, json_dumps_strict, provenance_payload
-from squisher_deconv.planning import output_path_for, slab_windows
+from squisher_deconv.planning import output_path_for, output_sidecar_path, slab_windows
 from squisher_deconv.scaling import ScalingParameters
-from squisher_deconv.sink import write_streamed_ome_tiff
+from squisher_deconv.sink import write_streamed_ome_zarr
 from squisher_deconv.source import TiffLogicalSource
 
 try:
@@ -46,7 +46,7 @@ class ProcessRunConfig:
     halo: int
     slab_depth: int
     output_mode: str
-    psf_path: Path | None
+    psf_paths: tuple[Path, ...]
     basic_paths: tuple[Path, ...]
     scaling_path: Path
     devices: tuple[int, ...]
@@ -246,17 +246,21 @@ def _process_file(
     config: ProcessRunConfig,
 ) -> float:
     source = replace(template_source, path=path)
-    slabs = slab_windows([source.path], z_counts=[source.z_count], slab_depth=config.slab_depth, halo=config.halo)
+    slabs = slab_windows(
+        [source.path], z_counts=[source.z_count], slab_depth=config.slab_depth, halo=config.halo
+    )
     output_path = output_path_for(config.out_dir, source.path, relative_root=config.output_relative_root)
-    sidecar = output_path.with_suffix(".deconv.json")
+    sidecar = output_sidecar_path(output_path)
     if sidecar.exists() and not config.overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing sidecar {sidecar}; pass --overwrite to replace it.")
+        raise FileExistsError(
+            f"Refusing to overwrite existing sidecar {sidecar}; pass --overwrite to replace it."
+        )
 
     provenance = provenance_payload(
         source.path,
         channels=config.channels,
         halo=config.halo,
-        psf_path=config.psf_path,
+        psf_paths=config.psf_paths,
         basic_paths=config.basic_paths,
         output_mode=config.output_mode,
         scaling_path=config.scaling_path,
@@ -382,7 +386,7 @@ def _process_file(
                 yield chunk
 
         try:
-            write_streamed_ome_tiff(
+            write_streamed_ome_zarr(
                 output_path,
                 source=source,
                 core_plane_chunks=chunks(),

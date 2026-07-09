@@ -59,12 +59,42 @@ def test_basic_profile_loader_rejects_non_2d_profiles(tmp_path) -> None:
         _load_basic_profiles([path], cp=_FakeCp)
 
 
+def test_cupy_jit_cuda_path_uses_conda_target(tmp_path, monkeypatch) -> None:
+    import squisher_deconv.gpu as gpu
+
+    target = tmp_path / "targets" / "x86_64-linux"
+    (target / "include").mkdir(parents=True)
+    (target / "lib").mkdir()
+    (target / "include" / "cuda.h").write_text("")
+    (target / "lib" / "libnvrtc.so").write_text("")
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    monkeypatch.setattr(gpu.sys, "prefix", str(tmp_path))
+
+    gpu.ensure_cuda_path_for_cupy_jit()
+
+    assert gpu.os.environ["CUDA_PATH"] == str(target)
+
+
+def test_cupy_jit_cuda_path_preserves_explicit_env(monkeypatch) -> None:
+    import squisher_deconv.gpu as gpu
+
+    monkeypatch.setenv("CUDA_PATH", "/explicit/cuda")
+
+    gpu.ensure_cuda_path_for_cupy_jit()
+
+    assert gpu.os.environ["CUDA_PATH"] == "/explicit/cuda"
+
+
 @pytest.mark.parametrize(
     ("darkfield", "flatfield", "message"),
     [
         (np.array([[np.nan]], dtype=np.float32), np.ones((1, 1), dtype=np.float32), "darkfield.*finite"),
         (np.zeros((1, 1), dtype=np.float32), np.array([[np.inf]], dtype=np.float32), "flatfield.*finite"),
-        (np.zeros((1, 1), dtype=np.float32), np.array([[0]], dtype=np.float32), "flatfield.*strictly positive"),
+        (
+            np.zeros((1, 1), dtype=np.float32),
+            np.array([[0]], dtype=np.float32),
+            "flatfield.*strictly positive",
+        ),
     ],
 )
 def test_basic_profile_loader_rejects_invalid_values(tmp_path, darkfield, flatfield, message) -> None:
@@ -98,7 +128,7 @@ def test_cupy_basic_richardson_lucy_deconvolver_smoke(tmp_path) -> None:
 
     deconvolver = CupyBasicRichardsonLucyDeconvolver(
         basic_paths=basic_paths,
-        psf_path=psf_path,
+        psf_paths=(psf_path, psf_path),
         device=0,
     )
     volume = np.arange(3 * 2 * 5 * 5, dtype=np.uint16).reshape(3, 2, 5, 5)
@@ -131,14 +161,15 @@ def test_cupy_engine_applies_basic_before_deconvolution(tmp_path, monkeypatch) -
 
     captured: list[np.ndarray] = []
 
-    def capture_deconvolution_input(img, projectors, *, cp):
+    def capture_deconvolution_input(img, projectors, *, iterations, cp):
+        assert iterations == 1
         captured.append(cp.asnumpy(img))
         return img
 
     monkeypatch.setattr(gpu, "_deconvolve_lucyrichardson_guo", capture_deconvolution_input)
     deconvolver = CupyBasicRichardsonLucyDeconvolver(
         basic_paths=[basic_path],
-        psf_path=psf_path,
+        psf_paths=(psf_path,),
         device=0,
     )
     volume = np.full((2, 1, 3, 3), 14, dtype=np.uint16)
@@ -147,6 +178,20 @@ def test_cupy_engine_applies_basic_before_deconvolution(tmp_path, monkeypatch) -
 
     assert np.allclose(captured[0], 2.0)
     assert np.allclose(out, 2.0)
+    cp.get_default_memory_pool().free_all_blocks()
+
+
+@pytest.mark.skipif(not _has_cupy_gpu(), reason="CuPy GPU is not available")
+def test_guo_backward_projector_keeps_dc_response() -> None:
+    import cupy as cp
+    from squisher_deconv.gpu import _calculate_projectors_3d
+
+    psf = cp.zeros((11, 9, 9), dtype=cp.float32)
+    psf[5, 4, 4] = 1.0
+
+    _forward, backward = _calculate_projectors_3d(psf, sigma_g=1.7, a=0.02, b=0.02, n=10, cp=cp)
+
+    assert 0.9 < float(backward.sum()) < 1.0
     cp.get_default_memory_pool().free_all_blocks()
 
 
@@ -185,9 +230,9 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
             "2",
             "--psf",
             str(psf_path),
+            "--psf",
+            str(psf_path),
             *basic_args,
-            "--engine",
-            "gpu",
             "--devices",
             "0",
             "--halo",
@@ -215,9 +260,9 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
             "2",
             "--psf",
             str(psf_path),
+            "--psf",
+            str(psf_path),
             *basic_args,
-            "--engine",
-            "gpu",
             "--devices",
             "0",
             "--halo",
@@ -239,7 +284,7 @@ def test_gpu_sample_scale_projectors_are_device_local(tmp_path) -> None:
     inputs = []
     for index in range(2):
         src = tmp_path / f"tile{index}.tif"
-        payload = (np.arange(2 * 5 * 5, dtype=np.uint16).reshape(2, 5, 5) + index)
+        payload = np.arange(2 * 5 * 5, dtype=np.uint16).reshape(2, 5, 5) + index
         tifffile.imwrite(src, payload, metadata={"axes": "ZYX"}, photometric="minisblack")
         inputs.append(src)
 
@@ -270,8 +315,6 @@ def test_gpu_sample_scale_projectors_are_device_local(tmp_path) -> None:
             str(psf_path),
             "--basic",
             str(basic_path),
-            "--engine",
-            "gpu",
             "--devices",
             "0,1",
             "--halo",

@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal, Mapping, TypedDict, cast
 
+from loguru import logger
 import numpy as np
 
 from squisher_lightsheet.artifacts import stamp_artifact
@@ -72,6 +74,97 @@ class TilePhaseFailedAttemptRow(TilePhaseBaseRow, total=False):
 
 
 TilePhaseRow = TilePhaseAcceptedRow | TilePhaseFailedAttemptRow
+
+
+def deconvolution_sidecar(path: Path) -> Path:
+    name = path.name
+    if name.endswith(".ome.tif"):
+        return path.with_name(name.removesuffix(".ome.tif") + ".ome.deconv.json")
+    if name.endswith(".ome.tiff"):
+        return path.with_name(name.removesuffix(".ome.tiff") + ".ome.deconv.json")
+    return path.with_suffix(path.suffix + ".deconv.json")
+
+
+def flattened_channel_count(path: Path) -> int:
+    sidecar = deconvolution_sidecar(path)
+    if not sidecar.exists():
+        return 1
+    payload = json.loads(sidecar.read_text())
+    channels = int(payload.get("provenance", {}).get("channels", 1))
+    if channels < 1:
+        raise ValueError(f"{sidecar} records invalid channel count {channels}")
+    return channels
+
+
+def _open_tile_level_array(path: Path, *, source_level: int = 0) -> tuple[Any, int, int, Any | None]:
+    import dask.array as da
+    import tifffile
+    import zarr
+
+    if stitch_legacy.is_ome_zarr_path(path):
+        available_levels = stitch_legacy._ome_zarr_level_count(path)
+        resolved_level = min(int(source_level), max(0, available_levels - 1))
+        zarray = stitch_legacy._open_ome_zarr_level_array(path, source_level=resolved_level)
+        return da.from_zarr(zarray), resolved_level, available_levels, None
+
+    available_levels = tiff_series_level_count(path)
+    resolved_level = min(int(source_level), max(0, available_levels - 1))
+    store = tifffile.imread(path, aszarr=True, level=resolved_level)
+    zarray = rough_legacy.base_zarr_array(zarr.open(store, mode="r"))
+    return da.from_zarr(zarray), resolved_level, available_levels, store
+
+
+def logical_tile_record(tile: rough_legacy.TileRecord) -> rough_legacy.TileRecord:
+    if tile.axes != "ZYX":
+        return tile
+    channels = flattened_channel_count(tile.path)
+    if channels == 1:
+        return tile
+    if int(tile.shape_zyx[0]) % channels:
+        raise ValueError(f"{tile.path} has {tile.shape_zyx[0]} planes, not divisible by channels={channels}")
+    shape = tile.shape_zyx.copy()
+    shape[0] = int(shape[0]) // channels
+    return rough_legacy.TileRecord(
+        tile=tile.tile,
+        side=tile.side,
+        path=tile.path,
+        translation_zyx_um=tile.translation_zyx_um,
+        scale_zyx_um=tile.scale_zyx_um,
+        shape_zyx=shape,
+        axes=tile.axes,
+    )
+
+
+def tile_record_from_position_record(record: Mapping[str, Any]) -> rough_legacy.TileRecord:
+    path = Path(str(record["path"]))
+    axes = str(record.get("axes", ""))
+    shape = record.get("shape")
+    if shape is None or not axes:
+        shape_zyx, axes = rough_legacy.tile_shape_and_axes(path)
+    else:
+        raw_shape = tuple(int(value) for value in shape)
+        if axes == "CZYX" and len(raw_shape) == 4:
+            shape_zyx = np.asarray(raw_shape[1:4], dtype=np.int64)
+        elif axes == "ZYX" and len(raw_shape) == 3:
+            shape_zyx = np.asarray(raw_shape, dtype=np.int64)
+        elif len(raw_shape) == 3:
+            shape_zyx = np.asarray(raw_shape, dtype=np.int64)
+        else:
+            raise ValueError(f"{path} has unsupported position shape/axes: shape={raw_shape!r}, axes={axes!r}")
+    side = record.get("side")
+    if side not in rough_legacy.SIDES:
+        raise ValueError(f"{path} has side={side!r}; expected one of {rough_legacy.SIDES}")
+    return logical_tile_record(
+        rough_legacy.TileRecord(
+            tile=str(record["tile"]),
+            side=str(side),
+            path=path,
+            translation_zyx_um=np.asarray([record["translation_um"][dim] for dim in DIMENSIONS], dtype=np.float64),
+            scale_zyx_um=np.asarray([record["scale_um"][dim] for dim in DIMENSIONS], dtype=np.float64),
+            shape_zyx=shape_zyx,
+            axes=axes,
+        )
+    )
 
 
 def normalize_volume_for_phase(volume: np.ndarray) -> np.ndarray:
@@ -272,17 +365,11 @@ def read_tile_patch(
     channel: int,
     slices_zyx: tuple[slice, slice, slice],
 ) -> np.ndarray:
-    import dask.array as da
-    import tifffile
-    import zarr
-
     if not slices_within_shape(slices_zyx, tile.shape_zyx):
         raise ValueError(f"Patch slices {slices_zyx} are outside tile shape {tile.shape_zyx.tolist()}")
 
-    store = tifffile.imread(tile.path, aszarr=True)
+    array, _source_level, _available_levels, store = _open_tile_level_array(tile.path, source_level=0)
     try:
-        zarray = rough_legacy.base_zarr_array(zarr.open(store, mode="r"))
-        array = da.from_zarr(zarray)
         raw_slices = []
         reverse_axes = []
         for axis, slc in enumerate(slices_zyx):
@@ -298,9 +385,15 @@ def read_tile_patch(
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
             patch = array[(channel, *raw_slices)]
         elif tile.axes == "ZYX":
-            if channel != 0:
-                raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
-            patch = array[tuple(raw_slices)]
+            channels = flattened_channel_count(tile.path)
+            if channel < 0 or channel >= channels:
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {channels}")
+            if channels == 1:
+                patch = array[tuple(raw_slices)]
+            else:
+                z_slice = raw_slices[0]
+                z_indices = np.arange(int(z_slice.start), int(z_slice.stop), dtype=np.int64)
+                patch = array[(z_indices * channels + channel, *raw_slices[1:])]
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
         result = np.asarray(patch.compute(), dtype=np.float32)
@@ -350,12 +443,111 @@ def _rgb_overlay(fixed_plane: np.ndarray, moving_plane: np.ndarray) -> np.ndarra
     return np.stack([red, green, blue], axis=-1)
 
 
+def _slice_axis_from_json(value: list[int], *, axis_size: int, axis_name: str) -> slice:
+    slc = _slice_from_json(value)
+    if not 0 <= slc.start < slc.stop <= int(axis_size):
+        raise ValueError(f"{axis_name} slice {value!r} is outside axis size {int(axis_size)}")
+    return slc
+
+
+def _z_indices_from_patch(patch: Mapping[str, Any], key: str, *, fallback_slice: slice, axis_size: int) -> np.ndarray:
+    raw_indices = patch.get(key)
+    if raw_indices is None:
+        if not 0 <= fallback_slice.start < fallback_slice.stop <= int(axis_size):
+            raise ValueError(f"Patch z slice {fallback_slice} is outside axis size {int(axis_size)}")
+        return np.arange(fallback_slice.start, fallback_slice.stop, dtype=np.int64)
+    indices = np.asarray(raw_indices, dtype=np.int64)
+    if indices.ndim != 1 or indices.size == 0:
+        raise ValueError(f"{key} must be a non-empty 1D z-index list")
+    if np.any(indices < 0) or np.any(indices >= int(axis_size)):
+        raise ValueError(f"{key} contains indices outside axis size {int(axis_size)}")
+    return indices
+
+
+def raw_axis_indices_for_oriented_indices(indices: np.ndarray, *, axis_size: int, flipped: bool) -> np.ndarray:
+    if np.any(indices < 0) or np.any(indices >= int(axis_size)):
+        raise ValueError(f"Indices are outside axis size {axis_size}")
+    if not flipped:
+        return indices.astype(np.int64, copy=False)
+    return (int(axis_size) - 1 - indices).astype(np.int64, copy=False)
+
+
+def read_tile_indexed_z_patch(
+    tile: rough_legacy.TileRecord,
+    *,
+    channel: int,
+    z_indices: np.ndarray,
+    y_slice: slice,
+    x_slice: slice,
+) -> np.ndarray:
+    z_indices = np.asarray(z_indices, dtype=np.int64)
+    if z_indices.ndim != 1 or z_indices.size == 0:
+        raise ValueError("z_indices must be a non-empty 1D array")
+    if np.any(z_indices < 0) or np.any(z_indices >= int(tile.shape_zyx[0])):
+        raise ValueError(f"z_indices are outside tile z shape {int(tile.shape_zyx[0])}")
+    if not slices_within_shape((slice(0, 1), y_slice, x_slice), np.asarray([1, tile.shape_zyx[1], tile.shape_zyx[2]])):
+        raise ValueError(f"Y/X patch slices {(y_slice, x_slice)} are outside tile shape {tile.shape_zyx.tolist()}")
+
+    array, _source_level, _available_levels, store = _open_tile_level_array(tile.path, source_level=0)
+    try:
+        raw_z_indices = raw_axis_indices_for_oriented_indices(
+            z_indices,
+            axis_size=int(tile.shape_zyx[0]),
+            flipped=bool(tile.scale_zyx_um[0] < 0),
+        )
+        raw_y_slice, reverse_y = raw_axis_slice_for_oriented_slice(
+            y_slice,
+            axis_size=int(tile.shape_zyx[1]),
+            flipped=bool(tile.scale_zyx_um[1] < 0),
+        )
+        raw_x_slice, reverse_x = raw_axis_slice_for_oriented_slice(
+            x_slice,
+            axis_size=int(tile.shape_zyx[2]),
+            flipped=bool(tile.scale_zyx_um[2] < 0),
+        )
+        if tile.axes == "CZYX":
+            if channel < 0 or channel >= int(array.shape[0]):
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
+            patch = array[(channel, raw_z_indices, raw_y_slice, raw_x_slice)]
+        elif tile.axes == "ZYX":
+            channels = flattened_channel_count(tile.path)
+            if channel < 0 or channel >= channels:
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {channels}")
+            if channels == 1:
+                patch = array[(raw_z_indices, raw_y_slice, raw_x_slice)]
+            else:
+                patch = array[(raw_z_indices * channels + channel, raw_y_slice, raw_x_slice)]
+        else:
+            raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
+        result = np.asarray(patch.compute(), dtype=np.float32)
+        if reverse_y:
+            result = np.flip(result, axis=1)
+        if reverse_x:
+            result = np.flip(result, axis=2)
+        return result
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
+def _display_residual_shift(patch: Mapping[str, Any], residual_shift: np.ndarray) -> np.ndarray:
+    if patch.get("patch_source") != "sparse_subifd_scout":
+        return residual_shift
+    scale = np.asarray(patch.get("coarse_scale_zyx", [1.0, 1.0, 1.0]), dtype=np.float32)
+    display_shift = residual_shift.astype(np.float32, copy=True)
+    if scale.shape == (3,) and float(scale[0]) > 0:
+        display_shift[0] = display_shift[0] / scale[0]
+    return display_shift
+
+
 def write_tile_phase_contact_sheets(
     *,
     rows: list[TilePhaseRow],
     reference_tiles: list[rough_legacy.TileRecord],
     output_dir: Path,
     reference_channel: int,
+    moving_channel: int,
     max_panel_size: int = 192,
 ) -> list[Path]:
     """Render per-tile QC sheets from recorded tile-phase patch measurements."""
@@ -391,14 +583,47 @@ def write_tile_phase_contact_sheets(
 
         row_images: list[Image.Image] = []
         for patch in patches:
-            fixed_slices = tuple(_slice_from_json(value) for value in patch["fixed_slices_zyx"])
-            moving_slices = tuple(_slice_from_json(value) for value in patch["moving_slices_zyx"])
+            fixed_slices = (
+                _slice_axis_from_json(patch["fixed_slices_zyx"][0], axis_size=int(reference_tile.shape_zyx[0]), axis_name="fixed z"),
+                _slice_axis_from_json(patch["fixed_slices_zyx"][1], axis_size=int(reference_tile.shape_zyx[1]), axis_name="fixed y"),
+                _slice_axis_from_json(patch["fixed_slices_zyx"][2], axis_size=int(reference_tile.shape_zyx[2]), axis_name="fixed x"),
+            )
+            moving_slices = (
+                _slice_axis_from_json(patch["moving_slices_zyx"][0], axis_size=int(moving_tile.shape_zyx[0]), axis_name="moving z"),
+                _slice_axis_from_json(patch["moving_slices_zyx"][1], axis_size=int(moving_tile.shape_zyx[1]), axis_name="moving y"),
+                _slice_axis_from_json(patch["moving_slices_zyx"][2], axis_size=int(moving_tile.shape_zyx[2]), axis_name="moving x"),
+            )
             residual_shift = np.asarray(patch["residual_shift_px_zyx"], dtype=np.float32)
-            fixed_patch = read_tile_patch(reference_tile, channel=reference_channel, slices_zyx=fixed_slices)
-            moving_patch = read_tile_patch(moving_tile, channel=0, slices_zyx=moving_slices)
+            fixed_z_indices = _z_indices_from_patch(
+                patch,
+                "fixed_z_indices_l0",
+                fallback_slice=fixed_slices[0],
+                axis_size=int(reference_tile.shape_zyx[0]),
+            )
+            moving_z_indices = _z_indices_from_patch(
+                patch,
+                "moving_z_indices_l0",
+                fallback_slice=moving_slices[0],
+                axis_size=int(moving_tile.shape_zyx[0]),
+            )
+            fixed_patch = read_tile_indexed_z_patch(
+                reference_tile,
+                channel=reference_channel,
+                z_indices=fixed_z_indices,
+                y_slice=fixed_slices[1],
+                x_slice=fixed_slices[2],
+            )
+            moving_patch = read_tile_indexed_z_patch(
+                moving_tile,
+                channel=moving_channel,
+                z_indices=moving_z_indices,
+                y_slice=moving_slices[1],
+                x_slice=moving_slices[2],
+            )
+            display_shift = _display_residual_shift(patch, residual_shift)
             shifted_moving = ndimage.shift(
                 moving_patch,
-                shift=residual_shift,
+                shift=display_shift,
                 order=1,
                 mode="constant",
                 cval=0.0,
@@ -435,7 +660,11 @@ def write_tile_phase_contact_sheets(
                 f"corr={patch.get('corr_after')} shift={np.round(residual_shift, 2).tolist()}"
             )
             draw.text((4, 4), label, fill=(0, 0, 0))
-            draw.text((4, 20), "488 fixed | 405 seed | 405 shifted | overlay 405 red / 488 green", fill=(0, 0, 0))
+            draw.text(
+                (4, 20),
+                f"fixed ch{reference_channel} | moving ch{moving_channel} seed | moving shifted | overlay moving red / fixed green",
+                fill=(0, 0, 0),
+            )
             x = 0
             for panel in panels:
                 canvas.paste(panel, (x, label_height))
@@ -465,24 +694,21 @@ def sampled_tile_volume_from_subifd(
     *,
     channel: int,
     requested_level: int,
-) -> tuple[np.ndarray, np.ndarray, int, int]:
-    import dask.array as da
-    import tifffile
-    import zarr
-
+    z_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, int, np.ndarray]:
     if requested_level < 0:
         raise ValueError("requested_level must be non-negative")
-    available_levels = tiff_series_level_count(tile.path)
-    source_level = min(int(requested_level), max(0, available_levels - 1))
     desired_factor = 2**int(requested_level)
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    array, source_level, available_levels, store = _open_tile_level_array(tile.path, source_level=int(requested_level))
     try:
-        zarray = rough_legacy.base_zarr_array(zarr.open(store, mode="r"))
-        array = da.from_zarr(zarray)
         if tile.axes == "CZYX":
             source_shape_zyx = np.asarray(array.shape[1:4], dtype=np.int64)
         elif tile.axes == "ZYX":
+            channels = flattened_channel_count(tile.path)
+            if int(array.shape[0]) % channels:
+                raise ValueError(f"{tile.path} has {array.shape[0]} planes, not divisible by channels={channels}")
             source_shape_zyx = np.asarray(array.shape, dtype=np.int64)
+            source_shape_zyx[0] = int(source_shape_zyx[0]) // channels
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
         source_factor_zyx = np.maximum(
@@ -496,18 +722,64 @@ def sampled_tile_volume_from_subifd(
         z_step = int(-remaining_step_zyx[0] if tile.scale_zyx_um[0] < 0 else remaining_step_zyx[0])
         y_step = int(-remaining_step_zyx[1] if tile.scale_zyx_um[1] < 0 else remaining_step_zyx[1])
         x_step = int(-remaining_step_zyx[2] if tile.scale_zyx_um[2] < 0 else remaining_step_zyx[2])
+        raw_z_indices: np.ndarray | None = None
+        if z_samples is not None:
+            if z_samples < 1:
+                raise ValueError("z_samples must be >= 1")
+            sampled_z_count = int(np.ceil(int(source_shape_zyx[0]) / abs(z_step)))
+            if z_samples < sampled_z_count:
+                raw_z_indices = np.unique(
+                    np.rint(np.linspace(0, int(source_shape_zyx[0]) - 1, z_samples)).astype(np.int64)
+                )
+                if tile.scale_zyx_um[0] < 0:
+                    raw_z_indices = raw_z_indices[::-1]
         if tile.axes == "CZYX":
             if channel < 0 or channel >= int(array.shape[0]):
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
-            volume = array[channel, ::z_step, ::y_step, ::x_step]
+            z_selection = slice(None, None, z_step) if raw_z_indices is None else raw_z_indices
+            volume = array[channel, z_selection, ::y_step, ::x_step]
         elif tile.axes == "ZYX":
-            if channel != 0:
-                raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
-            volume = array[::z_step, ::y_step, ::x_step]
+            channels = flattened_channel_count(tile.path)
+            if channel < 0 or channel >= channels:
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {channels}")
+            if channels == 1:
+                z_selection = slice(None, None, z_step) if raw_z_indices is None else raw_z_indices
+                volume = array[z_selection, ::y_step, ::x_step]
+            else:
+                if raw_z_indices is not None:
+                    z_indices = raw_z_indices
+                elif z_step > 0:
+                    z_indices = np.arange(0, int(source_shape_zyx[0]), z_step, dtype=np.int64)
+                else:
+                    z_indices = np.arange(int(source_shape_zyx[0]) - 1, -1, z_step, dtype=np.int64)
+                volume = array[z_indices * channels + channel, ::y_step, ::x_step]
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
         effective_factor_zyx = source_factor_zyx * remaining_step_zyx
-        return np.asarray(volume.compute(), dtype=np.float32), effective_factor_zyx.astype(np.float64), source_level, available_levels
+        if raw_z_indices is None:
+            if z_step > 0:
+                selected_raw_z_indices = np.arange(0, int(source_shape_zyx[0]), z_step, dtype=np.int64)
+            else:
+                selected_raw_z_indices = np.arange(int(source_shape_zyx[0]) - 1, -1, z_step, dtype=np.int64)
+        else:
+            selected_raw_z_indices = raw_z_indices
+        if tile.scale_zyx_um[0] < 0:
+            selected_logical_source_z = int(source_shape_zyx[0]) - 1 - selected_raw_z_indices
+        else:
+            selected_logical_source_z = selected_raw_z_indices
+        z_indices_l0 = np.rint(selected_logical_source_z.astype(np.float64) * float(source_factor_zyx[0])).astype(np.int64)
+        z_indices_l0 = np.clip(z_indices_l0, 0, int(tile.shape_zyx[0]) - 1)
+        if raw_z_indices is not None and len(raw_z_indices) > 1:
+            z_span = (int(source_shape_zyx[0]) - 1) * float(source_factor_zyx[0])
+            effective_factor_zyx = effective_factor_zyx.astype(np.float64)
+            effective_factor_zyx[0] = z_span / float(len(raw_z_indices) - 1)
+        return (
+            np.asarray(volume.compute(), dtype=np.float32),
+            effective_factor_zyx.astype(np.float64),
+            source_level,
+            available_levels,
+            z_indices_l0,
+        )
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -572,6 +844,94 @@ def candidate_patch_slices(
                 )
     ranked.sort(key=lambda item: item["content_score"], reverse=True)
     return ranked[:max_candidates]
+
+
+def candidate_sparse_scout_chunk_slices(
+    scout_volume: np.ndarray,
+    *,
+    patch_shape_zyx: tuple[int, int, int],
+    scout_scale_zyx: np.ndarray,
+    max_candidates: int,
+    moving_shape_zyx: np.ndarray,
+    shift_zyx_px: np.ndarray,
+) -> list[dict[str, Any]]:
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be >= 1")
+    scout_shape = np.asarray(scout_volume.shape, dtype=np.int64)
+    patch_shape_coarse = np.maximum(
+        1,
+        np.ceil(np.asarray(patch_shape_zyx, dtype=np.float64) / scout_scale_zyx.astype(np.float64)).astype(np.int64),
+    )
+    patch_shape_coarse[0] = int(scout_shape[0])
+    patch_shape_coarse = np.minimum(patch_shape_coarse, scout_shape)
+    starts_by_axis: list[list[int]] = [[0]]
+    for axis in (1, 2):
+        size = int(scout_shape[axis])
+        patch_size = int(patch_shape_coarse[axis])
+        if size == patch_size:
+            starts_by_axis.append([0])
+            continue
+        step = max(1, patch_size // 2)
+        starts = list(range(0, size - patch_size + 1, step))
+        if starts[-1] != size - patch_size:
+            starts.append(size - patch_size)
+        starts_by_axis.append(starts)
+
+    ranked = []
+    scout_norm = normalize_volume_for_phase(scout_volume)
+    for z0 in starts_by_axis[0]:
+        for y0 in starts_by_axis[1]:
+            for x0 in starts_by_axis[2]:
+                fixed_slices = (
+                    slice(z0, z0 + int(patch_shape_coarse[0])),
+                    slice(y0, y0 + int(patch_shape_coarse[1])),
+                    slice(x0, x0 + int(patch_shape_coarse[2])),
+                )
+                moving_slices = shifted_slices_zyx(fixed_slices, shift_zyx_px=shift_zyx_px)
+                if not slices_within_shape(moving_slices, moving_shape_zyx):
+                    continue
+                patch = scout_norm[fixed_slices]
+                finite = patch[np.isfinite(patch)]
+                if finite.size == 0:
+                    continue
+                positive_fraction = float(np.count_nonzero(finite > 0.0) / finite.size)
+                score = float(np.nanstd(finite)) * max(positive_fraction, 1e-6)
+                ranked.append(
+                    {
+                        "fixed_slices": fixed_slices,
+                        "content_score": score,
+                        "positive_fraction": positive_fraction,
+                    }
+                )
+    ranked.sort(key=lambda item: item["content_score"], reverse=True)
+    return ranked[:max_candidates]
+
+
+def scale_slices_to_l0_json(slices_zyx: tuple[slice, slice, slice], scale_zyx: np.ndarray) -> list[list[int]]:
+    return [
+        [int(np.floor(slc.start * scale)), int(np.ceil(slc.stop * scale))]
+        for slc, scale in zip(slices_zyx, scale_zyx, strict=True)
+    ]
+
+
+def sparse_scout_slices_to_l0_json(
+    slices_zyx: tuple[slice, slice, slice],
+    *,
+    scale_zyx: np.ndarray,
+    z_indices_l0: np.ndarray,
+) -> list[list[int]]:
+    patch_z = np.asarray(z_indices_l0[slices_zyx[0]], dtype=np.int64)
+    if patch_z.size == 0:
+        raise ValueError(f"Sparse scout z slice {slices_zyx[0]} selected no z planes")
+    return [
+        [int(np.min(patch_z)), int(np.max(patch_z)) + 1],
+        [int(np.floor(slices_zyx[1].start * scale_zyx[1])), int(np.ceil(slices_zyx[1].stop * scale_zyx[1]))],
+        [int(np.floor(slices_zyx[2].start * scale_zyx[2])), int(np.ceil(slices_zyx[2].stop * scale_zyx[2]))],
+    ]
+
+
+def sparse_scout_z_indices_json(slices_zyx: tuple[slice, slice, slice], z_indices_l0: np.ndarray) -> list[int]:
+    return [int(value) for value in np.asarray(z_indices_l0[slices_zyx[0]], dtype=np.int64)]
 
 
 def estimate_patch_shift_zyx_px(fixed: np.ndarray, moving: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
@@ -708,6 +1068,17 @@ def file_stat_fingerprint(path: Path, *, role: str, tile: str | None = None) -> 
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
     }
+    if stitch_legacy.is_ome_zarr_path(path):
+        import zarr
+
+        group = zarr.open_group(str(path), mode="r")
+        level0 = group["0"]
+        row["ome_zarr_level0_shape"] = [int(value) for value in level0.shape]
+        row["ome_zarr_level0_chunks"] = [int(value) for value in level0.chunks]
+        row["ome_zarr_axes"] = [
+            str(axis.get("name", axis)) if isinstance(axis, Mapping) else str(axis)
+            for axis in group.attrs.asdict().get("multiscales", [{}])[0].get("axes", [])
+        ]
     if tile is not None:
         row["tile"] = tile
     return row
@@ -737,6 +1108,7 @@ def tile_phase_cache_key(
     *,
     reference_position: Path,
     reference_channel: int,
+    moving_channel: int,
     reference_token: str,
     moving_token: str,
     level: int,
@@ -745,9 +1117,10 @@ def tile_phase_cache_key(
     min_inliers: int,
     max_candidate_patches: int,
     coarse_level: int,
+    scout_z_samples: int | None,
 ) -> dict[str, Any]:
     return {
-        "cache_version": "tile_phase_robust_v3",
+        "cache_version": "tile_phase_robust_v4",
         "reference_position": str(reference_position.resolve()),
         "reference_position_sha256": sha256_file(reference_position),
         "source_tile_fingerprints": tile_phase_source_fingerprints(
@@ -756,6 +1129,7 @@ def tile_phase_cache_key(
             moving_token=moving_token,
         ),
         "reference_channel": int(reference_channel),
+        "moving_channel": int(moving_channel),
         "reference_token": reference_token,
         "moving_token": moving_token,
         "level": int(level),
@@ -764,6 +1138,7 @@ def tile_phase_cache_key(
         "min_inliers": int(min_inliers),
         "max_candidate_patches": int(max_candidate_patches),
         "coarse_level": int(coarse_level),
+        "scout_z_samples": None if scout_z_samples is None else int(scout_z_samples),
         "inlier_thresholds_zyx": [float(value) for value in PATCH_INLIER_THRESHOLDS_ZYX],
         "quality_thresholds": {
             "min_corr_after": PATCH_MIN_CORR_AFTER,
@@ -903,6 +1278,20 @@ def _apply_shift_to_position_record(
 ) -> None:
     record["tile"] = moving_tile_name
     record["path"] = str(moving_path)
+    if stitch_legacy.is_ome_zarr_path(moving_path):
+        metadata = stitch_legacy.parse_ome_zarr_metadata(moving_path)
+        record["axes"] = metadata.axes
+        record["shape"] = [int(value) for value in metadata.shape]
+        record["channels"] = list(metadata.channels)
+        record["tracks"] = [
+            {
+                "slug": track.slug,
+                "track_id": track.track_id,
+                "channels": [int(channel) for channel in track.channels],
+                "channel_names": list(track.channel_names),
+            }
+            for track in metadata.tracks
+        ]
     for axis, value in zip(DIMENSIONS, shift_um, strict=True):
         record["translation_um"][axis] = float(record["translation_um"][axis] + value)
 
@@ -1027,6 +1416,97 @@ def _append_failed_tile(
     )
 
 
+def _measure_tile_phase_attempt(
+    *,
+    record: dict[str, Any],
+    reference_tile: rough_legacy.TileRecord,
+    moving_tile: rough_legacy.TileRecord,
+    moving_tile_name: str,
+    moving_path: Path,
+    reference_channel: int,
+    moving_channel: int,
+    level_factor: int,
+    upsample_factor: int,
+    patch_shape_zyx: tuple[int, int, int] | None,
+    min_inliers: int,
+    max_candidate_patches: int,
+    coarse_level: int,
+    scout_z_samples: int | None = None,
+    cached_phase_attempt: TilePhaseRow | None,
+) -> TilePhaseRow:
+    try:
+        if patch_shape_zyx is not None and cached_phase_attempt is not None:
+            shift_px, details = rescore_cached_patch_attempt(
+                reference_tile=reference_tile,
+                moving_tile=moving_tile,
+                reference_channel=reference_channel,
+                moving_channel=moving_channel,
+                cached_attempt=cached_phase_attempt,
+                min_inliers=min_inliers,
+            )
+            shift_um = shift_px * np.abs(reference_tile.scale_zyx_um)
+            row_record = {**record, "tile": moving_tile_name}
+            return _build_direct_measurement_row(
+                record=row_record,
+                reference_tile=reference_tile,
+                moving_path=moving_path,
+                shift_px=shift_px,
+                shift_um=shift_um,
+                details=details,
+                patch_details=details,
+                phase_error=None,
+                cache_source="cached_patch_residual_rescore",
+            )
+
+        if patch_shape_zyx is None:
+            fixed = rough_legacy.sampled_tile_volume(
+                reference_tile,
+                channel=reference_channel,
+                level_factor=level_factor,
+            )
+            moving = rough_legacy.sampled_tile_volume(
+                moving_tile,
+                channel=moving_channel,
+                level_factor=level_factor,
+            )
+            shift_px, details = estimate_tile_shift_zyx_px(fixed, moving, upsample_factor=upsample_factor)
+            shift_um = shift_px * np.abs(reference_tile.scale_zyx_um) * level_factor
+        else:
+            shift_px, details = measure_patch_tile_shift(
+                reference_tile=reference_tile,
+                moving_tile=moving_tile,
+                reference_channel=reference_channel,
+                moving_channel=moving_channel,
+                patch_shape_zyx=patch_shape_zyx,
+                coarse_level=coarse_level,
+                upsample_factor=upsample_factor,
+                max_candidate_patches=max_candidate_patches,
+                min_inliers=min_inliers,
+                scout_z_samples=scout_z_samples,
+            )
+            shift_um = shift_px * np.abs(reference_tile.scale_zyx_um)
+    except Exception as exc:
+        return _build_failed_attempt_row(
+            record=record,
+            reference_tile=reference_tile,
+            moving_tile_name=moving_tile_name,
+            moving_path=moving_path,
+            error=exc,
+        )
+
+    row_record = {**record, "tile": moving_tile_name}
+    return _build_direct_measurement_row(
+        record=row_record,
+        reference_tile=reference_tile,
+        moving_path=moving_path,
+        shift_px=shift_px,
+        shift_um=shift_um,
+        details=details,
+        patch_details=details if patch_shape_zyx is not None else None,
+        phase_error=details.get("phase_error"),
+    )
+
+
 def adapt_registration_from_reference(
     *,
     reference_registration_input: Path,
@@ -1111,15 +1591,32 @@ def adapt_registration_from_reference(
 
 
 def make_moving_tile_record(reference_tile: rough_legacy.TileRecord, moving_path: Path) -> rough_legacy.TileRecord:
-    moving_shape_zyx, moving_axes = rough_legacy.tile_shape_and_axes(moving_path)
-    return rough_legacy.TileRecord(
-        tile=moving_path.name,
-        side=reference_tile.side,
-        path=moving_path,
-        translation_zyx_um=reference_tile.translation_zyx_um.copy(),
-        scale_zyx_um=reference_tile.scale_zyx_um.copy(),
-        shape_zyx=np.asarray(moving_shape_zyx, dtype=np.int64),
-        axes=moving_axes,
+    if reference_tile.axes == "ZYX" and flattened_channel_count(moving_path) > 1:
+        return rough_legacy.TileRecord(
+            tile=moving_path.name,
+            side=reference_tile.side,
+            path=moving_path,
+            translation_zyx_um=reference_tile.translation_zyx_um.copy(),
+            scale_zyx_um=reference_tile.scale_zyx_um.copy(),
+            shape_zyx=reference_tile.shape_zyx.copy(),
+            axes="ZYX",
+        )
+    elif stitch_legacy.is_ome_zarr_path(moving_path):
+        metadata = stitch_legacy.parse_ome_zarr_metadata(moving_path)
+        moving_shape_zyx = np.asarray(stitch_legacy.normalized_czyx_shape(metadata.axes, metadata.shape)[1:], dtype=np.int64)
+        moving_axes = metadata.axes
+    else:
+        moving_shape_zyx, moving_axes = rough_legacy.tile_shape_and_axes(moving_path)
+    return logical_tile_record(
+        rough_legacy.TileRecord(
+            tile=moving_path.name,
+            side=reference_tile.side,
+            path=moving_path,
+            translation_zyx_um=reference_tile.translation_zyx_um.copy(),
+            scale_zyx_um=reference_tile.scale_zyx_um.copy(),
+            shape_zyx=np.asarray(moving_shape_zyx, dtype=np.int64),
+            axes=moving_axes,
+        )
     )
 
 
@@ -1279,6 +1776,187 @@ def infer_shift_from_adjacent_tiles(
     }
 
 
+def measure_sparse_scout_patch_shift(
+    *,
+    fixed_coarse: np.ndarray,
+    moving_coarse: np.ndarray,
+    fixed_coarse_scale_zyx: np.ndarray,
+    fixed_z_indices_l0: np.ndarray,
+    moving_z_indices_l0: np.ndarray,
+    coarse_shift_coarse_px: np.ndarray,
+    coarse_details: dict[str, Any],
+    patch_shape_zyx: tuple[int, int, int],
+    max_candidate_patches: int,
+    min_inliers: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    coarse_shift_l0_px = coarse_shift_coarse_px * fixed_coarse_scale_zyx
+    candidates = candidate_sparse_scout_chunk_slices(
+        fixed_coarse,
+        patch_shape_zyx=patch_shape_zyx,
+        scout_scale_zyx=fixed_coarse_scale_zyx,
+        max_candidates=max_candidate_patches,
+        moving_shape_zyx=np.asarray(moving_coarse.shape, dtype=np.int64),
+        shift_zyx_px=coarse_shift_coarse_px,
+    )
+    patch_rows: list[dict[str, Any]] = []
+    accepted_shift_rows: list[np.ndarray] = []
+    accepted_patch_indices: list[int] = []
+    final_shift_l0_px: np.ndarray | None = None
+    inlier_mask: np.ndarray | None = None
+    early_stop_after_patch: int | None = None
+
+    for patch_index, candidate in enumerate(candidates):
+        fixed_slices = candidate["fixed_slices"]
+        moving_slices, realized_seed_shift_coarse_px = shifted_slices_with_realized_shift(
+            fixed_slices,
+            requested_shift_zyx_px=coarse_shift_coarse_px,
+        )
+        row = {
+            "patch_index": int(patch_index),
+            "patch_source": "sparse_subifd_scout",
+            "fixed_slices_zyx": sparse_scout_slices_to_l0_json(
+                fixed_slices,
+                scale_zyx=fixed_coarse_scale_zyx,
+                z_indices_l0=fixed_z_indices_l0,
+            ),
+            "moving_slices_zyx": sparse_scout_slices_to_l0_json(
+                moving_slices,
+                scale_zyx=fixed_coarse_scale_zyx,
+                z_indices_l0=moving_z_indices_l0,
+            ),
+            "fixed_z_indices_l0": sparse_scout_z_indices_json(fixed_slices, fixed_z_indices_l0),
+            "moving_z_indices_l0": sparse_scout_z_indices_json(moving_slices, moving_z_indices_l0),
+            "fixed_slices_coarse_zyx": slices_to_json(fixed_slices),
+            "moving_slices_coarse_zyx": slices_to_json(moving_slices),
+            "requested_coarse_shift_px_zyx": [float(value) for value in coarse_shift_l0_px],
+            "realized_seed_shift_px_zyx": [float(value) for value in realized_seed_shift_coarse_px * fixed_coarse_scale_zyx],
+            "coarse_scale_zyx": [float(value) for value in fixed_coarse_scale_zyx],
+            "content_score": float(candidate["content_score"]),
+            "positive_fraction": float(candidate["positive_fraction"]),
+        }
+        if not slices_within_shape(moving_slices, np.asarray(moving_coarse.shape, dtype=np.int64)):
+            row.update(status="rejected", reason="moving_patch_out_of_bounds")
+            patch_rows.append(row)
+            continue
+        fixed_patch = fixed_coarse[fixed_slices]
+        moving_patch = moving_coarse[moving_slices]
+        residual_shift_coarse_px, details = estimate_tile_shift_zyx_px_gpu(fixed_patch, moving_patch)
+        total_shift_coarse_px = realized_seed_shift_coarse_px + residual_shift_coarse_px
+        total_shift_l0_px = total_shift_coarse_px * fixed_coarse_scale_zyx
+        residual_shift_l0_px = residual_shift_coarse_px * fixed_coarse_scale_zyx
+        row.update(
+            status="accepted",
+            reason="measured",
+            residual_shift_px_zyx=[float(value) for value in residual_shift_l0_px],
+            residual_shift_coarse_px_zyx=[float(value) for value in residual_shift_coarse_px],
+            total_shift_px_zyx=[float(value) for value in total_shift_l0_px],
+            total_shift_coarse_px_zyx=[float(value) for value in total_shift_coarse_px],
+            peak=details["peak"],
+            corr_before=details["corr_before"],
+            corr_after=details["corr_after"],
+        )
+        for detail_key in (
+            "corr_before_full_support",
+            "corr_valid_overlap_fraction",
+        ):
+            if detail_key in details:
+                row[detail_key] = details[detail_key]
+        rejection_reasons = []
+        if finite_float(details.get("corr_after")) < PATCH_MIN_CORR_AFTER:
+            rejection_reasons.append("corr_after_below_threshold")
+        if np.any(
+            np.abs(residual_shift_coarse_px)
+            >= PATCH_MAX_RESIDUAL_FRACTION * np.asarray(fixed_patch.shape, dtype=np.float64)
+        ):
+            rejection_reasons.append("residual_near_periodic_wrap")
+        if rejection_reasons:
+            row.update(status="rejected", reason="quality_threshold", rejection_reasons=rejection_reasons)
+            patch_rows.append(row)
+            continue
+        accepted_patch_indices.append(patch_index)
+        accepted_shift_rows.append(total_shift_l0_px)
+        patch_rows.append(row)
+        if len(accepted_shift_rows) >= max(PATCH_MIN_QUALITY_ACCEPTED_FOR_EARLY_STOP, min_inliers):
+            try:
+                inlier_mask, final_shift_l0_px = select_inlier_patch_measurements(
+                    np.vstack(accepted_shift_rows).astype(np.float64),
+                    min_inliers=min_inliers,
+                )
+            except ValueError:
+                final_shift_l0_px = None
+                inlier_mask = None
+            else:
+                if patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+                    early_stop_after_patch = patch_index
+                    break
+                final_shift_l0_px = None
+                inlier_mask = None
+
+    base_details = {
+        "mode": "sparse_subifd_patch_phase_robust_v1",
+        "patch_source": "sparse_subifd_scout",
+        "patch_shape_zyx": [int(value) for value in patch_shape_zyx],
+        "coarse_scale_zyx": [float(value) for value in fixed_coarse_scale_zyx],
+        "coarse_shift_level_px_zyx": [float(value) for value in coarse_shift_coarse_px],
+        "requested_coarse_shift_px_zyx": [float(value) for value in coarse_shift_l0_px],
+        "coarse_corr_before": coarse_details["corr_before"],
+        "coarse_corr_after": coarse_details["corr_after"],
+        "n_candidates": len(candidates),
+        "n_measured": len(accepted_shift_rows),
+        "n_inliers": 0 if inlier_mask is None else int(np.count_nonzero(inlier_mask)),
+        "patches": patch_rows,
+    }
+    if len(accepted_shift_rows) < min_inliers:
+        details = {**base_details, "measurement_status": "direct_failed"}
+        raise TilePhaseMeasurementError(
+            f"sparse scout produced {len(accepted_shift_rows)} accepted patch shifts; require {min_inliers}",
+            details=details,
+        )
+    if final_shift_l0_px is None or inlier_mask is None:
+        try:
+            inlier_mask, final_shift_l0_px = select_inlier_patch_measurements(
+                np.vstack(accepted_shift_rows).astype(np.float64),
+                min_inliers=min_inliers,
+            )
+        except ValueError as exc:
+            details = {**base_details, "measurement_status": "direct_failed"}
+            raise TilePhaseMeasurementError(str(exc), details=details) from exc
+    if not patch_inliers_have_xy_diversity(patch_rows, accepted_patch_indices, inlier_mask):
+        details = {
+            **base_details,
+            "measurement_status": "direct_failed",
+            "spatial_diversity_error": "inlier sparse scout shifts came from fewer than 2 XY windows",
+        }
+        raise TilePhaseMeasurementError("Inlier sparse scout shifts came from fewer than 2 XY windows", details=details)
+
+    inlier_patch_indices = {
+        int(patch_index)
+        for patch_index, is_inlier in zip(accepted_patch_indices, inlier_mask, strict=True)
+        if bool(is_inlier)
+    }
+    for row in patch_rows:
+        if row.get("status") != "accepted":
+            continue
+        if int(row["patch_index"]) in inlier_patch_indices:
+            row["inlier"] = True
+            row["reason"] = "inlier"
+        else:
+            row["inlier"] = False
+            row["reason"] = "outlier_shift_cluster"
+
+    inlier_rows = [row for row in patch_rows if row.get("inlier")]
+    inlier_corr_before = np.asarray([row["corr_before"] for row in inlier_rows], dtype=np.float64)
+    inlier_corr_after = np.asarray([row["corr_after"] for row in inlier_rows], dtype=np.float64)
+    return final_shift_l0_px, {
+        **base_details,
+        "measurement_status": "direct_accepted",
+        "corr_before": float(np.median(inlier_corr_before)),
+        "corr_after": float(np.median(inlier_corr_after)),
+        "n_inliers": int(np.count_nonzero(inlier_mask)),
+        "early_stop_after_patch": early_stop_after_patch,
+    }
+
+
 def measure_patch_tile_shift(
     *,
     reference_tile: rough_legacy.TileRecord,
@@ -1289,18 +1967,34 @@ def measure_patch_tile_shift(
     upsample_factor: int,
     max_candidate_patches: int,
     min_inliers: int,
+    moving_channel: int = 0,
+    scout_z_samples: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if min_inliers < 3:
         raise ValueError("Patch-mode registration requires min_inliers >= 3")
-    fixed_coarse, fixed_coarse_scale_zyx, fixed_source_level, fixed_available_levels = sampled_tile_volume_from_subifd(
+    (
+        fixed_coarse,
+        fixed_coarse_scale_zyx,
+        fixed_source_level,
+        fixed_available_levels,
+        fixed_z_indices_l0,
+    ) = sampled_tile_volume_from_subifd(
         reference_tile,
         channel=reference_channel,
         requested_level=coarse_level,
+        z_samples=scout_z_samples,
     )
-    moving_coarse, moving_coarse_scale_zyx, moving_source_level, moving_available_levels = sampled_tile_volume_from_subifd(
+    (
+        moving_coarse,
+        moving_coarse_scale_zyx,
+        moving_source_level,
+        moving_available_levels,
+        moving_z_indices_l0,
+    ) = sampled_tile_volume_from_subifd(
         moving_tile,
-        channel=0,
+        channel=moving_channel,
         requested_level=coarse_level,
+        z_samples=scout_z_samples,
     )
     if not np.array_equal(fixed_coarse_scale_zyx, moving_coarse_scale_zyx):
         raise ValueError(
@@ -1308,6 +2002,28 @@ def measure_patch_tile_shift(
             f"{fixed_coarse_scale_zyx.tolist()} vs {moving_coarse_scale_zyx.tolist()}"
         )
     coarse_shift_coarse_px, coarse_details = estimate_tile_shift_zyx_px_gpu(fixed_coarse, moving_coarse)
+    if scout_z_samples is not None:
+        shift_px, details = measure_sparse_scout_patch_shift(
+            fixed_coarse=fixed_coarse,
+            moving_coarse=moving_coarse,
+            fixed_coarse_scale_zyx=fixed_coarse_scale_zyx,
+            fixed_z_indices_l0=fixed_z_indices_l0,
+            moving_z_indices_l0=moving_z_indices_l0,
+            coarse_shift_coarse_px=coarse_shift_coarse_px,
+            coarse_details=coarse_details,
+            patch_shape_zyx=patch_shape_zyx,
+            max_candidate_patches=max_candidate_patches,
+            min_inliers=min_inliers,
+        )
+        details.update(
+            coarse_level=int(coarse_level),
+            scout_z_samples=int(scout_z_samples),
+            fixed_source_level=int(fixed_source_level),
+            moving_source_level=int(moving_source_level),
+            fixed_available_levels=int(fixed_available_levels),
+            moving_available_levels=int(moving_available_levels),
+        )
+        return shift_px, details
     coarse_shift_l0_px = coarse_shift_coarse_px * fixed_coarse_scale_zyx
     candidates = candidate_patch_slices(
         fixed_coarse,
@@ -1344,7 +2060,7 @@ def measure_patch_tile_shift(
             patch_rows.append(row)
             continue
         fixed_patch = read_tile_patch(reference_tile, channel=reference_channel, slices_zyx=fixed_slices)
-        moving_patch = read_tile_patch(moving_tile, channel=0, slices_zyx=moving_slices)
+        moving_patch = read_tile_patch(moving_tile, channel=moving_channel, slices_zyx=moving_slices)
         if fixed_patch.shape != patch_shape_zyx or moving_patch.shape != patch_shape_zyx:
             row.update(
                 status="rejected",
@@ -1459,6 +2175,7 @@ def measure_patch_tile_shift(
             "measurement_status": "direct_failed",
             "patch_shape_zyx": [int(value) for value in patch_shape_zyx],
             "coarse_level": int(coarse_level),
+            "scout_z_samples": None if scout_z_samples is None else int(scout_z_samples),
             "coarse_scale_zyx": [float(value) for value in fixed_coarse_scale_zyx],
             "fixed_source_level": int(fixed_source_level),
             "moving_source_level": int(moving_source_level),
@@ -1520,6 +2237,7 @@ def measure_patch_tile_shift(
         "measurement_status": "direct_accepted",
         "patch_shape_zyx": [int(value) for value in patch_shape_zyx],
         "coarse_level": int(coarse_level),
+        "scout_z_samples": None if scout_z_samples is None else int(scout_z_samples),
         "coarse_scale_zyx": [float(value) for value in fixed_coarse_scale_zyx],
         "fixed_source_level": int(fixed_source_level),
         "moving_source_level": int(moving_source_level),
@@ -1556,6 +2274,7 @@ def rescore_cached_patch_attempt(
     reference_channel: int,
     cached_attempt: dict[str, Any],
     min_inliers: int,
+    moving_channel: int = 0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     from scipy import ndimage
 
@@ -1583,7 +2302,7 @@ def rescore_cached_patch_attempt(
         fixed_slices = tuple(slice(int(start), int(stop)) for start, stop in row["fixed_slices_zyx"])
         moving_slices = tuple(slice(int(start), int(stop)) for start, stop in row["moving_slices_zyx"])
         fixed_patch = read_tile_patch(reference_tile, channel=reference_channel, slices_zyx=fixed_slices)
-        moving_patch = read_tile_patch(moving_tile, channel=0, slices_zyx=moving_slices)
+        moving_patch = read_tile_patch(moving_tile, channel=moving_channel, slices_zyx=moving_slices)
         if fixed_patch.shape != patch_shape_zyx or moving_patch.shape != patch_shape_zyx:
             row.update(
                 status="rejected",
@@ -1723,6 +2442,7 @@ def align_tiles_to_reference(
     output_position: Path,
     output_dir: Path,
     reference_channel: int = 3,
+    moving_channel: int = 0,
     reference_token: str = "488514561638",
     moving_token: str = "405",
     level: int = 4,
@@ -1731,6 +2451,8 @@ def align_tiles_to_reference(
     min_inliers: int = 3,
     max_candidate_patches: int = 24,
     coarse_level: int = 4,
+    scout_z_samples: int | None = 32,
+    workers: int = 1,
     reference_registration_input: Path | None = None,
     output_registration: Path | None = None,
 ) -> Path:
@@ -1744,17 +2466,25 @@ def align_tiles_to_reference(
         raise ValueError("patch-mode min_inliers must be >= 3")
     if max_candidate_patches < 1:
         raise ValueError("max_candidate_patches must be >= 1")
+    if scout_z_samples is not None and scout_z_samples < 1:
+        raise ValueError("scout_z_samples must be >= 1")
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
     if patch_shape_zyx is None and output_registration is not None:
         raise ValueError("--output-registration requires --patch-shape-zyx")
     if output_registration is not None and reference_registration_input is None:
         raise ValueError("--output-registration requires --reference-registration-input")
     payload = json.loads(reference_position.read_text())
-    reference_tiles = rough_legacy.load_tiles(payload)
+    if all(record.get("shape") is not None and record.get("axes") for record in payload["tiles"]):
+        reference_tiles = [tile_record_from_position_record(record) for record in payload["tiles"]]
+    else:
+        reference_tiles = [logical_tile_record(tile) for tile in rough_legacy.load_tiles(payload)]
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "tile_phase_measurement_cache.json"
     cache_key = tile_phase_cache_key(
         reference_position=reference_position,
         reference_channel=reference_channel,
+        moving_channel=moving_channel,
         reference_token=reference_token,
         moving_token=moving_token,
         level=level,
@@ -1763,6 +2493,7 @@ def align_tiles_to_reference(
         min_inliers=min_inliers,
         max_candidate_patches=max_candidate_patches,
         coarse_level=coarse_level,
+        scout_z_samples=scout_z_samples if patch_shape_zyx is not None else None,
     )
     cached_rows_by_tile = load_tile_phase_cache(cache_path, cache_key)
     strict_cached_attempts_by_tile = load_tile_phase_attempt_cache(cache_path, cache_key)
@@ -1780,6 +2511,7 @@ def align_tiles_to_reference(
     diagnostics["tile_phase_alignment"] = {
         "reference_position": str(reference_position.resolve()),
         "reference_channel": int(reference_channel),
+        "moving_channel": int(moving_channel),
         "reference_token": reference_token,
         "moving_token": moving_token,
         "level": int(level),
@@ -1789,24 +2521,147 @@ def align_tiles_to_reference(
         "min_inliers": int(min_inliers),
         "max_candidate_patches": int(max_candidate_patches),
         "coarse_level": int(coarse_level),
+        "scout_z_samples": None if scout_z_samples is None else int(scout_z_samples),
+        "workers": int(workers),
         "description": "Per-tile moving z/y/x translations shifted after 3D phase correlation to reference channel tiles.",
     }
     failed_tiles: list[dict[str, Any]] = []
     successful_moving_tiles: list[tuple[rough_legacy.TileRecord, np.ndarray]] = []
+    cached_successful_tiles: list[tuple[rough_legacy.TileRecord, Path, np.ndarray]] = []
+    cached_failed_tiles: list[tuple[dict[str, Any], rough_legacy.TileRecord, Path, TilePhaseRow]] = []
+    pending: dict[
+        Future[TilePhaseRow],
+        tuple[dict[str, Any], rough_legacy.TileRecord, rough_legacy.TileRecord, Path, str],
+    ] = {}
 
-    for record, reference_tile in zip(updated["tiles"], reference_tiles, strict=True):
-        moving_path = corresponding_moving_path(reference_tile.path, reference_token=reference_token, moving_token=moving_token)
-        moving_tile = make_moving_tile_record(reference_tile, moving_path)
-        moving_tile_name = make_moving_tile_name(record["tile"], reference_token=reference_token, moving_token=moving_token)
-        cached_row = cached_rows_by_tile.get(moving_tile_name)
-        if cached_row is not None:
-            shift_um = apply_shift_row_to_position_record(record, cached_row, moving_path=moving_path)
+    def handle_attempt_row(
+        row: TilePhaseRow,
+        *,
+        record: dict[str, Any],
+        reference_tile: rough_legacy.TileRecord,
+        moving_tile: rough_legacy.TileRecord,
+        moving_path: Path,
+        moving_tile_name: str,
+    ) -> None:
+        cached_attempts_by_tile[moving_tile_name] = row
+        if tile_phase_row_status(row) == "direct_accepted":
+            accepted_row = _validate_tile_phase_accepted_row(dict(row))
+            shift_um = apply_shift_row_to_position_record(record, accepted_row, moving_path=moving_path)
             successful_moving_tiles.append((moving_tile, shift_um))
-            rows.append(cached_row)
-            print(f"tile-phase-cache {reference_tile.tile} -> {moving_path.name}", flush=True)
-            continue
-        cached_attempt = strict_cached_attempts_by_tile.get(moving_tile_name)
-        if cached_attempt is not None and cached_attempt.get("measurement_status") == "direct_failed":
+            rows.append(accepted_row)
+            _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
+            if accepted_row.get("cache_source") == "cached_patch_residual_rescore":
+                logger.info(
+                    "tile-phase-cache-rescore {} -> {} shift_px={} n_inliers={}",
+                    reference_tile.tile,
+                    moving_path.name,
+                    accepted_row["shift_px_zyx"],
+                    accepted_row.get("n_inliers"),
+                )
+            else:
+                logger.info(
+                    "tile-phase {} -> {} shift_px={} corr_after={}",
+                    reference_tile.tile,
+                    moving_path.name,
+                    accepted_row["shift_px_zyx"],
+                    accepted_row["corr_after"],
+                )
+            return
+
+        _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
+        _append_failed_tile(
+            failed_tiles,
+            record=record,
+            reference_tile=reference_tile,
+            moving_tile=moving_tile,
+            moving_path=moving_path,
+            error=str(row.get("direct_error", "tile phase measurement failed")),
+            direct_attempt=row,
+        )
+
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        for record, reference_tile in zip(updated["tiles"], reference_tiles, strict=True):
+            moving_path = corresponding_moving_path(reference_tile.path, reference_token=reference_token, moving_token=moving_token)
+            moving_tile_name = make_moving_tile_name(record["tile"], reference_token=reference_token, moving_token=moving_token)
+            cached_row = cached_rows_by_tile.get(moving_tile_name)
+            if cached_row is not None:
+                shift_um = apply_shift_row_to_position_record(record, cached_row, moving_path=moving_path)
+                cached_successful_tiles.append((reference_tile, moving_path, shift_um))
+                rows.append(cached_row)
+                logger.info("tile-phase-cache {} -> {}", reference_tile.tile, moving_path.name)
+                continue
+            cached_attempt = strict_cached_attempts_by_tile.get(moving_tile_name)
+            if cached_attempt is not None and cached_attempt.get("measurement_status") == "direct_failed":
+                cached_failed_tiles.append((record, reference_tile, moving_path, cached_attempt))
+                logger.info("tile-phase-direct-cache-failed {} -> {}", reference_tile.tile, moving_path.name)
+                continue
+            cached_phase_attempt = compatible_phase_attempts_by_tile.get(moving_tile_name)
+            moving_tile = make_moving_tile_record(reference_tile, moving_path)
+            if executor is None:
+                row = _measure_tile_phase_attempt(
+                    record=record,
+                    reference_tile=reference_tile,
+                    moving_tile=moving_tile,
+                    moving_tile_name=moving_tile_name,
+                    moving_path=moving_path,
+                    reference_channel=reference_channel,
+                    moving_channel=moving_channel,
+                    level_factor=level_factor,
+                    upsample_factor=upsample_factor,
+                    patch_shape_zyx=patch_shape_zyx,
+                    min_inliers=min_inliers,
+                    max_candidate_patches=max_candidate_patches,
+                    coarse_level=coarse_level,
+                    cached_phase_attempt=cached_phase_attempt,
+                    scout_z_samples=scout_z_samples if patch_shape_zyx is not None else None,
+                )
+                handle_attempt_row(
+                    row,
+                    record=record,
+                    reference_tile=reference_tile,
+                    moving_tile=moving_tile,
+                    moving_path=moving_path,
+                    moving_tile_name=moving_tile_name,
+                )
+                continue
+            future = executor.submit(
+                _measure_tile_phase_attempt,
+                record=record,
+                reference_tile=reference_tile,
+                moving_tile=moving_tile,
+                moving_tile_name=moving_tile_name,
+                moving_path=moving_path,
+                reference_channel=reference_channel,
+                moving_channel=moving_channel,
+                level_factor=level_factor,
+                upsample_factor=upsample_factor,
+                patch_shape_zyx=patch_shape_zyx,
+                min_inliers=min_inliers,
+                max_candidate_patches=max_candidate_patches,
+                coarse_level=coarse_level,
+                cached_phase_attempt=cached_phase_attempt,
+                scout_z_samples=scout_z_samples if patch_shape_zyx is not None else None,
+            )
+            pending[future] = (record, reference_tile, moving_tile, moving_path, moving_tile_name)
+
+        for future in as_completed(pending):
+            record, reference_tile, moving_tile, moving_path, moving_tile_name = pending[future]
+            handle_attempt_row(
+                future.result(),
+                record=record,
+                reference_tile=reference_tile,
+                moving_tile=moving_tile,
+                moving_path=moving_path,
+                moving_tile_name=moving_tile_name,
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(cancel_futures=True)
+
+    if cached_failed_tiles:
+        for record, reference_tile, moving_path, cached_attempt in cached_failed_tiles:
+            moving_tile = make_moving_tile_record(reference_tile, moving_path)
             _append_failed_tile(
                 failed_tiles,
                 record=record,
@@ -1816,134 +2671,9 @@ def align_tiles_to_reference(
                 error=str(cached_attempt.get("direct_error", "cached direct failure")),
                 direct_attempt=cached_attempt,
             )
-            print(f"tile-phase-direct-cache-failed {reference_tile.tile} -> {moving_path.name}", flush=True)
-            continue
-        cached_phase_attempt = compatible_phase_attempts_by_tile.get(moving_tile_name)
-        if patch_shape_zyx is not None and cached_phase_attempt is not None:
-            try:
-                shift_px, details = rescore_cached_patch_attempt(
-                    reference_tile=reference_tile,
-                    moving_tile=moving_tile,
-                    reference_channel=reference_channel,
-                    cached_attempt=cached_phase_attempt,
-                    min_inliers=min_inliers,
-                )
-                shift_um = shift_px * np.abs(reference_tile.scale_zyx_um)
-            except Exception as exc:
-                attempt_row = _build_failed_attempt_row(
-                    record=record,
-                    reference_tile=reference_tile,
-                    moving_tile_name=moving_tile_name,
-                    moving_path=moving_path,
-                    error=exc,
-                )
-                cached_attempts_by_tile[moving_tile_name] = attempt_row
-                _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
-                _append_failed_tile(
-                    failed_tiles,
-                    record=record,
-                    reference_tile=reference_tile,
-                    moving_tile=moving_tile,
-                    moving_path=moving_path,
-                    error=str(exc),
-                    direct_attempt=attempt_row,
-                )
-                print(f"tile-phase-cache-rescore-failed {reference_tile.tile} -> {moving_path.name}", flush=True)
-                continue
-            _apply_shift_to_position_record(
-                record,
-                moving_tile_name=moving_tile_name,
-                moving_path=moving_path,
-                shift_um=shift_um,
-            )
-            successful_moving_tiles.append((moving_tile, shift_um))
-            row = _build_direct_measurement_row(
-                record=record,
-                reference_tile=reference_tile,
-                moving_path=moving_path,
-                shift_px=shift_px,
-                shift_um=shift_um,
-                details=details,
-                patch_details=details,
-                phase_error=None,
-                cache_source="cached_patch_residual_rescore",
-            )
-            rows.append(row)
-            cached_attempts_by_tile[moving_tile_name] = row
-            _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
-            print(
-                f"tile-phase-cache-rescore {reference_tile.tile} -> {moving_path.name} "
-                f"shift_px={shift_px.tolist()} n_inliers={details.get('n_inliers')}",
-                flush=True,
-            )
-            continue
-        try:
-            if patch_shape_zyx is None:
-                fixed = rough_legacy.sampled_tile_volume(
-                    reference_tile,
-                    channel=reference_channel,
-                    level_factor=level_factor,
-                )
-                moving = rough_legacy.sampled_tile_volume(moving_tile, channel=0, level_factor=level_factor)
-                shift_px, details = estimate_tile_shift_zyx_px(fixed, moving, upsample_factor=upsample_factor)
-                shift_um = shift_px * np.abs(reference_tile.scale_zyx_um) * level_factor
-            else:
-                shift_px, details = measure_patch_tile_shift(
-                    reference_tile=reference_tile,
-                    moving_tile=moving_tile,
-                    reference_channel=reference_channel,
-                    patch_shape_zyx=patch_shape_zyx,
-                    coarse_level=coarse_level,
-                    upsample_factor=upsample_factor,
-                    max_candidate_patches=max_candidate_patches,
-                    min_inliers=min_inliers,
-                )
-                shift_um = shift_px * np.abs(reference_tile.scale_zyx_um)
-        except Exception as exc:
-            attempt_row = _build_failed_attempt_row(
-                record=record,
-                reference_tile=reference_tile,
-                moving_tile_name=moving_tile_name,
-                moving_path=moving_path,
-                error=exc,
-            )
-            cached_attempts_by_tile[moving_tile_name] = attempt_row
-            _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
-            _append_failed_tile(
-                failed_tiles,
-                record=record,
-                reference_tile=reference_tile,
-                moving_tile=moving_tile,
-                moving_path=moving_path,
-                error=str(exc),
-                direct_attempt=attempt_row,
-            )
-            continue
-        _apply_shift_to_position_record(
-            record,
-            moving_tile_name=moving_tile_name,
-            moving_path=moving_path,
-            shift_um=shift_um,
-        )
-        successful_moving_tiles.append((moving_tile, shift_um))
-        row = _build_direct_measurement_row(
-            record=record,
-            reference_tile=reference_tile,
-            moving_path=moving_path,
-            shift_px=shift_px,
-            shift_um=shift_um,
-            details=details,
-            patch_details=details if patch_shape_zyx is not None else None,
-            phase_error=details.get("phase_error"),
-        )
-        rows.append(row)
-        cached_attempts_by_tile[moving_tile_name] = row
-        _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
-        print(
-            f"tile-phase {reference_tile.tile} -> {moving_path.name} "
-            f"shift_px={shift_px.tolist()} corr_after={details['corr_after']}",
-            flush=True,
-        )
+    if failed_tiles:
+        for reference_tile, moving_path, shift_um in cached_successful_tiles:
+            successful_moving_tiles.append((make_moving_tile_record(reference_tile, moving_path), shift_um))
 
     remaining_failed_tiles = []
     for failure in failed_tiles:
@@ -1991,10 +2721,12 @@ def align_tiles_to_reference(
         rows.append(row)
         cached_attempts_by_tile[record["tile"]] = row
         _persist_tile_phase_cache(cache_path, cache_key, rows, cached_attempts_by_tile)
-        print(
-            f"tile-phase-fallback {reference_tile.tile} -> {moving_path.name} "
-            f"shift_px={shift_px.tolist()} n_inliers={details.get('n_inliers')}",
-            flush=True,
+        logger.info(
+            "tile-phase-fallback {} -> {} shift_px={} n_inliers={}",
+            reference_tile.tile,
+            moving_path.name,
+            shift_px.tolist(),
+            details.get("n_inliers"),
         )
 
     if remaining_failed_tiles:
@@ -2014,6 +2746,7 @@ def align_tiles_to_reference(
         "reference_position": str(reference_position.resolve()),
         "output_position": str(output_position.resolve()),
         "reference_channel": int(reference_channel),
+        "moving_channel": int(moving_channel),
         "reference_token": reference_token,
         "moving_token": moving_token,
         "level": int(level),
@@ -2033,10 +2766,11 @@ def align_tiles_to_reference(
             reference_tiles=reference_tiles,
             output_dir=output_dir,
             reference_channel=reference_channel,
+            moving_channel=moving_channel,
         )
         summary["contact_sheets"] = [str(path.resolve()) for path in contact_sheet_paths]
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
-        print(f"wrote {len(contact_sheet_paths)} tile-phase contact sheets to {output_dir / 'contact_sheets'}", flush=True)
+        logger.info("wrote {} tile-phase contact sheets to {}", len(contact_sheet_paths), output_dir / "contact_sheets")
     if output_registration is not None and reference_registration_input is not None:
         adapt_registration_from_reference(
             reference_registration_input=reference_registration_input,

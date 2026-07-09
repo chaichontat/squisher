@@ -10,6 +10,27 @@ import numpy as np
 PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
 
 
+def cupy_argmax_index(values_gpu: Any) -> tuple[int, ...]:
+    shape = tuple(int(value) for value in values_gpu.shape)
+    if values_gpu.size == 0:
+        raise ValueError("Cannot find argmax of an empty array")
+    chunk_len = min(shape[0], 64) if shape else 1
+    best_value = -np.inf
+    best_flat = 0
+    trailing_size = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+    chunk_start = 0
+    while chunk_start < shape[0]:
+        chunk_stop = min(chunk_start + chunk_len, shape[0])
+        values = values_gpu[chunk_start:chunk_stop].get()
+        chunk_flat = int(np.argmax(values))
+        chunk_value = float(values.ravel()[chunk_flat])
+        if chunk_value > best_value:
+            best_value = chunk_value
+            best_flat = chunk_start * trailing_size + chunk_flat
+        chunk_start = chunk_stop
+    return tuple(int(value) for value in np.unravel_index(best_flat, shape))
+
+
 @dataclass(frozen=True)
 class RobustBoundarySettings:
     patch_shape_zyx: tuple[int, int, int] = (64, 512, 512)
@@ -355,7 +376,7 @@ def refined_phase_shifts_gpu(
         upsample_factor,
         sample_region_offset,
     ).conj()
-    refined_peak = tuple(int(value) for value in cp.unravel_index(cp.argmax(cp.abs(refined)), refined.shape))
+    refined_peak = cupy_argmax_index(cp.abs(refined))
     output = []
     for shift, maximum, size in zip(shifts, refined_peak, shape, strict=True):
         refined_shift = shift + (float(maximum) - float(dftshift)) / float(upsample_factor)
@@ -414,9 +435,11 @@ def phase_correlation_shift_gpu_arrays(
         moving_gpu = moving_gpu - cp.mean(moving_gpu)
     cross_power = cp.fft.fftn(fixed_gpu) * cp.conj(cp.fft.fftn(moving_gpu))
     magnitude = cp.abs(cross_power)
-    cross_power = cross_power / cp.maximum(magnitude, cp.finfo(cp.float32).eps)
+    cp.maximum(magnitude, cp.finfo(cp.float32).eps, out=magnitude)
+    cross_power /= magnitude
+    del magnitude
     corr = cp.real(cp.fft.ifftn(cross_power))
-    peak_index = tuple(int(value) for value in cp.unravel_index(cp.argmax(corr), corr.shape))
+    peak_index = cupy_argmax_index(corr)
     peak = float(corr[peak_index].get())
     shifts = refined_phase_shifts_gpu(cross_power, peak_index, upsample_factor=upsample_factor)
     return (shifts[0], shifts[1], shifts[2]), peak

@@ -3,10 +3,12 @@ from __future__ import annotations
 import fcntl
 import functools
 import hashlib
+import os
 from dataclasses import dataclass
 from os import fsync
 from pathlib import Path
 import pickle
+import sys
 import tempfile
 from typing import Any, Sequence
 
@@ -21,21 +23,26 @@ I_MAX = np.float32(2**16 - 1)
 
 
 class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
-    """CuPy BaSiC correction plus single-iteration Guo LR deconvolution."""
+    """CuPy BaSiC correction plus Guo LR deconvolution."""
 
     def __init__(
         self,
         *,
         basic_paths: Sequence[Path],
-        psf_path: Path,
+        psf_paths: Sequence[Path],
         device: int,
+        iterations: int = 1,
     ) -> None:
+        if iterations < 1:
+            raise ValueError("iterations must be at least 1.")
+        ensure_cuda_path_for_cupy_jit()
         import cupy as cp
 
         cp.cuda.Device(device).use()
         _initialize_cupy_allocator(cp)
         self._cp = cp
         self._device = int(device)
+        self._iterations = int(iterations)
         self._darkfield, self._flatfield = _load_basic_profiles(basic_paths, cp=cp)
         self._inv_flatfield = 1.0 / self._flatfield
         self._basic_kernel = cp.ElementwiseKernel(
@@ -44,16 +51,22 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
             "float t = (x - df) * inv_ff; y = t > 0.0f ? t : 0.0f;",
             name="squisher_deconv_basic_correct_clip",
         )
-        self._projectors = _projectors(
-            psf_path,
-            cp=cp,
-            device=self._device,
+        if not psf_paths:
+            raise ValueError("At least one PSF path is required.")
+        self._projectors = tuple(
+            _projectors(
+                psf_path,
+                cp=cp,
+                device=self._device,
+            )
+            for psf_path in psf_paths
         )
 
     @property
     def halo(self) -> int:
-        forward, backward = self._projectors
-        return int((forward.shape[0] - 1) + (backward.shape[0] - 1))
+        return max(
+            int((forward.shape[0] - 1) + (backward.shape[0] - 1)) for forward, backward in self._projectors
+        )
 
     def deconvolve(self, volume: np.ndarray) -> np.ndarray:
         result = self._deconvolve_gpu(volume)
@@ -84,22 +97,56 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
             raise ValueError(
                 f"Input has {x.shape[1]} channel(s), but {self._darkfield.shape[1]} BaSiC profile(s) were loaded."
             )
+        if x.shape[1] != len(self._projectors):
+            raise ValueError(
+                f"Input has {x.shape[1]} channel(s), but {len(self._projectors)} PSF(s) were loaded."
+            )
         self._basic_kernel(x, self._darkfield, self._inv_flatfield, x)
-        return _deconvolve_lucyrichardson_guo(x, self._projectors, cp=cp)
+        out = cp.empty_like(x, dtype=cp.float32)
+        for channel, projectors in enumerate(self._projectors):
+            out[:, channel : channel + 1] = _deconvolve_lucyrichardson_guo(
+                x[:, channel : channel + 1],
+                projectors,
+                iterations=self._iterations,
+                cp=cp,
+            )
+        return out
 
 
 @dataclass(frozen=True, slots=True)
 class CupyDeconvolverFactory:
     basic_paths: tuple[Path, ...]
-    psf_path: Path
+    psf_paths: tuple[Path, ...]
+    iterations: int = 1
     process_safe: bool = True
 
     def __call__(self, device: int) -> CupyBasicRichardsonLucyDeconvolver:
+        ensure_cuda_path_for_cupy_jit()
         return CupyBasicRichardsonLucyDeconvolver(
             basic_paths=self.basic_paths,
-            psf_path=self.psf_path,
+            psf_paths=self.psf_paths,
             device=device,
+            iterations=self.iterations,
         )
+
+
+def ensure_cuda_path_for_cupy_jit() -> None:
+    """Set CUDA_PATH from the active conda env when CuPy needs JIT compilation."""
+    if os.environ.get("CUDA_PATH"):
+        return
+    cuda_path = _conda_cuda_target(Path(sys.prefix))
+    if cuda_path is not None:
+        os.environ["CUDA_PATH"] = str(cuda_path)
+
+
+def _conda_cuda_target(prefix: Path) -> Path | None:
+    target = prefix / "targets" / "x86_64-linux"
+    if not (target / "include" / "cuda.h").exists():
+        return None
+    for lib_dir in (target / "lib", target / "lib64"):
+        if any(lib_dir.glob("libnvrtc.so*")):
+            return target
+    return None
 
 
 def _initialize_cupy_allocator(cp: Any) -> None:
@@ -222,12 +269,14 @@ def _atomic_save_projectors(path: Path, projectors: list[np.ndarray]) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-def _calculate_projectors_3d(pf: Any, *, sigma_g: float, a: float, b: float, n: int, cp: Any) -> tuple[Any, Any]:
+def _calculate_projectors_3d(
+    pf: Any, *, sigma_g: float, a: float, b: float, n: int, cp: Any
+) -> tuple[Any, Any]:
     pf_fft = cp.fft.fftn(pf)
     kc = 1.0 / (0.5 * 2.355 * sigma_g)
     kz = cp.fft.fftfreq(pf_fft.shape[0])
     kw = cp.fft.fftfreq(pf_fft.shape[1])
-    kk = cp.sqrt((cp.asarray(cp.meshgrid(kz, kw, kw, indexing="ij")) ** 2).sum())
+    kk = cp.sqrt((cp.asarray(cp.meshgrid(kz, kw, kw, indexing="ij")) ** 2).sum(axis=0))
     wiener = pf_fft / (cp.abs(pf_fft) ** 2 + a)
     eps = cp.sqrt(1.0 / (b**2) - 1)
     butterworth = 1.0 / cp.sqrt(1.0 + eps**2 * (kk / kc) ** (2 * n))
@@ -235,16 +284,22 @@ def _calculate_projectors_3d(pf: Any, *, sigma_g: float, a: float, b: float, n: 
     return pf, backward
 
 
-def _deconvolve_lucyrichardson_guo(img: Any, projectors: tuple[Any, Any], *, cp: Any) -> Any:
+def _deconvolve_lucyrichardson_guo(
+    img: Any, projectors: tuple[Any, Any], *, iterations: int = 1, cp: Any
+) -> Any:
     from cupyx.scipy.ndimage import convolve as cconvolve
 
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1.")
     if img.dtype not in [cp.float32, cp.float16]:
         raise ValueError("Image must be float32 or float16.")
     forward_projector, backward_projector = projectors
-    estimate = cp.clip(img, EPS, None)
-    filtered_estimate = cconvolve(estimate, forward_projector, mode="reflect").clip(EPS, I_MAX)
-    img /= filtered_estimate
-    estimate *= cconvolve(img, backward_projector, mode="reflect")
+    observed = cp.clip(img, EPS, None)
+    estimate = observed.copy()
+    for _ in range(iterations):
+        filtered_estimate = cconvolve(estimate, forward_projector, mode="reflect").clip(EPS, I_MAX)
+        ratio = observed / filtered_estimate
+        estimate *= cconvolve(ratio, backward_projector, mode="reflect")
     return estimate
 
 

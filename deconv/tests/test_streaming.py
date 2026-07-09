@@ -4,11 +4,11 @@ import hashlib
 import json
 import threading
 import time
-import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
 import tifffile
+import zarr
 
 from squisher_deconv.deconvolution import IdentityDeconvolver
 from squisher_deconv.process_workers import ProcessRunConfig, _process_file, run_process_gpu_streaming_deconv
@@ -17,15 +17,12 @@ from squisher_deconv.source import TiffLogicalSource
 from squisher_deconv.streaming import ProcessingError, run_streaming_deconv, sample_scale
 
 
-OME_NS = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
-
-
-def _map_annotation_values(ome_metadata: str) -> dict[str, str]:
-    root = ET.fromstring(ome_metadata)
-    return {
-        item.attrib["K"]: item.text or ""
-        for item in root.findall(".//ome:MapAnnotation/ome:Value/ome:M", OME_NS)
-    }
+def _read_deconv_ome_zarr(path):
+    root = zarr.open_group(str(path), mode="r")
+    array = root["0"]
+    czyx = array[:]
+    flattened = np.moveaxis(czyx, 0, 1).reshape(-1, array.shape[-2], array.shape[-1])
+    return flattened, root, array
 
 
 class FailingDeconvolver:
@@ -166,7 +163,7 @@ def test_sample_scale_writes_float32_samples_and_global_artifacts(tmp_path) -> N
         channels=2,
         halo=0,
         deconvolver=IdentityDeconvolver(),
-        psf_path=psf,
+        psf_paths=[psf],
         basic_paths=[basic],
         seed=1,
         p_low=0,
@@ -186,8 +183,7 @@ def test_sample_scale_writes_float32_samples_and_global_artifacts(tmp_path) -> N
     assert (tmp_path / "scale" / "sample-manifest.json").exists()
     manifest = json.loads((tmp_path / "scale" / "sample-manifest.json").read_text())
     assert manifest["channels"] == 2
-    assert manifest["psf"] == str(psf)
-    assert manifest["psf_sha256"] == _sha256(psf)
+    assert manifest["psfs"] == [{"path": str(psf), "sha256": _sha256(psf)}]
     assert manifest["basic_profiles"] == [{"path": str(basic), "sha256": _sha256(basic)}]
     assert "numpy" in manifest["versions"]
     assert manifest["windows"]
@@ -214,7 +210,7 @@ def test_sample_scale_uses_summary_metadata(tmp_path, monkeypatch) -> None:
         channels=2,
         halo=0,
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         seed=1,
         p_low=0,
         p_high=1,
@@ -254,7 +250,7 @@ def test_sample_scale_uses_first_input_header_for_all_sources(tmp_path, monkeypa
         channels=2,
         halo=0,
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         seed=1,
         p_low=0,
         p_high=1,
@@ -269,6 +265,34 @@ def test_sample_scale_uses_first_input_header_for_all_sources(tmp_path, monkeypa
     manifest = json.loads((tmp_path / "scale" / "sample-manifest.json").read_text())
     assert manifest["source_header_mode"] == "first_input"
     assert manifest["source_header_template"] == str(inputs[0])
+
+
+def test_sample_scale_preflights_device_deconvolvers_before_outputs(tmp_path) -> None:
+    src = tmp_path / "tile.tif"
+    payload = np.arange(2 * 2 * 3 * 4, dtype=np.uint16).reshape(4, 3, 4)
+    tifffile.imwrite(src, payload, metadata={"axes": "ZYX"}, photometric="minisblack")
+
+    with pytest.raises(RuntimeError, match="bootstrap failed on device 0"):
+        sample_scale(
+            [src],
+            out_dir=tmp_path / "scale",
+            planes=1,
+            channels=2,
+            halo=0,
+            deconvolver=None,
+            deconvolver_factory=RaisingProcessFactory(),
+            psf_paths=None,
+            seed=1,
+            p_low=0,
+            p_high=1,
+            gamma=1,
+            bins=4,
+            devices=[0, 1],
+            queue_depth=1,
+            stop_on_error=True,
+        )
+
+    assert not (tmp_path / "scale").exists()
 
 
 def test_run_uses_first_input_header_for_all_sources(tmp_path, monkeypatch) -> None:
@@ -297,7 +321,7 @@ def test_run_uses_first_input_header_for_all_sources(tmp_path, monkeypatch) -> N
         slab_depth=1,
         output_mode="float32",
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
@@ -305,7 +329,7 @@ def test_run_uses_first_input_header_for_all_sources(tmp_path, monkeypatch) -> N
 
     assert calls == [(inputs[0], 2, "summary")]
     for src in inputs:
-        assert (tmp_path / "out" / src.name).exists()
+        assert (tmp_path / "out" / f"{src.stem}.ome.zarr").exists()
 
 
 def test_streamed_u16_deconv_matches_eager_identity(tmp_path) -> None:
@@ -327,26 +351,24 @@ def test_streamed_u16_deconv_matches_eager_identity(tmp_path) -> None:
         slab_depth=2,
         output_mode="u16",
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         basic_paths=[basic],
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
     )
 
-    out = tmp_path / "out" / "tile.tif"
-    with tifffile.TiffFile(out) as tif:
-        actual = tif.asarray()
-        assert tif.is_bigtiff
-        assert all(page.compression == 22610 for page in tif.pages)
-        assert not hasattr(tif.pages[1], "description")
-        annotations = _map_annotation_values(tif.ome_metadata)
-        assert "squisher.deconv.provenance" in annotations
-        provenance = json.loads(annotations["squisher.deconv.provenance"])
-        assert provenance["basic_profiles"] == [{"path": str(basic), "sha256": _sha256(basic)}]
-        summary = json.loads(annotations["squisher.deconv.source_metadata_summary"])
-        assert summary["raw_shape"] == [6, 4, 5]
-        assert summary["raw_dtype"] == "uint16"
+    out = tmp_path / "out" / "tile.ome.zarr"
+    actual, root, array = _read_deconv_ome_zarr(out)
+    assert tuple(array.shape) == (2, 3, 4, 5)
+    assert tuple(array.chunks) == (1, 3, 4, 5)
+    assert array.attrs["_ARRAY_DIMENSIONS"] == ["c", "z", "y", "x"]
+    assert root.attrs["squisher_complete"] is True
+    assert root.attrs["squisher_deconv"]["provenance"]["basic_profiles"] == [
+        {"path": str(basic), "sha256": _sha256(basic)}
+    ]
+    assert root.attrs["squisher_deconv"]["source_metadata_summary"]["raw_shape"] == [6, 4, 5]
+    assert root.attrs["squisher_deconv"]["source_metadata_summary"]["raw_dtype"] == "uint16"
     assert np.allclose(actual, payload, atol=5)
 
     sidecar = json.loads((tmp_path / "out" / "tile.deconv.json").read_text())
@@ -378,15 +400,15 @@ def test_run_preserves_parent_dirs_for_duplicate_basenames(tmp_path) -> None:
         output_mode="u16",
         deconvolver=IdentityDeconvolver(),
         deconvolver_factory=None,
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=2,
         stop_on_error=True,
     )
 
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "roi-a" / "tile.tif"), payload_a, atol=5)
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "roi-b" / "tile.tif"), payload_b, atol=5)
-    assert not (tmp_path / "out" / "tile.tif").exists()
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "roi-a" / "tile.ome.zarr")[0], payload_a, atol=5)
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "roi-b" / "tile.ome.zarr")[0], payload_b, atol=5)
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
 
 
 def test_run_preserves_enough_parent_dirs_for_repeated_parent_names(tmp_path) -> None:
@@ -413,14 +435,22 @@ def test_run_preserves_enough_parent_dirs_for_repeated_parent_names(tmp_path) ->
         output_mode="u16",
         deconvolver=IdentityDeconvolver(),
         deconvolver_factory=None,
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=2,
         stop_on_error=True,
     )
 
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "top-a" / "roi" / "tile.tif"), payload_a, atol=5)
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "top-b" / "roi" / "tile.tif"), payload_b, atol=5)
+    assert np.allclose(
+        _read_deconv_ome_zarr(tmp_path / "out" / "top-a" / "roi" / "tile.ome.zarr")[0],
+        payload_a,
+        atol=5,
+    )
+    assert np.allclose(
+        _read_deconv_ome_zarr(tmp_path / "out" / "top-b" / "roi" / "tile.ome.zarr")[0],
+        payload_b,
+        atol=5,
+    )
 
 
 def test_streamed_u16_uses_backend_core_quantization_path(tmp_path) -> None:
@@ -440,7 +470,7 @@ def test_streamed_u16_uses_backend_core_quantization_path(tmp_path) -> None:
         slab_depth=1,
         output_mode="u16",
         deconvolver=deconvolver,
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
@@ -449,7 +479,7 @@ def test_streamed_u16_uses_backend_core_quantization_path(tmp_path) -> None:
     assert [call[1:3] for call in deconvolver.calls] == [(0, 1), (0, 1), (0, 1)]
     assert {call[3] for call in deconvolver.calls} == {(0.0, 0.0)}
     assert {call[4] for call in deconvolver.calls} == {(1.0, 1.0)}
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "tile.tif"), payload, atol=5)
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "tile.ome.zarr")[0], payload, atol=5)
 
 
 def test_factory_u16_deconvolver_must_expose_core_quantization_path(tmp_path) -> None:
@@ -470,13 +500,13 @@ def test_factory_u16_deconvolver_must_expose_core_quantization_path(tmp_path) ->
             output_mode="u16",
             deconvolver=None,
             deconvolver_factory=lambda _device: IdentityDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=True,
         )
 
-    assert not (tmp_path / "out" / "tile.tif").exists()
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
 
 
 def test_process_safe_factory_uses_process_gpu_runner(tmp_path, monkeypatch) -> None:
@@ -503,7 +533,7 @@ def test_process_safe_factory_uses_process_gpu_runner(tmp_path, monkeypatch) -> 
         output_mode="u16",
         deconvolver=None,
         deconvolver_factory=ProcessSafeRecordingFactory(),
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
@@ -543,7 +573,7 @@ def test_process_worker_file_pipeline_writes_streamed_u16_output(tmp_path) -> No
             halo=0,
             slab_depth=1,
             output_mode="u16",
-            psf_path=None,
+            psf_paths=None,
             basic_paths=(),
             scaling_path=scaling_dir / "scaling.json",
             devices=(0,),
@@ -554,11 +584,8 @@ def test_process_worker_file_pipeline_writes_streamed_u16_output(tmp_path) -> No
     )
 
     assert duration >= 0
-    out = tmp_path / "out" / "tile.tif"
-    with tifffile.TiffFile(out) as tif:
-        actual = tif.asarray()
-        assert tif.is_bigtiff
-        assert all(page.compression == 22610 for page in tif.pages)
+    out = tmp_path / "out" / "tile.ome.zarr"
+    actual, _root, _array = _read_deconv_ome_zarr(out)
     assert np.allclose(actual, payload, atol=5)
     sidecar = json.loads((tmp_path / "out" / "tile.deconv.json").read_text())
     assert sidecar["worker"] == {"worker_id": 0, "device": 0}
@@ -597,7 +624,7 @@ def test_process_worker_preserves_parent_dirs_for_duplicate_basenames(tmp_path) 
             halo=0,
             slab_depth=1,
             output_mode="u16",
-            psf_path=None,
+            psf_paths=None,
             basic_paths=(),
             scaling_path=scaling_dir / "scaling.json",
             devices=(0,),
@@ -609,8 +636,8 @@ def test_process_worker_preserves_parent_dirs_for_duplicate_basenames(tmp_path) 
     )
 
     assert failures == []
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "roi-a" / "tile.tif"), payload_a, atol=5)
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "roi-b" / "tile.tif"), payload_b, atol=5)
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "roi-a" / "tile.ome.zarr")[0], payload_a, atol=5)
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "roi-b" / "tile.ome.zarr")[0], payload_b, atol=5)
 
 
 def test_process_gpu_runner_spawn_writes_output(tmp_path) -> None:
@@ -640,7 +667,7 @@ def test_process_gpu_runner_spawn_writes_output(tmp_path) -> None:
             halo=0,
             slab_depth=1,
             output_mode="u16",
-            psf_path=None,
+            psf_paths=None,
             basic_paths=(),
             scaling_path=scaling_dir / "scaling.json",
             devices=(0,),
@@ -652,7 +679,7 @@ def test_process_gpu_runner_spawn_writes_output(tmp_path) -> None:
     )
 
     assert failures == []
-    assert np.allclose(tifffile.imread(tmp_path / "out" / "tile.tif"), payload, atol=5)
+    assert np.allclose(_read_deconv_ome_zarr(tmp_path / "out" / "tile.ome.zarr")[0], payload, atol=5)
 
 
 def test_process_gpu_runner_reports_worker_bootstrap_failure_without_hanging(tmp_path) -> None:
@@ -681,7 +708,7 @@ def test_process_gpu_runner_reports_worker_bootstrap_failure_without_hanging(tmp
             halo=0,
             slab_depth=1,
             output_mode="u16",
-            psf_path=None,
+            psf_paths=None,
             basic_paths=(),
             scaling_path=scaling_dir / "scaling.json",
             devices=(0,),
@@ -694,7 +721,7 @@ def test_process_gpu_runner_reports_worker_bootstrap_failure_without_hanging(tmp
 
     assert len(failures) == 1
     assert "bootstrap failed on device 0" in failures[0]
-    assert not (tmp_path / "out" / "tile.tif").exists()
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
 
 
 def test_streamed_u16_rejects_non_uint16_core_backend_output(tmp_path) -> None:
@@ -714,13 +741,13 @@ def test_streamed_u16_rejects_non_uint16_core_backend_output(tmp_path) -> None:
             slab_depth=1,
             output_mode="u16",
             deconvolver=BadU16CoreDtypeDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=True,
         )
 
-    assert not (tmp_path / "out" / "tile.tif").exists()
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
 
 
 def test_streamed_u16_rejects_wrong_shape_core_backend_output(tmp_path) -> None:
@@ -740,13 +767,13 @@ def test_streamed_u16_rejects_wrong_shape_core_backend_output(tmp_path) -> None:
             slab_depth=1,
             output_mode="u16",
             deconvolver=BadU16CoreShapeDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=True,
         )
 
-    assert not (tmp_path / "out" / "tile.tif").exists()
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
 
 
 def test_streamed_float32_deconv_does_not_require_scaling(tmp_path) -> None:
@@ -763,17 +790,15 @@ def test_streamed_float32_deconv_does_not_require_scaling(tmp_path) -> None:
         slab_depth=1,
         output_mode="float32",
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
     )
 
-    with tifffile.TiffFile(tmp_path / "out" / "tile.tif") as tif:
-        actual = tif.asarray()
-        assert tif.is_bigtiff
-        assert all(page.compression == 1 for page in tif.pages)
-        assert actual.dtype == np.float32
+    actual, _root, array = _read_deconv_ome_zarr(tmp_path / "out" / "tile.ome.zarr")
+    assert array.dtype == np.float32
+    assert actual.dtype == np.float32
     assert np.allclose(actual, payload.astype(np.float32))
     sidecar = json.loads((tmp_path / "out" / "tile.deconv.json").read_text())
     assert sidecar["compression_tiff_tag"] is None
@@ -812,14 +837,14 @@ def test_run_prefetches_reads_up_to_queue_depth(tmp_path, monkeypatch) -> None:
         slab_depth=1,
         output_mode="float32",
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=2,
         stop_on_error=True,
     )
 
     assert max_active == 2
-    actual = tifffile.imread(tmp_path / "out" / "tile.tif")
+    actual = _read_deconv_ome_zarr(tmp_path / "out" / "tile.ome.zarr")[0]
     assert np.allclose(actual, payload.astype(np.float32))
 
 
@@ -853,7 +878,7 @@ def test_sample_scale_prefetches_reads_up_to_queue_depth(tmp_path, monkeypatch) 
         channels=2,
         halo=0,
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         seed=1,
         p_low=0,
         p_high=1,
@@ -882,7 +907,7 @@ def test_queue_depth_must_be_positive(tmp_path) -> None:
             slab_depth=1,
             output_mode="float32",
             deconvolver=IdentityDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=0,
             stop_on_error=True,
@@ -897,8 +922,9 @@ def test_run_refuses_existing_output_without_overwrite(tmp_path) -> None:
     _write_identity_scaling(scaling_dir)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    existing = out_dir / "tile.tif"
-    existing.write_bytes(b"existing")
+    existing = out_dir / "tile.ome.zarr"
+    existing.mkdir(parents=True)
+    (existing / "sentinel").write_bytes(b"existing")
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite existing output"):
         run_streaming_deconv(
@@ -910,12 +936,12 @@ def test_run_refuses_existing_output_without_overwrite(tmp_path) -> None:
             slab_depth=2,
             output_mode="u16",
             deconvolver=IdentityDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=True,
         )
-    assert existing.read_bytes() == b"existing"
+    assert (existing / "sentinel").read_bytes() == b"existing"
 
 
 def test_run_rejects_scaling_channel_mismatch_before_output(tmp_path) -> None:
@@ -949,7 +975,7 @@ def test_run_rejects_scaling_channel_mismatch_before_output(tmp_path) -> None:
             slab_depth=1,
             output_mode="u16",
             deconvolver=IdentityDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=True,
@@ -966,7 +992,7 @@ def test_run_overwrites_existing_output_when_requested(tmp_path) -> None:
     _write_identity_scaling(scaling_dir)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "tile.tif").write_bytes(b"existing")
+    (out_dir / "tile.ome.zarr").mkdir(parents=True)
 
     run_streaming_deconv(
         [src],
@@ -977,15 +1003,14 @@ def test_run_overwrites_existing_output_when_requested(tmp_path) -> None:
         slab_depth=2,
         output_mode="u16",
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         devices=[0],
         queue_depth=1,
         stop_on_error=True,
         overwrite=True,
     )
 
-    with tifffile.TiffFile(out_dir / "tile.tif") as tif:
-        assert tif.is_bigtiff
+    assert (out_dir / "tile.ome.zarr" / ".zgroup").exists()
 
 
 def test_sample_scale_refuses_existing_artifacts_without_overwrite(tmp_path) -> None:
@@ -1004,7 +1029,7 @@ def test_sample_scale_refuses_existing_artifacts_without_overwrite(tmp_path) -> 
             channels=2,
             halo=0,
             deconvolver=IdentityDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             seed=1,
             p_low=0,
             p_high=1,
@@ -1034,7 +1059,7 @@ def test_sample_scale_overwrite_removes_stale_artifacts(tmp_path) -> None:
         channels=2,
         halo=0,
         deconvolver=IdentityDeconvolver(),
-        psf_path=None,
+        psf_paths=None,
         seed=1,
         p_low=0,
         p_high=1,
@@ -1071,7 +1096,7 @@ def test_run_uses_factory_deconvolver_for_scheduled_devices(tmp_path) -> None:
         output_mode="u16",
         deconvolver=IdentityDeconvolver(),
         deconvolver_factory=lambda device: RecordingDeconvolver(device, calls),
-        psf_path=None,
+        psf_paths=None,
         devices=[0, 1],
         queue_depth=1,
         stop_on_error=True,
@@ -1097,13 +1122,13 @@ def test_keep_going_reports_failed_run_jobs(tmp_path) -> None:
             slab_depth=1,
             output_mode="u16",
             deconvolver=FailingDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             devices=[0],
             queue_depth=1,
             stop_on_error=False,
         )
-    assert not (tmp_path / "out" / "tile.tif").exists()
-    assert not (tmp_path / "out" / ".tile.tif.partial").exists()
+    assert not (tmp_path / "out" / "tile.ome.zarr").exists()
+    assert not (tmp_path / "out" / ".tile.ome.zarr.partial").exists()
 
 
 def test_keep_going_reports_failed_sample_jobs(tmp_path) -> None:
@@ -1119,7 +1144,7 @@ def test_keep_going_reports_failed_sample_jobs(tmp_path) -> None:
             channels=2,
             halo=0,
             deconvolver=FailingDeconvolver(),
-            psf_path=None,
+            psf_paths=None,
             seed=1,
             p_low=0,
             p_high=1,

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+
 from squisher_lightsheet.artifacts import write_workflow_summary
 from squisher_lightsheet.legacy_runner import command_text
 from squisher_lightsheet.positions import create_position_file
@@ -191,7 +193,7 @@ def run_lr_dumb_stitch_alignment(
     }
 
     if dry_run:
-        print(paths, flush=True)
+        logger.info(paths)
         return paths
 
     create_position_file(

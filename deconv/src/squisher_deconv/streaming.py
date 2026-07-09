@@ -24,6 +24,7 @@ from squisher_deconv.planning import (
     group_sample_windows,
     output_path_for,
     output_relative_root,
+    output_sidecar_path,
     sample_planes_from_z_counts,
     slab_windows,
 )
@@ -36,7 +37,7 @@ from squisher_deconv.scaling import (
     validate_scaling_channels,
 )
 from squisher_deconv.scheduler import ScheduledJob, schedule_round_robin
-from squisher_deconv.sink import write_streamed_ome_tiff
+from squisher_deconv.sink import write_streamed_ome_zarr
 from squisher_deconv.source import TiffLogicalSource
 
 
@@ -57,7 +58,7 @@ def sample_scale(
     channels: int,
     halo: int,
     deconvolver: Deconvolver | None,
-    psf_path: Path | None,
+    psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
     deconvolver_factory: Callable[[int], Deconvolver] | None = None,
     seed: int,
@@ -73,13 +74,15 @@ def sample_scale(
     t_workflow = time.perf_counter()
     _validate_queue_depth(queue_depth)
     paths = [Path(path) for path in inputs]
+    psfs = tuple(Path(path) for path in (psf_paths or ()))
     _log(
         "sample-scale start "
         f"inputs={len(paths)} out_dir={out_dir} planes={planes} channels={channels} halo={halo} "
         f"devices={devices} queue_depth={queue_depth} seed={seed} p_low={p_low} p_high={p_high} "
         f"gamma={gamma} bins={bins} overwrite={overwrite}"
     )
-    _log(f"sample-scale psf={psf_path}")
+    for psf_path in psfs:
+        _log(f"sample-scale psf={psf_path}")
     for basic_path in basic_paths or []:
         _log(f"sample-scale basic={basic_path}")
     t_sources = time.perf_counter()
@@ -107,13 +110,21 @@ def sample_scale(
             f"plan window[{index:05d}] file={window.path} read_z=[{window.read_start},{window.read_stop}) "
             f"read_planes={window.read_stop - window.read_start} sampled_z={list(window.core_z)}"
         )
+    _preflight_device_deconvolvers(
+        devices,
+        deconvolver=deconvolver,
+        deconvolver_factory=deconvolver_factory,
+        context="sample-scale",
+    )
     sample_dir = out_dir / "float32-samples"
     _prepare_sample_scale_outputs(out_dir, sample_dir=sample_dir, overwrite=overwrite)
     sample_paths: list[Path] = []
     manifest_windows: list[dict[str, Any]] = []
     failures: list[str] = []
 
-    def process_device_jobs(device: int, jobs: list[ScheduledJob]) -> tuple[list[Path], list[dict[str, Any]], list[str]]:
+    def process_device_jobs(
+        device: int, jobs: list[ScheduledJob]
+    ) -> tuple[list[Path], list[dict[str, Any]], list[str]]:
         device_deconvolver = _device_deconvolver(
             device,
             deconvolver=deconvolver,
@@ -207,7 +218,9 @@ def sample_scale(
         raise ProcessingError(f"{len(failures)} sample-scale job(s) failed:\n{joined}")
     _log(f"sample jobs complete samples={len(sample_paths)} windows={len(manifest_windows)}")
     sample_paths.sort()
-    manifest_windows.sort(key=lambda item: (item["file"], item["read_start"], item["read_stop"], item["sample_path"]))
+    manifest_windows.sort(
+        key=lambda item: (item["file"], item["read_start"], item["read_stop"], item["sample_path"])
+    )
 
     manifest = {
         "inputs": [str(path) for path in paths],
@@ -216,8 +229,7 @@ def sample_scale(
         "seed": int(seed),
         "channels": int(channels),
         "halo": int(halo),
-        "psf": None if psf_path is None else str(psf_path),
-        "psf_sha256": None if psf_path is None else file_provenance_records([psf_path])[0]["sha256"],
+        "psfs": file_provenance_records(psfs),
         "basic_profiles": file_provenance_records(basic_paths or []),
         "devices": [int(device) for device in devices],
         "queue_depth": int(queue_depth),
@@ -258,7 +270,7 @@ def run_streaming_deconv(
     slab_depth: int,
     output_mode: str,
     deconvolver: Deconvolver | None,
-    psf_path: Path | None,
+    psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
     deconvolver_factory: Callable[[int], Deconvolver] | None = None,
     devices: list[int],
@@ -273,6 +285,7 @@ def run_streaming_deconv(
     if output_mode == "u16" and scaling_path is None:
         raise ValueError("output_mode='u16' requires a scaling path.")
     paths = [Path(path) for path in inputs]
+    psfs = tuple(Path(path) for path in (psf_paths or ()))
     relative_root = output_relative_root(paths)
     _log(
         "run start "
@@ -280,7 +293,8 @@ def run_streaming_deconv(
         f"output_mode={output_mode} devices={devices} queue_depth={queue_depth} overwrite={overwrite}"
     )
     _log(f"run scaling={scaling_path}")
-    _log(f"run psf={psf_path}")
+    for psf_path in psfs:
+        _log(f"run psf={psf_path}")
     for basic_path in basic_paths or []:
         _log(f"run basic={basic_path}")
     t_sources = time.perf_counter()
@@ -313,7 +327,7 @@ def run_streaming_deconv(
                 halo=halo,
                 slab_depth=slab_depth,
                 output_mode=output_mode,
-                psf_path=psf_path,
+                psf_paths=psfs,
                 basic_paths=tuple(Path(path) for path in (basic_paths or ())),
                 scaling_path=scaling_path,
                 devices=tuple(int(device) for device in devices),
@@ -339,8 +353,10 @@ def run_streaming_deconv(
             deconvolver=deconvolver,
             deconvolver_factory=deconvolver_factory,
         )
-        if output_mode == "u16" and deconvolver_factory is not None and not hasattr(
-            device_deconvolver, "deconvolve_core_u16"
+        if (
+            output_mode == "u16"
+            and deconvolver_factory is not None
+            and not hasattr(device_deconvolver, "deconvolve_core_u16")
         ):
             raise TypeError(
                 "Production u16 output requires a deconvolver with deconvolve_core_u16 so quantization remains "
@@ -396,7 +412,9 @@ def run_streaming_deconv(
                     core_stop = slab.core_stop - slab.read_start
                     if output_mode == "u16" and hasattr(device_deconvolver, "deconvolve_core_u16"):
                         if scaling is None:
-                            raise RuntimeError("u16 output reached quantization without loaded scaling parameters.")
+                            raise RuntimeError(
+                                "u16 output reached quantization without loaded scaling parameters."
+                            )
                         chunk = device_deconvolver.deconvolve_core_u16(
                             read,
                             core_start=core_start,
@@ -422,10 +440,14 @@ def run_streaming_deconv(
                         core = deconvolved[core_start:core_stop]
                         if output_mode == "u16":
                             if scaling is None:
-                                raise RuntimeError("u16 output reached quantization without loaded scaling parameters.")
+                                raise RuntimeError(
+                                    "u16 output reached quantization without loaded scaling parameters."
+                                )
                             chunk = quantize_global(core, scaling)
                         else:
-                            chunk = core.astype(np.float32, copy=False).reshape(-1, source.height, source.width)
+                            chunk = core.astype(np.float32, copy=False).reshape(
+                                -1, source.height, source.width
+                            )
                     _log(
                         f"slab ready device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
                         f"chunk_shape={chunk.shape} seconds={time.perf_counter() - t_slab:.2f}"
@@ -436,7 +458,7 @@ def run_streaming_deconv(
                 source.path,
                 channels=channels,
                 halo=halo,
-                psf_path=psf_path,
+                psf_paths=psfs,
                 basic_paths=basic_paths,
                 output_mode=output_mode,
                 scaling_path=scaling_path,
@@ -456,13 +478,13 @@ def run_streaming_deconv(
                 indent=2,
             )
             try:
-                sidecar = output_path.with_suffix(".deconv.json")
+                sidecar = output_sidecar_path(output_path)
                 if sidecar.exists() and not overwrite:
                     raise FileExistsError(
                         f"Refusing to overwrite existing sidecar {sidecar}; pass --overwrite to replace it."
                     )
                 t_file = time.perf_counter()
-                write_streamed_ome_tiff(
+                write_streamed_ome_zarr(
                     output_path,
                     source=source,
                     core_plane_chunks=core_iter(),
@@ -514,6 +536,31 @@ def _device_deconvolver(
     if deconvolver is None:
         raise ValueError("A deconvolver or deconvolver_factory is required.")
     return deconvolver
+
+
+def _preflight_device_deconvolvers(
+    devices: Sequence[int],
+    *,
+    deconvolver: Deconvolver | None,
+    deconvolver_factory: Callable[[int], Deconvolver] | None,
+    context: str,
+) -> None:
+    if deconvolver_factory is None:
+        if deconvolver is None:
+            raise ValueError("A deconvolver or deconvolver_factory is required.")
+        return
+    for device in devices:
+        t_start = time.perf_counter()
+        _log(f"{context} deconvolver preflight start device={device}")
+        _device_deconvolver(
+            int(device),
+            deconvolver=deconvolver,
+            deconvolver_factory=deconvolver_factory,
+        )
+        _log(
+            f"{context} deconvolver preflight done device={device} "
+            f"seconds={time.perf_counter() - t_start:.2f}"
+        )
 
 
 def _validate_queue_depth(queue_depth: int) -> None:

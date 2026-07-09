@@ -9,10 +9,14 @@ from squisher_lightsheet import workflow
 
 def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(workflow, "run_lr_dumb_stitch_alignment", lambda **_kwargs: None)
-    monkeypatch.setattr(workflow, "register_tiles", lambda **_kwargs: "registration command")
+    register_calls = []
+    monkeypatch.setattr(
+        workflow,
+        "register_tiles",
+        lambda **kwargs: register_calls.append(kwargs) or "registration command",
+    )
     monkeypatch.setattr(workflow, "render_registration_qc", lambda **_kwargs: "qc command")
     monkeypatch.setattr(workflow, "fuse_tiles", lambda **_kwargs: "fusion command")
-    monkeypatch.setattr(workflow, "add_pyramids", lambda **_kwargs: "pyramid command")
 
     left = tmp_path / "TL"
     right = tmp_path / "TR"
@@ -39,7 +43,9 @@ def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_
     assert summary["parameters"]["rough_phase_dimensions"] == "zyx"
     assert summary["parameters"]["rough_phase_z_sampling"] == "native_center_z_slab"
     assert summary["parameters"]["rough_phase_z_slab_planes"] == 8
+    assert register_calls[0]["registration_pair_mode"] == "axis-aligned"
     assert {"position", "rough_phase", "registration", "qc", "fusion", "pyramid"} <= set(summary["commands"])
+    assert summary["commands"]["pyramid"] == "fusion builds completed OME-Zarr pyramid"
 
 
 def test_run_tltr_pyramid_requires_fusion(tmp_path) -> None:

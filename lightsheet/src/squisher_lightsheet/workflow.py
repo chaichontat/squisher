@@ -15,9 +15,9 @@ from squisher_lightsheet.lr_alignment import (
     lr_dumb_stitch_alignment_paths,
     run_lr_dumb_stitch_alignment,
 )
-from squisher_lightsheet.pyramid import add_pyramids
 from squisher_lightsheet.qc import render_registration_qc
 from squisher_lightsheet.registration import register_tiles
+from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy_registration
 
 
 DEFAULT_LEVEL = 4
@@ -87,11 +87,11 @@ def run_tltr_workflow(
     seam_fraction: float = 0.10,
     z_slab_planes: int = DEFAULT_Z_SLAB_PLANES,
     phase_downsample_zyx: tuple[int, int, int] = DEFAULT_PHASE_DOWNSAMPLE_ZYX,
-    registration_pair_mode: str = "robust-boundary",
+    registration_pair_mode: str = legacy_registration.DEFAULT_REGISTRATION_PAIR_MODE,
     registration_pair_file: Path | None = None,
     skip_registration_plots: bool = True,
     dask_registration_workers: int | None = None,
-    pairwise_jobs: int | None = None,
+    pairwise_jobs: int | None = legacy_registration.DEFAULT_N_PARALLEL_PAIRWISE_REGS,
     do_fuse: bool = False,
     do_pyramid: bool = False,
     dry_run: bool = False,
@@ -215,7 +215,7 @@ def run_tltr_workflow(
             dry_run=dry_run,
         )
         if do_pyramid:
-            commands["pyramid"] = add_pyramids(ome_zarrs=fused_outputs, dry_run=dry_run)
+            commands["pyramid"] = "fusion builds completed OME-Zarr pyramid"
     if not dry_run:
         write_workflow_summary(
             paths.summary_json,

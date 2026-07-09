@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 import numpy as np
 
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
@@ -469,10 +470,13 @@ def run_track_z_diagnostics(
                         reason=reason,
                     )
                 )
-                print(
-                    f"track-z {tile.tile} track={track} channel={channel} "
-                    f"dz_px={dz_px} score={details['corr_after']}",
-                    flush=True,
+                logger.info(
+                    "track-z {} track={} channel={} dz_px={} score={}",
+                    tile.tile,
+                    track,
+                    channel,
+                    dz_px,
+                    details["corr_after"],
                 )
 
     track_measurements = aggregate_track_measurements(
