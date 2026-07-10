@@ -60,6 +60,35 @@ accidentally create millions of tiny chunk files. The default is
 `--min-zarr-chunk-pixels 16777216`. JPEG-XR chunks are restricted to
 `--zarr-chunk-z 1`; use `--zarr-compressor jpegxl` if you need multi-Z chunks.
 
+Add two XY SubIFD pyramid levels to existing OME-TIFF files:
+
+```bash
+uv run squisher pyramid /data/deconvolved-ome-tiffs \
+  --output-dir /data/deconvolved-ome-tiffs.pyramid \
+  --file-workers 1 \
+  --gpu-batch-size 32 \
+  --tiff-maxworkers 4
+```
+
+`pyramid` accepts one or more OME-TIFF files or folders. Folder inputs process only
+top-level `.tif`/`.tiff` files. By default, a folder input writes to a sibling
+`<folder>.pyramid/` directory; pass `--output-dir` to choose a different destination.
+Each level-0 page is copied with its source compression and metadata, and exactly two
+XY SubIFD levels are written for every page. When CuPy/cuCIM and CUDA are available,
+downsampling uses GPU batches controlled by `--gpu-batch-size`.
+
+To rewrite existing OME-TIFFs in place, pass `--overwrite` without `--output-dir`.
+Each file is written to a temporary file in the same directory and replaces the source
+only after that file completes:
+
+```bash
+uv run squisher pyramid /data/deconvolved-ome-tiffs \
+  --overwrite \
+  --file-workers 1 \
+  --gpu-batch-size 32 \
+  --tiff-maxworkers 4
+```
+
 Disable thumbnail output when only the archival OME-TIFFs are needed:
 
 ```bash

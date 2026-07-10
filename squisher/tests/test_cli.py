@@ -15,7 +15,24 @@ def test_cli_exposes_compress_subcommand() -> None:
     assert result.exit_code == 0
     assert "compress" in result.stdout
     assert "compare" in result.stdout
+    assert "pyramid" in result.stdout
+    assert "video" in result.stdout
     assert "verify" in result.stdout
+
+
+def test_pyramid_cli_uses_fixed_two_subifd_levels() -> None:
+    result = CliRunner().invoke(app, ["pyramid", "--help"])
+
+    assert result.exit_code == 0
+    assert "--levels" not in result.stdout
+    assert "--min-size" not in result.stdout
+
+
+def test_readme_documents_pyramid_subcommand() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+
+    assert "uv run squisher pyramid" in readme
+    assert "python -m squisher.tiff_pyramid" not in readme
 
 
 def test_compress_uses_expected_defaults(tmp_path, monkeypatch) -> None:
@@ -34,7 +51,7 @@ def test_compress_uses_expected_defaults(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert captured["level"] == 0.7
-    assert captured["tile_size"] == 512
+    assert captured["tile_size"] is None
     assert captured["maxworkers"] == 8
     assert captured["tile_workers"] == 8
     assert captured["zarr_chunks"] == DEFAULT_ZARR_CHUNKS_TCZYX
@@ -127,7 +144,9 @@ def test_compress_accepts_multiple_czi_paths(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr("squisher.compress_czi_to_ome_tiff", fake_compress_czi_to_ome_tiff)
 
-    result = CliRunner().invoke(app, ["compress", str(first), str(second), "--no-thumbnails", "--pos", str(pos_path)])
+    result = CliRunner().invoke(
+        app, ["compress", str(first), str(second), "--no-thumbnails", "--pos", str(pos_path)]
+    )
 
     assert result.exit_code == 0
     assert captured == [(first, pos_path), (second, pos_path)]
@@ -183,7 +202,9 @@ def test_compress_rejects_duplicate_stems_with_shared_out_dir(tmp_path, monkeypa
 
     monkeypatch.setattr("squisher.compress_czi_to_ome_tiff", fake_compress_czi_to_ome_tiff)
 
-    result = CliRunner().invoke(app, ["compress", str(first), str(second), "--out-dir", str(tmp_path / "out")])
+    result = CliRunner().invoke(
+        app, ["compress", str(first), str(second), "--out-dir", str(tmp_path / "out")]
+    )
 
     assert result.exit_code == 2
 

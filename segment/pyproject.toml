@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "squisher-segment"
+version = "0.1.0"
+description = "Extracted distributed Cellpose segmentation and 3D post-processing tools."
+requires-python = ">=3.12"
+dependencies = [
+    "cellpose @ git+https://github.com/chaichontat/cellpose.git@packed",
+    "click>=8.1",
+    "cucim-cu12>=26.6.0",
+    "cupy-cuda12x",
+    "dask",
+    "dask-jobqueue",
+    "distributed",
+    "imagecodecs",
+    "loguru>=0.7",
+    "numba",
+    "numpy>=1.25,<2.5",
+    "rich>=13.7",
+    "scikit-image>=0.25",
+    "scipy",
+    "tifffile",
+    "typer>=0.15",
+    "torch",
+    "zarr>=3.1",
+    "pyyaml",
+]
+
+[project.scripts]
+squisher-segment = "fishtools.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fishtools"]
+
+[tool.ruff]
+line-length = 110
+lint.ignore = ["E501", "E731", "E713"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

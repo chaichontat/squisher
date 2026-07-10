@@ -11,9 +11,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: squisher
     steps:
       - uses: actions/checkout@v5
 
@@ -21,7 +18,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
-          cache-dependency-glob: squisher/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Set up Python
         run: uv python install
@@ -33,10 +30,13 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Lint
-        run: uv run ruff check --output-format=concise src tests
+        run: uv run ruff check --output-format=concise squisher/src squisher/tests lightsheet/src lightsheet/tests
 
-      - name: Test
-        run: uv run pytest -q
+      - name: Test squisher
+        run: uv run --package squisher pytest -q squisher/tests
+
+      - name: Test lightsheet
+        run: uv run --package squisher-lightsheet pytest -q lightsheet/tests
 
   build-windows-exe:
     runs-on: windows-latest
@@ -53,7 +53,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
-          cache-dependency-glob: squisher/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Set up Python
         run: uv python install
