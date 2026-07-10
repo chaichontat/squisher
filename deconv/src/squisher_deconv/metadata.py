@@ -5,9 +5,13 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from xml.etree import ElementTree
 
 import numpy as np
 import tifffile
+
+
+CZI_SHARED_METADATA_NAMESPACE = "squisher/czi/shared-metadata"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,115 @@ def read_source_metadata(path: Path) -> SourceMetadata:
         raw_dtype=raw_dtype,
         metadata_hash=hashlib.sha256(encoded).hexdigest(),
     )
+
+
+def czi_dataset_metadata_payload(sources: Sequence[Path], outputs: Sequence[Path]) -> dict[str, Any]:
+    """Collect the CZI metadata shared by all inputs and each tile's OME position."""
+    if len(sources) != len(outputs):
+        raise ValueError(
+            f"Expected one output per source, got {len(sources)} sources and {len(outputs)} outputs."
+        )
+
+    shared_metadata_xml: str | None = None
+    positions: list[dict[str, Any]] = []
+    missing_shared_metadata: list[str] = []
+    for source, output in zip(sources, outputs, strict=True):
+        source = Path(source)
+        with tifffile.TiffFile(source) as tif:
+            ome_xml = tif.ome_metadata
+        if ome_xml is None:
+            missing_shared_metadata.append(str(source))
+            positions.append({"path": str(output), "source": str(source)})
+            continue
+        try:
+            ome = ElementTree.fromstring(ome_xml)
+        except ElementTree.ParseError as exc:
+            raise ValueError(f"Invalid OME-XML metadata in {source}: {exc}") from exc
+
+        current_shared = _czi_shared_metadata_xml(ome, source=source)
+        if current_shared is not None:
+            if shared_metadata_xml is None:
+                shared_metadata_xml = current_shared
+            elif current_shared != shared_metadata_xml:
+                raise ValueError(
+                    f"{source} contains different shared CZI metadata from the first input tile."
+                )
+        else:
+            missing_shared_metadata.append(str(source))
+        positions.append(_ome_position_record(ome, source=source, output=Path(output)))
+
+    if shared_metadata_xml is not None:
+        if missing_shared_metadata:
+            raise ValueError(
+                f"Input tile(s) are missing the shared CZI metadata present on other tiles: {missing_shared_metadata}"
+            )
+        missing = [record["source"] for record in positions if "tile_index" not in record]
+        if missing:
+            raise ValueError(f"CZI input tile(s) are missing tile metadata: {missing}")
+    return {"czi_shared_metadata_xml": shared_metadata_xml, "positions": positions}
+
+
+def _czi_shared_metadata_xml(ome: ElementTree.Element, *, source: Path) -> str | None:
+    annotations = [
+        element
+        for element in ome.iter()
+        if _local_name(element.tag) == "XMLAnnotation"
+        and element.attrib.get("Namespace") == CZI_SHARED_METADATA_NAMESPACE
+    ]
+    if not annotations:
+        return None
+    if len(annotations) != 1:
+        raise ValueError(
+            f"Expected one shared CZI metadata annotation in {source}, found {len(annotations)}."
+        )
+    value = next((element for element in annotations[0] if _local_name(element.tag) == "Value"), None)
+    wrapper = None if value is None else next(iter(value), None)
+    shared = None if wrapper is None else next(iter(wrapper), None)
+    if (
+        wrapper is None
+        or _local_name(wrapper.tag) != "CZISharedMetadata"
+        or shared is None
+        or _local_name(shared.tag) != "ImageDocument"
+    ):
+        raise ValueError(f"Malformed shared CZI metadata annotation in {source}.")
+    return ElementTree.tostring(shared, encoding="unicode")
+
+
+def _ome_position_record(ome: ElementTree.Element, *, source: Path, output: Path) -> dict[str, Any]:
+    map_values = {
+        element.attrib["K"]: element.text or ""
+        for element in ome.iter()
+        if _local_name(element.tag) == "M" and "K" in element.attrib
+    }
+    record: dict[str, Any] = {"path": str(output), "source": str(source)}
+    for metadata_key, record_key in (
+        ("squisher.output_tile_index", "tile_index"),
+        ("czi.mosaic_index", "mosaic_index"),
+    ):
+        if metadata_key in map_values:
+            try:
+                record[record_key] = int(map_values[metadata_key])
+            except ValueError as exc:
+                raise ValueError(f"Invalid {metadata_key} in {source}: {map_values[metadata_key]!r}") from exc
+
+    plane = next((element for element in ome.iter() if _local_name(element.tag) == "Plane"), None)
+    if plane is None:
+        return record
+    for axis in ("x", "y", "z"):
+        value = plane.attrib.get(f"Position{axis.upper()}")
+        if value is not None:
+            try:
+                record[axis] = float(value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid Position{axis.upper()} in {source}: {value!r}") from exc
+            unit = plane.attrib.get(f"Position{axis.upper()}Unit")
+            if unit is not None:
+                record[f"{axis}_unit"] = unit
+    return record
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def provenance_payload(

@@ -330,6 +330,16 @@ def test_run_uses_first_input_header_for_all_sources(tmp_path, monkeypatch) -> N
     assert calls == [(inputs[0], 2, "summary")]
     for src in inputs:
         assert (tmp_path / "out" / f"{src.stem}.ome.zarr").exists()
+    assert json.loads((tmp_path / "out" / "metadata.json").read_text()) == {
+        "czi_shared_metadata_xml": None,
+        "positions": [
+            {
+                "path": str(tmp_path / "out" / f"{src.stem}.ome.zarr"),
+                "source": str(src),
+            }
+            for src in inputs
+        ],
+    }
 
 
 def test_streamed_u16_deconv_matches_eager_identity(tmp_path) -> None:

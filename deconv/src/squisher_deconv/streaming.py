@@ -14,6 +14,7 @@ import numpy as np
 
 from squisher_deconv.deconvolution import Deconvolver
 from squisher_deconv.metadata import (
+    czi_dataset_metadata_payload,
     compression_tiff_tag,
     dependency_versions,
     file_provenance_records,
@@ -287,6 +288,25 @@ def run_streaming_deconv(
     paths = [Path(path) for path in inputs]
     psfs = tuple(Path(path) for path in (psf_paths or ()))
     relative_root = output_relative_root(paths)
+    metadata_path = out_dir / "metadata.json"
+    partial_metadata_path = metadata_path.with_name(f".{metadata_path.name}.partial")
+    if metadata_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing dataset metadata {metadata_path}; pass --overwrite to replace it."
+        )
+    if partial_metadata_path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite existing partial dataset metadata {partial_metadata_path}."
+        )
+    output_paths = [output_path_for(out_dir, path, relative_root=relative_root) for path in paths]
+    metadata_text = (
+        json_dumps_strict(
+            czi_dataset_metadata_payload(paths, output_paths),
+            context=f"Dataset metadata for {out_dir}",
+            indent=2,
+        )
+        + "\n"
+    )
     _log(
         "run start "
         f"inputs={len(paths)} out_dir={out_dir} channels={channels} halo={halo} slab_depth={slab_depth} "
@@ -340,6 +360,7 @@ def run_streaming_deconv(
         if failures:
             joined = "\n".join(failures)
             raise ProcessingError(f"{len(failures)} run job(s) failed:\n{joined}")
+        _write_dataset_metadata(metadata_path, metadata_text)
         _log(f"run complete seconds={time.perf_counter() - t_workflow:.2f}")
         return
     schedule = schedule_round_robin(len(paths), devices)
@@ -515,7 +536,19 @@ def run_streaming_deconv(
     if failures:
         joined = "\n".join(failures)
         raise ProcessingError(f"{len(failures)} run job(s) failed:\n{joined}")
+    _write_dataset_metadata(metadata_path, metadata_text)
     _log(f"run complete seconds={time.perf_counter() - t_workflow:.2f}")
+
+
+def _write_dataset_metadata(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.partial")
+    try:
+        partial.write_text(text)
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _jobs_by_device(schedule: Sequence[ScheduledJob]) -> dict[int, list[ScheduledJob]]:
