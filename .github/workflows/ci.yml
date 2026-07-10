@@ -36,6 +36,8 @@ jobs:
         run: uv run --package squisher pytest -q squisher/tests
 
       - name: Test lightsheet
+        env:
+          _TYPER_FORCE_DISABLE_TERMINAL: "1"
         run: uv run --package squisher-lightsheet pytest -q lightsheet/tests
 
   build-windows-exe:

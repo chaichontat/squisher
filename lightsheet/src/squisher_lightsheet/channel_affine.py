@@ -332,10 +332,10 @@ def output_to_input_from_model(
     moving_to_fixed_translation: np.ndarray,
     shape_zyx: tuple[int, int, int],
 ) -> tuple[np.ndarray, np.ndarray]:
-    center = (np.asarray(shape_zyx, dtype=np.float32) - np.float32(1.0)) / np.float32(2.0)
-    inverse = np.linalg.inv(moving_to_fixed_matrix).astype(np.float32)
-    offset = center - inverse @ (center + moving_to_fixed_translation.astype(np.float32))
-    return inverse, offset.astype(np.float32)
+    center = (np.asarray(shape_zyx, dtype=np.float64) - 1.0) / 2.0
+    inverse = np.linalg.inv(np.asarray(moving_to_fixed_matrix, dtype=np.float64))
+    offset = center - inverse @ (center + np.asarray(moving_to_fixed_translation, dtype=np.float64))
+    return inverse, offset
 
 
 def model_to_level0(
@@ -410,7 +410,7 @@ def output_to_input_to_model(
     center = (np.asarray(shape_zyx, dtype=np.float64) - 1.0) / 2.0
     moving_to_fixed = np.linalg.inv(np.asarray(matrix, dtype=np.float64))
     translation = moving_to_fixed @ (center - np.asarray(offset, dtype=np.float64)) - center
-    return moving_to_fixed.astype(np.float32), translation.astype(np.float32)
+    return moving_to_fixed, translation
 
 
 def center_model_to_homogeneous_um(
