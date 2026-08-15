@@ -31,6 +31,7 @@ from squisher_lightsheet.channel_subtraction import (
 from squisher_lightsheet.candidate_grid import render_candidate_grid
 from squisher_lightsheet.channel_affine import (
     align_tiles_to_reference_affine,
+    write_global_channel_affine_registration,
 )
 from squisher_lightsheet.cross_register_method8 import (
     DEFAULT_LIB_DIR as DEFAULT_CROSS_REGISTER_METHOD8_LIB_DIR,
@@ -128,6 +129,42 @@ def _parse_source_view_flatfield_dirs(values: list[str] | None) -> dict[str, Pat
 
 def _log_progress(message: str) -> None:
     logger.info(message)
+
+
+@app.command("channel-affine-registration")
+def channel_affine_registration(
+    window_dir: Annotated[
+        Path, typer.Option("--window-dir", exists=True, file_okay=False, readable=True)
+    ],
+    reference_registration: Annotated[
+        Path,
+        typer.Option(
+            "--reference-registration", exists=True, dir_okay=False, readable=True
+        ),
+    ],
+    output_registration: Annotated[Path, typer.Option("--output-registration")],
+    expected_moving_channel: Annotated[
+        int, typer.Option("--expected-moving-channel", min=0)
+    ],
+    expected_fixed_fused: Annotated[
+        Path,
+        typer.Option("--expected-fixed-fused", exists=True, file_okay=False, readable=True),
+    ],
+    source_label: Annotated[str, typer.Option("--source-label")],
+    target_label: Annotated[str, typer.Option("--target-label")],
+) -> None:
+    """Build one global channel affine from accepted fused-fixed windows."""
+    typer.echo(
+        write_global_channel_affine_registration(
+            window_dir=window_dir,
+            reference_registration_input=reference_registration,
+            output_registration=output_registration,
+            expected_moving_channel=expected_moving_channel,
+            expected_fixed_fused=expected_fixed_fused,
+            source_label=source_label,
+            target_label=target_label,
+        )
+    )
 
 
 @app.command("fused-fixed-contact-sheet")

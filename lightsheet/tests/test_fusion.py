@@ -199,19 +199,31 @@ def test_fuse_defaults_downsampled_materialization_to_zstd(monkeypatch, tmp_path
     assert args[args.index("--output-codec") + 1] == "zstd"
 
 
-def test_fuse_rejects_downsampled_materialization_on_level0_template(tmp_path) -> None:
+def test_fuse_allows_downsampled_input_on_matching_level0_template(
+    monkeypatch, tmp_path
+) -> None:
+    captured = {}
     position = tmp_path / "positions.json"
     position.write_text(json.dumps({"materialization_grid": {"level_factor_zyx": [4, 4, 4]}, "tiles": []}))
 
-    with pytest.raises(ValueError, match="cannot produce native level 0"):
-        fuse_tiles(
-            input_dir=tmp_path / "tiles",
-            position_input=position,
-            registration_input=tmp_path / "registration.json",
-            output=tmp_path / "production.ome.zarr",
-            output_grid_template=tmp_path / "fixed.ome.zarr",
-            output_grid_template_level=0,
-        )
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+
+    fuse_tiles(
+        input_dir=tmp_path / "tiles",
+        position_input=position,
+        registration_input=tmp_path / "registration.json",
+        output=tmp_path / "preview.ome.zarr",
+        output_grid_template=tmp_path / "fixed-preview.ome.zarr",
+        output_grid_template_level=0,
+    )
+
+    args = captured["args"]
+    assert args[args.index("--output-codec") + 1] == "zstd"
+    assert args[args.index("--output-grid-template-level") + 1] == "0"
 
 
 @pytest.mark.parametrize("with_fusion_weights", [False, True])

@@ -153,7 +153,8 @@ def test_streamed_ome_zarr_writes_czyx_array_with_metadata(tmp_path) -> None:
     root = zarr.open_group(str(output), mode="r")
     array = root["0"]
     assert tuple(array.shape) == (2, 2, 5, 6)
-    assert tuple(array.chunks) == (1, 2, 5, 6)
+    assert tuple(array.chunks) == (1, 1, 5, 6)
+    assert tuple(array.metadata.shards) == (1, 2, 5, 6)
     assert np.dtype(array.dtype) == np.uint16
     assert tuple(array.metadata.dimension_names) == ("c", "z", "y", "x")
     assert array.metadata.zarr_format == 3
@@ -189,11 +190,17 @@ def test_streamed_ome_zarr_writes_czyx_array_with_metadata(tmp_path) -> None:
     assert root.attrs["squisher_deconv"]["source_metadata"]["ome_xml"] == ome_xml
     assert root.attrs["squisher_deconv"]["source_ome"]["channel_names"] == ["WGA", "DAPI"]
     assert root.attrs["squisher_deconv"]["source_metadata_summary"]["raw_shape"] == [4, 5, 6]
-    np.testing.assert_array_equal(np.moveaxis(array[:], 0, 1).reshape(4, 5, 6), payload)
+    assert root.attrs["squisher_deconv"]["storage"]["codec"] == {
+        "name": "squisher.jpegxr",
+        "level": 0.7,
+        "checksum": "crc32c",
+    }
+    np.testing.assert_allclose(np.moveaxis(array[:], 0, 1).reshape(4, 5, 6), payload, atol=4)
     expected_level1 = np.rint(payload[:, :4, :].reshape(4, 2, 2, 3, 2).mean(axis=(2, 4))).astype(np.uint16)
     expected_level2 = np.rint(payload[:, :4, :4].reshape(4, 1, 4, 1, 4).mean(axis=(2, 4))).astype(np.uint16)
-    np.testing.assert_array_equal(np.moveaxis(root["1"][:], 0, 1).reshape(4, 2, 3), expected_level1)
-    np.testing.assert_array_equal(np.moveaxis(root["2"][:], 0, 1).reshape(4, 1, 1), expected_level2)
+    # JPEG-XR block coding is least accurate for these intentionally tiny 2x3 test planes.
+    np.testing.assert_allclose(np.moveaxis(root["1"][:], 0, 1).reshape(4, 2, 3), expected_level1, atol=16)
+    np.testing.assert_allclose(np.moveaxis(root["2"][:], 0, 1).reshape(4, 1, 1), expected_level2, atol=4)
 
 
 def test_streamed_ome_zarr_sidecar_failure_removes_final_output(tmp_path, monkeypatch) -> None:

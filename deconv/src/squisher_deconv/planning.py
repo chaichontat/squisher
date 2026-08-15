@@ -100,11 +100,9 @@ def sample_planes_from_z_counts(
 ) -> list[SamplePlane]:
     populations = [int(count) for count in z_counts]
     total = sum(populations)
-    if planes > total:
-        raise ValueError(f"Requested {planes} sampled plane(s), but only {total} logical plane(s) exist.")
     offsets = np.cumsum([0, *populations])
     rng = np.random.default_rng(seed)
-    selected = np.sort(rng.choice(total, size=planes, replace=False))
+    selected = np.sort(rng.choice(total, size=min(planes, total), replace=False))
     out: list[SamplePlane] = []
     for flat in selected:
         file_index = int(np.searchsorted(offsets, flat, side="right") - 1)

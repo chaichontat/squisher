@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -76,6 +77,96 @@ def test_load_image_zyx_reads_ome_tiff_stack(tmp_path) -> None:
     loaded = load_image_zyx(path)
 
     assert np.array_equal(loaded, volume)
+
+
+def test_load_image_zyx_can_discard_leading_z_planes(tmp_path) -> None:
+    volume = np.arange(4 * 5 * 7, dtype=np.uint16).reshape(4, 5, 7)
+    path = tmp_path / "stack.ome.tif"
+    tifffile.imwrite(path, volume, metadata={"axes": "ZYX"})
+
+    loaded = load_image_zyx(path, z_start=2)
+
+    assert np.array_equal(loaded, volume[2:])
+    with pytest.raises(ValueError, match="z_start=4"):
+        load_image_zyx(path, z_start=4)
+
+
+@pytest.mark.parametrize("command", ["detect-beads", "make-median", "render-centroid-qc"])
+def test_acquisition_commands_expose_z_start(command: str) -> None:
+    result = CliRunner().invoke(app, [command, "--help"])
+
+    assert result.exit_code == 0
+    assert "--z-start" in result.stdout
+
+
+def test_detect_beads_defaults_to_june_fwhm() -> None:
+    result = CliRunner().invoke(app, ["detect-beads", "--help"])
+
+    assert result.exit_code == 0
+    fwhm_line = next(line for line in result.stdout.splitlines() if "--fwhm" in line)
+    assert "[default: 1.5]" in fwhm_line
+
+
+def write_synthetic_bead_input(tmp_path: Path) -> tuple[Path, Path]:
+    z, y, x = np.indices((25, 31, 41), dtype=np.float64)
+    volume = sum(
+        1000 * np.exp(-(((z - 12) / 3.5) ** 2 + ((y - 15) / 2.0) ** 2 + ((x - xc) / 2.0) ** 2))
+        for xc in (12, 28)
+    )
+    image = tmp_path / "bead.ome.tif"
+    centers = tmp_path / "beads.csv"
+    tifffile.imwrite(image, volume.astype(np.float32), metadata={"axes": "ZYX"})
+    pd.DataFrame(
+        {
+            "id": [1, 2],
+            "z": [12.0, 12.0],
+            "y": [15.0, 15.0],
+            "x": [12.0, 28.0],
+            "peak_intensity": [1000, 1000],
+        }
+    ).to_csv(centers, index=False)
+    return image, centers
+
+
+def test_make_median_defaults_to_june_standard_profile(tmp_path) -> None:
+    image, centers = write_synthetic_bead_input(tmp_path)
+    prefix = tmp_path / "std"
+
+    result = CliRunner().invoke(
+        app, ["make-median", str(image), str(centers), "--prefix", str(prefix)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "profile=june-std" in result.output
+    assert tifffile.imread(tmp_path / "std_peaknorm.tif").shape == (21, 21, 21)
+    quality = pd.read_csv(tmp_path / "std_quality.csv")
+    assert quality["z_fwhm_min_px"].isna().all()
+
+
+def test_make_median_june_571_profile_owns_strict_z_defaults(tmp_path) -> None:
+    image, centers = write_synthetic_bead_input(tmp_path)
+    prefix = tmp_path / "strict"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "make-median",
+            str(image),
+            str(centers),
+            "--profile",
+            "june-571-zstrict",
+            "--prefix",
+            str(prefix),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "profile=june-571-zstrict" in result.output
+    quality = pd.read_csv(tmp_path / "strict_quality.csv")
+    assert quality["z_fwhm_min_px"].eq(5.0).all()
+    assert quality["z_support_span_min_px"].eq(9.0).all()
+    assert quality["z_pre_tail_fraction_offset4_min"].eq(0.05).all()
+    assert quality["central_z_peak_offset_max_px"].eq(2.0).all()
 
 
 def test_measure_shear_cli_writes_report_with_manifest(tmp_path) -> None:
@@ -181,6 +272,67 @@ def test_radialize_rejects_nan_raw_peak(tmp_path) -> None:
     assert "positive finite peak" in result.output
 
 
+def test_weighted_average_cli_normalizes_inputs_and_weights(tmp_path) -> None:
+    first = np.zeros((5, 7, 7), dtype=np.float32)
+    second = np.zeros_like(first)
+    first[2, 3, 3] = 2
+    second[2, 3, 4] = 4
+    first_path = tmp_path / "first.tif"
+    second_path = tmp_path / "second.tif"
+    output_path = tmp_path / "average.tif"
+    report_path = tmp_path / "average.json"
+    tifffile.imwrite(first_path, first, metadata={"axes": "ZYX"})
+    tifffile.imwrite(second_path, second, metadata={"axes": "ZYX"})
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "weighted-average",
+            str(first_path),
+            str(second_path),
+            "--weights",
+            "1,3",
+            "--output",
+            str(output_path),
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    average = tifffile.imread(output_path)
+    assert float(average.sum()) == pytest.approx(1.0)
+    assert float(average[2, 3, 3]) == pytest.approx(0.25)
+    assert float(average[2, 3, 4]) == pytest.approx(0.75)
+    report = json.loads(report_path.read_text())
+    assert report["normalized_weights"] == pytest.approx([0.25, 0.75])
+
+
+def test_weighted_average_cli_rejects_shape_mismatch(tmp_path) -> None:
+    first_path = tmp_path / "first.tif"
+    second_path = tmp_path / "second.tif"
+    tifffile.imwrite(first_path, np.ones((5, 7, 7), dtype=np.float32), metadata={"axes": "ZYX"})
+    tifffile.imwrite(second_path, np.ones((7, 7, 7), dtype=np.float32), metadata={"axes": "ZYX"})
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "weighted-average",
+            str(first_path),
+            str(second_path),
+            "--weights",
+            "1,1",
+            "--output",
+            str(tmp_path / "average.tif"),
+            "--report",
+            str(tmp_path / "average.json"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "same shape" in result.output
+
+
 def test_add_quality_flags_and_crop_alignment_on_synthetic_stack() -> None:
     stack = np.zeros((9, 15, 15), dtype=np.float32)
     stack[4, 7, 7] = 100.0
@@ -200,6 +352,44 @@ def test_add_quality_flags_and_crop_alignment_on_synthetic_stack() -> None:
     assert bool(quality.loc[0, "basic_quality"])
     assert bool(quality.loc[0, "full_crop"])
     assert np.unravel_index(int(np.nanargmax(crop)), crop.shape) == (2, 2, 2)
+
+
+def test_fractional_full_crop_alignment_is_finite() -> None:
+    center = np.array([4.25, 7.25, 7.25])
+    grid = np.indices((9, 15, 15), dtype=np.float64)
+    stack = np.exp(-np.sum((grid - center[:, None, None, None]) ** 2, axis=0)).astype(np.float32)
+    beads = pd.DataFrame(
+        {
+            "id": [1],
+            "z": [center[0]],
+            "y": [center[1]],
+            "x": [center[2]],
+            "peak_intensity": [float(stack.max())],
+        }
+    )
+
+    quality = add_quality_flags(beads, stack.shape, (5, 5, 5), min_xy_distance=2.0)
+    crop = crop_and_align(stack, quality.iloc[0], (5, 5, 5))
+
+    assert bool(quality.loc[0, "full_crop"])
+    assert np.isfinite(crop).all()
+    assert np.unravel_index(int(np.argmax(crop)), crop.shape) == (2, 2, 2)
+
+
+def test_full_crop_uses_fractional_sampling_bounds() -> None:
+    beads = pd.DataFrame(
+        {
+            "id": [1],
+            "z": [1.75],
+            "y": [7.0],
+            "x": [7.0],
+            "peak_intensity": [1.0],
+        }
+    )
+
+    quality = add_quality_flags(beads, (9, 15, 15), (5, 5, 5), min_xy_distance=2.0)
+
+    assert not bool(quality.loc[0, "full_crop"])
 
 
 def test_build_medians_outputs_quality_columns_and_peaknorm_crops() -> None:

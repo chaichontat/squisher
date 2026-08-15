@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -13,13 +13,15 @@ from typing import Any, Sequence
 import numpy as np
 import zarr
 
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL
+
 from squisher_deconv.deconvolution import Deconvolver
 from squisher_deconv.metadata import (
     czi_dataset_metadata_payload,
     dependency_versions,
+    file_stat_record,
     file_provenance_records,
     json_dumps_strict,
-    provenance_payload,
 )
 from squisher_deconv.planning import (
     group_sample_windows,
@@ -27,7 +29,6 @@ from squisher_deconv.planning import (
     output_relative_root,
     output_sidecar_path,
     sample_planes_from_z_counts,
-    slab_windows,
 )
 from squisher_deconv.process_workers import (
     ProcessRunConfig,
@@ -37,12 +38,10 @@ from squisher_deconv.process_workers import (
 from squisher_deconv.scaling import (
     collate_scaling,
     load_scaling,
-    quantize_global,
     save_float32_sample,
     validate_scaling_channels,
 )
 from squisher_deconv.scheduler import ScheduledJob, schedule_round_robin
-from squisher_deconv.sink import write_streamed_ome_zarr_with_sidecar
 from squisher_deconv.source import TiffLogicalSource
 
 
@@ -312,29 +311,29 @@ def run_streaming_deconv(
     channels: int,
     halo: int,
     slab_depth: int,
-    output_mode: str,
-    deconvolver: Deconvolver | None,
     psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
     deconvolver_factory: Callable[[int], Deconvolver] | None = None,
     devices: list[int],
     queue_depth: int,
     stop_on_error: bool,
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
     overwrite: bool = False,
     resume: bool = False,
 ) -> None:
     t_workflow = time.perf_counter()
     _validate_queue_depth(queue_depth)
-    if output_mode not in {"u16", "float32"}:
-        raise ValueError(f"Unsupported output_mode={output_mode!r}; expected 'u16' or 'float32'.")
-    if output_mode == "u16" and scaling_path is None:
-        raise ValueError("output_mode='u16' requires a scaling path.")
+    if scaling_path is None:
+        raise ValueError("run requires a scaling path.")
+    if deconvolver_factory is None or not getattr(deconvolver_factory, "process_safe", False):
+        raise ValueError("run requires a process-safe deconvolver factory.")
     paths = [Path(path) for path in inputs]
     psfs = tuple(Path(path) for path in (psf_paths or ()))
     _log(
         "run start "
         f"inputs={len(paths)} out_dir={out_dir} channels={channels} halo={halo} slab_depth={slab_depth} "
-        f"output_mode={output_mode} devices={devices} queue_depth={queue_depth} overwrite={overwrite}"
+        f"output_mode=u16 jpegxr_level={jpegxr_level} devices={devices} "
+        f"queue_depth={queue_depth} overwrite={overwrite}"
     )
     _log(f"run scaling={scaling_path}")
     for psf_path in psfs:
@@ -355,9 +354,28 @@ def run_streaming_deconv(
             f"Refusing to overwrite existing partial dataset metadata {partial_metadata_path}."
         )
     output_paths = [output_path_for(out_dir, path, relative_root=relative_root) for path in paths]
-    work_paths = _resume_pending_paths(paths, output_paths) if resume else paths
     if resume:
+        expected_resume_identity = {
+            "run_settings": {
+                "channels": int(channels),
+                "halo": int(halo),
+                "slab_depth": int(slab_depth),
+                "iterations": None if iterations is None else int(iterations),
+                "output_mode": "u16",
+                "jpegxr_level": float(jpegxr_level),
+            },
+            "psfs": file_provenance_records(psfs),
+            "basic_profiles": file_provenance_records(basic_paths or []),
+            "scaling": file_provenance_records([scaling_path])[0],
+        }
+        work_paths = _resume_pending_paths(
+            paths,
+            output_paths,
+            expected_identity=expected_resume_identity,
+        )
         _log(f"run resume complete={len(paths) - len(work_paths)} pending={len(work_paths)}")
+    else:
+        work_paths = paths
     metadata_text = (
         json_dumps_strict(
             czi_dataset_metadata_payload(paths, output_paths),
@@ -366,221 +384,35 @@ def run_streaming_deconv(
         )
         + "\n"
     )
-    scaling = load_scaling(scaling_path) if output_mode == "u16" else None
-    if scaling is not None:
-        validate_scaling_channels(scaling, channels=channels, context=f"Scaling file {scaling_path}")
+    scaling = load_scaling(scaling_path)
+    validate_scaling_channels(scaling, channels=channels, context=f"Scaling file {scaling_path}")
     if not work_paths:
         _write_dataset_metadata(metadata_path, metadata_text)
         _log(f"run complete seconds={time.perf_counter() - t_workflow:.2f}")
         return
-    if (
-        output_mode == "u16"
-        and deconvolver is None
-        and deconvolver_factory is not None
-        and getattr(deconvolver_factory, "process_safe", False)
-    ):
-        if scaling is None or scaling_path is None:
-            raise RuntimeError("Process GPU u16 run requires loaded scaling parameters.")
-        failures = run_process_gpu_streaming_deconv(
-            work_paths,
-            template_source=template_source,
-            scaling=scaling,
-            deconvolver_factory=deconvolver_factory,
-            config=ProcessRunConfig(
-                out_dir=out_dir,
-                channels=channels,
-                halo=halo,
-                slab_depth=slab_depth,
-                output_mode=output_mode,
-                psf_paths=psfs,
-                basic_paths=tuple(Path(path) for path in (basic_paths or ())),
-                scaling_path=scaling_path,
-                devices=tuple(int(device) for device in devices),
-                queue_depth=queue_depth,
-                overwrite=overwrite,
-                output_relative_root=relative_root,
-                iterations=None if iterations is None else int(iterations),
-            ),
-            stop_on_error=stop_on_error,
-        )
-        if failures:
-            joined = "\n".join(failures)
-            raise ProcessingError(f"{len(failures)} run job(s) failed:\n{joined}")
-        _write_dataset_metadata(metadata_path, metadata_text)
-        _log(f"run complete seconds={time.perf_counter() - t_workflow:.2f}")
-        return
-    schedule = schedule_round_robin(len(work_paths), devices)
-    _log(f"run schedule ready jobs={len(schedule)} devices={devices}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    failures: list[str] = []
-
-    def process_device_jobs(device: int, jobs: list[ScheduledJob]) -> list[str]:
-        device_deconvolver = _device_deconvolver(
-            device,
-            deconvolver=deconvolver,
-            deconvolver_factory=deconvolver_factory,
-        )
-        if (
-            output_mode == "u16"
-            and deconvolver_factory is not None
-            and not hasattr(device_deconvolver, "deconvolve_core_u16")
-        ):
-            raise TypeError(
-                "Production u16 output requires a deconvolver with deconvolve_core_u16 so quantization remains "
-                "on the GPU until final uint16 transfer."
-            )
-        local_failures: list[str] = []
-        _log(f"worker start device={device} files={len(jobs)}")
-        for scheduled in jobs:
-            source = _source_for_path(template_source, work_paths[scheduled.index])
-            slabs = slab_windows([source.path], z_counts=[source.z_count], slab_depth=slab_depth, halo=halo)
-            output_path = output_path_for(out_dir, source.path, relative_root=relative_root)
-            _log(
-                f"file start device={device} file_index={scheduled.index} file={source.path.name} "
-                f"slabs={len(slabs)} output={output_path}"
-            )
-
-            def core_iter():
-                def read_slab(item):
-                    t_read = time.perf_counter()
-                    _log(
-                        f"read start device={device} file={source.path.name} "
-                        f"read_z=[{item.read_start},{item.read_stop})"
-                    )
-                    data = source.read_window(item.read_start, item.read_stop)
-                    _log(
-                        f"read done device={device} file={source.path.name} "
-                        f"read_z=[{item.read_start},{item.read_stop}) shape={data.shape} "
-                        f"dtype={data.dtype} seconds={time.perf_counter() - t_read:.2f}"
-                    )
-                    return data
-
-                for slab_index, (slab, read, read_error) in enumerate(
-                    _prefetched_reads(
-                        slabs,
-                        queue_depth=queue_depth,
-                        read=read_slab,
-                    )
-                ):
-                    t_slab = time.perf_counter()
-                    _log(
-                        f"slab received device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
-                        f"read_z=[{slab.read_start},{slab.read_stop}) core_z=[{slab.core_start},{slab.core_stop}) "
-                        f"shape={None if read is None else read.shape}"
-                    )
-                    if read_error is not None:
-                        raise read_error
-                    t_deconv = time.perf_counter()
-                    _log(
-                        f"deconv start device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
-                        f"input_shape={read.shape}"
-                    )
-                    core_start = slab.core_start - slab.read_start
-                    core_stop = slab.core_stop - slab.read_start
-                    if output_mode == "u16" and hasattr(device_deconvolver, "deconvolve_core_u16"):
-                        if scaling is None:
-                            raise RuntimeError(
-                                "u16 output reached quantization without loaded scaling parameters."
-                            )
-                        chunk = device_deconvolver.deconvolve_core_u16(
-                            read,
-                            core_start=core_start,
-                            core_stop=core_stop,
-                            scaling=scaling,
-                        )
-                        _validate_u16_core_chunk(
-                            chunk,
-                            source=source,
-                            core_planes=slab.core_stop - slab.core_start,
-                        )
-                        _log(
-                            f"deconv+quant done device={device} file={source.path.name} "
-                            f"slab={slab_index}/{len(slabs)} output_shape={chunk.shape} "
-                            f"seconds={time.perf_counter() - t_deconv:.2f}"
-                        )
-                    else:
-                        deconvolved = device_deconvolver.deconvolve(read)
-                        _log(
-                            f"deconv done device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
-                            f"output_shape={deconvolved.shape} seconds={time.perf_counter() - t_deconv:.2f}"
-                        )
-                        core = deconvolved[core_start:core_stop]
-                        if output_mode == "u16":
-                            if scaling is None:
-                                raise RuntimeError(
-                                    "u16 output reached quantization without loaded scaling parameters."
-                                )
-                            chunk = quantize_global(core, scaling)
-                        else:
-                            chunk = core.astype(np.float32, copy=False).reshape(
-                                -1, source.height, source.width
-                            )
-                    _log(
-                        f"slab ready device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
-                        f"chunk_shape={chunk.shape} seconds={time.perf_counter() - t_slab:.2f}"
-                    )
-                    yield chunk
-
-            provenance = provenance_payload(
-                source.path,
-                channels=channels,
-                halo=halo,
-                slab_depth=slab_depth,
-                iterations=None if iterations is None else int(iterations),
-                psf_paths=psfs,
-                basic_paths=basic_paths,
-                output_mode=output_mode,
-                scaling_path=scaling_path,
-                devices=devices,
-                queue_depth=queue_depth,
-            )
-            sidecar_payload = {
-                "source_metadata": asdict(source.metadata),
-                "provenance": provenance,
-                "chunking": {"slab_depth": slab_depth, "halo": halo},
-                "output_mode": output_mode,
-            }
-            sidecar_text = json_dumps_strict(
-                sidecar_payload,
-                context=f"Deconvolution sidecar for {source.path}",
-                indent=2,
-            )
-            try:
-                sidecar = output_sidecar_path(output_path)
-                if sidecar.exists() and not overwrite:
-                    raise FileExistsError(
-                        f"Refusing to overwrite existing sidecar {sidecar}; pass --overwrite to replace it."
-                    )
-                t_file = time.perf_counter()
-                write_streamed_ome_zarr_with_sidecar(
-                    output_path,
-                    sidecar_path=sidecar,
-                    sidecar_text=sidecar_text,
-                    source=source,
-                    core_plane_chunks=core_iter(),
-                    output_mode=output_mode,
-                    provenance=provenance,
-                    overwrite=overwrite,
-                )
-            except Exception as exc:
-                if stop_on_error:
-                    raise
-                local_failures.append(f"{source.path} on device {device}: {exc}")
-                continue
-            _log(
-                f"file complete device={device} file_index={scheduled.index} file={source.path.name} "
-                f"seconds={time.perf_counter() - t_file:.2f}"
-            )
-        return local_failures
-
-    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-        futures = [
-            executor.submit(process_device_jobs, device, jobs)
-            for device, jobs in _jobs_by_device(schedule).items()
-        ]
-        for future in as_completed(futures):
-            failures.extend(future.result())
-
+    failures = run_process_gpu_streaming_deconv(
+        work_paths,
+        template_source=template_source,
+        scaling=scaling,
+        deconvolver_factory=deconvolver_factory,
+        config=ProcessRunConfig(
+            out_dir=out_dir,
+            channels=channels,
+            halo=halo,
+            slab_depth=slab_depth,
+            output_mode="u16",
+            psf_paths=psfs,
+            basic_paths=tuple(Path(path) for path in (basic_paths or ())),
+            scaling_path=scaling_path,
+            devices=tuple(int(device) for device in devices),
+            queue_depth=queue_depth,
+            overwrite=overwrite,
+            output_relative_root=relative_root,
+            iterations=None if iterations is None else int(iterations),
+            jpegxr_level=jpegxr_level,
+        ),
+        stop_on_error=stop_on_error,
+    )
     if failures:
         joined = "\n".join(failures)
         raise ProcessingError(f"{len(failures)} run job(s) failed:\n{joined}")
@@ -599,7 +431,12 @@ def _write_dataset_metadata(path: Path, text: str) -> None:
         raise
 
 
-def _resume_pending_paths(paths: Sequence[Path], output_paths: Sequence[Path]) -> list[Path]:
+def _resume_pending_paths(
+    paths: Sequence[Path],
+    output_paths: Sequence[Path],
+    *,
+    expected_identity: dict[str, Any],
+) -> list[Path]:
     pending: list[Path] = []
     for source, output in zip(paths, output_paths, strict=True):
         sidecar = output_sidecar_path(output)
@@ -613,6 +450,42 @@ def _resume_pending_paths(paths: Sequence[Path], output_paths: Sequence[Path]) -
         root = zarr.open_group(str(output), mode="r")
         if root.attrs.get("squisher_complete") is not True:
             raise ValueError(f"Cannot resume {source}: {output} is missing squisher_complete=true.")
+        try:
+            provenance = json.loads(sidecar.read_text())["provenance"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError(f"Cannot resume {source}: {sidecar} has invalid provenance.") from exc
+        if provenance.get("source_file") != file_stat_record(source):
+            raise ValueError(f"Cannot resume {source}: recorded source identity differs from the current file.")
+        expected_settings = expected_identity["run_settings"]
+        recorded_settings = provenance.get("run_settings")
+        if not isinstance(recorded_settings, dict) or {
+            key: recorded_settings.get(key) for key in expected_settings
+        } != expected_settings:
+            raise ValueError(f"Cannot resume {source}: recorded run settings differ from the current run.")
+        for key in ("psfs", "basic_profiles", "scaling"):
+            if provenance.get(key) != expected_identity[key]:
+                raise ValueError(f"Cannot resume {source}: recorded {key} differ from the current run.")
+        source_summary = TiffLogicalSource.open(
+            source,
+            channels=int(expected_settings["channels"]),
+            metadata_mode="summary",
+        )
+        expected_shape = (
+            source_summary.channels,
+            source_summary.z_count,
+            source_summary.height,
+            source_summary.width,
+        )
+        if "0" not in root:
+            raise ValueError(f"Cannot resume {source}: {output} is missing level-0 array '0'.")
+        level0 = root["0"]
+        if tuple(level0.shape) != expected_shape:
+            raise ValueError(
+                f"Cannot resume {source}: {output} level-0 shape {tuple(level0.shape)} "
+                f"differs from expected {expected_shape}."
+            )
+        if np.dtype(level0.dtype) != np.dtype(np.uint16):
+            raise ValueError(f"Cannot resume {source}: {output} level-0 dtype is {level0.dtype}, expected uint16.")
     return pending
 
 
@@ -667,14 +540,6 @@ def _preflight_device_deconvolvers(
 def _validate_queue_depth(queue_depth: int) -> None:
     if queue_depth < 1:
         raise ValueError(f"queue_depth must be at least 1, got {queue_depth}")
-
-
-def _validate_u16_core_chunk(chunk: np.ndarray, *, source: TiffLogicalSource, core_planes: int) -> None:
-    expected_shape = (core_planes * source.channels, source.height, source.width)
-    if chunk.dtype != np.uint16:
-        raise TypeError(f"deconvolve_core_u16 must return uint16 data, got {chunk.dtype}.")
-    if chunk.shape != expected_shape:
-        raise ValueError(f"deconvolve_core_u16 returned shape {chunk.shape}, expected {expected_shape}.")
 
 
 def _prefetched_reads(

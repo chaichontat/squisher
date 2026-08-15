@@ -70,10 +70,63 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "track-z-diagnostics",
         "align-lr-dumb-stitch",
         "tile-phase-align",
+        "channel-affine-registration",
         "cross-register-method8",
         "run-tltr",
     ):
         assert command in result.stdout
+
+
+def test_channel_affine_registration_cli_forwards_required_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    window_dir = tmp_path / "windows"
+    window_dir.mkdir()
+    reference = tmp_path / "reference.json"
+    reference.touch()
+    fixed_fused = tmp_path / "fixed.ome.zarr"
+    fixed_fused.mkdir()
+    output = tmp_path / "output.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(cli_module, "write_global_channel_affine_registration", fake_write)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "channel-affine-registration",
+            "--window-dir",
+            str(window_dir),
+            "--reference-registration",
+            str(reference),
+            "--output-registration",
+            str(output),
+            "--expected-moving-channel",
+            "1",
+            "--expected-fixed-fused",
+            str(fixed_fused),
+            "--source-label",
+            "638",
+            "--target-label",
+            "561",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(output.resolve())
+    assert captured == {
+        "window_dir": window_dir,
+        "reference_registration_input": reference,
+        "output_registration": output,
+        "expected_moving_channel": 1,
+        "expected_fixed_fused": fixed_fused,
+        "source_label": "638",
+        "target_label": "561",
+    }
 
 
 def test_cli_registers_jpegxr_codec_before_command(tmp_path: Path, monkeypatch) -> None:

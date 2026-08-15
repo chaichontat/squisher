@@ -38,21 +38,13 @@ def resolve_fusion_output_codec(
     *,
     position_input: Path,
     fusion_level: int,
-    output_grid_template: Path | None,
-    output_grid_template_level: int,
     output_codec: OutputCodec,
 ) -> Literal["zstd", "jpegxr"]:
     """Resolve the standard codec from the actual output resolution contract."""
     materialization_factors = _materialization_level_factor_zyx(position_input)
     native_source = materialization_factors == (1, 1, 1) and fusion_level == 0
-    if output_grid_template is not None and output_grid_template_level == 0 and not native_source:
-        raise ValueError(
-            "downsampled materialization or fusion input cannot produce native level 0; "
-            "use corrected level-0 source tiles with fusion_level=0"
-        )
-    native_output = native_source if output_grid_template is None else output_grid_template_level == 0
     if output_codec == "auto":
-        return "jpegxr" if native_output else "zstd"
+        return "jpegxr" if native_source else "zstd"
     return output_codec
 
 
@@ -131,8 +123,6 @@ def fuse_tiles(
     resolved_output_codec = resolve_fusion_output_codec(
         position_input=position_input,
         fusion_level=fusion_level,
-        output_grid_template=output_grid_template,
-        output_grid_template_level=output_grid_template_level,
         output_codec=output_codec,
     )
     args = [

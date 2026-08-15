@@ -8,17 +8,16 @@ from xml.etree import ElementTree
 
 import numpy as np
 import zarr
-from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
 
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL, jpegxr_sharding_codec
 from squisher_deconv.metadata import json_dumps_strict
 from squisher_deconv.source import TiffLogicalSource
 
 
 _DIMENSION_NAMES = ("c", "z", "y", "x")
-_INNER_CHUNKS_CZYX = (1, 12, 240, 240)
+_INNER_CHUNKS_CZYX = (1, 1, 240, 240)
 _MAX_SHARD_SHAPE_CZYX = (1, 48, 960, 960)
 _PYRAMID_FACTORS_YX = (2, 4)
-_ZSTD_LEVEL = 3
 
 
 def _remove_path(path: Path) -> None:
@@ -35,6 +34,7 @@ def write_streamed_ome_zarr(
     core_plane_chunks: Iterable[np.ndarray],
     output_mode: str,
     provenance: dict[str, Any],
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
     overwrite: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +57,7 @@ def write_streamed_ome_zarr(
         provenance=provenance,
         output_mode=output_mode,
         pyramid_factors=pyramid_factors,
+        jpegxr_level=jpegxr_level,
     )
     json_dumps_strict(attrs, context="OME-Zarr deconvolution metadata")
     try:
@@ -73,6 +74,7 @@ def write_streamed_ome_zarr(
                     source.width // factor,
                 ),
                 dtype=dtype,
+                jpegxr_level=jpegxr_level,
             )
             for level, factor in enumerate((1, *pyramid_factors))
         }
@@ -124,6 +126,7 @@ def write_streamed_ome_zarr_with_sidecar(
     core_plane_chunks: Iterable[np.ndarray],
     output_mode: str,
     provenance: dict[str, Any],
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
     overwrite: bool = False,
 ) -> None:
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +152,7 @@ def write_streamed_ome_zarr_with_sidecar(
             core_plane_chunks=core_plane_chunks,
             output_mode=output_mode,
             provenance=provenance,
+            jpegxr_level=jpegxr_level,
             overwrite=False,
         )
         if path.exists():
@@ -195,6 +199,7 @@ def _create_level_array(
     dataset_path: str,
     shape: tuple[int, int, int, int],
     dtype: np.dtype[Any],
+    jpegxr_level: float,
 ) -> Any:
     inner_chunks = tuple(min(size, target) for size, target in zip(shape, _INNER_CHUNKS_CZYX, strict=True))
     shard_shape = tuple(
@@ -209,12 +214,7 @@ def _create_level_array(
         dtype=dtype,
         zarr_format=3,
         dimension_names=_DIMENSION_NAMES,
-        codecs=[
-            ShardingCodec(
-                chunk_shape=inner_chunks,
-                codecs=[BytesCodec(endian="little"), ZstdCodec(level=_ZSTD_LEVEL)],
-            )
-        ],
+        codecs=[jpegxr_sharding_codec(inner_chunks, level=jpegxr_level)],
     )
 
 
@@ -245,6 +245,7 @@ def _ome_zarr_attrs(
     provenance: dict[str, Any],
     output_mode: str,
     pyramid_factors: tuple[int, ...],
+    jpegxr_level: float,
 ) -> dict[str, Any]:
     source_ome = _source_ome_metadata(source)
     spatial_scales = source_ome["spatial_scales_micrometer"]
@@ -303,7 +304,7 @@ def _ome_zarr_attrs(
                 "max_shard_shape_czyx": list(_MAX_SHARD_SHAPE_CZYX),
                 "pyramid_downsample_factors_yx": list(pyramid_factors),
                 "pyramid_method": "mean_from_scale0",
-                "codec": {"name": "zstd", "level": _ZSTD_LEVEL},
+                "codec": {"name": "squisher.jpegxr", "level": jpegxr_level, "checksum": "crc32c"},
             },
         },
     }

@@ -5,7 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.ndimage import shift
+from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
 
 
@@ -143,12 +143,12 @@ def add_quality_flags(
     xy = out[["x", "y"]].to_numpy(dtype=np.float64)
     out["nearest_xy_px"] = cKDTree(xy).query(xy, k=2)[0][:, 1] if len(out) > 1 else np.inf
     out["full_crop"] = (
-        (out["z_round"] >= rz)
-        & (out["z_round"] < z_size - rz)
-        & (out["y_round"] >= ry)
-        & (out["y_round"] < y_size - ry)
-        & (out["x_round"] >= rx)
-        & (out["x_round"] < x_size - rx)
+        (out["z"] - rz >= 0)
+        & (out["z"] + rz <= z_size - 1)
+        & (out["y"] - ry >= 0)
+        & (out["y"] + ry <= y_size - 1)
+        & (out["x"] - rx >= 0)
+        & (out["x"] + rx <= x_size - 1)
     )
     out["center_in_bounds"] = (
         (out["z_round"] >= 0)
@@ -166,34 +166,21 @@ def add_quality_flags(
 
 
 def crop_and_align(stack: np.ndarray, bead: pd.Series, crop_shape: tuple[int, int, int]) -> np.ndarray:
+    """Sample around the fitted centroid without inventing crop-edge padding during alignment."""
     rz, ry, rx = (size // 2 for size in crop_shape)
-    zc = int(bead["z_round"])
-    yc = int(bead["y_round"])
-    xc = int(bead["x_round"])
-    crop = np.full(crop_shape, np.nan, dtype=np.float32)
-    z0_src = max(0, zc - rz)
-    z1_src = min(stack.shape[0], zc + rz + 1)
-    y0_src = max(0, yc - ry)
-    y1_src = min(stack.shape[1], yc + ry + 1)
-    x0_src = max(0, xc - rx)
-    x1_src = min(stack.shape[2], xc + rx + 1)
-    z0_dst = z0_src - (zc - rz)
-    y0_dst = y0_src - (yc - ry)
-    x0_dst = x0_src - (xc - rx)
-    crop[
-        z0_dst : z0_dst + (z1_src - z0_src),
-        y0_dst : y0_dst + (y1_src - y0_src),
-        x0_dst : x0_dst + (x1_src - x0_src),
-    ] = stack[z0_src:z1_src, y0_src:y1_src, x0_src:x1_src]
-    aligned = shift(
-        crop,
-        shift=(zc - float(bead["z"]), yc - float(bead["y"]), xc - float(bead["x"])),
+    coordinates = np.indices(crop_shape, dtype=np.float64)
+    coordinates[0] += float(bead["z"]) - rz
+    coordinates[1] += float(bead["y"]) - ry
+    coordinates[2] += float(bead["x"]) - rx
+    return map_coordinates(
+        stack,
+        coordinates,
+        output=np.float32,
         order=1,
         mode="constant",
         cval=np.nan,
         prefilter=False,
     )
-    return aligned.astype(np.float32, copy=False)
 
 
 def subtract_border_background(crop: np.ndarray) -> np.ndarray:

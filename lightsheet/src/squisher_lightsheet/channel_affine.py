@@ -2085,6 +2085,263 @@ def _registration_spacing_um(payload: dict[str, Any]) -> np.ndarray:
     return np.ones(3, dtype=np.float64)
 
 
+def _finite_array(value: Any, *, shape: tuple[int, ...], label: str) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != shape:
+        raise ValueError(f"{label} must have shape {shape}, got {array.shape}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} must contain only finite values")
+    return array
+
+
+def _czyx_tile_geometry(record: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    tile = str(record.get("tile", "<unknown>"))
+    if record.get("axes") != "CZYX":
+        raise ValueError(f"Registration tile {tile!r} must have CZYX axes")
+    shape = np.asarray(record.get("shape"), dtype=np.int64)
+    if shape.shape != (4,) or np.any(shape <= 0):
+        raise ValueError(f"Registration tile {tile!r} must have a positive CZYX shape")
+    scale = None
+    for key in ("stage_scale_um", "spacing_um", "scale_um"):
+        if key in record:
+            scale = _finite_array(
+                [record[key][dim] for dim in DIMENSIONS],
+                shape=(3,),
+                label=f"Registration tile {tile!r} {key}",
+            )
+            break
+    if scale is None or np.any(scale == 0):
+        raise ValueError(f"Registration tile {tile!r} must have finite, nonzero ZYX spacing")
+    return shape[-3:], np.abs(scale)
+
+
+def isolate_window_channel_affine_um(
+    *,
+    row: dict[str, Any],
+    reference_record: dict[str, Any],
+) -> np.ndarray:
+    """Remove the fused grid and reference placement from one absolute window fit."""
+    matrix = _finite_array(
+        row.get("selected_moving_l0_to_fixed_fused_l0_matrix_zyx"),
+        shape=(3, 3),
+        label="selected moving-L0 to fused-L0 matrix",
+    )
+    offset = _finite_array(
+        row.get("selected_moving_l0_to_fixed_fused_l0_offset_zyx"),
+        shape=(3,),
+        label="selected moving-L0 to fused-L0 offset",
+    )
+    fused_scale = _finite_array(
+        row.get("fused_scale_zyx"), shape=(3,), label="fused scale"
+    )
+    fused_translation = _finite_array(
+        row.get("fused_translation_zyx"), shape=(3,), label="fused translation"
+    )
+    _shape, moving_scale = _czyx_tile_geometry(reference_record)
+    if np.any(fused_scale == 0):
+        raise ValueError("fused scale must be nonzero")
+
+    moving_pixels_to_fused_um = np.eye(4, dtype=np.float64)
+    moving_pixels_to_fused_um[:3, :3] = np.diag(fused_scale) @ matrix
+    moving_pixels_to_fused_um[:3, 3] = fused_translation + fused_scale * offset
+    moving_um_to_fused_um = moving_pixels_to_fused_um @ np.diag(
+        np.r_[1.0 / moving_scale, 1.0]
+    )
+    placement = _tile_record_placement_um(reference_record)
+    if not np.all(np.isfinite(placement)) or abs(float(np.linalg.det(placement[:3, :3]))) < 1e-12:
+        raise ValueError(f"Reference placement for {reference_record.get('tile')!r} is not invertible")
+    return np.linalg.inv(placement) @ moving_um_to_fused_um
+
+
+def write_global_channel_affine_registration(
+    *,
+    window_dir: Path,
+    reference_registration_input: Path,
+    output_registration: Path,
+    expected_moving_channel: int,
+    expected_fixed_fused: Path,
+    source_label: str,
+    target_label: str,
+) -> Path:
+    """Estimate one global channel affine from accepted windows and compose it into all tiles."""
+    if expected_moving_channel < 0:
+        raise ValueError("expected_moving_channel must be nonnegative")
+    if not source_label.strip() or not target_label.strip() or source_label == target_label:
+        raise ValueError("source_label and target_label must be nonempty and distinct")
+    if output_registration.resolve() == reference_registration_input.resolve():
+        raise ValueError("output_registration must differ from reference_registration_input")
+
+    payload = json.loads(reference_registration_input.read_text())
+    records = payload.get("tiles")
+    if not isinstance(records, list) or not records:
+        raise ValueError("reference registration must contain a nonempty tiles list")
+
+    by_path: dict[Path, dict[str, Any]] = {}
+    common_shape: np.ndarray | None = None
+    common_scale: np.ndarray | None = None
+    for record in records:
+        shape, scale = _czyx_tile_geometry(record)
+        if expected_moving_channel >= int(record["shape"][0]):
+            raise ValueError(
+                f"Registration tile {record.get('tile')!r} does not contain requested acquisition "
+                f"channel {expected_moving_channel}"
+            )
+        registered = _record_registered_affine_um(record)
+        stage = _record_stage_translation_um(record)
+        if not np.all(np.isfinite(registered)) or not np.all(np.isfinite(stage)):
+            raise ValueError(f"Registration tile {record.get('tile')!r} has nonfinite placement geometry")
+        path_value = record.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            raise ValueError(f"Registration tile {record.get('tile')!r} has no source path")
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = reference_registration_input.parent / path
+        resolved = path.resolve()
+        if resolved in by_path:
+            raise ValueError(f"Duplicate registration source path {resolved}")
+        by_path[resolved] = record
+        if common_shape is None:
+            common_shape, common_scale = shape, scale
+        elif not np.array_equal(shape, common_shape) or not np.allclose(scale, common_scale):
+            raise ValueError("All registration tiles must have consistent ZYX shape and spacing")
+    assert common_shape is not None and common_scale is not None
+
+    window_paths = sorted(window_dir.glob("*.json"))
+    if not window_paths:
+        raise ValueError(f"No window JSON files found in {window_dir}")
+    centered_models: list[np.ndarray] = []
+    accepted_tiles: set[str] = set()
+    fused_geometry: tuple[np.ndarray, np.ndarray] | None = None
+    for window_path in window_paths:
+        row = json.loads(window_path.read_text())
+        if row.get("status") != "accepted":
+            continue
+        if row.get("moving_channel") != expected_moving_channel:
+            raise ValueError(
+                f"Accepted window {window_path} has moving_channel={row.get('moving_channel')!r}; "
+                f"expected acquisition channel {expected_moving_channel}"
+            )
+        fixed_fused_value = row.get("fixed_fused")
+        if not isinstance(fixed_fused_value, str) or not fixed_fused_value:
+            raise ValueError(f"Accepted window {window_path} has no fixed_fused path")
+        fixed_fused = Path(fixed_fused_value)
+        if not fixed_fused.is_absolute():
+            fixed_fused = window_path.parent / fixed_fused
+        if fixed_fused.resolve() != expected_fixed_fused.resolve():
+            raise ValueError(
+                f"Accepted window {window_path} fixed_fused resolves to {fixed_fused.resolve()}, "
+                f"expected {expected_fixed_fused.resolve()}"
+            )
+        moving_path_value = row.get("moving_path")
+        if not isinstance(moving_path_value, str) or not moving_path_value:
+            raise ValueError(f"Accepted window {window_path} has no moving_path")
+        moving_path = Path(moving_path_value)
+        if not moving_path.is_absolute():
+            moving_path = window_path.parent / moving_path
+        reference_record = by_path.get(moving_path.resolve())
+        if reference_record is None:
+            raise ValueError(
+                f"Accepted window {window_path} moving_path is absent from the reference registration"
+            )
+        current_fused_geometry = (
+            _finite_array(row.get("fused_scale_zyx"), shape=(3,), label="fused scale"),
+            _finite_array(
+                row.get("fused_translation_zyx"), shape=(3,), label="fused translation"
+            ),
+        )
+        if fused_geometry is None:
+            fused_geometry = current_fused_geometry
+        elif not all(
+            np.allclose(current, expected)
+            for current, expected in zip(current_fused_geometry, fused_geometry, strict=True)
+        ):
+            raise ValueError("Accepted windows have inconsistent fused scale or translation")
+        isolated = isolate_window_channel_affine_um(row=row, reference_record=reference_record)
+        matrix, translation = homogeneous_um_to_center_model(
+            homogeneous_um=isolated,
+            shape_zyx=common_shape,
+            fixed_scale_um_zyx=common_scale,
+            moving_scale_um_zyx=common_scale,
+        )
+        centered_models.append(np.r_[matrix.reshape(-1), translation])
+        accepted_tiles.add(str(reference_record["tile"]))
+    if not centered_models:
+        raise ValueError(f"No accepted windows found in {window_dir}")
+
+    parameters = np.stack(centered_models)
+    median = np.median(parameters, axis=0)
+    mad = np.median(np.abs(parameters - median), axis=0)
+    median_matrix = median[:9].reshape(3, 3)
+    median_translation = median[9:]
+    global_affine = center_model_to_homogeneous_um(
+        matrix_px=median_matrix,
+        translation_px=median_translation,
+        shape_zyx=common_shape,
+        fixed_scale_um_zyx=common_scale,
+        moving_scale_um_zyx=common_scale,
+    )
+    if abs(float(np.linalg.det(global_affine[:3, :3]))) < 1e-12:
+        raise ValueError("Componentwise-median channel affine is singular")
+
+    adapted = json.loads(json.dumps(payload))
+    for record in adapted["tiles"]:
+        record["registered_affine"] = compose_registration_affine(
+            reference_affine=record["registered_affine"],
+            channel_affine_um=global_affine,
+            stage_translation_um_zyx=_record_stage_translation_um(record),
+            moving_stage_translation_um_zyx=_record_stage_translation_um(record),
+        )
+        if not np.all(np.isfinite(_record_registered_affine_um(record))):
+            raise ValueError(f"Composed affine for {record.get('tile')!r} is not finite")
+
+    adapted["artifact_type"] = "squisher_lightsheet.global_channel_affine_registration.v1"
+    adapted["adapted_from"] = str(reference_registration_input.resolve())
+    adapted["adaptation_method"] = "componentwise_median_full_tile_centered_channel_affine"
+    adapted["transform_contract"] = RegistrationTransformContract(
+        registered_affine_semantics="moving_tile_stage_um_to_reference_registered_um",
+        source_space=f"{source_label}_stage_um",
+        target_space=f"{target_label}_registered_um",
+        composition_order=(
+            "reference_registered_affine",
+            "reference_stage_translation_um",
+            "moving_to_reference_channel_affine_um",
+            "inverse_moving_stage_translation_um",
+        ),
+        registered_affine_contains_full_channel_affine=True,
+        stage_translation_source="reference_registration_input",
+    ).model_dump(mode="json", by_alias=True)
+    adapted.setdefault("diagnostics", {})["global_channel_affine"] = {
+        "window_dir": str(window_dir.resolve()),
+        "reference_registration_input": str(reference_registration_input.resolve()),
+        "expected_moving_channel": expected_moving_channel,
+        "expected_fixed_fused": str(expected_fixed_fused.resolve()),
+        "source_label": source_label,
+        "target_label": target_label,
+        "accepted_window_count": len(centered_models),
+        "accepted_tile_count": len(accepted_tiles),
+        "full_tile_shape_zyx": common_shape.tolist(),
+        "spacing_um_zyx": common_scale.tolist(),
+        "median_centered_pixel_model": {
+            "matrix_zyx": median_matrix.tolist(),
+            "translation_px_zyx": median_translation.tolist(),
+        },
+        "component_mad": {
+            "matrix_zyx": mad[:9].reshape(3, 3).tolist(),
+            "translation_px_zyx": mad[9:].tolist(),
+        },
+        "channel_affine_um_zyx_homogeneous": global_affine.tolist(),
+        "estimator": "componentwise_median_9_matrix_plus_3_centered_translation",
+        "window_transform_source": (
+            "selected_moving_l0_to_fixed_fused_l0_matrix_zyx_and_offset_zyx"
+        ),
+    }
+    output_registration.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_registration.with_name(f".{output_registration.name}.tmp")
+    temporary.write_text(json.dumps(adapted, indent=2) + "\n")
+    temporary.replace(output_registration)
+    return output_registration.resolve()
+
+
 def write_affine_registration_from_reference(
     *,
     reference_registration_input: Path,

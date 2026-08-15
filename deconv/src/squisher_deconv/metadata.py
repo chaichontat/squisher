@@ -177,11 +177,13 @@ def provenance_payload(
     scaling_path: Path | None,
     devices: list[int],
     queue_depth: int,
+    jpegxr_level: float,
 ) -> dict[str, Any]:
     return {
         "tool": "squisher-deconv",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
+        "source_file": file_stat_record(source),
         "run_settings": {
             "channels": int(channels),
             "halo": int(halo),
@@ -190,11 +192,22 @@ def provenance_payload(
             "output_mode": output_mode,
             "devices": [int(device) for device in devices],
             "queue_depth": int(queue_depth),
+            "jpegxr_level": float(jpegxr_level),
         },
         "psfs": file_provenance_records(psf_paths or []),
         "basic_profiles": file_provenance_records(basic_paths or []),
         "scaling": None if scaling_path is None else file_provenance_records([scaling_path])[0],
         "versions": dependency_versions(),
+    }
+
+
+def file_stat_record(path: Path) -> dict[str, str | int]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
     }
 
 

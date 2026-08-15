@@ -21,6 +21,7 @@ from squisher_lightsheet.channel_affine import (
     full_model_to_local,
     grid_fanout_order,
     homogeneous_um_to_center_model,
+    isolate_window_channel_affine_um,
     level0_model_to_sampled,
     local_model_to_full,
     model_to_level0,
@@ -30,6 +31,7 @@ from squisher_lightsheet.channel_affine import (
     rigid_group_mean,
     select_content_fixed_crop_candidates_l0,
     select_content_fixed_crop_start_l0,
+    write_global_channel_affine_registration,
 )
 
 
@@ -112,6 +114,65 @@ def _registration_record(tile: TileRecord, *, registered_translation_zyx: tuple[
     matrix[:3, 3] = np.asarray(registered_translation_zyx, dtype=np.float64)
     record["registered_affine"] = {"matrix": matrix.tolist()}
     return record
+
+
+def _czyx_registration_record(
+    path: Path,
+    *,
+    tile: str,
+    stage: tuple[float, float, float],
+    registered: np.ndarray,
+    shape_zyx: tuple[int, int, int] = (21, 31, 41),
+    scale_zyx: tuple[float, float, float] = (0.6, 0.3, 0.3),
+) -> dict[str, object]:
+    return {
+        "tile": tile,
+        "path": str(path),
+        "shape": [3, *shape_zyx],
+        "axes": "CZYX",
+        "spacing_um": dict(zip("zyx", scale_zyx, strict=True)),
+        "stage_translation_um": dict(zip("zyx", stage, strict=True)),
+        "stage_scale_um": dict(zip("zyx", scale_zyx, strict=True)),
+        "registered_affine": {
+            "dims": ["x_in", "x_out"],
+            "coords": {
+                "x_in": ["z", "y", "x", "1"],
+                "x_out": ["z", "y", "x", "1"],
+            },
+            "matrix": registered.tolist(),
+        },
+        "source_view": "L",
+    }
+
+
+def _absolute_window_row(
+    record: dict[str, object],
+    channel_affine_um: np.ndarray,
+    *,
+    fused_scale: tuple[float, float, float] = (0.5, 0.25, 0.25),
+    fused_translation: tuple[float, float, float] = (-4.0, 7.0, 11.0),
+) -> dict[str, object]:
+    scale = np.asarray([record["stage_scale_um"][dim] for dim in "zyx"], dtype=np.float64)
+    stage = np.asarray([record["stage_translation_um"][dim] for dim in "zyx"], dtype=np.float64)
+    placement = np.asarray(record["registered_affine"]["matrix"], dtype=np.float64).copy()
+    stage_matrix = np.eye(4, dtype=np.float64)
+    stage_matrix[:3, 3] = stage
+    placement = placement @ stage_matrix
+    moving_pixels_to_world = placement @ channel_affine_um @ np.diag(np.r_[scale, 1.0])
+    fused_pixels_to_world = np.eye(4, dtype=np.float64)
+    fused_pixels_to_world[:3, :3] = np.diag(fused_scale)
+    fused_pixels_to_world[:3, 3] = fused_translation
+    forward = np.linalg.inv(fused_pixels_to_world) @ moving_pixels_to_world
+    return {
+        "status": "accepted",
+        "moving_channel": 1,
+        "fixed_fused": str(Path(record["path"]).parent / "fixed.ome.zarr"),
+        "moving_path": record["path"],
+        "fused_scale_zyx": list(fused_scale),
+        "fused_translation_zyx": list(fused_translation),
+        "selected_moving_l0_to_fixed_fused_l0_matrix_zyx": forward[:3, :3].tolist(),
+        "selected_moving_l0_to_fixed_fused_l0_offset_zyx": forward[:3, 3].tolist(),
+    }
 
 
 def test_fused_gradient_component_ncc_matches_cupy_sobel_interior_reference() -> None:
@@ -798,6 +859,147 @@ def test_homogeneous_um_to_center_model_round_trips() -> None:
 
     np.testing.assert_allclose(recovered_matrix, matrix, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(recovered_translation, translation, rtol=1e-6, atol=1e-5)
+
+
+def test_isolate_window_channel_affine_round_trips_nonidentity_placement(tmp_path: Path) -> None:
+    registered = np.eye(4, dtype=np.float64)
+    registered[:3, :3] = np.asarray(
+        [[1.0, 0.01, 0.0], [-0.02, 0.99, 0.03], [0.0, -0.01, 1.02]]
+    )
+    registered[:3, 3] = [3.0, -5.0, 9.0]
+    record = _czyx_registration_record(
+        tmp_path / "tile.ome.zarr",
+        tile="tile.ome.zarr",
+        stage=(12.0, 34.0, 56.0),
+        registered=registered,
+    )
+    expected = np.eye(4, dtype=np.float64)
+    expected[:3, :3] = np.asarray(
+        [[1.001, 0.002, 0.0], [-0.001, 0.999, 0.003], [0.0, -0.002, 1.002]]
+    )
+    expected[:3, 3] = [0.4, -0.7, 1.1]
+    row = _absolute_window_row(record, expected)
+
+    actual = isolate_window_channel_affine_um(row=row, reference_record=record)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_global_channel_affine_ignores_crop_local_pivots_and_composes_all_tiles(
+    tmp_path: Path,
+) -> None:
+    first_registered = np.eye(4, dtype=np.float64)
+    first_registered[1, 3] = 4.0
+    second_registered = np.eye(4, dtype=np.float64)
+    second_registered[:3, :3] = np.diag([1.0, 1.01, 0.99])
+    first = _czyx_registration_record(
+        tmp_path / "first.ome.zarr",
+        tile="first.ome.zarr",
+        stage=(0.0, 20.0, 40.0),
+        registered=first_registered,
+    )
+    second = _czyx_registration_record(
+        tmp_path / "second.ome.zarr",
+        tile="second.ome.zarr",
+        stage=(2.0, 80.0, 100.0),
+        registered=second_registered,
+    )
+    reference_path = tmp_path / "reference.json"
+    reference_payload = {"registered_transform_key": "registered_affine", "tiles": [first, second]}
+    reference_path.write_text(json.dumps(reference_payload))
+    expected = np.eye(4, dtype=np.float64)
+    expected[:3, :3] = np.asarray(
+        [[1.0, 0.001, 0.0], [-0.002, 1.001, 0.003], [0.0, -0.001, 0.999]]
+    )
+    expected[:3, 3] = [0.6, -0.9, 1.2]
+    window_dir = tmp_path / "windows"
+    window_dir.mkdir()
+    for index, record in enumerate((first, second)):
+        row = _absolute_window_row(record, expected)
+        row["moving_channel"] = 2
+        row.update(
+            {
+                "moving_start_l0_zyx": [index * 7, index * 11, index * 13],
+                "fixed_start_zyx": [index * 17, index * 19, index * 23],
+                "selected_local_matrix_zyx": (np.eye(3) * (index + 2)).tolist(),
+                "selected_local_translation_zyx": [100 + index, 200 + index, 300 + index],
+            }
+        )
+        (window_dir / f"window_{index}.json").write_text(json.dumps(row))
+
+    output_path = tmp_path / "output.json"
+    result = write_global_channel_affine_registration(
+        window_dir=window_dir,
+        reference_registration_input=reference_path,
+        output_registration=output_path,
+        expected_moving_channel=2,
+        expected_fixed_fused=tmp_path / "fixed.ome.zarr",
+        source_label="514",
+        target_label="561",
+    )
+
+    assert result == output_path.resolve()
+    output = json.loads(output_path.read_text())
+    assert [record["path"] for record in output["tiles"]] == [first["path"], second["path"]]
+    assert [record["stage_translation_um"] for record in output["tiles"]] == [
+        first["stage_translation_um"],
+        second["stage_translation_um"],
+    ]
+    for source, composed in zip((first, second), output["tiles"], strict=True):
+        expected_composed = compose_registration_affine(
+            reference_affine=source["registered_affine"],
+            channel_affine_um=expected,
+            stage_translation_um_zyx=np.asarray(
+                [source["stage_translation_um"][dim] for dim in "zyx"]
+            ),
+        )
+        np.testing.assert_allclose(
+            composed["registered_affine"]["matrix"], expected_composed["matrix"], atol=1e-5
+        )
+    diagnostics = output["diagnostics"]["global_channel_affine"]
+    assert diagnostics["accepted_window_count"] == 2
+    assert diagnostics["accepted_tile_count"] == 2
+    np.testing.assert_allclose(
+        diagnostics["channel_affine_um_zyx_homogeneous"], expected, atol=1e-5
+    )
+    assert not output_path.with_name(f".{output_path.name}.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda row: row.update(moving_channel=0), "expected acquisition channel 1"),
+        (lambda row: row.update(fixed_fused="/wrong/fixed.ome.zarr"), "fixed_fused resolves"),
+        (lambda row: row.update(fused_scale_zyx=[0.5, float("nan"), 0.25]), "finite"),
+    ],
+)
+def test_global_channel_affine_rejects_invalid_window_lineage_or_geometry(
+    tmp_path: Path, mutation, message: str
+) -> None:
+    record = _czyx_registration_record(
+        tmp_path / "tile.ome.zarr",
+        tile="tile.ome.zarr",
+        stage=(0.0, 0.0, 0.0),
+        registered=np.eye(4),
+    )
+    reference_path = tmp_path / "reference.json"
+    reference_path.write_text(json.dumps({"tiles": [record]}))
+    window_dir = tmp_path / "windows"
+    window_dir.mkdir()
+    row = _absolute_window_row(record, np.eye(4))
+    mutation(row)
+    (window_dir / "window.json").write_text(json.dumps(row))
+
+    with pytest.raises(ValueError, match=message):
+        write_global_channel_affine_registration(
+            window_dir=window_dir,
+            reference_registration_input=reference_path,
+            output_registration=tmp_path / "output.json",
+            expected_moving_channel=1,
+            expected_fixed_fused=tmp_path / "fixed.ome.zarr",
+            source_label="638",
+            target_label="561",
+        )
 
 
 def test_compose_registration_affine_left_multiplies_reference_transform() -> None:

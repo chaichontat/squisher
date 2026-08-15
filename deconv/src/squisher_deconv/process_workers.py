@@ -13,6 +13,7 @@ from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL
 from squisher_deconv.deconvolution import Deconvolver
 from squisher_deconv.metadata import json_dumps_strict, provenance_payload
 from squisher_deconv.planning import SampleWindow, output_path_for, output_sidecar_path, slab_windows
@@ -54,6 +55,7 @@ class ProcessRunConfig:
     overwrite: bool
     output_relative_root: Path | None
     iterations: int | None = None
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL
 
 
 def run_process_gpu_streaming_deconv(
@@ -484,6 +486,7 @@ def _process_file(
         scaling_path=config.scaling_path,
         devices=config.devices,
         queue_depth=config.queue_depth,
+        jpegxr_level=config.jpegxr_level,
     )
     sidecar_payload = {
         "source_metadata": asdict(source.metadata),
@@ -512,7 +515,7 @@ def _process_file(
 
     if config.queue_depth == 1:
 
-        def chunks():
+        def chunks(window_reader):
             for slab_index, slab in enumerate(slabs):
                 t_slab = time.perf_counter()
                 t_read = time.perf_counter()
@@ -520,7 +523,7 @@ def _process_file(
                     f"read start device={device} file={source.path.name} "
                     f"read_z=[{slab.read_start},{slab.read_stop})"
                 )
-                read = source.read_window(slab.read_start, slab.read_stop)
+                read = window_reader.read_window(slab.read_start, slab.read_stop)
                 _log(
                     f"read done device={device} file={source.path.name} "
                     f"read_z=[{slab.read_start},{slab.read_stop}) shape={read.shape} "
@@ -556,35 +559,38 @@ def _process_file(
                 )
                 yield chunk
 
-        write_streamed_ome_zarr_with_sidecar(
-            output_path,
-            sidecar_path=sidecar,
-            sidecar_text=sidecar_text,
-            source=source,
-            core_plane_chunks=chunks(),
-            output_mode=config.output_mode,
-            provenance=provenance,
-            overwrite=config.overwrite,
-        )
+        with source.open_reader() as window_reader:
+            write_streamed_ome_zarr_with_sidecar(
+                output_path,
+                sidecar_path=sidecar,
+                sidecar_text=sidecar_text,
+                source=source,
+                core_plane_chunks=chunks(window_reader),
+                output_mode=config.output_mode,
+                provenance=provenance,
+                jpegxr_level=config.jpegxr_level,
+                overwrite=config.overwrite,
+            )
         return time.perf_counter() - t_file
 
     def reader() -> None:
         try:
-            for slab_index, slab in enumerate(slabs):
-                if stop_event.is_set():
-                    break
-                t_read = time.perf_counter()
-                _log(
-                    f"read start device={device} file={source.path.name} "
-                    f"read_z=[{slab.read_start},{slab.read_stop})"
-                )
-                data = source.read_window(slab.read_start, slab.read_stop)
-                _log(
-                    f"read done device={device} file={source.path.name} "
-                    f"read_z=[{slab.read_start},{slab.read_stop}) shape={data.shape} "
-                    f"dtype={data.dtype} seconds={time.perf_counter() - t_read:.2f}"
-                )
-                _put(read_queue, (slab_index, slab, data), stop_event)
+            with source.open_reader() as window_reader:
+                for slab_index, slab in enumerate(slabs):
+                    if stop_event.is_set():
+                        break
+                    t_read = time.perf_counter()
+                    _log(
+                        f"read start device={device} file={source.path.name} "
+                        f"read_z=[{slab.read_start},{slab.read_stop})"
+                    )
+                    data = window_reader.read_window(slab.read_start, slab.read_stop)
+                    _log(
+                        f"read done device={device} file={source.path.name} "
+                        f"read_z=[{slab.read_start},{slab.read_stop}) shape={data.shape} "
+                        f"dtype={data.dtype} seconds={time.perf_counter() - t_read:.2f}"
+                    )
+                    _put(read_queue, (slab_index, slab, data), stop_event)
         except BaseException as exc:
             errors.append(exc)
             stop_event.set()
@@ -669,6 +675,7 @@ def _process_file(
                 core_plane_chunks=chunks(),
                 output_mode=config.output_mode,
                 provenance=provenance,
+                jpegxr_level=config.jpegxr_level,
                 overwrite=config.overwrite,
             )
         except BaseException as exc:

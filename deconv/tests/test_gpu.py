@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import tifffile
 from typer.testing import CliRunner
+import zarr
 
 from squisher_deconv.cli import app
 
@@ -182,6 +183,38 @@ def test_cupy_engine_applies_basic_before_deconvolution(tmp_path, monkeypatch) -
 
 
 @pytest.mark.skipif(not _has_cupy_gpu(), reason="CuPy GPU is not available")
+def test_cupy_engine_without_basic_preserves_deconvolution_input(tmp_path, monkeypatch) -> None:
+    import cupy as cp
+    import squisher_deconv.gpu as gpu
+    from squisher_deconv.gpu import CupyBasicRichardsonLucyDeconvolver
+
+    psf = np.zeros((3, 3, 3), dtype=np.float32)
+    psf[1, 1, 1] = 1.0
+    psf_path = tmp_path / "psf.tif"
+    tifffile.imwrite(psf_path, psf, photometric="minisblack")
+
+    captured: list[np.ndarray] = []
+
+    def capture_deconvolution_input(img, projectors, *, iterations, cp):
+        captured.append(cp.asnumpy(img))
+        return img
+
+    monkeypatch.setattr(gpu, "_deconvolve_lucyrichardson_guo", capture_deconvolution_input)
+    deconvolver = CupyBasicRichardsonLucyDeconvolver(
+        basic_paths=(),
+        psf_paths=(psf_path,),
+        device=0,
+    )
+    volume = np.arange(18, dtype=np.uint16).reshape(2, 1, 3, 3)
+
+    out = deconvolver.deconvolve(volume)
+
+    assert np.array_equal(captured[0], volume.astype(np.float32))
+    assert np.array_equal(out, volume.astype(np.float32))
+    cp.get_default_memory_pool().free_all_blocks()
+
+
+@pytest.mark.skipif(not _has_cupy_gpu(), reason="CuPy GPU is not available")
 def test_guo_backward_projector_keeps_dc_response() -> None:
     import cupy as cp
     from squisher_deconv.gpu import _calculate_projectors_3d
@@ -196,7 +229,7 @@ def test_guo_backward_projector_keeps_dc_response() -> None:
 
 
 @pytest.mark.skipif(not _has_cupy_gpu(), reason="CuPy GPU is not available")
-def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
+def test_gpu_cli_sample_scale_and_run_without_basic_smoke(tmp_path) -> None:
     runner = CliRunner()
     src = tmp_path / "tile.tif"
     psf_path = tmp_path / "psf.tif"
@@ -206,16 +239,6 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
     psf = np.zeros((5, 5, 5), dtype=np.float32)
     psf[2, 2, 2] = 1.0
     tifffile.imwrite(psf_path, psf, photometric="minisblack")
-
-    basic_args: list[str] = []
-    for channel in range(2):
-        basic = SimpleNamespace(
-            darkfield=np.zeros((5, 5), dtype=np.float32),
-            flatfield=np.ones((5, 5), dtype=np.float32),
-        )
-        path = tmp_path / f"basic-c{channel}.pkl"
-        path.write_bytes(pickle.dumps({"basic": basic}))
-        basic_args.extend(["--basic", str(path)])
 
     sample = runner.invoke(
         app,
@@ -232,7 +255,6 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
             str(psf_path),
             "--psf",
             str(psf_path),
-            *basic_args,
             "--devices",
             "0",
             "--halo",
@@ -262,7 +284,6 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
             str(psf_path),
             "--psf",
             str(psf_path),
-            *basic_args,
             "--devices",
             "0",
             "--halo",
@@ -272,10 +293,13 @@ def test_gpu_cli_sample_scale_and_run_smoke(tmp_path) -> None:
         ],
     )
     assert run.exit_code == 0, run.output
-    with tifffile.TiffFile(tmp_path / "out" / "tile.tif") as tif:
-        assert tif.is_bigtiff
-        assert len(tif.pages) == 4
-        assert all(page.compression == 22610 for page in tif.pages)
+    from squisher.jpegxr_zarr import register_jpegxr_codec
+
+    register_jpegxr_codec()
+    root = zarr.open_group(str(tmp_path / "out" / "tile.ome.zarr"), mode="r")
+    assert root.attrs["squisher_complete"] is True
+    assert root["0"].shape == (2, 2, 5, 5)
+    assert root["0"].dtype == np.dtype(np.uint16)
 
 
 @pytest.mark.skipif(_cupy_gpu_count() < 2, reason="At least two CuPy GPUs are required")

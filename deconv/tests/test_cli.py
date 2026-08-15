@@ -64,8 +64,6 @@ def test_basic_cli_runs_joint_autotune_darkfield_workflow(tmp_path, monkeypatch)
             "sample",
             "--channels",
             "1",
-            "--device",
-            "cpu",
         ],
     )
 
@@ -75,11 +73,23 @@ def test_basic_cli_runs_joint_autotune_darkfield_workflow(tmp_path, monkeypatch)
     assert captured["cache_samples_per_channel"] == 500
     assert captured["exclude_blank_slices"] is True
     assert captured["exclude_edge_slices"] is True
-    assert captured["device"] == "cpu"
+    assert captured["device"] == "cuda"
     assert str(tmp_path / "basic" / "sample-sampling.json") in result.output
 
 
-def test_cli_requires_one_basic_profile_per_channel(tmp_path) -> None:
+def test_basic_cli_does_not_expose_device_override() -> None:
+    runner = CliRunner()
+
+    help_result = runner.invoke(app, ["basic", "--help"])
+    override_result = runner.invoke(app, ["basic", "--device", "cpu"])
+
+    assert help_result.exit_code == 0
+    assert "--device" not in help_result.output
+    assert override_result.exit_code != 0
+    assert "No such option: --device" in override_result.output
+
+
+def test_cli_rejects_partial_basic_profiles(tmp_path) -> None:
     runner = CliRunner()
     src = tmp_path / "tile.tif"
     psf = tmp_path / "psf.tif"
@@ -156,6 +166,22 @@ def test_deconvolver_factory_passes_iterations_to_gpu_backend(tmp_path) -> None:
     assert factory.iterations == 3
 
 
+def test_deconvolver_factory_allows_no_basic_profiles(tmp_path) -> None:
+    from squisher_deconv.gpu import CupyDeconvolverFactory
+
+    psf = tmp_path / "psf.tif"
+
+    factory = cli._build_deconvolver_factory(
+        basic=None,
+        channels=1,
+        psfs=[psf],
+        iterations=1,
+    )
+
+    assert isinstance(factory, CupyDeconvolverFactory)
+    assert factory.basic_paths == ()
+
+
 def test_infer_psf_halo_uses_psf_z_extent(tmp_path) -> None:
     psf = tmp_path / "psf.tif"
     tifffile.imwrite(psf, np.ones((4, 3, 3), dtype=np.float32), photometric="minisblack")
@@ -219,7 +245,7 @@ def test_sample_scale_cli_infers_halo_without_eager_deconvolver_init(tmp_path, m
     assert callable(captured["deconvolver_factory"])
 
 
-def test_run_cli_requires_scaling_for_u16_output(tmp_path) -> None:
+def test_run_cli_requires_scaling(tmp_path) -> None:
     runner = CliRunner()
     src = tmp_path / "tile.tif"
     psf = tmp_path / "psf.tif"
@@ -241,7 +267,7 @@ def test_run_cli_requires_scaling_for_u16_output(tmp_path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--output-mode u16 requires --scaling" in result.output
+    assert "run requires --scaling" in result.output
 
 
 def test_qc_cli_renders_selected_finished_tiles_without_opening_every_tiff(tmp_path, monkeypatch) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -38,6 +39,34 @@ class ShearMode(str, Enum):
     sum_y = "sum_y"
     central_y = "central_y"
     max_y = "max_y"
+
+
+class MedianProfile(str, Enum):
+    june_std = "june-std"
+    june_571_zstrict = "june-571-zstrict"
+
+
+@dataclass(frozen=True)
+class MedianDefaults:
+    crop_shape_text: str = "21,21,21"
+    size_mad_mult: float = 2.0
+    z_asym_mad_mult: float = 1.5
+    z_near_ratio_floor: float = 0.35
+    min_z_fwhm_px: float | None = None
+    min_z_support_span_px: float | None = None
+    min_z_pre_tail_fraction: float | None = None
+    max_central_z_peak_offset_px: float | None = None
+
+
+MEDIAN_DEFAULTS = {
+    MedianProfile.june_std: MedianDefaults(),
+    MedianProfile.june_571_zstrict: MedianDefaults(
+        min_z_fwhm_px=5.0,
+        min_z_support_span_px=9.0,
+        min_z_pre_tail_fraction=0.05,
+        max_central_z_peak_offset_px=2.0,
+    ),
+}
 
 
 app = typer.Typer(no_args_is_help=True)
@@ -111,13 +140,14 @@ def detect_beads(
     output: Annotated[Path, typer.Option("--output")],
     qc: Annotated[Path, typer.Option("--qc")],
     channel: Annotated[int | None, typer.Option("--channel", min=0)] = None,
-    fwhm: Annotated[float, typer.Option("--fwhm", min=0.0)] = 2.5,
+    z_start: Annotated[int, typer.Option("--z-start", min=0)] = 0,
+    fwhm: Annotated[float, typer.Option("--fwhm", min=0.0)] = 1.5,
     threshold_sigma: Annotated[float, typer.Option("--threshold-sigma", min=0.0)] = 5.0,
     brightest: Annotated[int | None, typer.Option("--brightest", min=1)] = None,
     xy_radius: Annotated[int, typer.Option("--xy-radius", min=0)] = 2,
     z_radius: Annotated[int, typer.Option("--z-radius", min=0)] = 2,
 ) -> None:
-    stack = load_image_zyx(image, channel=channel)
+    stack = load_image_zyx(image, channel=channel, z_start=z_start)
     beads = detect_beads_in_stack(
         stack,
         fwhm=fwhm,
@@ -131,6 +161,7 @@ def detect_beads(
     beads.to_csv(output, index=False)
     write_bead_qc_png(stack, beads, qc)
     typer.echo(f"stack_shape_zyx={tuple(int(v) for v in stack.shape)}")
+    typer.echo(f"z_start={z_start}")
     typer.echo(f"beads={len(beads)}")
     typer.echo(f"csv={output}")
     typer.echo(f"qc={qc}")
@@ -142,11 +173,13 @@ def make_median(
     centers: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     prefix: Annotated[Path, typer.Option("--prefix")],
     channel: Annotated[int | None, typer.Option("--channel", min=0)] = None,
-    crop_shape_text: Annotated[str, typer.Option("--crop-shape", metavar="Z,Y,X")] = "11,21,21",
+    z_start: Annotated[int, typer.Option("--z-start", min=0)] = 0,
+    profile: Annotated[MedianProfile, typer.Option("--profile")] = MedianProfile.june_std,
+    crop_shape_text: Annotated[str | None, typer.Option("--crop-shape", metavar="Z,Y,X")] = None,
     min_xy_distance: Annotated[float, typer.Option("--min-xy-distance", min=0.0)] = 12.0,
-    size_mad_mult: Annotated[float, typer.Option("--size-mad-mult", min=0.0)] = 2.0,
-    z_asym_mad_mult: Annotated[float, typer.Option("--z-asym-mad-mult", min=0.0)] = 1.5,
-    z_near_ratio_floor: Annotated[float, typer.Option("--z-near-ratio-floor", min=0.0)] = 0.35,
+    size_mad_mult: Annotated[float | None, typer.Option("--size-mad-mult", min=0.0)] = None,
+    z_asym_mad_mult: Annotated[float | None, typer.Option("--z-asym-mad-mult", min=0.0)] = None,
+    z_near_ratio_floor: Annotated[float | None, typer.Option("--z-near-ratio-floor", min=0.0)] = None,
     require_full_crop: Annotated[bool, typer.Option("--require-full-crop/--allow-padded-crop")] = False,
     min_z_fwhm_px: Annotated[float | None, typer.Option("--min-z-fwhm-px", min=0.0)] = None,
     max_z_fwhm_px: Annotated[float | None, typer.Option("--max-z-fwhm-px", min=0.0)] = None,
@@ -159,24 +192,44 @@ def make_median(
         float | None, typer.Option("--max-central-z-peak-offset-px", min=0.0)
     ] = None,
 ) -> None:
-    crop_shape = parse_odd_shape_zyx(crop_shape_text)
-    stack = load_image_zyx(image, channel=channel)
+    defaults = MEDIAN_DEFAULTS[profile]
+    crop_shape = parse_odd_shape_zyx(crop_shape_text or defaults.crop_shape_text)
+    resolved_size_mad_mult = defaults.size_mad_mult if size_mad_mult is None else size_mad_mult
+    resolved_z_asym_mad_mult = defaults.z_asym_mad_mult if z_asym_mad_mult is None else z_asym_mad_mult
+    resolved_z_near_ratio_floor = (
+        defaults.z_near_ratio_floor if z_near_ratio_floor is None else z_near_ratio_floor
+    )
+    resolved_min_z_fwhm_px = defaults.min_z_fwhm_px if min_z_fwhm_px is None else min_z_fwhm_px
+    resolved_min_z_support_span_px = (
+        defaults.min_z_support_span_px if min_z_support_span_px is None else min_z_support_span_px
+    )
+    resolved_min_z_pre_tail_fraction = (
+        defaults.min_z_pre_tail_fraction
+        if min_z_pre_tail_fraction is None
+        else min_z_pre_tail_fraction
+    )
+    resolved_max_central_z_peak_offset_px = (
+        defaults.max_central_z_peak_offset_px
+        if max_central_z_peak_offset_px is None
+        else max_central_z_peak_offset_px
+    )
+    stack = load_image_zyx(image, channel=channel, z_start=z_start)
     centers_df = pd.read_csv(centers)
     quality = add_quality_flags(centers_df, stack.shape, crop_shape, min_xy_distance)
     crops, raw_median, norm_median = build_medians(
         stack,
         quality,
         crop_shape,
-        size_mad_mult=size_mad_mult,
-        z_asym_mad_mult=z_asym_mad_mult,
-        z_near_ratio_floor=z_near_ratio_floor,
+        size_mad_mult=resolved_size_mad_mult,
+        z_asym_mad_mult=resolved_z_asym_mad_mult,
+        z_near_ratio_floor=resolved_z_near_ratio_floor,
         require_full_crop=require_full_crop,
-        min_z_fwhm_px=min_z_fwhm_px,
+        min_z_fwhm_px=resolved_min_z_fwhm_px,
         max_z_fwhm_px=max_z_fwhm_px,
-        min_z_support_span_px=min_z_support_span_px,
+        min_z_support_span_px=resolved_min_z_support_span_px,
         max_z_support_span_px=max_z_support_span_px,
-        min_z_pre_tail_fraction=min_z_pre_tail_fraction,
-        max_central_z_peak_offset_px=max_central_z_peak_offset_px,
+        min_z_pre_tail_fraction=resolved_min_z_pre_tail_fraction,
+        max_central_z_peak_offset_px=resolved_max_central_z_peak_offset_px,
     )
     prefix.parent.mkdir(parents=True, exist_ok=True)
     quality_path = prefix.with_name(f"{prefix.name}_quality.csv")
@@ -191,6 +244,8 @@ def make_median(
     np.save(crops_npy, crops / np.maximum(crop_peaks, 1))
     write_median_qc_png(quality, raw_median, norm_median, qc_png)
     typer.echo(f"stack_shape_zyx={tuple(int(v) for v in stack.shape)}")
+    typer.echo(f"z_start={z_start}")
+    typer.echo(f"profile={profile.value}")
     typer.echo(f"crop_shape_zyx={crop_shape}")
     typer.echo(f"candidate_beads={len(quality)}")
     typer.echo(f"good_quality_beads={int(quality['good_quality'].sum())}")
@@ -211,6 +266,7 @@ def render_centroid_qc(
     output_png: Annotated[Path, typer.Option("--output-png")],
     output_csv: Annotated[Path, typer.Option("--output-csv")],
     channel: Annotated[int | None, typer.Option("--channel", min=0)] = None,
+    z_start: Annotated[int, typer.Option("--z-start", min=0)] = 0,
     crop_shape_text: Annotated[str, typer.Option("--crop-shape", metavar="Z,Y,X")] = "21,21,21",
     require_full_crop: Annotated[bool, typer.Option("--require-full-crop/--allow-edge-crop")] = False,
 ) -> None:
@@ -218,15 +274,83 @@ def render_centroid_qc(
     df = pd.read_csv(quality_csv)
     if require_full_crop:
         df = df[df["full_crop"]].copy()
-    stack = load_image_zyx(image, channel=channel)
+    stack = load_image_zyx(image, channel=channel, z_start=z_start)
     selected = choose_spots(df, crop_shape, stack.shape)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     output_png.parent.mkdir(parents=True, exist_ok=True)
     selected.to_csv(output_csv, index=False)
     render_sheet(stack, selected, crop_shape, output_png)
     typer.echo(f"selected_spots={len(selected)}")
+    typer.echo(f"z_start={z_start}")
     typer.echo(f"output_png={output_png}")
     typer.echo(f"output_csv={output_csv}")
+
+
+@app.command("weighted-average")
+def weighted_average(
+    inputs: Annotated[
+        list[Path], typer.Argument(exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[Path, typer.Option("--output")],
+    report: Annotated[Path, typer.Option("--report")],
+    weights_text: Annotated[str, typer.Option("--weights", metavar="W1,W2,...")],
+) -> None:
+    """Combine co-registered PSFs after normalizing each input to unit mass."""
+    if len(inputs) < 2:
+        raise typer.BadParameter("weighted-average requires at least two input PSFs")
+    try:
+        weights = np.asarray([float(value) for value in weights_text.split(",")], dtype=np.float64)
+    except ValueError as exc:
+        raise typer.BadParameter("--weights must be comma-separated numbers") from exc
+    if len(weights) != len(inputs):
+        raise typer.BadParameter(
+            f"--weights has {len(weights)} values but {len(inputs)} input PSFs were provided"
+        )
+    if not np.isfinite(weights).all() or np.any(weights < 0) or float(weights.sum()) <= 0:
+        raise typer.BadParameter("--weights must be finite, non-negative, and have a positive sum")
+
+    volumes = [np.asarray(tifffile.imread(path), dtype=np.float64) for path in inputs]
+    if any(volume.ndim != 3 for volume in volumes):
+        raise typer.BadParameter("all input PSFs must be 3D ZYX TIFFs")
+    shapes = {volume.shape for volume in volumes}
+    if len(shapes) != 1:
+        raise typer.BadParameter(f"all input PSFs must have the same shape, got {sorted(shapes)}")
+
+    normalized_volumes = []
+    for path, volume in zip(inputs, volumes, strict=True):
+        if not np.isfinite(volume).all():
+            raise typer.BadParameter(f"input PSF contains non-finite values: {path}")
+        if np.any(volume < 0):
+            raise typer.BadParameter(f"input PSF contains negative values: {path}")
+        mass = float(volume.sum())
+        if mass <= 0:
+            raise typer.BadParameter(f"input PSF must have positive mass: {path}")
+        normalized_volumes.append(volume / mass)
+
+    normalized_weights = weights / float(weights.sum())
+    combined = np.tensordot(
+        normalized_weights, np.stack(normalized_volumes, axis=0), axes=(0, 0)
+    )
+    combined /= float(combined.sum())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(output, combined.astype(np.float32), metadata={"axes": "ZYX"})
+
+    input_paths = {f"psf_{index}": path for index, path in enumerate(inputs)}
+    output_paths = {"weighted_tif": output, "report_json": report}
+    payload: dict[str, object] = {
+        **provenance(input_paths, output_paths),
+        "command": "weighted-average",
+        "input_psfs": [str(path) for path in inputs],
+        "raw_weights": weights.tolist(),
+        "normalized_weights": normalized_weights.tolist(),
+        "shape_zyx": list(combined.shape),
+        "output_sum": float(combined.sum()),
+        "output_tif": str(output),
+        "report_json": str(report),
+    }
+    write_json(report, payload)
+    typer.echo(json.dumps(payload, indent=2))
 
 
 def write_tif_bundle(out_dir: Path, name: str, volume: np.ndarray, raw_peak: float) -> dict[str, Path]:

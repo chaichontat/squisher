@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+from types import TracebackType
 from xml.etree import ElementTree
 
 import numpy as np
@@ -68,20 +69,11 @@ class TiffLogicalSource:
         )
 
     def read_window(self, start: int, stop: int) -> np.ndarray:
-        if start < 0 or stop > self.z_count or start >= stop:
-            raise ValueError(f"Invalid z window [{start}, {stop}) for z_count={self.z_count}")
-        page_keys = self._page_keys(start, stop)
-        with tifffile.TiffFile(self.path) as tif:
-            if len(tif.pages) <= max(page_keys):
-                raise ValueError(
-                    f"{self.path} exposes {len(tif.pages)} TIFF page(s), but window [{start}, {stop}) "
-                    f"requires flattened page {max(page_keys)}."
-                )
-            if _is_contiguous(page_keys):
-                window = tif.asarray(key=slice(page_keys[0], page_keys[-1] + 1))
-            else:
-                window = tif.asarray(key=page_keys)
-        return window.reshape(stop - start, self.channels, self.height, self.width)
+        with self.open_reader() as reader:
+            return reader.read_window(start, stop)
+
+    def open_reader(self) -> "TiffWindowReader":
+        return TiffWindowReader(self)
 
     def page_key(self, *, channel: int, z: int) -> int:
         if not 0 <= channel < self.channels:
@@ -107,6 +99,57 @@ class TiffLogicalSource:
             for z_index in range(start, stop)
             for channel in range(self.channels)
         ]
+
+
+class TiffWindowReader:
+    """Reuse one TIFF handle for all slab reads belonging to one tile."""
+
+    def __init__(self, source: TiffLogicalSource) -> None:
+        self._source = source
+        self._tif: tifffile.TiffFile | None = None
+
+    def __enter__(self) -> "TiffWindowReader":
+        if self._tif is not None:
+            raise RuntimeError(f"TIFF reader for {self._source.path} is already open.")
+        self._tif = tifffile.TiffFile(self._source.path)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._tif is not None:
+            self._tif.close()
+            self._tif = None
+
+    def read_window(self, start: int, stop: int) -> np.ndarray:
+        if start < 0 or stop > self._source.z_count or start >= stop:
+            raise ValueError(f"Invalid z window [{start}, {stop}) for z_count={self._source.z_count}")
+        page_keys = self._source._page_keys(start, stop)
+        last_page = max(page_keys)
+        tif = self._tif
+        if tif is None:
+            raise RuntimeError(f"TIFF reader for {self._source.path} is not open.")
+        try:
+            tif.pages[last_page]
+        except IndexError as exc:
+            page_count = len(tif.pages)
+            raise ValueError(
+                f"{self._source.path} exposes {page_count} TIFF page(s), but window [{start}, {stop}) "
+                f"requires flattened page {last_page}."
+            ) from exc
+        if _is_contiguous(page_keys):
+            window = tif.asarray(key=slice(page_keys[0], page_keys[-1] + 1))
+        else:
+            window = tif.asarray(key=page_keys)
+        return window.reshape(
+            stop - start,
+            self._source.channels,
+            self._source.height,
+            self._source.width,
+        )
 
 
 def _logical_axes(
@@ -142,9 +185,13 @@ def _is_contiguous(keys: list[int]) -> bool:
 def _summary_metadata(path: Path, *, tif: tifffile.TiffFile) -> tuple[SourceMetadata, str]:
     ome_xml = tif.ome_metadata
     if ome_xml is None:
-        raise ValueError(f"{path} is missing OME-XML metadata; summary inspection requires OME-TIFF input.")
-    raw_shape, axes = _ome_pixels_shape(path, ome_xml=ome_xml)
-    raw_dtype = str(tif.pages[0].dtype)
+        series = tif.series[0]
+        raw_shape = tuple(int(value) for value in series.shape)
+        axes = str(series.axes)
+        raw_dtype = str(series.dtype)
+    else:
+        raw_shape, axes = _ome_pixels_shape(path, ome_xml=ome_xml)
+        raw_dtype = str(tif.pages[0].dtype)
     payload = {
         "metadata_mode": "summary",
         "raw_shape": raw_shape,

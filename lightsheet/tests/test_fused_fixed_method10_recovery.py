@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from scipy.linalg import polar
 from scipy.spatial.transform import Rotation
+import zarr
 
 
 def _load_recovery():
@@ -375,7 +376,7 @@ def test_selected_transform_update_keeps_all_representations_consistent() -> Non
     ],
     ids=["missing-output", "native-rejection", "spatial-outlier"],
 )
-def test_unvalidated_recovery_initializer_remains_rejected(tmp_path, rerun_payload, expected_reason) -> None:
+def test_failed_refit_retains_accepted_original(tmp_path, rerun_payload, expected_reason) -> None:
     recovery = _load_recovery()
     original_path = tmp_path / "input" / "window.json"
     output_dir = tmp_path / "output"
@@ -397,11 +398,12 @@ def test_unvalidated_recovery_initializer_remains_rejected(tmp_path, rerun_paylo
     )
     recovered = recovery._read_json(output_path)
 
-    assert result["status"] == "rejected"
-    assert recovered["status"] == "rejected"
-    assert recovered["rejection_reason"] == expected_reason
-    assert recovered["selected_attempt"] is None
-    assert recovered["method8_attempts"][-1]["status"] == "rejected"
+    assert result["status"] == "accepted"
+    assert recovered["status"] == "accepted"
+    assert recovered["rejection_reason"] is None
+    assert recovered["selected_attempt"] == row["selected_attempt"]
+    assert recovered["outlier_recovery"]["native_rerun_selected"] is False
+    assert recovered["outlier_recovery"]["retained_original_reason"] == expected_reason
 
 
 def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path) -> None:
@@ -517,19 +519,16 @@ def test_rerun_all_preserves_spatial_outlier_reason(tmp_path: Path, monkeypatch,
 
 
 @pytest.mark.parametrize(
-    ("rerun_grad_ncc", "expected_status", "expected_reason"),
+    "rerun_grad_ncc",
     [
-        (0.41, "accepted", None),
-        (0.40, "rejected", "native_rerun_grad_ncc_not_improved"),
-        (0.39, "rejected", "native_rerun_grad_ncc_not_improved"),
-        (None, "rejected", "native_rerun_grad_ncc_not_improved"),
+        0.40,
+        0.39,
+        None,
     ],
 )
-def test_spatial_outlier_refit_requires_grad_ncc_improvement(
+def test_nonimproving_spatial_refit_retains_accepted_original(
     tmp_path: Path,
     rerun_grad_ncc: float | None,
-    expected_status: str,
-    expected_reason: str | None,
 ) -> None:
     recovery = _load_recovery()
     original_path = tmp_path / "input" / "window.json"
@@ -561,10 +560,78 @@ def test_spatial_outlier_refit_requires_grad_ncc_improvement(
     )
     recovered = recovery._read_json(output_path)
 
-    assert result["status"] == expected_status
-    assert recovered["rejection_reason"] == expected_reason
+    assert result["status"] == "accepted"
+    assert recovered["status"] == "accepted"
+    assert recovered["rejection_reason"] is None
+    assert recovered["selected_attempt"] == row["selected_attempt"]
+    assert recovered["selected_gradient_component_ncc_mean"] == 0.40
+    assert recovered["outlier_recovery"]["native_rerun_selected"] is False
+    assert recovered["outlier_recovery"]["retained_original_reason"] == (
+        "native_rerun_grad_ncc_not_improved"
+    )
     assert recovered["outlier_recovery"]["original_gradient_component_ncc_mean"] == 0.40
     assert recovered["outlier_recovery"]["native_rerun_gradient_component_ncc_mean"] == rerun_grad_ncc
+
+
+def test_final_linear_filter_retains_fit_when_support_is_insufficient(
+    tmp_path: Path, monkeypatch
+) -> None:
+    recovery = _load_recovery()
+    window_path = tmp_path / "window.json"
+    moving_position_path = tmp_path / "positions.json"
+    fixed_path = tmp_path / "fixed.zarr"
+    output_dir = tmp_path / "output"
+    row = {**_recovery_row(), "moving_tile": "sample.001"}
+    recovery._write_json(window_path, row)
+    recovery._write_json(
+        moving_position_path,
+        {
+            "tiles": [
+                {
+                    "tile": "sample.001",
+                    "scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                    "translation_um": {"z": 0.0, "y": 0.0, "x": 0.0},
+                }
+            ]
+        },
+    )
+    zarr.open_group(fixed_path, mode="w")
+    monkeypatch.setattr(
+        recovery.ngff,
+        "scale_translation",
+        lambda _group: (["z", "y", "x"], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], True, True),
+    )
+    summary_path = tmp_path / "summary.json"
+    recovery._write_json(
+        summary_path,
+        {
+            "moving_position": str(moving_position_path),
+            "fixed_fused": str(fixed_path),
+            "windows": [{"level0_json": str(window_path)}],
+        },
+    )
+
+    result_path = recovery.filter_final_linear_outliers(
+        SimpleNamespace(
+            summary=summary_path,
+            output_dir=output_dir,
+            minimum_linear_samples=8,
+            linear_loss_scale_um=2.0,
+            outlier_mad=4.0,
+            minimum_linear_outlier_um=3.0,
+            maximum_linear_outlier_um=8.0,
+            maximum_linear_median_residual_um=4.0,
+        )
+    )
+    result = recovery._read_json(result_path)
+    retained = recovery._read_json(Path(result["windows"][0]["level0_json"]))
+
+    assert retained["status"] == "accepted"
+    assert retained["rejection_reason"] is None
+    assert result["final_linear_filter"]["excluded_count"] == 0
+    assert result["final_linear_filter"]["tiles"][0]["status"] == (
+        "skipped_insufficient_support"
+    )
 
 
 def test_adjacent_translation_initializer_collapses_duplicate_window_coordinates() -> None:

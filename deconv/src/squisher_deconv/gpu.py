@@ -23,7 +23,7 @@ I_MAX = np.float32(2**16 - 1)
 
 
 class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
-    """CuPy BaSiC correction plus Guo LR deconvolution."""
+    """Optional CuPy BaSiC correction followed by Guo LR deconvolution."""
 
     def __init__(
         self,
@@ -43,14 +43,19 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
         self._cp = cp
         self._device = int(device)
         self._iterations = int(iterations)
-        self._darkfield, self._flatfield = _load_basic_profiles(basic_paths, cp=cp)
-        self._inv_flatfield = 1.0 / self._flatfield
-        self._basic_kernel = cp.ElementwiseKernel(
-            "float32 x, float32 df, float32 inv_ff",
-            "float32 y",
-            "float t = (x - df) * inv_ff; y = t > 0.0f ? t : 0.0f;",
-            name="squisher_deconv_basic_correct_clip",
-        )
+        if basic_paths:
+            self._darkfield, flatfield = _load_basic_profiles(basic_paths, cp=cp)
+            self._inv_flatfield = 1.0 / flatfield
+            self._basic_kernel = cp.ElementwiseKernel(
+                "float32 x, float32 df, float32 inv_ff",
+                "float32 y",
+                "float t = (x - df) * inv_ff; y = t > 0.0f ? t : 0.0f;",
+                name="squisher_deconv_basic_correct_clip",
+            )
+        else:
+            self._darkfield = None
+            self._inv_flatfield = None
+            self._basic_kernel = None
         if not psf_paths:
             raise ValueError("At least one PSF path is required.")
         self._projectors = tuple(
@@ -99,15 +104,19 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
         cp = self._cp
         cp.cuda.Device(self._device).use()
         x = cp.asarray(volume, dtype=cp.float32)
-        if x.shape[1] != self._darkfield.shape[1]:
-            raise ValueError(
-                f"Input has {x.shape[1]} channel(s), but {self._darkfield.shape[1]} BaSiC profile(s) were loaded."
-            )
         if x.shape[1] != len(self._projectors):
             raise ValueError(
                 f"Input has {x.shape[1]} channel(s), but {len(self._projectors)} PSF(s) were loaded."
             )
-        self._basic_kernel(x, self._darkfield, self._inv_flatfield, x)
+        if self._basic_kernel is not None:
+            if self._darkfield is None or self._inv_flatfield is None:
+                raise RuntimeError("BaSiC correction kernel was initialized without correction profiles.")
+            if x.shape[1] != self._darkfield.shape[1]:
+                raise ValueError(
+                    f"Input has {x.shape[1]} channel(s), but "
+                    f"{self._darkfield.shape[1]} BaSiC profile(s) were loaded."
+                )
+            self._basic_kernel(x, self._darkfield, self._inv_flatfield, x)
         out = cp.empty_like(x, dtype=cp.float32)
         for channel, projectors in enumerate(self._projectors):
             out[:, channel : channel + 1] = _deconvolve_lucyrichardson_guo(

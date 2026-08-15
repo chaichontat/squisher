@@ -9,7 +9,7 @@ Commands:
 ```bash
 squisher-deconv basic INPUT... --out-dir BASIC_DIR --label SAMPLE --channels 2 --device cuda
 squisher-deconv sample-scale INPUT... --out-dir DIR --planes N --channels 2 --psf PSF-c0.tif --psf PSF-c1.tif --iter 1
-squisher-deconv run INPUT... --out-dir DIR --channels 2 --psf PSF-c0.tif --psf PSF-c1.tif --scaling DIR/scaling.json --output-mode u16 --iter 1
+squisher-deconv run INPUT... --out-dir DIR --channels 2 --psf PSF-c0.tif --psf PSF-c1.tif --scaling DIR/scaling.json --iter 1
 ```
 
 `basic` samples level-0 OME-TIFF planes with blank- and edge-slice rejection, then fits one

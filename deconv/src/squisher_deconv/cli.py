@@ -6,6 +6,7 @@ from typing import Annotated
 
 import typer
 
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL
 from squisher_deconv.basic import fit_basic_profiles
 from squisher_deconv.deconvolution import infer_psf_halo_many
 from squisher_deconv.gpu import CupyDeconvolverFactory
@@ -77,7 +78,6 @@ def basic(
     ] = 1.8,
     fitting_mode: Annotated[str, typer.Option("--fitting-mode")] = "approximate",
     working_size: Annotated[int, typer.Option("--working-size", min=1)] = 128,
-    device: Annotated[str, typer.Option("--device")] = "cuda",
     seed: Annotated[int, typer.Option("--seed")] = 20260709,
 ) -> None:
     """Fit a joint-channel autotuned BaSiC profile with darkfield correction."""
@@ -101,7 +101,7 @@ def basic(
         smoothness_flatfield=smoothness_flatfield,
         fitting_mode=fitting_mode,
         working_size=working_size,
-        device=device,
+        device="cuda",
         seed=seed,
         progress=typer.echo,
     )
@@ -197,17 +197,19 @@ def run(
         ),
     ] = None,
     iterations: Annotated[int, typer.Option("--iter", min=1, help="Richardson-Lucy iterations.")] = 1,
-    output_mode: Annotated[str, typer.Option("--output-mode")] = "u16",
     halo: Annotated[int | None, typer.Option("--halo", min=0)] = None,
     slab_depth: Annotated[int, typer.Option("--slab-depth", min=1)] = 16,
     devices: Annotated[str, typer.Option("--devices")] = "auto",
     queue_depth: Annotated[int, typer.Option("--queue-depth", min=1)] = 2,
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (
+        DEFAULT_JPEGXR_LEVEL
+    ),
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error/--keep-going")] = True,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
     resume: Annotated[bool, typer.Option("--resume/--no-resume")] = False,
 ) -> None:
-    if output_mode == "u16" and scaling is None:
-        raise typer.BadParameter("--output-mode u16 requires --scaling.")
+    if scaling is None:
+        raise typer.BadParameter("run requires --scaling.")
     run_streaming_deconv(
         inputs,
         out_dir=out_dir,
@@ -215,8 +217,6 @@ def run(
         channels=channels,
         halo=infer_psf_halo_many(psf) if halo is None else halo,
         slab_depth=slab_depth,
-        output_mode=output_mode,
-        deconvolver=None,
         deconvolver_factory=_build_deconvolver_factory(
             basic=basic,
             channels=channels,
@@ -227,6 +227,7 @@ def run(
         basic_paths=basic,
         devices=parse_devices(devices, gpu_auto=True),
         queue_depth=queue_depth,
+        jpegxr_level=jpegxr_level,
         stop_on_error=stop_on_error,
         overwrite=overwrite,
         resume=resume,
@@ -271,12 +272,12 @@ def _build_deconvolver_factory(
 ) -> CupyDeconvolverFactory:
     if len(psfs) != channels:
         raise typer.BadParameter(f"Expected exactly {channels} --psf path(s), got {len(psfs)}.")
-    if basic is None or len(basic) != channels:
+    if basic is not None and len(basic) != channels:
         raise typer.BadParameter(
-            f"Expected exactly {channels} --basic profile path(s), got {0 if basic is None else len(basic)}."
+            f"Expected exactly {channels} --basic profile path(s), got {len(basic)}."
         )
     return CupyDeconvolverFactory(
-        basic_paths=tuple(Path(path) for path in basic),
+        basic_paths=tuple(Path(path) for path in basic or ()),
         psf_paths=tuple(Path(path) for path in psfs),
         iterations=iterations,
     )

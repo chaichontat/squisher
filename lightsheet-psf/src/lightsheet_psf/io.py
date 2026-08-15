@@ -7,11 +7,20 @@ import tifffile
 from aicspylibczi import CziFile
 
 
-def load_image_zyx(path: Path, channel: int | None = None) -> np.ndarray:
+def load_image_zyx(path: Path, channel: int | None = None, z_start: int = 0) -> np.ndarray:
+    """Load a ZYX stack after discarding any requested leading Z planes."""
+    if z_start < 0:
+        raise ValueError(f"z_start must be non-negative, got {z_start}.")
     suffixes = "".join(path.suffixes).lower()
     if suffixes.endswith((".tif", ".tiff", ".ome.tif", ".ome.tiff")):
-        return load_tiff_zyx(path, channel=channel)
-    return load_czi_zyx(path, channel=channel)
+        stack = load_tiff_zyx(path, channel=channel)
+    else:
+        stack = load_czi_zyx(path, channel=channel)
+    if z_start >= stack.shape[0]:
+        raise ValueError(
+            f"z_start={z_start} must be smaller than the stack's {stack.shape[0]} Z planes."
+        )
+    return stack[z_start:]
 
 
 def _select_zyx(path: Path, arr: np.ndarray, dims: str, channel: int | None) -> np.ndarray:

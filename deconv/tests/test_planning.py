@@ -27,6 +27,24 @@ def test_uniform_sampling_is_over_all_files_with_seed(tmp_path) -> None:
     assert len({(sample.file_index, sample.true_z) for sample in first}) == 4
 
 
+def test_uniform_sampling_caps_requested_planes_at_total(tmp_path) -> None:
+    a = tmp_path / "a.tif"
+    b = tmp_path / "b.tif"
+    _write_stack(a, z=2, channels=2)
+    _write_stack(b, z=4, channels=2)
+
+    samples = uniform_sample_planes([a, b], planes=10, channels=2, seed=10)
+
+    assert [(sample.file_index, sample.true_z) for sample in samples] == [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+    ]
+
+
 def test_group_sample_windows_preserves_requested_core_planes(tmp_path) -> None:
     path = tmp_path / "a.tif"
     samples = [
