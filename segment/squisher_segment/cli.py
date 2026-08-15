@@ -6,12 +6,52 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from fishtools.segment.extract import run_extract
+from squisher_segment.segment.extract import run_extract
 
 
 app = typer.Typer(no_args_is_help=True)
 segment_app = typer.Typer(no_args_is_help=True)
 postproc_app = typer.Typer(no_args_is_help=True)
+
+
+@app.command("train")
+def train(
+    path: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Training-data root.")],
+    name: Annotated[str, typer.Argument(help="Model config stem under PATH/models.")],
+    packed: Annotated[
+        bool,
+        typer.Option("--packed/--no-packed", help="Enable packed-stripe training."),
+    ] = False,
+    skip_trt: Annotated[
+        bool,
+        typer.Option("--skip-trt", help="Skip TensorRT engine generation after training."),
+    ] = False,
+) -> None:
+    """Train Cellpose from ``PATH/models/NAME.json``."""
+    from squisher_segment.segment.train import TrainConfig, run_train
+
+    models_path = path / "models"
+    if not models_path.is_dir():
+        raise typer.BadParameter(f"Models path {models_path} does not exist.", param_hint="path")
+
+    config_path = models_path / f"{name}.json"
+    if not config_path.is_file():
+        raise typer.BadParameter(f"Config file {config_path} does not exist.", param_hint="name")
+
+    config_text = config_path.read_text()
+    train_config = TrainConfig.model_validate_json(
+        "\n".join(line for line in config_text.splitlines() if not line.lstrip().startswith("//"))
+        + ("\n" if config_text.endswith("\n") else "")
+    )
+    train_config = train_config.model_copy(
+        update={
+            "packed": packed,
+            "skip_trt": train_config.skip_trt or skip_trt,
+        }
+    )
+
+    updated = run_train(name, path, train_config)
+    (models_path / f"{name}.trained.json").write_text(updated.model_dump_json(indent=2))
 
 
 @segment_app.command("run")
@@ -29,7 +69,7 @@ def segment_run(
     cellpose_only: Annotated[bool, typer.Option("--cellpose-only/--no-cellpose-only", help="Stop after Cellpose inference.")] = False,
     stagger_seconds: Annotated[float, typer.Option(help="Seconds to stagger worker starts on one GPU.")] = 5.0,
 ) -> None:
-    from fishtools.segmentation.distributed import distributed_segmentation as segment_mod
+    from squisher_segment.segmentation.distributed import distributed_segmentation as segment_mod
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     logging.getLogger("cellpose").setLevel(logging.WARNING)
@@ -54,19 +94,28 @@ def segment_stitch(
     temp_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Cellpose temp directory.")],
     output_path: Annotated[Path, typer.Argument(help="Output segmentation .zarr path.")],
     cleanup: Annotated[bool, typer.Option("--cleanup/--no-cleanup", help="Remove temp directory after stitching.")] = True,
+    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")] = False,
 ) -> None:
-    from fishtools.segmentation.distributed import distributed_segmentation as segment_mod
+    from squisher_segment.segmentation.distributed import distributed_segmentation as segment_mod
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     if not (temp_dir / "segmentation_unstitched.zarr").exists():
         raise FileNotFoundError(f"No segmentation_unstitched.zarr found in {temp_dir}")
     if not (temp_dir / "intermediate_state.npz").exists():
         raise FileNotFoundError(f"No intermediate_state.npz found in {temp_dir}")
+    run_identity = segment_mod.load_run_identity(temp_dir / "run_config.json")
+    if overwrite:
+        segment_mod.completion_marker_path(output_path).unlink(missing_ok=True)
+    elif segment_mod.completed_run_matches(output_path, run_identity):
+        logging.getLogger(__name__).info(f"Completed output already matches this run: {output_path}")
+        return
+    elif output_path.exists():
+        raise FileExistsError(f"Output {output_path} already exists; use --overwrite to replace it.")
 
     segment_mod.stitch_segmentation(temp_dir, output_path)
+    segment_mod.write_completion_marker(output_path, run_identity)
     if cleanup:
         shutil.rmtree(temp_dir)
-    (output_path.parent / "segmentation.done").touch()
 
 
 @postproc_app.command("run")
@@ -81,7 +130,7 @@ def postproc_run(
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")] = False,
 ) -> None:
     import zarr
-    from fishtools.segmentation.distributed import distributed_postproc as postproc_mod
+    from squisher_segment.segmentation.distributed import distributed_postproc as postproc_mod
 
     input_zarr = zarr.open(input_zarr_path, mode="r")
     resolved_output_path = output_path

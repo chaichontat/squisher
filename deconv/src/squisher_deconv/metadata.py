@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from xml.etree import ElementTree
@@ -168,6 +169,8 @@ def provenance_payload(
     *,
     channels: int,
     halo: int,
+    slab_depth: int,
+    iterations: int | None,
     psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
     output_mode: str,
@@ -177,26 +180,22 @@ def provenance_payload(
 ) -> dict[str, Any]:
     return {
         "tool": "squisher-deconv",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
-        "channels": int(channels),
-        "halo": int(halo),
+        "run_settings": {
+            "channels": int(channels),
+            "halo": int(halo),
+            "slab_depth": int(slab_depth),
+            "iterations": None if iterations is None else int(iterations),
+            "output_mode": output_mode,
+            "devices": [int(device) for device in devices],
+            "queue_depth": int(queue_depth),
+        },
         "psfs": file_provenance_records(psf_paths or []),
         "basic_profiles": file_provenance_records(basic_paths or []),
-        "output_mode": output_mode,
-        "compression_tiff_tag": compression_tiff_tag(output_mode),
-        "scaling_path": None if scaling_path is None else str(scaling_path),
-        "devices": [int(device) for device in devices],
-        "queue_depth": int(queue_depth),
+        "scaling": None if scaling_path is None else file_provenance_records([scaling_path])[0],
         "versions": dependency_versions(),
     }
-
-
-def compression_tiff_tag(output_mode: str) -> int | None:
-    if output_mode == "u16":
-        return 22610
-    if output_mode == "float32":
-        return None
-    raise ValueError(f"Unsupported output_mode={output_mode!r}; expected 'u16' or 'float32'.")
 
 
 def file_provenance_records(paths: Sequence[Path]) -> list[dict[str, str]]:
@@ -220,14 +219,27 @@ def _file_sha256(path: Path) -> str:
 
 def dependency_versions() -> dict[str, str]:
     from importlib.metadata import PackageNotFoundError, version
+    import tomllib
 
-    packages = ("numpy", "tifffile", "imagecodecs", "squisher-deconv")
+    packages = {
+        "numpy": "numpy",
+        "tifffile": "tifffile",
+        "imagecodecs": "imagecodecs",
+        "zarr": "zarr",
+        "cupy": "cupy-cuda12x",
+        "basicpy": "BaSiCPy",
+        "squisher-deconv": "squisher-deconv",
+    }
     versions: dict[str, str] = {}
-    for package in packages:
+    for label, distribution in packages.items():
         try:
-            versions[package] = version(package)
+            versions[label] = version(distribution)
         except PackageNotFoundError:
-            versions[package] = "not-installed"
+            versions[label] = "not-installed"
+    if versions["squisher-deconv"] == "not-installed":
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if pyproject.exists():
+            versions["squisher-deconv"] = str(tomllib.loads(pyproject.read_text())["project"]["version"])
     return versions
 
 

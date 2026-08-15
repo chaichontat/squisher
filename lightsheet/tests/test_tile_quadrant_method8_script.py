@@ -1,5 +1,8 @@
+import json
+import pickle
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -45,7 +48,7 @@ def test_quadrant_z_windows_cover_960_tile_with_480_step_and_528_window() -> Non
         assert np.all(stop <= [3161, 960, 960])
 
 
-def test_preseeded_level0_model_uses_coarse_position_translation_at_tile_center(tmp_path: Path) -> None:
+def test_preseeded_level0_model_uses_resolved_tiles(tmp_path: Path) -> None:
     fixed = _position_record(
         tmp_path,
         tile="Image_14.000.ome.zarr",
@@ -59,9 +62,11 @@ def test_preseeded_level0_model_uses_coarse_position_translation_at_tile_center(
         scale_zyx_um=(2.0, 1.0, 0.5),
     )
 
+    fixed_tile = tile_quadrant_method8.tile_record_from_position_record(fixed)
+    moving_tile = tile_quadrant_method8.tile_record_from_position_record(moving)
     matrix, translation = tile_quadrant_method8.preseeded_level0_model(
-        fixed_record=fixed,
-        moving_record=moving,
+        fixed_tile=fixed_tile,
+        moving_tile=moving_tile,
         preseed_matrix_zyx=tile_quadrant_method8.README_PRESEED_MATRIX_ZYX,
     )
 
@@ -203,6 +208,69 @@ def test_cache_config_includes_inputs_and_window_geometry(tmp_path: Path) -> Non
     assert config["moving_position"].endswith("moving.positions.json")
     assert config["core_shape_zyx"] == [480, 480, 480]
     assert config["window_shape_zyx"] == [528, 528, 528]
+
+
+def test_build_tasks_passes_resolved_tiles_to_workers(tmp_path: Path, monkeypatch: Any) -> None:
+    fixed = _position_record(
+        tmp_path,
+        tile="Image_14.000.ome.zarr",
+        translation_zyx_um=(0.0, 100.0, 200.0),
+    )
+    moving = _position_record(
+        tmp_path,
+        tile="Image_10.000.ome.zarr",
+        translation_zyx_um=(4.0, 112.0, 207.0),
+    )
+    fixed_position = tmp_path / "fixed.json"
+    moving_position = tmp_path / "moving.json"
+    fixed_position.write_text(json.dumps({"tiles": [fixed]}))
+    moving_position.write_text(json.dumps({"tiles": [moving]}))
+    calls: list[str] = []
+    original = tile_quadrant_method8.tile_record_from_position_record
+
+    def count_resolution(record: dict[str, object]) -> Any:
+        calls.append(str(record["tile"]))
+        return original(record)
+
+    monkeypatch.setattr(tile_quadrant_method8, "tile_record_from_position_record", count_resolution)
+    args = SimpleNamespace(
+        fixed_position=fixed_position,
+        moving_position=moving_position,
+        fixed_channel=0,
+        moving_channel=0,
+        core_shape_zyx=(480, 480, 480),
+        window_shape_zyx=(528, 528, 528),
+        fit_downsample_zyx=(1, 1, 1),
+        native_lib_dir=tmp_path,
+        ftol=1e-4,
+        max_iterations=300,
+        min_corr=0.15,
+        min_grad_ncc=0.24,
+        empty_precheck_level=-1,
+        empty_precheck_min_dynamic_range=1.0,
+        empty_precheck_min_std=0.25,
+        fixed_mask_threshold=3000.0,
+        fixed_mask_level=2,
+        fixed_mask_min_voxels=256,
+        fixed_mask_max_masked_fraction=0.95,
+        preseed_matrix_zyx=None,
+        tile_filter=None,
+        devices="0",
+        output_dir=tmp_path / "output",
+        resume=False,
+        max_windows=1,
+    )
+
+    tasks, cached = tile_quadrant_method8._build_tasks(args)
+
+    assert cached == []
+    assert calls == [fixed["tile"], moving["tile"]]
+    assert len(tasks) == 1
+    assert tasks[0]["fixed_tile"].tile == fixed["tile"]
+    assert tasks[0]["moving_tile"].tile == moving["tile"]
+    restored = pickle.loads(pickle.dumps(tasks[0]))
+    assert restored["fixed_tile"].tile == fixed["tile"]
+    assert restored["moving_tile"].tile == moving["tile"]
 
 
 def test_resume_cache_requires_mask_evidence_for_masked_rows() -> None:

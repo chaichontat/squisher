@@ -84,11 +84,14 @@ def page_index_for_channel_z(tif: tifffile.TiffFile, z: int, *, channel: int) ->
 
 
 def decon_channel_count(path: Path) -> int:
-    sidecar = path.with_suffix(".deconv.json")
+    sidecar = output_sidecar_path(path) if path.name.endswith(".ome.zarr") else path.with_suffix(".deconv.json")
     if not sidecar.exists():
         return 1
     payload = json.loads(sidecar.read_text())
-    channels = int(payload.get("provenance", {}).get("channels", 1))
+    try:
+        channels = int(payload["provenance"]["run_settings"]["channels"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{sidecar} is missing a valid provenance.run_settings.channels value") from error
     if channels <= 0:
         raise ValueError(f"{sidecar} records invalid channel count {channels}")
     return channels
@@ -126,7 +129,7 @@ def finished_tiles(deconv_dir: Path, prefix: str, tile_count: int) -> list[str]:
 
 def read_ome_zarr_plane(path: Path, z: int, *, channel: int) -> np.ndarray:
     array = zarr.open_group(str(path), mode="r")["0"]
-    axes = list(array.attrs.get("_ARRAY_DIMENSIONS", []))
+    axes = list(getattr(array.metadata, "dimension_names", None) or array.attrs.get("_ARRAY_DIMENSIONS", []))
     if axes != ["c", "z", "y", "x"]:
         raise ValueError(f"{path}/0 axes must be ['c', 'z', 'y', 'x'], got {axes}")
     channels, z_count, _, _ = map(int, array.shape)

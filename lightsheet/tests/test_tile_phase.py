@@ -46,6 +46,15 @@ def _write_test_ome_zarr(path: Path, *, axes: str, levels: list[np.ndarray]) -> 
     group.attrs["multiscales"] = [{"version": "0.4", "axes": axis_names, "datasets": datasets}]
 
 
+def test_flattened_channel_count_reads_deconvolution_run_settings(tmp_path: Path) -> None:
+    path = tmp_path / "tile.ome.tif"
+    tile_phase_module.deconvolution_sidecar(path).write_text(
+        json.dumps({"provenance": {"run_settings": {"channels": 2}}})
+    )
+
+    assert tile_phase_module.flattened_channel_count(path) == 2
+
+
 def test_estimate_tile_shift_zyx_px_recovers_synthetic_translation() -> None:
     z, y, x = np.mgrid[:32, :48, :48]
     fixed = np.exp(-(((z - 16) ** 2) / 12.0 + ((y - 24) ** 2 + (x - 24) ** 2) / 150.0)).astype(np.float32)
@@ -97,6 +106,13 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
         channel=1,
         slices_zyx=(slice(1, 3), slice(2, 5), slice(1, 4)),
     )
+    moving_indexed_patch = tile_phase_module.read_tile_indexed_z_patch(
+        moving,
+        channel=1,
+        z_indices=np.arange(1, 3, dtype=np.int64),
+        y_slice=slice(2, 5),
+        x_slice=slice(1, 4),
+    )
     moving_from_path = tile_phase_module.make_moving_tile_record(reference, czyx_path)
     scout, scale_zyx, source_level, available_levels, z_indices_l0 = tile_phase_module.sampled_tile_volume_from_subifd(
         moving,
@@ -119,6 +135,7 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
 
     np.testing.assert_array_equal(fixed_patch, zyx_level0[1:3, 2:5, 1:4])
     np.testing.assert_array_equal(moving_patch, czyx_level0[1, 1:3, 2:5, 1:4])
+    np.testing.assert_array_equal(moving_indexed_patch, czyx_level0[1, 1:3, 2:5, 1:4])
     np.testing.assert_array_equal(scout, czyx_level1[1])
     np.testing.assert_array_equal(scale_zyx, [2.0, 2.0, 2.0])
     np.testing.assert_array_equal(z_indices_l0, [0, 2])
@@ -131,6 +148,56 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
     assert position_record["translation_um"] == {"z": 1.5, "y": 3.5, "x": 5.5}
     assert source_level == 1
     assert available_levels == 2
+
+
+@pytest.mark.parametrize(
+    ("indices", "expected_indexer", "expected_reverse"),
+    [
+        (np.asarray([2, 3, 4]), slice(2, 5), False),
+        (np.asarray([4, 3, 2]), slice(2, 5), True),
+        (np.asarray([3]), slice(3, 4), False),
+    ],
+)
+def test_contiguous_raw_z_indices_use_slice(
+    indices: np.ndarray,
+    expected_indexer: slice,
+    expected_reverse: bool,
+) -> None:
+    indexer, reverse = tile_phase_module.raw_z_indexer(indices)
+
+    assert indexer == expected_indexer
+    assert reverse is expected_reverse
+
+
+def test_sparse_raw_z_indices_remain_fancy_indexed() -> None:
+    indices = np.asarray([1, 3, 6])
+
+    indexer, reverse = tile_phase_module.raw_z_indexer(indices)
+
+    np.testing.assert_array_equal(indexer, indices)
+    assert reverse is False
+
+
+def test_position_record_loader_accepts_side_less_canonical_positions(tmp_path) -> None:
+    path = tmp_path / "fixed.000.ome.zarr"
+    _write_test_ome_zarr(
+        path,
+        axes="CZYX",
+        levels=[np.zeros((1, 4, 6, 8), dtype=np.uint16)],
+    )
+
+    tile = tile_phase_module.tile_record_from_position_record(
+        {
+            "tile": path.name,
+            "path": str(path),
+            "translation_um": {"z": 1.0, "y": 2.0, "x": 3.0},
+            "scale_um": {"z": 0.6, "y": 0.3, "x": 0.3},
+        }
+    )
+
+    assert tile.side == "all"
+    assert tile.axes == "CZYX"
+    np.testing.assert_array_equal(tile.shape_zyx, [4, 6, 8])
 
 
 def test_token_rewrite_resolves_corresponding_405_tile(tmp_path) -> None:
@@ -816,7 +883,7 @@ def test_candidate_patch_slices_filters_shifted_moving_out_of_bounds() -> None:
         assert tile_phase_module.slices_within_shape(moving_slices, np.asarray([64, 128, 128]))
 
 
-def test_adapt_registration_copies_affine_and_replaces_405_stage(tmp_path) -> None:
+def test_adapt_registration_writes_stage_records_with_identity_affine(tmp_path) -> None:
     reference_registration = tmp_path / "registration.track0.json"
     output_registration = tmp_path / "registration.405.json"
     affine = {
@@ -846,6 +913,7 @@ def test_adapt_registration_copies_affine_and_replaces_405_stage(tmp_path) -> No
             {
                 "tile": "230Tnc-CL-405.000.ome.tif",
                 "path": str(moving_path),
+                "side": "L",
                 "translation_um": {"z": 10.0, "y": 20.0, "x": 30.0},
                 "scale_um": {"z": 2.0, "y": 0.5, "x": 0.5},
             }
@@ -881,10 +949,12 @@ def test_adapt_registration_copies_affine_and_replaces_405_stage(tmp_path) -> No
     assert adapted["adapted_from"] == str(reference_registration.resolve())
     assert adapted["tiles"][0]["tile"] == "230Tnc-CL-405.000.ome.tif"
     assert adapted["tiles"][0]["path"] == str(moving_path)
+    assert adapted["tiles"][0]["source_view"] == "L"
     assert adapted["tiles"][0]["stage_translation_um"] == {"z": 10.0, "y": 20.0, "x": 30.0}
     assert adapted["tiles"][0]["stage_scale_um"] == {"z": 2.0, "y": 0.5, "x": 0.5}
-    assert adapted["tiles"][0]["registered_affine"] == affine
-    assert adapted["transform_contract"]["registered_affine_copied_exactly"] is True
+    assert adapted["tiles"][0]["registered_affine"]["matrix"] == np.eye(4).tolist()
+    assert adapted["transform_contract"]["registered_affine_copied_exactly"] is False
+    assert adapted["transform_contract"]["registered_affine_source"] == "identity_stage_translation_baked"
     assert adapted["tile_phase_summary"]["measurements"][0]["measurement_status"] == "direct_accepted"
 
 
@@ -930,6 +1000,62 @@ def test_adapt_registration_rejects_failed_measurement(tmp_path) -> None:
     }
 
     with pytest.raises(ValueError, match="Refusing to adapt registration"):
+        adapt_registration_from_reference(
+            reference_registration_input=reference_registration,
+            output_registration=output_registration,
+            adapted_position_payload=position_payload,
+            reference_token="488514561638",
+            moving_token="405",
+            adapted_to_position=tmp_path / "positions.json",
+            tile_phase_summary=summary,
+        )
+
+    assert not output_registration.exists()
+
+
+def test_adapt_registration_rejects_fallback_measurement(tmp_path) -> None:
+    reference_registration = tmp_path / "registration.track0.json"
+    output_registration = tmp_path / "registration.405.json"
+    reference_registration.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "230Tnc-CL-488514561638.000.ome.tif",
+                        "stage_translation_um": {"z": 1.0, "y": 2.0, "x": 3.0},
+                        "stage_scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                    }
+                ]
+            }
+        )
+    )
+    moving_path = tmp_path / "230Tnc-CL-405" / "230Tnc-CL-405.000.ome.tif"
+    position_payload = {
+        "tiles": [
+            {
+                "tile": "230Tnc-CL-405.000.ome.tif",
+                "path": str(moving_path),
+                "translation_um": {"z": 10.0, "y": 20.0, "x": 30.0},
+                "scale_um": {"z": 2.0, "y": 0.5, "x": 0.5},
+            }
+        ]
+    }
+    summary = {
+        "output_position": str(tmp_path / "positions.json"),
+        "measurements": [
+            {
+                "tile": "230Tnc-CL-405.000.ome.tif",
+                "reference_tile": "230Tnc-CL-488514561638.000.ome.tif",
+                "shift_px_zyx": [1.0, 2.0, 3.0],
+                "shift_um_zyx": [2.0, 1.0, 1.5],
+                "n_inliers": 4,
+                "measurement_status": "fallback_accepted",
+                "fallback": True,
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="status=fallback_accepted"):
         adapt_registration_from_reference(
             reference_registration_input=reference_registration,
             output_registration=output_registration,

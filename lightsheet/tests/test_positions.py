@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 from pathlib import Path
 
+from squisher_lightsheet._legacy import create_lr_position_file as legacy
 from squisher_lightsheet.positions import TileInfo, compute_joined_tiles
 
 
@@ -15,6 +16,42 @@ def tile(name: str, side: str, translation: tuple[float, float, float], shape=(1
         spacing_zyx=(1.0, 1.0, 1.0),
         translation_zyx=translation,
     )
+
+
+def test_read_tile_info_uses_ome_xml_without_constructing_tiff_series(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "tile.ome.tif"
+    path.touch()
+    ome_metadata = """<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+      <Image ID="Image:0"><Pixels DimensionOrder="XYZCT" Type="uint16"
+        SizeX="5" SizeY="4" SizeZ="3" SizeC="2" SizeT="1"
+        PhysicalSizeX="0.25" PhysicalSizeY="0.5" PhysicalSizeZ="1.0">
+        <Plane TheC="0" TheZ="0" TheT="0" PositionX="30" PositionY="20" PositionZ="10"/>
+      </Pixels></Image>
+    </OME>"""
+
+    class FakeTiffFile:
+        def __init__(self, _path: Path) -> None:
+            self.ome_metadata = ome_metadata
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        @property
+        def series(self):
+            raise AssertionError("metadata discovery must not construct the TIFF series")
+
+    import tifffile
+
+    monkeypatch.setattr(tifffile, "TiffFile", FakeTiffFile)
+
+    info = legacy.read_tile_info(path, side="R")
+
+    assert info.shape_zyx == (3, 4, 5)
+    assert info.spacing_zyx == (1.0, 0.5, 0.25)
+    assert info.translation_zyx == (10.0, 20.0, 30.0)
 
 
 def test_tltr_x_join_has_no_flips_and_aligns_centroids_in_yz() -> None:

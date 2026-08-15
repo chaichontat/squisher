@@ -61,7 +61,7 @@ Additional Utilities
 Typical Usage
 -------------
 ```python
-from fishtools.segment.postproc3d import (
+from squisher_segment.segment.postproc3d import (
     gaussian_smooth_labels_cupy,
     relabel_connected_components,
     compute_metadata_and_adjacency,
@@ -81,7 +81,7 @@ volumes, adjacency, contact_areas = compute_metadata_and_adjacency(masks)
 masks = donate_small_cells(masks, volumes, adjacency, contact_areas, V_min=8000)
 ```
 
-For large volumes, see `fishtools.segmentation.distributed.distributed_postproc`
+For large volumes, see `squisher_segment.segmentation.distributed.distributed_postproc`
 which applies this pipeline in a chunked/tiled manner with Dask.
 
 Performance Notes

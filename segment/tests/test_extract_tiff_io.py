@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 import tifffile
 
-import fishtools.segment.extract_core as extract_core
-from fishtools.segment.extract_core import (
+import squisher_segment.segment.extract_core as extract_core
+from squisher_segment.segment.extract_core import (
     ContentEstimationVolume,
     LazyTiffArray,
     OrthoSliceRequest,
@@ -25,7 +25,7 @@ from fishtools.segment.extract_core import (
     _z_crop_slice_around,
     normalize_numeric_options,
 )
-from fishtools.segment.extract_helpers import _expand_positions_with_context
+from squisher_segment.segment.extract_helpers import _expand_positions_with_context
 
 
 def _write_tiff(path: Path, data: np.ndarray, axes: str) -> None:
@@ -108,6 +108,28 @@ def test_open_volume_accepts_single_channel_ome_zarr_zyx(tmp_path: Path) -> None
     assert vol.shape == (2, 3, 4, 1)
     np.testing.assert_array_equal(vol[1, 1:, :2, 0], data[1, 1:, :2])
     np.testing.assert_array_equal(vol[0, :2, :3, :], data[0, :2, :3, None])
+
+
+def test_open_zarr_registers_squisher_codec_before_parsing(monkeypatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+    path = tmp_path / "volume.zarr"
+    path.mkdir()
+
+    monkeypatch.setattr(
+        extract_core,
+        "register_jpegxr_codec",
+        lambda: calls.append("register"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        extract_core.zarr,
+        "open_array",
+        lambda *_args, **_kwargs: calls.append("open") or object(),
+    )
+
+    extract_core._open_zarr_array(path)
+
+    assert calls == ["register", "open"]
 
 
 def test_open_volume_accepts_ome_v05_nested_multiscales_without_array_dimensions(tmp_path: Path) -> None:

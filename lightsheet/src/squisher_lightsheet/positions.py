@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from squisher_lightsheet.artifacts import stamp_artifact
 from squisher_lightsheet._legacy import create_lr_position_file as legacy
@@ -88,4 +91,72 @@ def create_position_file(
     output.write_text(json.dumps(position_payload(joined, diagnostics), indent=2) + "\n")
     legacy.write_positions_csv(output, joined)
     legacy.render_positions(output, joined, title=plot_title)
+    return output
+
+
+def create_single_position_file(
+    *,
+    input_dir: Path,
+    output: Path,
+    side: str,
+    plot_title: str = "metadata tile positions",
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    """Write acquisition-local tile positions without joining another source view."""
+    input_dir = input_dir.resolve()
+    paths = sorted(input_dir.glob("*.ome.tif"))
+    if not paths:
+        raise FileNotFoundError(f"No *.ome.tif files found in {input_dir}")
+    if progress is not None:
+        progress(f"single-position start side={side} tiles={len(paths)} input={input_dir}")
+    tiles: list[TileInfo] = []
+    for index, path in enumerate(paths, start=1):
+        if progress is not None:
+            progress(f"single-position metadata tile={index}/{len(paths)} file={path.name}")
+        tiles.append(legacy.read_tile_info(path, side=side))
+    joined: list[JoinedTile] = []
+    for tile in tiles:
+        tile_bounds = legacy.bounds_zyx(tile.translation_zyx, tile.spacing_zyx, tile.shape_zyx)
+        joined.append(
+            JoinedTile(
+                info=tile,
+                translation_zyx=tile.translation_zyx,
+                scale_zyx=tile.spacing_zyx,
+                raw_bounds_zyx=tile_bounds,
+                joined_bounds_zyx=tile_bounds,
+            )
+        )
+    bounds = [tile.joined_bounds_zyx for tile in joined]
+    payload = stamp_artifact(
+        {
+            "units": "micrometer",
+            "source": "metadata-only OME Plane Position and PhysicalSize",
+            "transform": {side: {"scale_zyx": [1.0, 1.0, 1.0]}},
+            "diagnostics": {
+                "mode": "single_view_metadata",
+                "side": side,
+                "tile_count": len(joined),
+                "joined_min_zyx_um": np.min([value[0] for value in bounds], axis=0).tolist(),
+                "joined_max_zyx_um": np.max([value[1] for value in bounds], axis=0).tolist(),
+            },
+            "tiles": [
+                {
+                    "tile": tile.info.tile,
+                    "side": side,
+                    "path": str(tile.info.path),
+                    "translation_um": legacy.dict_zyx(tile.translation_zyx),
+                    "scale_um": legacy.dict_zyx(tile.scale_zyx),
+                }
+                for tile in joined
+            ],
+        },
+        "lightsheet.position.v1",
+    )
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    legacy.write_positions_csv(output, joined)
+    legacy.render_positions(output, joined, title=plot_title)
+    if progress is not None:
+        progress(f"single-position complete output={output}")
     return output

@@ -65,6 +65,7 @@ def create_zarr_array(
     )
 
 logger = logging.getLogger(__name__)
+GLOBAL_LABEL_BITS = 16
 
 
 def determine_merge_relabeling(
@@ -271,7 +272,7 @@ def global_segment_ids(
     segmentation: NDArray[Any],
     block_index: tuple[int, ...],
     nblocks: NDArray[np.int_],
-    label_bits: int = 16,
+    label_bits: int = GLOBAL_LABEL_BITS,
 ) -> tuple[NDArray[np.uint32], list[np.uint32]]:
     """
     Generate globally unique segment IDs using bit-packing.
@@ -334,6 +335,49 @@ def global_segment_ids(
     # Direct indexing - O(N) instead of O(N log N)
     segmentation_global = remap[segmentation.ravel()].reshape(segmentation.shape)
     return segmentation_global, remap
+
+
+def decode_block_global_labels(
+    segmentation: NDArray[Any],
+    *,
+    label_bits: int = GLOBAL_LABEL_BITS,
+) -> tuple[NDArray[np.uint32], NDArray[np.uint32]]:
+    """Decode one temporary block into bounded local labels and global IDs.
+
+    Temporary segmentation blocks contain one bit-packed block token in their
+    upper bits and the original Cellpose label in their lower bits. Decoding
+    the lower bits keeps bounding-box allocation proportional to local labels
+    instead of the largest global ID.
+    """
+    if not np.issubdtype(segmentation.dtype, np.integer):
+        raise TypeError(f"Expected integer segmentation labels, got {segmentation.dtype}.")
+    if label_bits <= 0 or label_bits >= 32:
+        raise ValueError("label_bits must be between 1 and 31.")
+
+    if np.issubdtype(segmentation.dtype, np.signedinteger) and int(segmentation.min()) < 0:
+        raise ValueError("Segmentation labels cannot be negative.")
+    max_global_id = int(segmentation.max())
+    if max_global_id > np.iinfo(np.uint32).max:
+        raise ValueError("Segmentation labels exceed the uint32 encoding range.")
+
+    encoded = segmentation.astype(np.uint32, copy=False)
+    label_mask = np.uint32((1 << label_bits) - 1)
+    local_labels = np.bitwise_and(encoded, label_mask)
+    if max_global_id == 0:
+        return local_labels, np.empty(0, dtype=np.uint32)
+
+    min_global_id = int(
+        np.min(encoded, where=encoded != 0, initial=np.iinfo(np.uint32).max)
+    )
+    min_token = min_global_id >> label_bits
+    max_token = max_global_id >> label_bits
+    if min_token != max_token:
+        raise ValueError("A temporary segmentation block contains labels from multiple block tokens.")
+
+    present_local_ids = np.flatnonzero(np.bincount(local_labels.ravel()))
+    present_local_ids = present_local_ids[present_local_ids != 0].astype(np.uint32, copy=False)
+    global_ids = present_local_ids | np.uint32(min_token << label_bits)
+    return local_labels, global_ids
 
 
 def remove_overlaps(
@@ -678,7 +722,10 @@ def stitch_labels(
     Returns:
         (final_zarr, new_labeling LUT)
     """
-    all_box_ids = np.concatenate(box_ids_list).astype(np.uint32)
+    if box_ids_list:
+        all_box_ids = np.concatenate(box_ids_list).astype(np.uint32)
+    else:
+        all_box_ids = np.empty(0, dtype=np.uint32)
 
     new_labeling = determine_merge_relabeling(
         [(bi[0], bi[1], bi[2]) for bi in block_indices],
@@ -715,5 +762,7 @@ def merge_boxes_for_labels(
         Merged bounding boxes (one per final label)
     """
     boxes = [box for sublist in boxes_list for box in sublist]
+    if not box_ids_list:
+        return []
     box_ids = np.concatenate(box_ids_list).astype(np.uint32)
     return merge_all_boxes(boxes, new_labeling[box_ids])

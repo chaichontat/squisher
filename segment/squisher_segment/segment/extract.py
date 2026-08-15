@@ -6,7 +6,7 @@ from pathlib import Path
 import click
 from loguru import logger
 
-from fishtools.segment.extract_core import (
+from squisher_segment.segment.extract_core import (
     _is_zarr_path,
     normalize_numeric_options,
     run_single_file_extract,

@@ -15,6 +15,8 @@ from typing import Any, Literal
 import numpy as np
 from scipy.optimize import least_squares
 
+from squisher_lightsheet import ngff
+
 
 DEFAULT_MVS_SEAM_QUALITY_THRESHOLD = 0.25
 DIMENSIONS = ("z", "y", "x")
@@ -97,23 +99,12 @@ def _tiff_level_metadata(path: Path, *, level: int) -> tuple[str, int, tuple[int
         return str(page_series.axes), source_level, tuple(int(value) for value in page_series.shape)
 
 
+def _zarr_multiscales(root: Any) -> list[dict[str, Any]]:
+    return ngff.multiscales(root)
+
+
 def _zarr_level_path(root: Any, *, level: int, path: Path) -> str:
-    source_level = int(level)
-    if source_level < 0:
-        raise ValueError(f"Requested negative pyramid level {level} for {path}")
-    multiscales = root.attrs.get("multiscales")
-    if multiscales:
-        datasets = multiscales[0].get("datasets", [])
-        if source_level >= len(datasets):
-            raise ValueError(f"{path} has {len(datasets)} OME-Zarr pyramid level(s); requested level {level}")
-        dataset_path = datasets[source_level].get("path")
-        if not dataset_path:
-            raise ValueError(f"{path} multiscales dataset {source_level} is missing a path")
-        return str(dataset_path)
-    dataset_path = str(source_level)
-    if dataset_path not in root:
-        raise ValueError(f"{path} does not contain OME-Zarr pyramid level {level}")
-    return dataset_path
+    return ngff.level_path(root, level=level, context=path)
 
 
 def _zarr_level_metadata(path: Path, *, level: int) -> tuple[str, int, tuple[int, ...]]:
@@ -122,11 +113,7 @@ def _zarr_level_metadata(path: Path, *, level: int) -> tuple[str, int, tuple[int
     root = zarr.open_group(str(path), mode="r")
     source_level = int(level)
     array = root[_zarr_level_path(root, level=source_level, path=path)]
-    dims = array.attrs.get("_ARRAY_DIMENSIONS")
-    if dims is None:
-        dims = [axis["name"] for axis in root.attrs.get("multiscales", [{}])[0].get("axes", [])]
-    axes = "".join(str(dim).upper() for dim in dims)
-    return axes, source_level, tuple(int(value) for value in array.shape)
+    return ngff.axes(root, array), source_level, tuple(int(value) for value in array.shape)
 
 
 def _image_level_metadata(path: Path, *, level: int) -> tuple[str, int, tuple[int, ...]]:

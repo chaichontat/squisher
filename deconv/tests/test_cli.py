@@ -10,6 +10,7 @@ import zarr
 from typer.testing import CliRunner
 
 import squisher_deconv.cli as cli
+from squisher_deconv.basic import BasicFitOutputs
 from squisher_deconv.cli import app
 from squisher_deconv.deconvolution import infer_psf_halo, infer_psf_halo_many
 from squisher_deconv.planning import output_sidecar_path
@@ -25,6 +26,57 @@ def test_cli_help_exposes_gpu_options_without_fiducials() -> None:
     assert "--iter" in result.output
     assert "--engine" not in result.output
     assert "--n-fids" not in result.output
+
+
+def test_basic_cli_runs_joint_autotune_darkfield_workflow(tmp_path, monkeypatch) -> None:
+    runner = CliRunner()
+    src = tmp_path / "tile.ome.tif"
+    tifffile.imwrite(
+        src,
+        np.zeros((1, 2, 4, 4), dtype=np.uint16),
+        ome=True,
+        metadata={"axes": "CZYX"},
+        photometric="minisblack",
+    )
+    captured: dict[str, object] = {}
+
+    def capture_workflow(**kwargs):
+        captured.update(kwargs)
+        out_dir = Path(kwargs["out_dir"])
+        return BasicFitOutputs(
+            profile_paths=(out_dir / "sample-ch0.pkl",),
+            flatfield_paths=(out_dir / "sample-ch0-flatfield.tif",),
+            darkfield_paths=(out_dir / "sample-ch0-darkfield.tif",),
+            png_paths=(out_dir / "sample-ch0.png",),
+            manifest=out_dir / "sample-sampling.json",
+        )
+
+    monkeypatch.setattr(cli, "fit_basic_profiles", capture_workflow)
+
+    result = runner.invoke(
+        app,
+        [
+            "basic",
+            str(src),
+            "--out-dir",
+            str(tmp_path / "basic"),
+            "--label",
+            "sample",
+            "--channels",
+            "1",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["inputs"] == [src]
+    assert captured["samples"] == 500
+    assert captured["cache_samples_per_channel"] == 500
+    assert captured["exclude_blank_slices"] is True
+    assert captured["exclude_edge_slices"] is True
+    assert captured["device"] == "cpu"
+    assert str(tmp_path / "basic" / "sample-sampling.json") in result.output
 
 
 def test_cli_requires_one_basic_profile_per_channel(tmp_path) -> None:
@@ -162,6 +214,7 @@ def test_sample_scale_cli_infers_halo_without_eager_deconvolver_init(tmp_path, m
 
     assert result.exit_code == 0, result.output
     assert captured["halo"] == 6
+    assert captured["iterations"] == 1
     assert captured["deconvolver"] is None
     assert callable(captured["deconvolver_factory"])
 
@@ -208,9 +261,13 @@ def test_qc_cli_renders_selected_finished_tiles_without_opening_every_tiff(tmp_p
         root = zarr.open_group(str(deconv_path), mode="w", zarr_format=2)
         array = root.create_array("0", data=deconv.reshape(2, 2, 4, 4), chunks=(1, 1, 4, 4))
         array.attrs["_ARRAY_DIMENSIONS"] = ["c", "z", "y", "x"]
-        output_sidecar_path(deconv_path).write_text(json.dumps({"provenance": {"channels": 2}}))
+        output_sidecar_path(deconv_path).write_text(
+            json.dumps({"provenance": {"run_settings": {"channels": 2}}})
+        )
 
     import squisher_deconv.qc as qc_module
+
+    assert qc_module.decon_channel_count(deconv_dir / "Image_99.000.ome.zarr") == 2
 
     real_tiff_file = qc_module.tifffile.TiffFile
     opened: list[str] = []

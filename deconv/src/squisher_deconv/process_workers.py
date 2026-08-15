@@ -14,10 +14,10 @@ from typing import Any, Callable, Literal, Sequence
 import numpy as np
 
 from squisher_deconv.deconvolution import Deconvolver
-from squisher_deconv.metadata import compression_tiff_tag, json_dumps_strict, provenance_payload
-from squisher_deconv.planning import output_path_for, output_sidecar_path, slab_windows
-from squisher_deconv.scaling import ScalingParameters
-from squisher_deconv.sink import write_streamed_ome_zarr
+from squisher_deconv.metadata import json_dumps_strict, provenance_payload
+from squisher_deconv.planning import SampleWindow, output_path_for, output_sidecar_path, slab_windows
+from squisher_deconv.scaling import ScalingParameters, save_float32_sample
+from squisher_deconv.sink import write_streamed_ome_zarr_with_sidecar
 from squisher_deconv.source import TiffLogicalSource
 
 try:
@@ -53,6 +53,7 @@ class ProcessRunConfig:
     queue_depth: int
     overwrite: bool
     output_relative_root: Path | None
+    iterations: int | None = None
 
 
 def run_process_gpu_streaming_deconv(
@@ -64,15 +65,18 @@ def run_process_gpu_streaming_deconv(
     config: ProcessRunConfig,
     stop_on_error: bool,
 ) -> list[str]:
-    task_queues = [MP_CONTEXT.Queue(maxsize=config.queue_depth) for _ in config.devices]
-    result_queue = MP_CONTEXT.Queue()
-    processes = [
-        MP_CONTEXT.Process(
-            target=_worker_loop,
+    _messages, failures = _run_worker_pool(
+        task_count=len(paths),
+        devices=config.devices,
+        queue_depth=config.queue_depth,
+        stop_on_error=stop_on_error,
+        put_task=lambda task_queue, index: task_queue.put((index, Path(paths[index]))),
+        make_process=lambda worker_id, device, task_queue, result_queue: MP_CONTEXT.Process(
+            target=_file_worker_loop,
             kwargs={
                 "worker_id": worker_id,
                 "device": int(device),
-                "task_queue": task_queues[worker_id],
+                "task_queue": task_queue,
                 "result_queue": result_queue,
                 "template_source": template_source,
                 "scaling": scaling,
@@ -81,12 +85,89 @@ def run_process_gpu_streaming_deconv(
                 "stop_on_error": stop_on_error,
             },
             daemon=False,
+        ),
+    )
+    return failures
+
+
+def run_process_gpu_sample_scale(
+    windows: Sequence[SampleWindow],
+    *,
+    paths: Sequence[Path],
+    template_source: TiffLogicalSource,
+    sample_dir: Path,
+    deconvolver_factory: Callable[[int], Deconvolver],
+    devices: Sequence[int],
+    queue_depth: int,
+    stop_on_error: bool,
+) -> tuple[list[Path], list[dict[str, Any]], list[str]]:
+    messages, failures = _run_worker_pool(
+        task_count=len(windows),
+        devices=tuple(int(device) for device in devices),
+        queue_depth=queue_depth,
+        stop_on_error=stop_on_error,
+        put_task=lambda task_queue, index: task_queue.put(index),
+        make_process=lambda worker_id, device, task_queue, result_queue: MP_CONTEXT.Process(
+            target=_sample_scale_worker_loop,
+            kwargs={
+                "worker_id": worker_id,
+                "device": int(device),
+                "task_queue": task_queue,
+                "result_queue": result_queue,
+                "template_source": template_source,
+                "paths": tuple(Path(path) for path in paths),
+                "windows": tuple(windows),
+                "sample_dir": sample_dir,
+                "deconvolver_factory": deconvolver_factory,
+                "stop_on_error": stop_on_error,
+            },
+            daemon=False,
+        ),
+    )
+    sample_paths: list[Path] = []
+    manifest_windows: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.file_index is None or msg.device is None:
+            continue
+        window_index = int(msg.file_index)
+        window = windows[window_index]
+        source_path = Path(paths[window.file_index])
+        sample_path = sample_dir / f"{source_path.stem}-window{window_index:05d}.tif"
+        sample_paths.append(sample_path)
+        manifest_windows.append(
+            {
+                "file": str(source_path),
+                "device": int(msg.device),
+                "read_start": int(window.read_start),
+                "read_stop": int(window.read_stop),
+                "sampled_z": [int(z) for z in window.core_z],
+                "sample_path": str(sample_path),
+            }
         )
-        for worker_id, device in enumerate(config.devices)
+    return sample_paths, manifest_windows, failures
+
+
+def _run_worker_pool(
+    *,
+    task_count: int,
+    devices: Sequence[int],
+    queue_depth: int,
+    stop_on_error: bool,
+    put_task: Callable[[mp.Queue, int], None],
+    make_process: Callable[[int, int, mp.Queue, mp.Queue], mp.Process],
+) -> tuple[list[WorkerMessage], list[str]]:
+    if not devices:
+        raise ValueError("At least one device is required for process GPU execution.")
+    task_queues = [MP_CONTEXT.Queue(maxsize=queue_depth) for _ in devices]
+    result_queue = MP_CONTEXT.Queue()
+    processes = [
+        make_process(worker_id, int(device), task_queues[worker_id], result_queue)
+        for worker_id, device in enumerate(devices)
     ]
     for process in processes:
         process.start()
 
+    completed: list[WorkerMessage] = []
     failures: list[str] = []
     next_index = 0
     stopped: set[int] = set()
@@ -96,8 +177,8 @@ def run_process_gpu_streaming_deconv(
     def assign(worker_id: int, count: int = 1) -> None:
         nonlocal next_index
         for _ in range(count):
-            if next_index < len(paths):
-                task_queues[worker_id].put((next_index, Path(paths[next_index])))
+            if next_index < task_count:
+                put_task(task_queues[worker_id], next_index)
                 queued[worker_id] += 1
                 next_index += 1
             elif queued[worker_id] == 0:
@@ -122,7 +203,7 @@ def run_process_gpu_streaming_deconv(
                             process.terminate()
                     break
         for worker_id in sorted(ready):
-            assign(worker_id, config.queue_depth)
+            assign(worker_id, queue_depth)
 
         while len(stopped) < len(processes):
             msg = _next_worker_message(result_queue, processes=processes, stopped=stopped)
@@ -142,8 +223,9 @@ def run_process_gpu_streaming_deconv(
                 if msg.path is None:
                     continue
             else:
+                completed.append(msg)
                 _log(
-                    f"file complete device={msg.device} file_index={msg.file_index} "
+                    f"task complete device={msg.device} file_index={msg.file_index} "
                     f"file={None if msg.path is None else msg.path.name} seconds={msg.duration:.2f}"
                 )
             if not failures or not stop_on_error:
@@ -159,10 +241,10 @@ def run_process_gpu_streaming_deconv(
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
-    return failures
+    return completed, failures
 
 
-def _worker_loop(
+def _file_worker_loop(
     *,
     worker_id: int,
     device: int,
@@ -187,7 +269,7 @@ def _worker_loop(
                 break
             file_index, path = item
             try:
-                duration = _process_file(
+                duration = _process_file_with_slab_recovery(
                     worker_id=worker_id,
                     device=device,
                     file_index=int(file_index),
@@ -234,6 +316,140 @@ def _worker_loop(
         result_queue.put(WorkerMessage(worker_id=worker_id, status="stopped", device=device))
 
 
+def _sample_scale_worker_loop(
+    *,
+    worker_id: int,
+    device: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    template_source: TiffLogicalSource,
+    paths: Sequence[Path],
+    windows: Sequence[SampleWindow],
+    sample_dir: Path,
+    deconvolver_factory: Callable[[int], Deconvolver],
+    stop_on_error: bool,
+) -> None:
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        deconvolver = deconvolver_factory(device)
+        if not hasattr(deconvolver, "deconvolve"):
+            raise TypeError("Process GPU sample-scale worker requires deconvolve.")
+        _log(f"sample worker process start worker={worker_id} device={device}")
+        result_queue.put(WorkerMessage(worker_id=worker_id, status="ready", device=device))
+        while True:
+            item = task_queue.get()
+            if item is None:
+                break
+            window_index = int(item)
+            window = windows[window_index]
+            source_path = Path(paths[window.file_index])
+            try:
+                duration = _process_sample_window(
+                    worker_id=worker_id,
+                    device=device,
+                    window_index=window_index,
+                    path=source_path,
+                    window=window,
+                    template_source=template_source,
+                    sample_dir=sample_dir,
+                    deconvolver=deconvolver,
+                )
+            except Exception:
+                result_queue.put(
+                    WorkerMessage(
+                        worker_id=worker_id,
+                        status="error",
+                        path=source_path,
+                        file_index=window_index,
+                        device=device,
+                        error=traceback.format_exc(),
+                    )
+                )
+                if stop_on_error:
+                    break
+                continue
+            result_queue.put(
+                WorkerMessage(
+                    worker_id=worker_id,
+                    status="ok",
+                    path=source_path,
+                    file_index=window_index,
+                    device=device,
+                    duration=duration,
+                )
+            )
+    except Exception:
+        result_queue.put(
+            WorkerMessage(
+                worker_id=worker_id,
+                status="error",
+                device=device,
+                error=traceback.format_exc(),
+            )
+        )
+    finally:
+        result_queue.put(WorkerMessage(worker_id=worker_id, status="stopped", device=device))
+
+
+def _source_for_path(template_source: TiffLogicalSource, path: Path) -> TiffLogicalSource:
+    metadata_mode = "summary" if template_source.metadata.tags.get("metadata_mode") == "summary" else "full"
+    source = TiffLogicalSource.open(Path(path), channels=template_source.channels, metadata_mode=metadata_mode)
+    if (source.height, source.width) != (template_source.height, template_source.width):
+        raise ValueError(
+            f"{source.path} has yx=({source.height},{source.width}), expected "
+            f"({template_source.height},{template_source.width}) from template {template_source.path}."
+        )
+    if source.dtype != template_source.dtype:
+        raise ValueError(f"{source.path} has dtype={source.dtype}, expected {template_source.dtype}.")
+    return source
+
+
+def _process_sample_window(
+    *,
+    worker_id: int,
+    device: int,
+    window_index: int,
+    path: Path,
+    window: SampleWindow,
+    template_source: TiffLogicalSource,
+    sample_dir: Path,
+    deconvolver: Deconvolver,
+) -> float:
+    source = _source_for_path(template_source, path)
+    t_window = time.perf_counter()
+    _log(
+        f"sample start worker={worker_id} device={device} window[{window_index:05d}] "
+        f"file={source.path.name} read_z=[{window.read_start},{window.read_stop}) "
+        f"sampled_z={list(window.core_z)}"
+    )
+    t_read = time.perf_counter()
+    read = source.read_window(window.read_start, window.read_stop)
+    _log(
+        f"sample read done device={device} window[{window_index:05d}] file={source.path.name} "
+        f"shape={read.shape} dtype={read.dtype} seconds={time.perf_counter() - t_read:.2f}"
+    )
+    t_deconv = time.perf_counter()
+    deconvolved = deconvolver.deconvolve(read)
+    _log(
+        f"sample deconv done device={device} window[{window_index:05d}] file={source.path.name} "
+        f"output_shape={deconvolved.shape} seconds={time.perf_counter() - t_deconv:.2f}"
+    )
+    core_indexes = [z - window.read_start for z in window.core_z]
+    core = deconvolved[np.asarray(core_indexes, dtype=np.int64)].astype(np.float32, copy=False)
+    sample_path = sample_dir / f"{source.path.stem}-window{window_index:05d}.tif"
+    t_save = time.perf_counter()
+    save_float32_sample(
+        sample_path,
+        core,
+        metadata={"axes": "ZYX", "source": str(source.path), "core_z": list(window.core_z)},
+    )
+    _log(
+        f"sample saved device={device} window[{window_index:05d}] path={sample_path} "
+        f"core_shape={core.shape} seconds={time.perf_counter() - t_save:.2f}"
+    )
+    return time.perf_counter() - t_window
+
+
 def _process_file(
     *,
     worker_id: int,
@@ -245,7 +461,7 @@ def _process_file(
     deconvolver: Deconvolver,
     config: ProcessRunConfig,
 ) -> float:
-    source = replace(template_source, path=path)
+    source = _source_for_path(template_source, path)
     slabs = slab_windows(
         [source.path], z_counts=[source.z_count], slab_depth=config.slab_depth, halo=config.halo
     )
@@ -260,6 +476,8 @@ def _process_file(
         source.path,
         channels=config.channels,
         halo=config.halo,
+        slab_depth=config.slab_depth,
+        iterations=config.iterations,
         psf_paths=config.psf_paths,
         basic_paths=config.basic_paths,
         output_mode=config.output_mode,
@@ -272,7 +490,6 @@ def _process_file(
         "provenance": provenance,
         "chunking": {"slab_depth": config.slab_depth, "halo": config.halo},
         "output_mode": config.output_mode,
-        "compression_tiff_tag": compression_tiff_tag(config.output_mode),
         "worker": {"worker_id": worker_id, "device": device},
     }
     sidecar_text = json_dumps_strict(
@@ -292,6 +509,64 @@ def _process_file(
         f"file start device={device} file_index={file_index} file={source.path.name} "
         f"slabs={len(slabs)} output={output_path}"
     )
+
+    if config.queue_depth == 1:
+
+        def chunks():
+            for slab_index, slab in enumerate(slabs):
+                t_slab = time.perf_counter()
+                t_read = time.perf_counter()
+                _log(
+                    f"read start device={device} file={source.path.name} "
+                    f"read_z=[{slab.read_start},{slab.read_stop})"
+                )
+                read = source.read_window(slab.read_start, slab.read_stop)
+                _log(
+                    f"read done device={device} file={source.path.name} "
+                    f"read_z=[{slab.read_start},{slab.read_stop}) shape={read.shape} "
+                    f"dtype={read.dtype} seconds={time.perf_counter() - t_read:.2f}"
+                )
+                _log(
+                    f"slab received device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
+                    f"read_z=[{slab.read_start},{slab.read_stop}) core_z=[{slab.core_start},{slab.core_stop}) "
+                    f"shape={read.shape}"
+                )
+                t_deconv = time.perf_counter()
+                _log(
+                    f"deconv start device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
+                    f"input_shape={read.shape}"
+                )
+                core_start = slab.core_start - slab.read_start
+                core_stop = slab.core_stop - slab.read_start
+                chunk = deconvolver.deconvolve_core_u16(
+                    read,
+                    core_start=core_start,
+                    core_stop=core_stop,
+                    scaling=scaling,
+                )
+                _validate_u16_core_chunk(chunk, source=source, core_planes=slab.core_stop - slab.core_start)
+                _log(
+                    f"deconv+quant done device={device} file={source.path.name} "
+                    f"slab={slab_index}/{len(slabs)} output_shape={chunk.shape} "
+                    f"seconds={time.perf_counter() - t_deconv:.2f}"
+                )
+                _log(
+                    f"slab ready device={device} file={source.path.name} slab={slab_index}/{len(slabs)} "
+                    f"chunk_shape={chunk.shape} seconds={time.perf_counter() - t_slab:.2f}"
+                )
+                yield chunk
+
+        write_streamed_ome_zarr_with_sidecar(
+            output_path,
+            sidecar_path=sidecar,
+            sidecar_text=sidecar_text,
+            source=source,
+            core_plane_chunks=chunks(),
+            output_mode=config.output_mode,
+            provenance=provenance,
+            overwrite=config.overwrite,
+        )
+        return time.perf_counter() - t_file
 
     def reader() -> None:
         try:
@@ -386,15 +661,16 @@ def _process_file(
                 yield chunk
 
         try:
-            write_streamed_ome_zarr(
+            write_streamed_ome_zarr_with_sidecar(
                 output_path,
+                sidecar_path=sidecar,
+                sidecar_text=sidecar_text,
                 source=source,
                 core_plane_chunks=chunks(),
                 output_mode=config.output_mode,
                 provenance=provenance,
                 overwrite=config.overwrite,
             )
-            sidecar.write_text(sidecar_text)
         except BaseException as exc:
             errors.append(exc)
             stop_event.set()
@@ -414,6 +690,52 @@ def _process_file(
     if errors:
         raise errors[0]
     return time.perf_counter() - t_file
+
+
+def _process_file_with_slab_recovery(
+    *,
+    worker_id: int,
+    device: int,
+    file_index: int,
+    path: Path,
+    template_source: TiffLogicalSource,
+    scaling: ScalingParameters,
+    deconvolver: Deconvolver,
+    config: ProcessRunConfig,
+) -> float:
+    """Retry one transactional output with halved slabs after a CuPy allocation OOM."""
+    t_file = time.perf_counter()
+    attempt_config = config
+    while True:
+        try:
+            _process_file(
+                worker_id=worker_id,
+                device=device,
+                file_index=file_index,
+                path=path,
+                template_source=template_source,
+                scaling=scaling,
+                deconvolver=deconvolver,
+                config=attempt_config,
+            )
+            return time.perf_counter() - t_file
+        except Exception as exc:
+            if not _is_cupy_out_of_memory(exc) or attempt_config.slab_depth == 1:
+                raise
+            next_slab_depth = max(1, attempt_config.slab_depth // 2)
+            _log(
+                f"CUDA OOM recovery device={device} file={path.name} "
+                f"slab_depth={attempt_config.slab_depth}->{next_slab_depth}: {exc}"
+            )
+            release_memory = getattr(deconvolver, "release_memory", None)
+            if callable(release_memory):
+                release_memory()
+            attempt_config = replace(attempt_config, slab_depth=next_slab_depth)
+
+
+def _is_cupy_out_of_memory(exc: BaseException) -> bool:
+    error_type = type(exc)
+    return error_type.__name__ == "OutOfMemoryError" and error_type.__module__.startswith("cupy.")
 
 
 def _next_worker_message(

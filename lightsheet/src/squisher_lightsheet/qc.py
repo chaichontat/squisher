@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+from squisher_lightsheet import ngff
 from squisher_lightsheet.legacy_runner import run_legacy_script
 
 
@@ -272,67 +273,6 @@ def _tile_index_label(tile_name: str) -> str:
     return str(int(match.group(1))) if match else basename
 
 
-def _ngff_multiscale(root_attrs: dict[str, Any]) -> dict[str, Any]:
-    if "ome" in root_attrs:
-        multiscales = root_attrs["ome"].get("multiscales")
-    else:
-        multiscales = root_attrs.get("multiscales")
-    if not isinstance(multiscales, list) or not multiscales:
-        raise ValueError("OME-Zarr root metadata is missing multiscales")
-    multiscale = multiscales[0]
-    if not isinstance(multiscale, dict):
-        raise ValueError("OME-Zarr multiscales[0] must be an object")
-    return multiscale
-
-
-def _ngff_axes(multiscale: dict[str, Any], ndim: int) -> list[str]:
-    axes = multiscale.get("axes")
-    if isinstance(axes, list) and len(axes) == ndim:
-        names = [axis.get("name") if isinstance(axis, dict) else axis for axis in axes]
-        if all(isinstance(name, str) for name in names):
-            return list(names)
-    defaults = {
-        2: ["y", "x"],
-        3: ["z", "y", "x"],
-        4: ["c", "z", "y", "x"],
-        5: ["t", "c", "z", "y", "x"],
-    }
-    if ndim not in defaults:
-        raise ValueError(f"Cannot infer fused OME-Zarr axes for ndim={ndim}")
-    return defaults[ndim]
-
-
-def _ngff_scale_translation(multiscale: dict[str, Any], level: int, ndim: int) -> tuple[np.ndarray, np.ndarray]:
-    datasets = multiscale.get("datasets")
-    if not isinstance(datasets, list):
-        raise ValueError("OME-Zarr multiscales[0] is missing datasets")
-    dataset = next((item for item in datasets if isinstance(item, dict) and str(item.get("path")) == str(level)), None)
-    if dataset is None:
-        raise ValueError(f"OME-Zarr multiscales[0] has no dataset path {level!r}")
-    scale = np.ones(ndim, dtype=np.float64)
-    translation = np.zeros(ndim, dtype=np.float64)
-    transforms = dataset.get("coordinateTransformations", [])
-    if not isinstance(transforms, list):
-        raise ValueError(f"OME-Zarr dataset {level!r} coordinateTransformations must be a list")
-    for transform in transforms:
-        if not isinstance(transform, dict):
-            continue
-        values = transform.get("scale" if transform.get("type") == "scale" else "translation")
-        if values is None:
-            continue
-        array = np.asarray(values, dtype=np.float64)
-        if array.shape != (ndim,):
-            raise ValueError(
-                f"OME-Zarr dataset {level!r} transform {transform.get('type')!r} "
-                f"has {array.size} values for ndim={ndim}"
-            )
-        if transform.get("type") == "scale":
-            scale = array
-        elif transform.get("type") == "translation":
-            translation = array
-    return scale, translation
-
-
 def _zyx_values(record: dict[str, Any], *keys: str) -> np.ndarray:
     for key in keys:
         value = record.get(key)
@@ -394,20 +334,19 @@ def render_fused_tile_index_overlay(
     summary_output: Path | None = None,
     level: int = 2,
     z_index: int | None = None,
+    draw_labels: bool = True,
+    draw_markers: bool = True,
 ) -> Path:
-    """Render a fused OME-Zarr center-z PNG with numeric tile-index labels."""
+    """Render a fused OME-Zarr center-z PNG with tile centers and optional labels."""
     from PIL import Image, ImageDraw, ImageFont
     import zarr
 
     output = default_fused_tile_index_overlay_path(fused_zarr, level) if output is None else output
     summary_output = output.with_suffix(".json") if summary_output is None else summary_output
     root = zarr.open_group(fused_zarr, mode="r")
-    level_key = str(level)
-    if level_key not in root:
-        raise ValueError(f"{fused_zarr} does not contain pyramid level {level}")
-    array = root[level_key]
-    multiscale = _ngff_multiscale(dict(root.attrs))
-    axes = _ngff_axes(multiscale, len(array.shape))
+    dataset_path = ngff.level_path(root, level=level, context=fused_zarr)
+    array = root[dataset_path]
+    axes = list(ngff.axes(root, array).lower())
     for dim in ("z", "y", "x"):
         if dim not in axes:
             raise ValueError(f"{fused_zarr}/{level} axes {axes} do not contain {dim!r}")
@@ -436,12 +375,21 @@ def render_fused_tile_index_overlay(
     scaled, limits = scale_u8_with_limits(plane)
     image = Image.fromarray(scaled, mode="L").convert("RGB")
     draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-    except OSError:
-        font = ImageFont.load_default()
+    font = None
+    if draw_labels:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        except OSError:
+            font = ImageFont.load_default()
 
-    scale, translation = _ngff_scale_translation(multiscale, level, len(array.shape))
+    dataset_index = ngff.dataset_paths(root).index(dataset_path)
+    transform_axes, scale_values, translation_values, _has_scale, _has_translation = (
+        ngff.scale_translation(root, dataset_index=dataset_index)
+    )
+    if transform_axes != axes:
+        raise ValueError(f"OME-Zarr transform axes {transform_axes} differ from array axes {axes}")
+    scale = np.asarray(scale_values, dtype=np.float64)
+    translation = np.asarray(translation_values, dtype=np.float64)
     axis_to_index = {axis: index for index, axis in enumerate(axes)}
     scale_zyx = np.asarray([scale[axis_to_index[dim]] for dim in ("z", "y", "x")], dtype=np.float64)
     translation_zyx = np.asarray([translation[axis_to_index[dim]] for dim in ("z", "y", "x")], dtype=np.float64)
@@ -458,15 +406,17 @@ def render_fused_tile_index_overlay(
         x = int(round(center_level_zyx[2]))
         drawn = 0 <= x < image.width and 0 <= y < image.height
         if drawn:
-            bbox = draw.textbbox((x, y), label, font=font, stroke_width=3)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            position = (
-                min(max(2, x - text_width // 2), max(2, image.width - text_width - 2)),
-                min(max(2, y - text_height // 2), max(2, image.height - text_height - 2)),
-            )
-            draw.text(position, label, fill=(255, 255, 255), font=font, stroke_width=3, stroke_fill=(0, 0, 0))
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(255, 210, 0), outline=(0, 0, 0))
+            if draw_labels:
+                bbox = draw.textbbox((x, y), label, font=font, stroke_width=3)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+                position = (
+                    min(max(2, x - text_width // 2), max(2, image.width - text_width - 2)),
+                    min(max(2, y - text_height // 2), max(2, image.height - text_height - 2)),
+                )
+                draw.text(position, label, fill=(255, 255, 255), font=font, stroke_width=3, stroke_fill=(0, 0, 0))
+            if draw_markers:
+                draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(255, 210, 0), outline=(0, 0, 0))
         records.append(
             {
                 "tile": record.get("tile"),
@@ -495,7 +445,8 @@ def render_fused_tile_index_overlay(
                     "level_zyx = (registered_affine @ stage_center_um - "
                     "ngff_level_translation_um) / ngff_level_scale_um"
                 ),
-                "labels": "numeric tile index only",
+                "labels": "numeric tile index only" if draw_labels else "none",
+                "markers": "yellow tile centers" if draw_markers else "none",
                 "drawn_count": sum(1 for record in records if record["drawn"]),
                 "tile_count": len(records),
                 "records": records,

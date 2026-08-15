@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from squisher_deconv.basic import fit_basic_profiles
 from squisher_deconv.deconvolution import infer_psf_halo_many
 from squisher_deconv.gpu import CupyDeconvolverFactory
 from squisher_deconv.qc import DEFAULT_Z_PLANES, render_before_after_qc
@@ -14,11 +16,104 @@ from squisher_deconv.streaming import run_streaming_deconv, sample_scale as samp
 app = typer.Typer(no_args_is_help=True)
 
 
+@app.command("basic")
+def basic(
+    inputs: Annotated[
+        list[Path],
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Level-0 OME-TIFF tile inputs.",
+        ),
+    ],
+    out_dir: Annotated[Path, typer.Option("--out-dir", file_okay=False)],
+    label: Annotated[str, typer.Option("--label", help="Output profile basename.")],
+    channels: Annotated[int, typer.Option("--channels", min=1)],
+    samples: Annotated[int, typer.Option("--samples", min=1)] = 500,
+    cache_samples_per_channel: Annotated[
+        int | None,
+        typer.Option("--cache-samples-per-channel", min=1),
+    ] = None,
+    samples_per_tile: Annotated[
+        int,
+        typer.Option(
+            "--samples-per-tile",
+            min=1,
+            help="Target planes per sampled TIFF; higher values index fewer source files.",
+        ),
+    ] = 25,
+    blank_slice_sample_stride: Annotated[
+        int,
+        typer.Option("--blank-slice-sample-stride", min=1),
+    ] = 16,
+    blank_slice_min_relative_signal: Annotated[
+        float,
+        typer.Option("--blank-slice-min-relative-signal", min=0.0),
+    ] = 0.10,
+    blank_slice_min_nonzero_fraction: Annotated[
+        float,
+        typer.Option("--blank-slice-min-nonzero-fraction", min=0.0, max=1.0),
+    ] = 1e-4,
+    exclude_blank_slices: Annotated[
+        bool,
+        typer.Option("--exclude-blank-slices/--include-blank-slices"),
+    ] = True,
+    exclude_edge_slices: Annotated[
+        bool,
+        typer.Option("--exclude-edge-slices/--include-edge-slices"),
+    ] = True,
+    edge_slice_min_profile_jump: Annotated[
+        float,
+        typer.Option("--edge-slice-min-profile-jump", min=0.0),
+    ] = 0.05,
+    edge_slice_min_band_delta: Annotated[
+        float,
+        typer.Option("--edge-slice-min-band-delta", min=0.0),
+    ] = 0.35,
+    smoothness_flatfield: Annotated[
+        float,
+        typer.Option("--smoothness-flatfield", min=0.0),
+    ] = 1.8,
+    fitting_mode: Annotated[str, typer.Option("--fitting-mode")] = "approximate",
+    working_size: Annotated[int, typer.Option("--working-size", min=1)] = 128,
+    device: Annotated[str, typer.Option("--device")] = "cuda",
+    seed: Annotated[int, typer.Option("--seed")] = 20260709,
+) -> None:
+    """Fit a joint-channel autotuned BaSiC profile with darkfield correction."""
+    outputs = fit_basic_profiles(
+        inputs=inputs,
+        out_dir=out_dir,
+        label=label,
+        channels=channels,
+        samples=samples,
+        cache_samples_per_channel=math.ceil(samples / channels)
+        if cache_samples_per_channel is None
+        else cache_samples_per_channel,
+        samples_per_tile=samples_per_tile,
+        blank_slice_sample_stride=blank_slice_sample_stride,
+        blank_slice_min_relative_signal=blank_slice_min_relative_signal,
+        blank_slice_min_nonzero_fraction=blank_slice_min_nonzero_fraction,
+        exclude_blank_slices=exclude_blank_slices,
+        exclude_edge_slices=exclude_edge_slices,
+        edge_slice_min_profile_jump=edge_slice_min_profile_jump,
+        edge_slice_min_band_delta=edge_slice_min_band_delta,
+        smoothness_flatfield=smoothness_flatfield,
+        fitting_mode=fitting_mode,
+        working_size=working_size,
+        device=device,
+        seed=seed,
+        progress=typer.echo,
+    )
+    typer.echo(str(outputs.manifest))
+    for profile_path in outputs.profile_paths:
+        typer.echo(str(profile_path))
+
+
 @app.command("sample-scale")
 def sample_scale(
     inputs: Annotated[list[Path], typer.Argument(help="Flattened TIFF inputs.")],
     out_dir: Annotated[Path, typer.Option("--out-dir", file_okay=False)],
-    planes: Annotated[int, typer.Option("--planes", min=1)],
     channels: Annotated[int, typer.Option("--channels", min=1)],
     psf: Annotated[
         list[Path],
@@ -26,6 +121,7 @@ def sample_scale(
             "--psf", exists=True, dir_okay=False, readable=True, help="PSF TIFF path; repeat per channel."
         ),
     ],
+    planes: Annotated[int, typer.Option("--planes", min=1)] = 200,
     basic: Annotated[
         list[Path] | None,
         typer.Option(
@@ -61,6 +157,7 @@ def sample_scale(
             psfs=psf,
             iterations=iterations,
         ),
+        iterations=iterations,
         psf_paths=psf,
         basic_paths=basic,
         seed=seed,
@@ -107,6 +204,7 @@ def run(
     queue_depth: Annotated[int, typer.Option("--queue-depth", min=1)] = 2,
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error/--keep-going")] = True,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
+    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = False,
 ) -> None:
     if output_mode == "u16" and scaling is None:
         raise typer.BadParameter("--output-mode u16 requires --scaling.")
@@ -131,6 +229,7 @@ def run(
         queue_depth=queue_depth,
         stop_on_error=stop_on_error,
         overwrite=overwrite,
+        resume=resume,
     )
 
 

@@ -40,6 +40,90 @@ def test_channel_output_paths_match_legacy_per_channel_names() -> None:
         Path("/run/fused.ch0.ome.zarr"),
         Path("/run/fused.ch2.ome.zarr"),
     ]
+    assert channel_output_path(Path("/run/fused.ch0.ome.zarr"), 0) == Path("/run/fused.ch0.ome.zarr")
+    assert legacy.channel_output_path(Path("/run/fused.ch0.ome.zarr"), 0, separate_channels=True) == Path(
+        "/run/fused.ch0.ome.zarr"
+    )
+
+
+def test_channel_output_path_rejects_mismatched_qualified_channel() -> None:
+    with pytest.raises(ValueError, match="already targets channel 1"):
+        channel_output_path(Path("/run/fused.ch1.ome.zarr"), 0)
+
+
+def test_create_fusion_temp_workspace_creates_missing_output_parent(tmp_path: Path) -> None:
+    channel_output = tmp_path / "new-output" / "fused.ch1.ome.zarr"
+
+    temp_root = legacy.create_fusion_temp_workspace(channel_output)
+
+    assert temp_root.parent == channel_output.parent
+    assert temp_root.is_dir()
+    assert temp_root.name.startswith(".fused.ch1.ome.zarr.fusion-")
+
+
+def test_fusion_resume_uses_only_matching_workspace(tmp_path: Path) -> None:
+    channel_output = tmp_path / "fused.ch0.ome.zarr"
+    matching = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(matching, channel_output) / "0").mkdir(parents=True)
+    legacy.write_fusion_resume_plan(matching, {"plan": "matching"})
+    newer_mismatch = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(newer_mismatch, channel_output) / "0").mkdir(parents=True)
+    legacy.write_fusion_resume_plan(newer_mismatch, {"plan": "different"})
+
+    actual = legacy.find_latest_fusion_temp_workspace(
+        channel_output,
+        expected_plan={"plan": "matching"},
+    )
+
+    assert actual == matching
+
+
+def test_fusion_resume_rejects_workspace_without_plan(tmp_path: Path) -> None:
+    channel_output = tmp_path / "fused.ch0.ome.zarr"
+    workspace = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(workspace, channel_output) / "0").mkdir(parents=True)
+
+    assert (
+        legacy.find_latest_fusion_temp_workspace(
+            channel_output,
+            expected_plan={"plan": "matching"},
+        )
+        is None
+    )
+
+
+def test_fusion_resume_requires_completion_marker(tmp_path: Path) -> None:
+    scale0 = tmp_path / "fused.ome.zarr" / "0"
+    scale0.mkdir(parents=True)
+    (scale0 / "zarr.json").write_text("{}")
+    chunk = scale0 / "c" / "0" / "0" / "0"
+    chunk.parent.mkdir(parents=True)
+    chunk.write_bytes(b"partial")
+    marker_dir = tmp_path / "completed-fusion-blocks"
+    processed = []
+
+    def fuse_chunk(block_id):
+        processed.append(tuple(block_id))
+        chunk.write_bytes(b"complete")
+
+    resume = legacy.resume_fusion_batch_func(None, scale0_path=scale0, marker_dir=marker_dir)
+    resume(fuse_chunk, [(0, 0, 0)])
+
+    assert processed == [(0, 0, 0)]
+    assert legacy.fusion_block_marker_path(marker_dir, (0, 0, 0)).is_file()
+
+    resume(fuse_chunk, [(0, 0, 0)])
+    assert processed == [(0, 0, 0)]
+
+
+def test_fusion_resume_rejects_zarr_without_completion_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "source.ome.zarr"
+    (source / "0").mkdir(parents=True)
+    (source / "zarr.json").write_text("{}")
+    (source / "0" / "zarr.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="missing squisher.complete.json"):
+        legacy.source_tile_resume_identity(source, require_completion=True)
 
 
 def test_fuse_uses_backend_supported_defaults(monkeypatch) -> None:
@@ -65,9 +149,122 @@ def test_fuse_uses_backend_supported_defaults(monkeypatch) -> None:
     args = captured["args"]
     assert args[args.index("--fusion-weight-mode") + 1] == "content-preibisch-coarse"
     assert args[args.index("--fusion-level") + 1] == "0"
-    assert args[args.index("--batch-size") + 1] == "4"
+    assert args[args.index("--batch-size") + 1] == "1"
     assert args[args.index("--basic-cache-tiles") + 1] == "64"
+    assert args[args.index("--jpegxr-level") + 1] == "0.7"
+    assert args[args.index("--output-codec") + 1] == "jpegxr"
     assert "--per-chunk-cupy-cleanup" not in args
+    assert "--resume-fusion" not in args
+
+
+def test_fuse_passes_resume_fusion(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+
+    fuse_tiles(
+        input_dir=Path("/run"),
+        position_input=Path("/run/positions.json"),
+        registration_input=Path("/run/registration.json"),
+        output=Path("/run/fused.ome.zarr"),
+        resume_fusion=True,
+    )
+
+    assert "--resume-fusion" in captured["args"]
+
+
+def test_fuse_defaults_downsampled_materialization_to_zstd(monkeypatch, tmp_path) -> None:
+    captured = {}
+    position = tmp_path / "positions.json"
+    position.write_text(json.dumps({"materialization_grid": {"level_factor_zyx": [4, 4, 4]}, "tiles": []}))
+
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+
+    fuse_tiles(
+        input_dir=tmp_path / "tiles",
+        position_input=position,
+        registration_input=tmp_path / "registration.json",
+        output=tmp_path / "preview.ome.zarr",
+    )
+
+    args = captured["args"]
+    assert args[args.index("--output-codec") + 1] == "zstd"
+
+
+def test_fuse_rejects_downsampled_materialization_on_level0_template(tmp_path) -> None:
+    position = tmp_path / "positions.json"
+    position.write_text(json.dumps({"materialization_grid": {"level_factor_zyx": [4, 4, 4]}, "tiles": []}))
+
+    with pytest.raises(ValueError, match="cannot produce native level 0"):
+        fuse_tiles(
+            input_dir=tmp_path / "tiles",
+            position_input=position,
+            registration_input=tmp_path / "registration.json",
+            output=tmp_path / "production.ome.zarr",
+            output_grid_template=tmp_path / "fixed.ome.zarr",
+            output_grid_template_level=0,
+        )
+
+
+@pytest.mark.parametrize("with_fusion_weights", [False, True])
+def test_inplace_weighted_average_matches_mvs(with_fusion_weights: bool) -> None:
+    from multiview_stitcher.fusion import _core as fusion_core
+
+    transformed = np.asarray(
+        [
+            [[1.0, np.nan, 3.0], [4.0, 5.0, np.nan]],
+            [[7.0, 8.0, np.nan], [10.0, np.nan, 12.0]],
+        ],
+        dtype=np.float32,
+    )
+    blending = np.asarray(
+        [
+            [[0.25, 0.0, 1.0], [0.0, 0.5, 0.0]],
+            [[0.75, 1.0, 0.0], [1.0, 0.5, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    fusion_weights = (
+        np.asarray(
+            [
+                [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[1.0, 0.0, 0.0], [0.0, 3.0, 0.0]],
+            ],
+            dtype=np.float32,
+        )
+        if with_fusion_weights
+        else None
+    )
+    transformed_input = transformed.copy()
+    blending_input = blending.copy()
+    fusion_weights_input = None if fusion_weights is None else fusion_weights.copy()
+    expected = fusion_core.weighted_average_fusion(
+        transformed.copy(),
+        blending.copy(),
+        None if fusion_weights is None else fusion_weights.copy(),
+    )
+
+    actual = legacy.inplace_weighted_average_fusion(
+        transformed_input,
+        blending_input,
+        fusion_weights,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    assert not np.array_equal(transformed_input, transformed, equal_nan=True)
+    if fusion_weights is None:
+        np.testing.assert_array_equal(blending_input, blending)
+    else:
+        assert not np.array_equal(blending_input, blending, equal_nan=True)
+        np.testing.assert_array_equal(fusion_weights, fusion_weights_input)
 
 
 def test_fuse_normalizes_canonical_output_dir(monkeypatch) -> None:
@@ -159,6 +356,30 @@ def test_fuse_passes_output_chunksize(monkeypatch) -> None:
     ]
 
 
+def test_fuse_passes_level0_output_chunksize_by_default(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+
+    fuse_tiles(
+        input_dir=Path("/run"),
+        position_input=Path("/run/positions.json"),
+        registration_input=Path("/run/registration.json"),
+        output=Path("/run/fused.ome.zarr"),
+    )
+
+    args = captured["args"]
+    assert args[args.index("--output-chunksize") + 1 : args.index("--output-chunksize") + 4] == [
+        "12",
+        "960",
+        "960",
+    ]
+
+
 def test_fuse_passes_output_grid_template(monkeypatch) -> None:
     captured = {}
 
@@ -174,10 +395,16 @@ def test_fuse_passes_output_grid_template(monkeypatch) -> None:
         registration_input=Path("/run/registration.json"),
         output=Path("/run/fused.ome.zarr"),
         output_grid_template=Path("/run/reference.ch0.ome.zarr"),
+        output_grid_template_level=2,
+        output_codec="zstd",
+        zstd_level=5,
     )
 
     args = captured["args"]
     assert args[args.index("--output-grid-template") + 1] == "/run/reference.ch0.ome.zarr"
+    assert args[args.index("--output-grid-template-level") + 1] == "2"
+    assert args[args.index("--output-codec") + 1] == "zstd"
+    assert args[args.index("--zstd-level") + 1] == "5"
 
 
 def test_fuse_passes_source_view_flatfield_dirs(monkeypatch, tmp_path) -> None:
@@ -208,7 +435,9 @@ def test_fuse_passes_source_view_flatfield_dirs(monkeypatch, tmp_path) -> None:
 
     assert captured["script_name"] == "stitch_20x_tl_multiview.py"
     args = captured["args"]
-    view_dir_args = [args[index + 1] for index, value in enumerate(args) if value == "--flatfield-dir-by-source-view"]
+    view_dir_args = [
+        args[index + 1] for index, value in enumerate(args) if value == "--flatfield-dir-by-source-view"
+    ]
     assert view_dir_args == [f"L={basic_left}", f"R={basic_right}"]
 
 
@@ -349,6 +578,8 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
 
     assert args.flatfield_dir is None
     assert args.basic_cache_max_gib == legacy.DEFAULT_BASIC_CACHE_MAX_GIB
+    assert args.batch_size == 1
+    assert args.output_chunksize == (12, 960, 960)
 
     monkeypatch.setattr(
         sys,
@@ -362,7 +593,9 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
 
 
 def test_profile_fusion_skip_requires_max_batches() -> None:
-    with pytest.raises(ValueError, match="--profile-skip-fusion-batches requires --profile-max-fusion-batches"):
+    with pytest.raises(
+        ValueError, match="--profile-skip-fusion-batches requires --profile-max-fusion-batches"
+    ):
         legacy.validate_profile_fusion_options(
             Namespace(
                 profile_skip_fusion_batches=1,
@@ -503,7 +736,9 @@ def test_squeezed_scale0_metadata_repairs_pyramids_and_marks_complete(monkeypatc
         shape = (1, 1, 224, 224, 224)
         dims = ("t", "c", "z", "y", "x")
 
-    def fake_block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    def fake_block_reduce_mean_gpu(
+        block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype
+    ) -> np.ndarray:
         reduced = block.reshape(
             block.shape[0] // factors[0],
             factors[0],
@@ -530,6 +765,8 @@ def test_squeezed_scale0_metadata_repairs_pyramids_and_marks_complete(monkeypatc
         for transform in dataset["coordinateTransformations"]:
             values = transform.get("scale") or transform.get("translation")
             assert len(values) == 3
+    level1 = zarr.open_array(str(output / "1"), mode="r")
+    assert [codec["name"] for codec in level1.metadata.to_dict()["codecs"]] == ["bytes", "zstd"]
 
 
 def test_ome_zarr_complete_requires_completion_marker(tmp_path) -> None:
@@ -578,7 +815,9 @@ def test_downsampled_pyramid_writes_shard_aligned_blocks(monkeypatch, tmp_path) 
     source[:] = np.arange(8 * 12 * 16, dtype=np.uint16).reshape(8, 12, 16)
     seen_block_shapes = []
 
-    def fake_block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    def fake_block_reduce_mean_gpu(
+        block: np.ndarray, factors: tuple[int, ...], dtype: np.dtype
+    ) -> np.ndarray:
         seen_block_shapes.append(block.shape)
         reduced = block.reshape(
             block.shape[0] // factors[0],
@@ -592,17 +831,23 @@ def test_downsampled_pyramid_writes_shard_aligned_blocks(monkeypatch, tmp_path) 
 
     monkeypatch.setattr(legacy, "block_reduce_mean_gpu", fake_block_reduce_mean_gpu)
 
-    legacy.write_zstd_downsampled_level(
+    legacy.write_downsampled_level(
         source,
         tmp_path / "pyramid.ome.zarr",
         dataset_path="1",
         dimension_names=("z", "y", "x"),
         factors={"z": 2, "y": 3, "x": 2},
+        jpegxr_level=0.8,
+        output_codec="jpegxr",
+        zstd_level=3,
     )
 
     destination = zarr.open(str(tmp_path / "pyramid.ome.zarr" / "1"), mode="r")
-    assert destination.chunks == (2, 2, 4)
+    assert destination.chunks == (1, 2, 4)
     assert destination.metadata.shards == (4, 4, 8)
+    inner_codecs = destination.metadata.to_dict()["codecs"][0]["configuration"]["codecs"]
+    assert [codec["name"] for codec in inner_codecs] == ["squisher.jpegxr", "crc32c"]
+    assert inner_codecs[0]["configuration"]["level"] == 0.8
     assert seen_block_shapes == [(8, 12, 16)]
 
 
@@ -692,25 +937,27 @@ def test_position_input_reads_each_ome_zarr_shape(tmp_path) -> None:
             dtype="uint16",
             dimension_names=("c", "z", "y", "x"),
         )
-        group.attrs["multiscales"] = [
-            {
-                "version": "0.4",
-                "datasets": [
-                    {
-                        "path": "0",
-                        "coordinateTransformations": [
-                            {"type": "scale", "scale": [1.0, 1.0, 0.5, 0.5]},
-                        ],
-                    }
-                ],
-                "axes": [
-                    {"name": "c", "type": "channel"},
-                    {"name": "z", "type": "space"},
-                    {"name": "y", "type": "space"},
-                    {"name": "x", "type": "space"},
-                ],
-            }
-        ]
+        group.attrs["ome"] = {
+            "version": "0.5",
+            "multiscales": [
+                {
+                    "datasets": [
+                        {
+                            "path": "0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [1.0, 1.0, 0.5, 0.5]},
+                            ],
+                        }
+                    ],
+                    "axes": [
+                        {"name": "c", "type": "channel"},
+                        {"name": "z", "type": "space"},
+                        {"name": "y", "type": "space"},
+                        {"name": "x", "type": "space"},
+                    ],
+                }
+            ],
+        }
         tile_paths.append(path)
     position_input = tmp_path / "positions.json"
     position_input.write_text(
@@ -739,6 +986,56 @@ def test_position_input_reads_each_ome_zarr_shape(tmp_path) -> None:
 
     assert [tile.shape for tile in tiles] == shapes
     assert legacy.tile_flip_axes_zyx(tiles[1]) == (True, False, True)
+
+
+def test_position_input_maps_source_ome_tiff_name_to_deconvolved_ome_zarr(tmp_path) -> None:
+    zarr = pytest.importorskip("zarr")
+    input_dir = tmp_path / "deconv"
+    input_dir.mkdir()
+    tile_path = input_dir / "sample.000.ome.zarr"
+    group = zarr.open_group(str(tile_path), mode="w", zarr_format=3)
+    group.create_array(
+        "0",
+        shape=(2, 3, 6, 7),
+        chunks=(1, 1, 6, 7),
+        dtype="uint16",
+        dimension_names=("c", "z", "y", "x"),
+    )
+    group.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [{"name": axis} for axis in ("c", "z", "y", "x")],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [{"type": "scale", "scale": [1.0, 0.6, 0.3, 0.3]}],
+                    }
+                ],
+            }
+        ],
+    }
+    position_input = tmp_path / "positions.json"
+    position_input.write_text(
+        json.dumps(
+            {
+                "units": "micrometer",
+                "tiles": [
+                    {
+                        "path": "/original/sample.000.ome.tif",
+                        "translation_um": {"z": 0.0, "y": 0.0, "x": 0.0},
+                        "scale_um": {"z": 0.6, "y": 0.3, "x": 0.3},
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+
+    tiles = legacy.read_position_input_tiles(position_input, input_dir=input_dir)
+
+    assert tiles[0].path == tile_path.resolve()
+    assert tiles[0].shape == (2, 3, 6, 7)
 
 
 def test_fusion_source_tile_uses_selected_ome_zarr_level_transform(tmp_path) -> None:
@@ -1148,7 +1445,7 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
             output_chunksize=output_chunksize,
             weights_func=None,
             weights_func_kwargs=None,
-            fusion_func=fusion_core.weighted_average_fusion,
+            fusion_func=legacy.inplace_weighted_average_fusion,
             fusion_func_kwargs=None,
             interpolation_order=0,
         )
@@ -1208,7 +1505,7 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
             "fuse_kwargs": {
                 "images": sims,
                 "transform_key": legacy.TRANSFORM_KEY,
-                "fusion_func": fusion_core.weighted_average_fusion,
+                "fusion_func": legacy.inplace_weighted_average_fusion,
                 "fusion_func_kwargs": None,
                 "weights_func": None,
                 "weights_func_kwargs": None,
@@ -1227,6 +1524,64 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
         assert np.count_nonzero(output_array[:]) > 0
     finally:
         legacy.close_stores(stores)
+
+
+def test_loky_fusion_worker_registers_jpegxr_before_opening_output(
+    monkeypatch,
+) -> None:
+    from multiview_stitcher import fusion as _fusion  # noqa: F401
+    import zarr
+
+    calls = []
+
+    class StopAfterOpen(RuntimeError):
+        pass
+
+    class FakeDevice:
+        def __init__(self, _device: int):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_open_array(*_args, **_kwargs):
+        calls.append("open")
+        raise StopAfterOpen
+
+    monkeypatch.setattr(legacy, "register_jpegxr_codec", lambda: calls.append("register"))
+    monkeypatch.setitem(
+        sys.modules,
+        "cupy",
+        type("FakeCupy", (), {"cuda": type("Cuda", (), {"Device": FakeDevice})}),
+    )
+    monkeypatch.setattr(zarr, "open_array", fake_open_array)
+
+    with pytest.raises(StopAfterOpen):
+        legacy.run_mvs_fuse_chunk_loky_worker_once((0, 0, 0), {"output_zarr_url": "fake.zarr"}, device=0)
+
+    assert calls == ["register", "open"]
+
+
+def test_fusion_main_registers_jpegxr_before_parsing_inputs(monkeypatch) -> None:
+    calls = []
+
+    class StopAfterParse(RuntimeError):
+        pass
+
+    def fake_parse_args():
+        calls.append("parse")
+        raise StopAfterParse
+
+    monkeypatch.setattr(legacy, "register_jpegxr_codec", lambda: calls.append("register"))
+    monkeypatch.setattr(legacy, "parse_args", fake_parse_args)
+
+    with pytest.raises(StopAfterParse):
+        legacy.main()
+
+    assert calls == ["register", "parse"]
 
 
 def test_zarr_safe_fusion_selection_avoids_deepcopying_tiff_store(tmp_path) -> None:

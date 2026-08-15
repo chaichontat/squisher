@@ -11,9 +11,11 @@ from loguru import logger
 import numpy as np
 
 from squisher_lightsheet.artifacts import stamp_artifact
+from squisher_lightsheet.channel_optimization import IDENTITY_AFFINE
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as stitch_legacy
 from squisher_lightsheet import phase_metrics
+from squisher_lightsheet import ngff
 from squisher_lightsheet.tiff import tiff_series_level_count
 
 
@@ -90,7 +92,10 @@ def flattened_channel_count(path: Path) -> int:
     if not sidecar.exists():
         return 1
     payload = json.loads(sidecar.read_text())
-    channels = int(payload.get("provenance", {}).get("channels", 1))
+    try:
+        channels = int(payload["provenance"]["run_settings"]["channels"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{sidecar} is missing a valid provenance.run_settings.channels value") from error
     if channels < 1:
         raise ValueError(f"{sidecar} records invalid channel count {channels}")
     return channels
@@ -151,13 +156,17 @@ def tile_record_from_position_record(record: Mapping[str, Any]) -> rough_legacy.
             shape_zyx = np.asarray(raw_shape, dtype=np.int64)
         else:
             raise ValueError(f"{path} has unsupported position shape/axes: shape={raw_shape!r}, axes={axes!r}")
-    side = record.get("side")
-    if side not in rough_legacy.SIDES:
-        raise ValueError(f"{path} has side={side!r}; expected one of {rough_legacy.SIDES}")
+    side_value = record.get("side")
+    if side_value is None:
+        side = "all"
+    elif not isinstance(side_value, str) or not side_value:
+        raise ValueError(f"{path} has invalid side={side_value!r}; expected a non-empty string")
+    else:
+        side = side_value
     return logical_tile_record(
         rough_legacy.TileRecord(
             tile=str(record["tile"]),
-            side=str(side),
+            side=side,
             path=path,
             translation_zyx_um=np.asarray([record["translation_um"][dim] for dim in DIMENSIONS], dtype=np.float64),
             scale_zyx_um=np.asarray([record["scale_um"][dim] for dim in DIMENSIONS], dtype=np.float64),
@@ -472,6 +481,22 @@ def raw_axis_indices_for_oriented_indices(indices: np.ndarray, *, axis_size: int
     return (int(axis_size) - 1 - indices).astype(np.int64, copy=False)
 
 
+def raw_z_indexer(indices: np.ndarray) -> tuple[slice | np.ndarray, bool]:
+    """Preserve contiguous frame requests as slices and report whether to reverse Z."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 1 or indices.size == 0:
+        raise ValueError("indices must be a non-empty 1D array")
+    if indices.size == 1:
+        value = int(indices[0])
+        return slice(value, value + 1), False
+    steps = np.diff(indices)
+    if np.all(steps == 1):
+        return slice(int(indices[0]), int(indices[-1]) + 1), False
+    if np.all(steps == -1):
+        return slice(int(indices[-1]), int(indices[0]) + 1), True
+    return indices, False
+
+
 def read_tile_indexed_z_patch(
     tile: rough_legacy.TileRecord,
     *,
@@ -488,13 +513,25 @@ def read_tile_indexed_z_patch(
     if not slices_within_shape((slice(0, 1), y_slice, x_slice), np.asarray([1, tile.shape_zyx[1], tile.shape_zyx[2]])):
         raise ValueError(f"Y/X patch slices {(y_slice, x_slice)} are outside tile shape {tile.shape_zyx.tolist()}")
 
-    array, _source_level, _available_levels, store = _open_tile_level_array(tile.path, source_level=0)
-    try:
-        raw_z_indices = raw_axis_indices_for_oriented_indices(
-            z_indices,
-            axis_size=int(tile.shape_zyx[0]),
-            flipped=bool(tile.scale_zyx_um[0] < 0),
+    raw_z_indices = raw_axis_indices_for_oriented_indices(
+        z_indices,
+        axis_size=int(tile.shape_zyx[0]),
+        flipped=bool(tile.scale_zyx_um[0] < 0),
+    )
+    raw_z_selection, reverse_z = raw_z_indexer(raw_z_indices)
+    direct_zarr = (
+        stitch_legacy.is_ome_zarr_path(tile.path)
+        and isinstance(raw_z_selection, slice)
+        and (tile.axes == "CZYX" or flattened_channel_count(tile.path) == 1)
+    )
+    if direct_zarr:
+        array = stitch_legacy._open_ome_zarr_level_array(tile.path, source_level=0)
+        store = None
+    else:
+        array, _source_level, _available_levels, store = _open_tile_level_array(
+            tile.path, source_level=0
         )
+    try:
         raw_y_slice, reverse_y = raw_axis_slice_for_oriented_slice(
             y_slice,
             axis_size=int(tile.shape_zyx[1]),
@@ -508,18 +545,26 @@ def read_tile_indexed_z_patch(
         if tile.axes == "CZYX":
             if channel < 0 or channel >= int(array.shape[0]):
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
-            patch = array[(channel, raw_z_indices, raw_y_slice, raw_x_slice)]
+            patch = array[(channel, raw_z_selection, raw_y_slice, raw_x_slice)]
         elif tile.axes == "ZYX":
             channels = flattened_channel_count(tile.path)
             if channel < 0 or channel >= channels:
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {channels}")
             if channels == 1:
-                patch = array[(raw_z_indices, raw_y_slice, raw_x_slice)]
+                patch = array[(raw_z_selection, raw_y_slice, raw_x_slice)]
             else:
-                patch = array[(raw_z_indices * channels + channel, raw_y_slice, raw_x_slice)]
+                if isinstance(raw_z_selection, slice):
+                    flattened_z = np.arange(
+                        int(raw_z_selection.start), int(raw_z_selection.stop), dtype=np.int64
+                    )
+                else:
+                    flattened_z = raw_z_selection
+                patch = array[(flattened_z * channels + channel, raw_y_slice, raw_x_slice)]
         else:
             raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
-        result = np.asarray(patch.compute(), dtype=np.float32)
+        result = np.asarray(patch if direct_zarr else patch.compute(), dtype=np.float32)
+        if reverse_z:
+            result = np.flip(result, axis=0)
         if reverse_y:
             result = np.flip(result, axis=1)
         if reverse_x:
@@ -1072,13 +1117,10 @@ def file_stat_fingerprint(path: Path, *, role: str, tile: str | None = None) -> 
         import zarr
 
         group = zarr.open_group(str(path), mode="r")
-        level0 = group["0"]
+        level0 = ngff.level_array(group, context=path)
         row["ome_zarr_level0_shape"] = [int(value) for value in level0.shape]
         row["ome_zarr_level0_chunks"] = [int(value) for value in level0.chunks]
-        row["ome_zarr_axes"] = [
-            str(axis.get("name", axis)) if isinstance(axis, Mapping) else str(axis)
-            for axis in group.attrs.asdict().get("multiscales", [{}])[0].get("axes", [])
-        ]
+        row["ome_zarr_axes"] = list(ngff.axes(group, level0).lower())
     if tile is not None:
         row["tile"] = tile
     return row
@@ -1518,14 +1560,14 @@ def adapt_registration_from_reference(
     tile_phase_summary: dict[str, Any],
 ) -> Path:
     reference_registration = json.loads(reference_registration_input.read_text())
-    adapted = json.loads(json.dumps(reference_registration))
+    adapted = {key: json.loads(json.dumps(value)) for key, value in reference_registration.items() if key != "tiles"}
     position_by_tile = position_records_by_tile(adapted_position_payload)
     measurement_by_tile = {
         item["tile"]: item for item in tile_phase_summary.get("measurements", []) if "tile" in item
     }
     adapted_tiles = []
     missing = []
-    for record in adapted["tiles"]:
+    for record in reference_registration.get("tiles", []):
         moving_tile = make_moving_tile_name(record["tile"], reference_token=reference_token, moving_token=moving_token)
         position_record = position_by_tile.get(moving_tile)
         if position_record is None:
@@ -1541,16 +1583,19 @@ def adapt_registration_from_reference(
             raise ValueError(
                 f"Refusing to adapt registration for rejected tile {moving_tile}: status={measurement_status}"
             ) from None
-        if measurement_status not in {"direct_accepted", "fallback_accepted"}:
+        if measurement_status != "direct_accepted":
             raise ValueError(f"Refusing to adapt registration for rejected tile {moving_tile}: status={measurement_status}")
-        adapted_record = json.loads(json.dumps(record))
-        adapted_record["tile"] = moving_tile
-        adapted_record["stage_translation_um"] = position_record["translation_um"]
-        adapted_record["stage_scale_um"] = position_record["scale_um"]
-        if "path" in adapted_record or position_record.get("path") is not None:
+        adapted_record = {
+            "tile": moving_tile,
+            "stage_translation_um": position_record["translation_um"],
+            "stage_scale_um": position_record["scale_um"],
+            "registered_affine": json.loads(json.dumps(IDENTITY_AFFINE)),
+        }
+        if position_record.get("path") is not None:
             adapted_record["path"] = position_record["path"]
-        if adapted_record.get("registered_affine") != record.get("registered_affine"):
-            raise ValueError(f"registered_affine changed while adapting {moving_tile}")
+        source_view = position_record.get("source_view", position_record.get("side"))
+        if source_view is not None:
+            adapted_record["source_view"] = source_view
         adapted_tiles.append(adapted_record)
     if missing:
         raise ValueError(f"Adapted position file is missing tiles required by registration: {missing}")
@@ -1560,11 +1605,13 @@ def adapt_registration_from_reference(
         adapted["input_dir"] = str(first_path.parent)
     adapted["adapted_from"] = str(reference_registration_input.resolve())
     adapted["adapted_to_position"] = str(adapted_to_position.resolve())
-    adapted["adaptation_method"] = "copy_registered_affine_from_reference_replace_405_stage_from_tile_phase"
+    adapted["adaptation_method"] = "tile_phase_adjusted_stage_translation_with_identity_registered_affine"
     adapted["transform_contract"] = {
-        "registered_affine_copied_exactly": True,
+        "registered_affine_copied_exactly": False,
+        "registered_affine_source": "identity_stage_translation_baked",
         "stage_translation_is_phase_adjusted": True,
-        "loader_must_compose_stage_and_registered_affine": True,
+        "loader_composes_identity_registered_affine": True,
+        "accepted_measurement_status": "direct_accepted",
     }
     adapted["tile_phase_summary"] = {
         "output_position": tile_phase_summary["output_position"],
@@ -1577,7 +1624,7 @@ def adapt_registration_from_reference(
                 "final_shift_px_zyx": item["shift_px_zyx"],
                 "final_shift_um_zyx": item["shift_um_zyx"],
                 "n_inliers": item.get("n_inliers"),
-        "measurement_status": tile_phase_row_status(item),
+                "measurement_status": tile_phase_row_status(item),
                 "fallback": bool(item.get("fallback", False)),
             }
             for item in tile_phase_summary["measurements"]
@@ -2475,10 +2522,10 @@ def align_tiles_to_reference(
     if output_registration is not None and reference_registration_input is None:
         raise ValueError("--output-registration requires --reference-registration-input")
     payload = json.loads(reference_position.read_text())
-    if all(record.get("shape") is not None and record.get("axes") for record in payload["tiles"]):
-        reference_tiles = [tile_record_from_position_record(record) for record in payload["tiles"]]
-    else:
+    if all(record.get("side") in rough_legacy.SIDES for record in payload["tiles"]):
         reference_tiles = [logical_tile_record(tile) for tile in rough_legacy.load_tiles(payload)]
+    else:
+        reference_tiles = [tile_record_from_position_record(record) for record in payload["tiles"]]
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "tile_phase_measurement_cache.json"
     cache_key = tile_phase_cache_key(

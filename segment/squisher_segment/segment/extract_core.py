@@ -13,9 +13,10 @@ import tifffile
 import zarr
 from loguru import logger
 from scipy.ndimage import zoom
+from squisher.jpegxr_zarr import register_jpegxr_codec
 
-from fishtools.segment.extract_support import unsharp_all
-from fishtools.segment.extract_helpers import (
+from squisher_segment.segment.extract_support import unsharp_all
+from squisher_segment.segment.extract_helpers import (
     DEFAULT_CROP_SIZE,
     MAX_WIDTH_AFTER_UPSCALE,
     ZARR_TILE_SIZE,
@@ -48,7 +49,7 @@ from fishtools.segment.extract_helpers import (
     _write_tiff,
     load_roi_points,
 )
-from fishtools.segment.extract_support import (
+from squisher_segment.segment.extract_support import (
     ProgressReporter,
     TaskCancelledException,
     get_cancel_event,
@@ -263,6 +264,7 @@ def _is_zarr_path(file: Path) -> bool:
 
 
 def _open_zarr_array(file: Path) -> zarr.Array:
+    register_jpegxr_codec()
     if _is_ome_zarr_path(file):
         return _open_ome_zarr_level_array(file)
     return zarr.open_array(file, mode="r")

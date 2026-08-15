@@ -51,8 +51,10 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
     assert result.exit_code == 0
     for command in (
         "position",
+        "plot-zeiss-positions",
+        "zeiss-tile-positions",
+        "single-position",
         "rough-phase",
-        "register",
         "fuse",
         "pyramid",
         "qc",
@@ -60,6 +62,7 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "live-fusion-preview",
         "fused-xyz-overlay-qc",
         "registration-center-z-spotcheck",
+        "ome-metadata-dumb-stitch",
         "mvs-edge-audit",
         "mvs-refine-level0",
         "rechunk-ome-tiff",
@@ -71,6 +74,154 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "run-tltr",
     ):
         assert command in result.stdout
+
+
+def test_cli_registers_jpegxr_codec_before_command(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(cli_module, "register_jpegxr_codec", lambda: calls.append("codec"))
+    monkeypatch.setattr(
+        cli_module,
+        "create_single_position_file",
+        lambda **kwargs: calls.append("command") or kwargs["output"],
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "single-position",
+            "--input-dir",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "position.json"),
+            "--side",
+            "L",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["codec", "command"]
+
+
+def test_single_position_cli_forwards_metadata_position_options(tmp_path: Path, monkeypatch) -> None:
+    output = tmp_path / "R.positions.json"
+    captured = {}
+
+    def fake_create_single_position_file(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(cli_module, "create_single_position_file", fake_create_single_position_file)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "single-position",
+            "--input-dir",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--side",
+            "R",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "input_dir": tmp_path,
+        "output": output,
+        "side": "R",
+        "plot_title": "metadata tile positions",
+        "progress": cli_module.typer.echo,
+    }
+
+
+def test_plot_zeiss_positions_cli_forwards_options(tmp_path: Path, monkeypatch) -> None:
+    input_path = tmp_path / "input.pos"
+    output_path = tmp_path / "positions.png"
+    tile_positions = tmp_path / "tiles.json"
+    input_path.touch()
+    tile_positions.touch()
+    captured = {}
+
+    def fake_plot_xy_positions(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return output_path.resolve()
+
+    monkeypatch.setattr(cli_module, "plot_xy_positions", fake_plot_xy_positions)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "plot-zeiss-positions",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--title",
+            "Acquisition XY",
+            "--tile-positions",
+            str(tile_positions),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "args": (input_path, output_path),
+        "kwargs": {"title": "Acquisition XY", "tile_positions": tile_positions},
+    }
+    assert result.stdout.strip() == str(output_path.resolve())
+
+
+def test_zeiss_tile_positions_cli_forwards_options(tmp_path: Path, monkeypatch) -> None:
+    pos_input = tmp_path / "input.pos"
+    pos_input.touch()
+    output = tmp_path / "positions.json"
+    captured = {}
+
+    def fake_create_zeiss_tile_position_file(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(
+        cli_module,
+        "create_zeiss_tile_position_file",
+        fake_create_zeiss_tile_position_file,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "zeiss-tile-positions",
+            "--pos-input",
+            str(pos_input),
+            "--output",
+            str(output),
+            "--side",
+            "R",
+            "--overlap-fraction",
+            "0.25",
+            "--min-hull-overlap-fraction",
+            "0.03",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "pos_input": pos_input,
+        "output": output,
+        "side": "R",
+        "overlap_fraction": 0.25,
+        "min_hull_overlap_fraction": 0.03,
+    }
+    assert result.stdout.strip() == str(output.resolve())
+
+
+def test_cli_does_not_expose_generic_register_command() -> None:
+    result = CliRunner().invoke(app, ["register", "--help"])
+
+    assert result.exit_code == 2
+    assert "No such command 'register'" in result.stderr
 
 
 def test_cross_register_method8_group_exposes_stage_subcommands() -> None:
@@ -184,7 +335,9 @@ def test_cross_register_method8_method8_forwards_runner_options(tmp_path: Path, 
     assert captured["resume"] is False
 
 
-def test_cross_register_method8_method8_forwards_default_geometry_and_mask_off(tmp_path: Path, monkeypatch) -> None:
+def test_cross_register_method8_method8_forwards_default_geometry_and_mask_off(
+    tmp_path: Path, monkeypatch
+) -> None:
     fixed_position = tmp_path / "fixed.positions.json"
     moving_position = tmp_path / "moving.positions.json"
     fixed_position.write_text('{"tiles":[]}\n')
@@ -271,6 +424,8 @@ def test_cross_register_method8_materialize_forwards_export_options(tmp_path: Pa
             "1",
             "--channel-source-shift-px-zyx",
             "2.3,1.3,1.1",
+            "--jpegxr-level",
+            "0.85",
         ],
     )
 
@@ -281,6 +436,70 @@ def test_cross_register_method8_materialize_forwards_export_options(tmp_path: Pa
     assert captured["output_dir"] == output_dir / "materialized_fusion_inputs_ch1"
     assert captured["channel_source_shift_px_zyx"] == (2.3, 1.3, 1.1)
     assert captured["include_quality_gate_rejected"] is False
+    assert captured["jpegxr_level"] == 0.85
+
+
+def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_registration = tmp_path / "core.registration.json"
+    moving_position = tmp_path / "moving.positions.json"
+    source_registration.write_text('{"tiles":[]}\n')
+    moving_position.write_text('{"tiles":[]}\n')
+    output_dir = tmp_path / "overlap"
+    captured = {}
+
+    def fake_export_fused_fixed_overlapping_materialized_chunks(**kwargs):
+        captured.update(kwargs)
+        output_dir.mkdir(parents=True)
+        outputs = {
+            "position": output_dir / "positions.json",
+            "registration": output_dir / "registration.json",
+            "summary": output_dir / "summary.json",
+        }
+        for path in outputs.values():
+            path.write_text("{}\n")
+        return outputs
+
+    monkeypatch.setattr(
+        cli_module,
+        "export_fused_fixed_overlapping_materialized_chunks",
+        fake_export_fused_fixed_overlapping_materialized_chunks,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fused-fixed-materialize-overlap",
+            "--source-registration",
+            str(source_registration),
+            "--moving-position",
+            str(moving_position),
+            "--output-dir",
+            str(output_dir),
+            "--output-codec",
+            "zstd",
+            "--workers",
+            "6",
+            "--max-tiles",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["source_registration_input"] == source_registration
+    assert captured["source_summary_input"] is None
+    assert captured["moving_position_input"] == moving_position
+    assert captured["output_dir"] == output_dir
+    assert captured["core_shape_zyx"] == (480, 480, 480)
+    assert captured["window_shape_zyx"] == (528, 528, 528)
+    assert captured["level_factor_zyx"] == (4, 4, 4)
+    assert captured["source_channel"] == 0
+    assert captured["output_codec"] == "zstd"
+    assert captured["jpegxr_level"] == 0.7
+    assert captured["workers"] == 6
+    assert captured["max_tiles"] == 2
+    assert captured["resume"] is False
 
 
 def test_cross_register_method8_manifest_validates_expected_outputs(tmp_path: Path) -> None:
@@ -374,6 +593,42 @@ def test_align_405_to_488_exposes_stage3_mattes_command() -> None:
     assert "render-candidate-grid" in result.stdout
 
 
+def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypatch) -> None:
+    run_dir = tmp_path / "active-run"
+    run_dir.mkdir()
+    renderer_python = tmp_path / "python"
+    renderer_python.touch()
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(stdout="/tmp/accepted_contact_sheet.png\n", stderr="")
+
+    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_module, "FUSED_FIXED_CONTACT_SHEET_SCRIPT", Path(__file__))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fused-fixed-contact-sheet",
+            "--run-dir",
+            str(run_dir),
+            "--limit",
+            "8",
+            "--renderer-python",
+            str(renderer_python),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "accepted_contact_sheet.png" in result.stdout
+    assert captured["command"][captured["command"].index("--run-dir") + 1] == str(run_dir.resolve())
+    assert captured["command"][captured["command"].index("--limit") + 1] == "8"
+    assert captured["command"][0] == str(renderer_python)
+    assert captured["kwargs"] == {"check": True, "text": True, "capture_output": True}
+
+
 def test_mvs_edge_audit_cli_reports_dropped_edges(tmp_path) -> None:
     registration = tmp_path / "registration.json"
     registration.write_text(
@@ -404,6 +659,13 @@ def test_mvs_edge_audit_cli_reports_dropped_edges(tmp_path) -> None:
     assert audit["measured_edge_count"] == 2
     assert audit["used_edge_count"] == 1
     assert audit["dropped_edges"][0]["pair"] == [1, 2]
+
+
+def test_mvs_edge_audit_cli_requires_registration_input() -> None:
+    result = CliRunner().invoke(app, ["mvs-edge-audit"])
+
+    assert result.exit_code == 2
+    assert "--registration-input" in result.output
 
 
 def test_mvs_refine_level0_defaults_to_more_candidate_patches() -> None:
@@ -483,6 +745,42 @@ def test_fuse_cli_parses_output_chunksize_zyx(tmp_path, monkeypatch) -> None:
             str(tmp_path / "fused.ome.zarr"),
             "--output-chunksize-zyx",
             "12,960,960",
+            "--resume-fusion",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["output_chunksize_zyx"] == (12, 960, 960)
+    assert captured["batch_size"] == 1
+    assert captured["resume_fusion"] is True
+
+
+def test_fuse_cli_uses_level0_output_chunksize_by_default(tmp_path, monkeypatch) -> None:
+    captured = {}
+
+    def fake_fuse_tiles(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    input_dir = tmp_path / "tiles"
+    input_dir.mkdir()
+    position = tmp_path / "positions.json"
+    registration = tmp_path / "registration.json"
+    position.write_text("{}")
+    registration.write_text("{}")
+    monkeypatch.setattr(cli_module, "fuse_tiles", fake_fuse_tiles)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fuse",
+            str(input_dir),
+            "--position-input",
+            str(position),
+            "--registration-input",
+            str(registration),
+            "--output",
+            str(tmp_path / "fused.ome.zarr"),
         ],
     )
 
@@ -558,6 +856,8 @@ def test_fused_tile_index_qc_cli_dispatches_renderer(tmp_path, monkeypatch) -> N
             "2",
             "--z-index",
             "7",
+            "--no-labels",
+            "--no-markers",
         ],
     )
 
@@ -568,8 +868,69 @@ def test_fused_tile_index_qc_cli_dispatches_renderer(tmp_path, monkeypatch) -> N
         "output": output,
         "level": 2,
         "z_index": 7,
+        "draw_labels": False,
+        "draw_markers": False,
     }
     assert str(output.resolve()) in result.stdout
+
+
+def test_ome_metadata_dumb_stitch_cli_dispatches_renderer(tmp_path, monkeypatch) -> None:
+    captured = {}
+    left = tmp_path / "L"
+    right = tmp_path / "R"
+    basic = tmp_path / "basic"
+    output_dir = tmp_path / "qc"
+    left.mkdir()
+    right.mkdir()
+    basic.mkdir()
+    manifest = output_dir / "manifest.json"
+    contact_sheet = output_dir / "contact.png"
+
+    def fake_render_ome_metadata_dumb_stitch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            manifest_path=manifest,
+            contact_sheet_path=contact_sheet,
+            output_paths=[manifest, contact_sheet],
+        )
+
+    monkeypatch.setattr(cli_module, "render_ome_metadata_dumb_stitch", fake_render_ome_metadata_dumb_stitch)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "ome-metadata-dumb-stitch",
+            "--input-dir",
+            f"L={left}",
+            "--input-dir",
+            f"R={right}",
+            "--output-dir",
+            str(output_dir),
+            "--channels",
+            "0,1",
+            "--level",
+            "2",
+            "--write-tiff",
+            "--basic-dir",
+            str(basic),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["input_dirs_by_view"] == {"L": left, "R": right}
+    assert captured["output_dir"] == output_dir
+    assert captured["channels"] == (0, 1)
+    assert captured["basic_dir"] == basic
+    assert captured["level"] == 2
+    assert captured["center_z_index"] is None
+    assert captured["output_prefix"] == "ome_metadata_dumb_stitch"
+    assert captured["draw_tile_labels"] is False
+    assert captured["draw_tile_outlines"] is False
+    assert captured["write_tiff"] is True
+    assert captured["progress"] == cli_module._log_progress
+    payload = json.loads(result.stdout)
+    assert payload["manifest"].endswith("manifest.json")
+    assert payload["contact_sheet"].endswith("contact.png")
 
 
 def test_live_fusion_preview_cli_dispatches_renderer(tmp_path, monkeypatch) -> None:

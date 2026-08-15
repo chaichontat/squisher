@@ -88,18 +88,9 @@ def read_tile_info(path: Path, *, side: str) -> TileInfo:
     import tifffile
 
     with tifffile.TiffFile(path) as tif:
-        series = tif.series[0]
-        shape = tuple(int(value) for value in series.shape)
-        axes = str(series.axes)
         ome_xml = tif.ome_metadata
     if ome_xml is None:
         raise ValueError(f"{path} has no OME metadata")
-    if axes == "CZYX":
-        shape_zyx = (shape[1], shape[2], shape[3])
-    elif axes == "ZYX":
-        shape_zyx = shape
-    else:
-        raise ValueError(f"{path} has unsupported axes {axes!r}")
 
     pixels_attrs: dict[str, str] | None = None
     plane_attrs: dict[str, str] | None = None
@@ -112,6 +103,13 @@ def read_tile_info(path: Path, *, side: str) -> TileInfo:
             break
     if pixels_attrs is None or plane_attrs is None:
         raise ValueError(f"{path} OME metadata lacks Pixels or Plane metadata")
+    if int(pixels_attrs["SizeT"]) != 1:
+        raise ValueError(f"{path} has unsupported SizeT={pixels_attrs['SizeT']}; expected a single timepoint")
+    shape_zyx = (
+        int(pixels_attrs["SizeZ"]),
+        int(pixels_attrs["SizeY"]),
+        int(pixels_attrs["SizeX"]),
+    )
 
     return TileInfo(
         tile=path.name,

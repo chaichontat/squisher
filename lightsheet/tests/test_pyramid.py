@@ -56,8 +56,10 @@ def test_standalone_pyramid_level_uses_shards_with_downsampled_inner_chunks(monk
     )
 
     destination = zarr.open(str(root / "1"), mode="r")
-    assert destination.chunks == (2, 2, 4)
+    assert destination.chunks == (1, 2, 4)
     assert destination.metadata.shards == (4, 4, 8)
+    inner_codecs = destination.metadata.to_dict()["codecs"][0]["configuration"]["codecs"]
+    assert [codec["name"] for codec in inner_codecs] == ["squisher.jpegxr", "crc32c"]
 
 
 def test_pyramid_relative_factors_downsample_only_large_spatial_axes() -> None:

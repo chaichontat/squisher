@@ -14,6 +14,11 @@ import cupy as cp
 from cucim.skimage.measure import block_reduce
 from loguru import logger
 import numpy as np
+from squisher.jpegxr_zarr import (
+    DEFAULT_JPEGXR_LEVEL,
+    jpegxr_plane_chunk_shape,
+    jpegxr_sharding_codec,
+)
 from squisher_lightsheet.pyramid import (
     chunk_count,
     chunk_slices,
@@ -23,10 +28,6 @@ from squisher_lightsheet.pyramid import (
     pyramid_relative_factors,
 )
 import zarr
-from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
-
-
-ZSTD_LEVEL = 0
 
 
 def log(message: str) -> None:
@@ -81,11 +82,13 @@ def write_pyramid_level(
     destination_path: str,
     dims: tuple[str, ...],
     factors: dict[str, int],
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
 ) -> tuple[int, ...]:
     source = zarr.open_array(str(root / source_path), mode="r", zarr_format=3)
     factor_tuple = tuple(int(factors[dim]) for dim in dims)
     shape = output_shape(tuple(int(size) for size in source.shape), dims, factors)
     inner_chunks = downsampled_chunks(tuple(int(chunk) for chunk in source.chunks), shape, factor_tuple)
+    inner_chunks = jpegxr_plane_chunk_shape(inner_chunks, dims)
     source_storage_chunks = tuple(int(chunk) for chunk in (source.metadata.shards or source.chunks))
     shard_chunks = pyramid_shard_chunks(source_storage_chunks, shape, inner_chunks)
     destination = zarr.open(
@@ -96,12 +99,7 @@ def write_pyramid_level(
         dtype=source.dtype,
         zarr_format=3,
         dimension_names=dims,
-        codecs=[
-            ShardingCodec(
-                chunk_shape=inner_chunks,
-                codecs=[BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
-            )
-        ],
+        codecs=[jpegxr_sharding_codec(inner_chunks, level=jpegxr_level)],
     )
 
     total_chunks = chunk_count(shape, shard_chunks)
@@ -156,7 +154,12 @@ def seed_root_metadata_from_template(root: Path, template: Path) -> None:
     log(f"Seeded root OME metadata for {root} from {template}")
 
 
-def add_pyramid(root: Path, *, template: Path | None = None) -> None:
+def add_pyramid(
+    root: Path,
+    *,
+    template: Path | None = None,
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
+) -> None:
     if template is not None:
         seed_root_metadata_from_template(root, template)
     payload = read_root_payload(root)
@@ -196,6 +199,7 @@ def add_pyramid(root: Path, *, template: Path | None = None) -> None:
             destination_path=destination_path,
             dims=dims,
             factors=factors,
+            jpegxr_level=jpegxr_level,
         )
         new_datasets.append(
             {
@@ -226,17 +230,20 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="OME-Zarr root whose level-0 multiscales metadata should seed targets that lack root metadata.",
     )
+    parser.add_argument("--jpegxr-level", type=float, default=DEFAULT_JPEGXR_LEVEL)
     parser.add_argument("ome_zarr", type=Path, nargs="+")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if not 0.0 <= args.jpegxr_level <= 1.0:
+        raise ValueError(f"--jpegxr-level must be between 0 and 1, got {args.jpegxr_level}")
     template = args.template.resolve() if args.template is not None else None
     for path in args.ome_zarr:
         root = path.resolve()
         log(f"Adding pyramid levels to {root}")
-        add_pyramid(root, template=template)
+        add_pyramid(root, template=template, jpegxr_level=args.jpegxr_level)
     return 0
 
 

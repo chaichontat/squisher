@@ -862,6 +862,8 @@ def phasecorr_shift_gpu(
     *,
     fft_highpass_sigma_zyx: tuple[float, float, float] | None = None,
     spatial_highpass_sigma: float | None = 4.0,
+    search_center_zyx: np.ndarray | None = None,
+    max_shift_from_center_zyx: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     cp, _cu_feature, _cpx_ndimage = require_gpu_modules()
     fixed_gpu = preprocess_gpu(fixed, spatial_highpass_sigma=spatial_highpass_sigma)
@@ -873,9 +875,52 @@ def phasecorr_shift_gpu(
     if fft_highpass_sigma_zyx is not None and any(float(value) > 0.0 for value in fft_highpass_sigma_zyx):
         product *= fft_gaussian_highpass_weight(product.shape, fft_highpass_sigma_zyx)
     corr = cp.real(cp.fft.ifftn(product))
-    peak_flat = int(cp.argmax(corr).get())
-    peak = np.asarray(np.unravel_index(peak_flat, corr.shape), dtype=np.int64)
+    if (search_center_zyx is None) != (max_shift_from_center_zyx is None):
+        raise ValueError(
+            "search_center_zyx and max_shift_from_center_zyx must be provided together"
+        )
+    bounded_search = search_center_zyx is not None
+    search_corr = corr
+    if bounded_search:
+        center = np.asarray(search_center_zyx, dtype=np.float64)
+        radius = np.asarray(max_shift_from_center_zyx, dtype=np.float64)
+        if (
+            center.shape != (3,)
+            or radius.shape != (3,)
+            or not np.all(np.isfinite(center))
+            or not np.all(np.isfinite(radius))
+            or np.any(radius < 0)
+        ):
+            raise ValueError(
+                "Phase-correlation search center must be a finite 3-vector and radius "
+                "must be a finite nonnegative 3-vector"
+            )
+        valid = cp.ones(corr.shape, dtype=cp.bool_)
+        for axis, size in enumerate(corr.shape):
+            indices = cp.arange(size, dtype=cp.float64)
+            signed = cp.where(indices <= np.fix(size / 2), indices, indices - size)
+            axis_valid = cp.abs(signed - float(center[axis])) <= float(radius[axis])
+            axis_shape = [1] * corr.ndim
+            axis_shape[axis] = size
+            valid &= axis_valid.reshape(axis_shape)
+        if not bool(cp.any(valid).get()):
+            raise ValueError("Phase-correlation search window contains no candidate shifts")
+        search_corr = cp.where(valid, corr, -cp.inf)
+        del valid
+    peak_flat = int(cp.argmax(search_corr).get())
+    peak = np.asarray(np.unravel_index(peak_flat, search_corr.shape), dtype=np.int64)
     subpixel = subpixel_peak(corr, tuple(int(v) for v in peak))
+    if bounded_search:
+        for axis, (index, size) in enumerate(zip(peak, corr.shape, strict=True)):
+            neighbor_indices = ((int(index) - 1) % size, (int(index) + 1) % size)
+            neighbor_shifts = np.asarray(
+                [value if value <= np.fix(size / 2) else value - size for value in neighbor_indices],
+                dtype=np.float64,
+            )
+            if np.any(
+                np.abs(neighbor_shifts - center[axis]) > radius[axis]
+            ):
+                subpixel[axis] = 0.0
     shifts = peak.astype(np.float64) + subpixel
     midpoint = np.asarray([np.fix(axis_size / 2) for axis_size in corr.shape], dtype=np.float64)
     shape = np.asarray(corr.shape, dtype=np.float64)
@@ -885,8 +930,12 @@ def phasecorr_shift_gpu(
         "peak_value": peak_value,
         "phasecorr_fft_highpass_sigma_zyx": list(fft_highpass_sigma_zyx) if fft_highpass_sigma_zyx is not None else None,
         "phasecorr_spatial_highpass_sigma": spatial_highpass_sigma,
+        "search_center_zyx": None if search_center_zyx is None else center.tolist(),
+        "max_shift_from_center_zyx": (
+            None if max_shift_from_center_zyx is None else radius.tolist()
+        ),
     }
-    del fixed_gpu, moving_gpu, product, corr
+    del fixed_gpu, moving_gpu, product, corr, search_corr
     cp.get_default_memory_pool().free_all_blocks()
     return shifts, metadata
 

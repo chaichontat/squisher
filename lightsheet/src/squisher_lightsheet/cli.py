@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+import subprocess
+import sys
 from typing import Annotated, Literal
 
 import typer
+
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL, register_jpegxr_codec
 import numpy as np
 from loguru import logger
 
@@ -32,8 +36,19 @@ from squisher_lightsheet.cross_register_method8 import (
     DEFAULT_LIB_DIR as DEFAULT_CROSS_REGISTER_METHOD8_LIB_DIR,
     run_tile_quadrant_method8,
 )
-from squisher_lightsheet.fusion import fuse_tiles
-from squisher_lightsheet.tile_quadrant_fusion import export_tile_quadrant_materialized_chunks
+from squisher_lightsheet.fusion import DEFAULT_OUTPUT_CHUNKSIZE_ZYX, fuse_tiles
+from squisher_lightsheet.global_phase import (
+    DEFAULT_FFT_HIGHPASS_SIGMA_ZYX,
+    DEFAULT_LEVEL as DEFAULT_GLOBAL_PHASE_LEVEL,
+    DEFAULT_MAX_RESIDUAL_SHIFT_UM,
+    DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
+    DEFAULT_Z_SLAB_PLANES as DEFAULT_GLOBAL_PHASE_Z_SLAB_PLANES,
+    run_global_phase,
+)
+from squisher_lightsheet.tile_quadrant_fusion import (
+    export_fused_fixed_overlapping_materialized_chunks,
+    export_tile_quadrant_materialized_chunks,
+)
 from squisher_lightsheet.lr_alignment import (
     DEFAULT_LEVEL as DEFAULT_LR_ALIGNMENT_LEVEL,
     DEFAULT_PHASE_DOWNSAMPLE_ZYX,
@@ -51,9 +66,14 @@ from squisher_lightsheet.mvs_seams import (
     refine_mvs_registration_level0,
     score_mvs_edges_with_gradient_ncc,
 )
+from squisher_lightsheet.ome_metadata_dumb_stitch import (
+    parse_channels as parse_ome_metadata_dumb_stitch_channels,
+    parse_view_dir as parse_ome_metadata_dumb_stitch_view_dir,
+    render_ome_metadata_dumb_stitch,
+)
 from squisher_lightsheet.ome_rechunk import rechunk_ome_tiffs
 from squisher_lightsheet.parsing import parse_source_view_path_entry
-from squisher_lightsheet.positions import create_position_file
+from squisher_lightsheet.positions import create_position_file, create_single_position_file
 from squisher_lightsheet.pyramid import add_pyramids
 from squisher_lightsheet.qc import (
     render_live_fusion_preview,
@@ -62,19 +82,32 @@ from squisher_lightsheet.qc import (
     render_registration_center_z_spotcheck,
     render_registration_qc,
 )
-from squisher_lightsheet.registration import register_tiles
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy_registration
 from squisher_lightsheet.rough_phase import rough_phase_align
 from squisher_lightsheet.tile_phase import align_tiles_to_reference, parse_shape_zyx
 from squisher_lightsheet.track_z import run_track_z_diagnostics
 from squisher_lightsheet.workflow import DEFAULT_LEVEL, DEFAULT_OVERLAP_FRACTION, run_tltr_workflow
+from squisher_lightsheet.zeiss_positions import plot_xy_positions
+from squisher_lightsheet.zeiss_tile_positions import create_zeiss_tile_position_file
 
 
 app = typer.Typer(no_args_is_help=True)
 align_405_to_488_app = typer.Typer(no_args_is_help=True)
+cross_register_app = typer.Typer(no_args_is_help=True)
 cross_register_method8_app = typer.Typer(no_args_is_help=True)
 app.add_typer(align_405_to_488_app, name="align-405-to-488")
+app.add_typer(cross_register_app, name="cross-register")
 app.add_typer(cross_register_method8_app, name="cross-register-method8")
+
+FUSED_FIXED_CONTACT_SHEET_SCRIPT = Path(
+    "/home/chaichontat/nvme/lightsheet/scripts/render_fused_fixed_method8_contact_sheets.py"
+)
+
+
+@app.callback()
+def lightsheet() -> None:
+    """Lightsheet metadata, registration, fusion, and QC workflows."""
+    register_jpegxr_codec()
 
 
 def _parse_source_view_flatfield_dir(value: str) -> tuple[str, Path]:
@@ -95,6 +128,123 @@ def _parse_source_view_flatfield_dirs(values: list[str] | None) -> dict[str, Pat
 
 def _log_progress(message: str) -> None:
     logger.info(message)
+
+
+@app.command("fused-fixed-contact-sheet")
+def fused_fixed_contact_sheet(
+    run_dir: Annotated[Path, typer.Option("--run-dir", exists=True, file_okay=False, readable=True)],
+    output_dir: Annotated[Path | None, typer.Option("--output-dir", file_okay=False)] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1)] = 24,
+    columns: Annotated[int, typer.Option("--columns", min=1)] = 2,
+    device: Annotated[int, typer.Option("--device", min=0)] = 0,
+    renderer_python: Annotated[
+        Path | None,
+        typer.Option("--renderer-python", exists=True, dir_okay=False),
+    ] = None,
+    status: Annotated[str, typer.Option("--status")] = "accepted",
+    before_transform: Annotated[
+        Literal["phase-correlation", "linear-initializer"],
+        typer.Option("--before-transform"),
+    ] = "phase-correlation",
+) -> None:
+    """Render completed fused-fixed windows, including an incomplete active run."""
+    if not FUSED_FIXED_CONTACT_SHEET_SCRIPT.is_file():
+        raise FileNotFoundError(
+            f"Missing fused-fixed contact-sheet renderer: {FUSED_FIXED_CONTACT_SHEET_SCRIPT}"
+        )
+    resolved_output = (output_dir or run_dir / "contact_sheets").resolve()
+    command = [
+        str(renderer_python or sys.executable),
+        str(FUSED_FIXED_CONTACT_SHEET_SCRIPT),
+        "--run-dir",
+        str(run_dir.resolve()),
+        "--output-dir",
+        str(resolved_output),
+        "--limit",
+        str(limit),
+        "--columns",
+        str(columns),
+        "--device",
+        str(device),
+        "--status",
+        status,
+        "--before-transform",
+        before_transform,
+    ]
+    logger.info("{}", " ".join(command))
+    result = subprocess.run(command, check=True, text=True, capture_output=True)
+    if result.stderr:
+        typer.echo(result.stderr, err=True)
+    typer.echo(result.stdout.strip())
+
+
+@app.command("fused-fixed-materialize-overlap")
+def fused_fixed_materialize_overlap(
+    moving_position: Annotated[
+        Path,
+        typer.Option("--moving-position", exists=True, dir_okay=False, readable=True),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    output_codec: Annotated[
+        Literal["zstd", "jpegxr"],
+        typer.Option("--output-codec"),
+    ],
+    moving_source_registration: Annotated[
+        Path | None,
+        typer.Option(
+            "--moving-source-registration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Registration artifact that maps moving tile identities to pixel-source paths.",
+        ),
+    ] = None,
+    source_registration: Annotated[
+        Path | None,
+        typer.Option("--source-registration", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    source_summary: Annotated[
+        Path | None,
+        typer.Option("--source-summary", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    source_channel: Annotated[int, typer.Option("--source-channel", min=0)] = 0,
+    core_shape_zyx: Annotated[str, typer.Option("--core-shape-zyx")] = "480,480,480",
+    window_shape_zyx: Annotated[str, typer.Option("--window-shape-zyx")] = "528,528,528",
+    level_factor_zyx: Annotated[str, typer.Option("--level-factor-zyx")] = "4,4,4",
+    zstd_level: Annotated[int, typer.Option("--zstd-level", min=1, max=22)] = 3,
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = DEFAULT_JPEGXR_LEVEL,
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 1,
+    max_tiles: Annotated[int | None, typer.Option("--max-tiles", min=1)] = None,
+    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = False,
+    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
+) -> None:
+    """Rematerialize fused-fixed cores with cross-registration-style overlap."""
+    if (source_registration is None) == (source_summary is None):
+        raise typer.BadParameter("pass exactly one of --source-registration or --source-summary")
+    if resume and overwrite:
+        raise typer.BadParameter("--resume and --overwrite are mutually exclusive")
+    if not resume:
+        _require_empty_or_overwrite(
+            output_dir, overwrite=overwrite, label="overlapping materialized output directory"
+        )
+    outputs = export_fused_fixed_overlapping_materialized_chunks(
+        source_registration_input=source_registration,
+        source_summary_input=source_summary,
+        moving_position_input=moving_position,
+        moving_source_input=moving_source_registration,
+        output_dir=output_dir,
+        source_channel=source_channel,
+        core_shape_zyx=parse_shape_zyx(core_shape_zyx),
+        window_shape_zyx=parse_shape_zyx(window_shape_zyx),
+        level_factor_zyx=parse_shape_zyx(level_factor_zyx),
+        output_codec=output_codec,
+        zstd_level=zstd_level,
+        jpegxr_level=jpegxr_level,
+        workers=workers,
+        max_tiles=max_tiles,
+        resume=resume,
+    )
+    typer.echo(json.dumps({key: str(path) for key, path in outputs.items()}, indent=2))
 
 
 def _parse_float_zyx(text: str) -> tuple[float, float, float]:
@@ -153,6 +303,10 @@ def _cross_register_manifest_path(output_dir: Path) -> Path:
     return output_dir / "cross_register_method8_manifest.json"
 
 
+def _global_cross_register_manifest_path(output_dir: Path) -> Path:
+    return output_dir / "cross-register.manifest.json"
+
+
 def _read_json_if_exists(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
@@ -185,6 +339,28 @@ def _update_cross_register_manifest(
     manifest.update(
         {
             "artifact_type": "squisher_lightsheet.cross_register_method8_manifest.v1",
+            "output_dir": str(output_dir.resolve()),
+            "stages": stages,
+        }
+    )
+    return _write_json_atomic(manifest_path, manifest)
+
+
+def _update_global_cross_register_manifest(
+    output_dir: Path,
+    *,
+    stage: str,
+    updates: dict[str, object],
+) -> Path:
+    manifest_path = _global_cross_register_manifest_path(output_dir)
+    manifest = _read_json_if_exists(manifest_path)
+    stages = manifest.get("stages")
+    if not isinstance(stages, dict):
+        stages = {}
+    stages[stage] = updates
+    manifest.update(
+        {
+            "artifact_type": "squisher_lightsheet.cross_register_manifest.v1",
             "output_dir": str(output_dir.resolve()),
             "stages": stages,
         }
@@ -226,9 +402,163 @@ def _require_paths_exist(paths: dict[str, Path]) -> None:
         raise typer.BadParameter(f"Missing required cross-register artifact(s): {details}")
 
 
+def _require_distinct_paths(
+    *,
+    inputs: dict[str, Path],
+    outputs: dict[str, Path],
+) -> None:
+    resolved_inputs = {label: path.resolve() for label, path in inputs.items()}
+    resolved_outputs = {label: path.resolve() for label, path in outputs.items()}
+    aliases = []
+    for output_label, output_path in resolved_outputs.items():
+        for input_label, input_path in resolved_inputs.items():
+            if output_path == input_path:
+                aliases.append(f"{output_label} aliases {input_label} at {output_path}")
+    output_items = list(resolved_outputs.items())
+    for index, (left_label, left_path) in enumerate(output_items):
+        for right_label, right_path in output_items[index + 1 :]:
+            if left_path == right_path:
+                aliases.append(f"{left_label} aliases {right_label} at {left_path}")
+    if aliases:
+        raise typer.BadParameter("Cross-register paths must be distinct: " + "; ".join(aliases))
+
+
+@cross_register_app.command("global-phase")
+def cross_register_global_phase(
+    fixed_position: Annotated[
+        Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)
+    ],
+    moving_position: Annotated[
+        Path, typer.Option("--moving-position", exists=True, dir_okay=False, readable=True)
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    fixed_tile_dir: Annotated[
+        Path | None,
+        typer.Option("--fixed-tile-dir", exists=True, file_okay=False, readable=True),
+    ] = None,
+    moving_tile_dir: Annotated[
+        Path | None,
+        typer.Option("--moving-tile-dir", exists=True, file_okay=False, readable=True),
+    ] = None,
+    output_position: Annotated[Path | None, typer.Option("--output-position", dir_okay=False)] = None,
+    fixed_channel: Annotated[int, typer.Option("--fixed-channel", min=0)] = 0,
+    moving_channel: Annotated[int, typer.Option("--moving-channel", min=0)] = 0,
+    level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_GLOBAL_PHASE_LEVEL,
+    z_slab_planes: Annotated[int, typer.Option("--z-slab-planes", min=1)] = (
+        DEFAULT_GLOBAL_PHASE_Z_SLAB_PLANES
+    ),
+    fixed_intensity_transform: Annotated[
+        Literal["identity", "log1p"], typer.Option("--fixed-intensity-transform")
+    ] = "log1p",
+    moving_intensity_transform: Annotated[
+        Literal["identity", "log1p"], typer.Option("--moving-intensity-transform")
+    ] = "identity",
+    fft_highpass_sigma_zyx: Annotated[str | None, typer.Option("--fft-highpass-sigma-zyx")] = ",".join(
+        str(value) for value in DEFAULT_FFT_HIGHPASS_SIGMA_ZYX
+    ),
+    spatial_highpass_sigma: Annotated[float | None, typer.Option("--spatial-highpass-sigma", min=0.0)] = None,
+    max_residual_shift_um: Annotated[
+        float, typer.Option("--max-residual-shift-um", min=0.0)
+    ] = DEFAULT_MAX_RESIDUAL_SHIFT_UM,
+    orthogonal_lateral_factor: Annotated[
+        int, typer.Option("--orthogonal-lateral-factor", min=1)
+    ] = DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
+    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
+) -> None:
+    resolved_output_position = output_position or output_dir / "global-phase.positions.json"
+    outputs = {
+        "output position": resolved_output_position,
+        "summary": output_dir / "global-phase.summary.json",
+        "fixed phase MIP": output_dir / "fixed.phase.tif",
+        "moving phase MIP": output_dir / "moving.phase.tif",
+        "before overlay": output_dir / "before.png",
+        "after overlay": output_dir / "after.png",
+        "orthogonal summary": output_dir / "orthogonal" / "orthogonal.summary.json",
+        "orthogonal contact sheet": output_dir / "orthogonal" / "orthogonal.png",
+        "manifest": _global_cross_register_manifest_path(output_dir),
+    }
+    for plane in ("zx", "zy"):
+        for artifact in ("fixed.tif", "moving.tif", "before.png", "after.png"):
+            outputs[f"orthogonal {plane} {artifact}"] = output_dir / "orthogonal" / f"{plane}.{artifact}"
+    for plane in ("zx", "zy"):
+        for artifact in ("fixed.tif", "moving.tif", "before.png", "after.png"):
+            outputs[f"orthogonal {plane} {artifact}"] = output_dir / "orthogonal" / f"{plane}.{artifact}"
+    _require_distinct_paths(
+        inputs={"fixed position": fixed_position, "moving position": moving_position},
+        outputs=outputs,
+    )
+    for label, path in outputs.items():
+        if label == "manifest":
+            continue
+        _require_empty_or_overwrite(path, overwrite=overwrite, label=label)
+    parsed_fft_highpass = None if fft_highpass_sigma_zyx is None else _parse_float_zyx(fft_highpass_sigma_zyx)
+    result = run_global_phase(
+        fixed_position=fixed_position,
+        moving_position=moving_position,
+        output_dir=output_dir,
+        output_position=resolved_output_position,
+        fixed_tile_dir=fixed_tile_dir,
+        moving_tile_dir=moving_tile_dir,
+        fixed_channel=fixed_channel,
+        moving_channel=moving_channel,
+        level=level,
+        z_slab_planes=z_slab_planes,
+        fixed_intensity_transform=fixed_intensity_transform,
+        moving_intensity_transform=moving_intensity_transform,
+        fft_highpass_sigma_zyx=parsed_fft_highpass,
+        spatial_highpass_sigma=spatial_highpass_sigma,
+        max_residual_shift_um=max_residual_shift_um,
+        orthogonal_lateral_factor=orthogonal_lateral_factor,
+    )
+    manifest = _update_global_cross_register_manifest(
+        output_dir,
+        stage="global-phase",
+        updates={
+            "fixed_position": fixed_position.resolve(),
+            "moving_position": moving_position.resolve(),
+            "fixed_tile_dir": None if fixed_tile_dir is None else fixed_tile_dir.resolve(),
+            "moving_tile_dir": None if moving_tile_dir is None else moving_tile_dir.resolve(),
+            "output_position": result.output_position,
+            "summary": result.summary,
+            "fixed_mip": result.fixed_mip,
+            "moving_mip": result.moving_mip,
+            "before_overlay": result.before_overlay,
+            "after_overlay": result.after_overlay,
+            "orthogonal_summary": result.orthogonal_summary,
+            "orthogonal_contact_sheet": result.orthogonal_contact_sheet,
+            "fixed_channel": fixed_channel,
+            "moving_channel": moving_channel,
+            "level": level,
+            "z_slab_planes": z_slab_planes,
+            "fixed_intensity_transform": fixed_intensity_transform,
+            "moving_intensity_transform": moving_intensity_transform,
+            "fft_highpass_sigma_zyx": parsed_fft_highpass,
+            "spatial_highpass_sigma": spatial_highpass_sigma,
+            "max_residual_shift_um": max_residual_shift_um,
+            "orthogonal_lateral_factor": orthogonal_lateral_factor,
+        },
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "output_position": str(result.output_position),
+                "summary": str(result.summary),
+                "before_overlay": str(result.before_overlay),
+                "after_overlay": str(result.after_overlay),
+                "orthogonal_summary": str(result.orthogonal_summary),
+                "orthogonal_contact_sheet": str(result.orthogonal_contact_sheet),
+                "manifest": str(manifest),
+            },
+            indent=2,
+        )
+    )
+
+
 @cross_register_method8_app.command("coarse")
 def cross_register_method8_coarse(
-    fixed_position: Annotated[Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)],
+    fixed_position: Annotated[
+        Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     output_position: Annotated[Path | None, typer.Option("--output-position", dir_okay=False)] = None,
     fixed_channel: Annotated[int, typer.Option("--fixed-channel", min=0)] = 0,
@@ -258,7 +588,9 @@ def cross_register_method8_coarse(
     )
     _require_empty_or_overwrite(resolved_output_position, overwrite=overwrite, label="coarse output position")
     if output_registration is not None:
-        _require_empty_or_overwrite(output_registration, overwrite=overwrite, label="coarse output registration")
+        _require_empty_or_overwrite(
+            output_registration, overwrite=overwrite, label="coarse output registration"
+        )
     path = align_tiles_to_reference(
         reference_position=fixed_position,
         output_position=resolved_output_position,
@@ -300,7 +632,9 @@ def cross_register_method8_coarse(
 
 @cross_register_method8_app.command("method8")
 def cross_register_method8_method8(
-    fixed_position: Annotated[Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)],
+    fixed_position: Annotated[
+        Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)
+    ],
     coarse_moving_position: Annotated[
         Path,
         typer.Option("--coarse-moving-position", exists=True, dir_okay=False, readable=True),
@@ -324,11 +658,15 @@ def cross_register_method8_method8(
     min_corr: Annotated[float, typer.Option("--min-corr")] = 0.15,
     min_grad_ncc: Annotated[float, typer.Option("--min-grad-ncc")] = 0.24,
     empty_precheck_level: Annotated[int, typer.Option("--empty-precheck-level")] = -1,
-    empty_precheck_min_dynamic_range: Annotated[float, typer.Option("--empty-precheck-min-dynamic-range")] = 1.0,
+    empty_precheck_min_dynamic_range: Annotated[
+        float, typer.Option("--empty-precheck-min-dynamic-range")
+    ] = 1.0,
     empty_precheck_min_std: Annotated[float, typer.Option("--empty-precheck-min-std")] = 0.25,
     fixed_mask_threshold: Annotated[
         str,
-        typer.Option("--fixed-mask-threshold", help="Fixed-mask threshold; use none/off/disabled to turn it off."),
+        typer.Option(
+            "--fixed-mask-threshold", help="Fixed-mask threshold; use none/off/disabled to turn it off."
+        ),
     ] = "3000",
     fixed_mask_level: Annotated[int, typer.Option("--fixed-mask-level", min=0)] = 2,
     fixed_mask_min_voxels: Annotated[int, typer.Option("--fixed-mask-min-voxels", min=1)] = 256,
@@ -407,12 +745,23 @@ def cross_register_method8_method8(
             "resume": resume,
         },
     )
-    typer.echo(json.dumps({"method8_summary": str(path), "window_json_dir": str(window_json_dir.resolve()), "manifest": str(manifest)}, indent=2))
+    typer.echo(
+        json.dumps(
+            {
+                "method8_summary": str(path),
+                "window_json_dir": str(window_json_dir.resolve()),
+                "manifest": str(manifest),
+            },
+            indent=2,
+        )
+    )
 
 
 @cross_register_method8_app.command("materialize")
 def cross_register_method8_materialize(
-    window_json_dir: Annotated[Path, typer.Option("--window-json-dir", exists=True, file_okay=False, readable=True)],
+    window_json_dir: Annotated[
+        Path, typer.Option("--window-json-dir", exists=True, file_okay=False, readable=True)
+    ],
     coarse_moving_position: Annotated[
         Path,
         typer.Option("--coarse-moving-position", exists=True, dir_okay=False, readable=True),
@@ -435,13 +784,16 @@ def cross_register_method8_materialize(
         bool,
         typer.Option("--include-quality-gate-rejected/--skip-quality-gate-rejected"),
     ] = False,
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (DEFAULT_JPEGXR_LEVEL),
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
 ) -> None:
     resolved_output_dir = materialized_output_dir or _default_materialized_output_dir(
         output_dir,
         fusion_channel=fusion_channel,
     )
-    _require_empty_or_overwrite(resolved_output_dir, overwrite=overwrite, label="materialized output directory")
+    _require_empty_or_overwrite(
+        resolved_output_dir, overwrite=overwrite, label="materialized output directory"
+    )
     outputs = export_tile_quadrant_materialized_chunks(
         window_json_dir=window_json_dir,
         moving_position_input=coarse_moving_position,
@@ -451,6 +803,7 @@ def cross_register_method8_materialize(
             None if channel_source_shift_px_zyx is None else _parse_float_zyx(channel_source_shift_px_zyx)
         ),
         include_quality_gate_rejected=include_quality_gate_rejected,
+        jpegxr_level=jpegxr_level,
     )
     manifest = _update_cross_register_manifest(
         output_dir,
@@ -466,7 +819,9 @@ def cross_register_method8_materialize(
             "registration": outputs["registration"],
             "summary": outputs["summary"],
             "channel_source_shift_px_zyx": (
-                None if channel_source_shift_px_zyx is None else list(_parse_float_zyx(channel_source_shift_px_zyx))
+                None
+                if channel_source_shift_px_zyx is None
+                else list(_parse_float_zyx(channel_source_shift_px_zyx))
             ),
             "include_quality_gate_rejected": include_quality_gate_rejected,
         },
@@ -495,7 +850,9 @@ def cross_register_method8_manifest(
     coarse_position: Annotated[Path | None, typer.Option("--coarse-position", dir_okay=False)] = None,
     method8_summary: Annotated[Path | None, typer.Option("--method8-summary", dir_okay=False)] = None,
     window_json_dir: Annotated[Path | None, typer.Option("--window-json-dir", file_okay=False)] = None,
-    materialized_output_dir: Annotated[Path | None, typer.Option("--materialized-output-dir", file_okay=False)] = None,
+    materialized_output_dir: Annotated[
+        Path | None, typer.Option("--materialized-output-dir", file_okay=False)
+    ] = None,
     validate: Annotated[bool, typer.Option("--validate/--no-validate")] = True,
 ) -> None:
     resolved_coarse = coarse_position or _default_cross_register_coarse_position(
@@ -511,7 +868,9 @@ def cross_register_method8_manifest(
         fusion_channel=fusion_channel,
     )
     materialized_position = resolved_materialized_dir / "tile_quadrant_materialized_chunks.positions.json"
-    materialized_registration = resolved_materialized_dir / "tile_quadrant_materialized_chunks.registration.json"
+    materialized_registration = (
+        resolved_materialized_dir / "tile_quadrant_materialized_chunks.registration.json"
+    )
     materialized_summary = resolved_materialized_dir / "tile_quadrant_materialized_chunks.summary.json"
     if validate:
         _require_paths_exist(
@@ -567,9 +926,67 @@ def position(
     typer.echo(output.resolve())
 
 
+@app.command("plot-zeiss-positions")
+def plot_zeiss_positions(
+    input_path: Annotated[Path, typer.Option("--input", exists=True, dir_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    title: Annotated[str, typer.Option("--title")] = "Zeiss XY positions",
+    tile_positions: Annotated[
+        Path | None,
+        typer.Option("--tile-positions", exists=True, dir_okay=False, readable=True),
+    ] = None,
+) -> None:
+    output_path = plot_xy_positions(
+        input_path,
+        output,
+        title=title,
+        tile_positions=tile_positions,
+    )
+    typer.echo(output_path)
+
+
+@app.command("zeiss-tile-positions")
+def zeiss_tile_positions(
+    pos_input: Annotated[Path, typer.Option("--pos-input", exists=True, dir_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    side: Annotated[str, typer.Option("--side")] = "single",
+    overlap_fraction: Annotated[float, typer.Option("--overlap-fraction", min=0.0, max=0.99)] = 0.2,
+    min_hull_overlap_fraction: Annotated[
+        float, typer.Option("--min-hull-overlap-fraction", min=0.0, max=0.99)
+    ] = 0.02,
+) -> None:
+    output_path = create_zeiss_tile_position_file(
+        pos_input=pos_input,
+        output=output,
+        side=side,
+        overlap_fraction=overlap_fraction,
+        min_hull_overlap_fraction=min_hull_overlap_fraction,
+    )
+    typer.echo(output_path)
+
+
+@app.command("single-position")
+def single_position(
+    input_dir: Annotated[Path, typer.Option("--input-dir", exists=True, file_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option("--output")],
+    side: Annotated[str, typer.Option("--side")],
+    plot_title: Annotated[str, typer.Option("--plot-title")] = "metadata tile positions",
+) -> None:
+    create_single_position_file(
+        input_dir=input_dir,
+        output=output,
+        side=side,
+        plot_title=plot_title,
+        progress=typer.echo,
+    )
+    typer.echo(output.resolve())
+
+
 @app.command("rough-phase")
 def rough_phase(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_position: Annotated[Path, typer.Option("--output-position")],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
@@ -580,7 +997,9 @@ def rough_phase(
     crop_overlap: Annotated[bool, typer.Option("--crop-overlap/--no-crop-overlap")] = True,
     z_slab_planes: Annotated[int, typer.Option("--z-slab-planes", min=1)] = DEFAULT_Z_SLAB_PLANES,
     phase_downsample_yx: Annotated[int, typer.Option("--phase-downsample-yx", min=1)] = 1,
-    phase_downsample_zyx: Annotated[str | None, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(DEFAULT_PHASE_DOWNSAMPLE_ZYX),
+    phase_downsample_zyx: Annotated[str | None, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(
+        DEFAULT_PHASE_DOWNSAMPLE_ZYX
+    ),
 ) -> None:
     rough_phase_align(
         position_input=position_input,
@@ -594,86 +1013,18 @@ def rough_phase(
         crop_overlap=crop_overlap,
         z_slab_planes=z_slab_planes,
         phase_downsample_yx=phase_downsample_yx,
-        phase_downsample_zyx=_parse_int_zyx(phase_downsample_zyx) if phase_downsample_zyx is not None else None,
+        phase_downsample_zyx=_parse_int_zyx(phase_downsample_zyx)
+        if phase_downsample_zyx is not None
+        else None,
     )
     typer.echo(output_position.resolve())
 
 
-@app.command()
-def register(
-    run_dir: Annotated[Path, typer.Argument()],
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
-    registration_output: Annotated[Path, typer.Option("--registration-output")],
-    level: Annotated[int, typer.Option("--level", min=0)] = legacy_registration.DEFAULT_COARSE_REG_RES_LEVELS[0],
-    registration_pair_mode: Annotated[str, typer.Option("--registration-pair-mode")] = legacy_registration.DEFAULT_REGISTRATION_PAIR_MODE,
-    robust_boundary_qc_dir: Annotated[Path | None, typer.Option("--robust-boundary-qc-dir")] = None,
-    registration_plots_dir: Annotated[Path | None, typer.Option("--registration-plots-dir")] = None,
-    skip_registration_plots: Annotated[bool, typer.Option("--skip-registration-plots/--registration-plots")] = True,
-    dask_num_workers: Annotated[int | None, typer.Option("--dask-num-workers", min=1)] = None,
-    pairwise_jobs: Annotated[int | None, typer.Option("--pairwise-jobs", min=0)] = legacy_registration.DEFAULT_N_PARALLEL_PAIRWISE_REGS,
-    registration_cache_max_gib: Annotated[
-        float,
-        typer.Option("--registration-cache-max-gib", min=0.0),
-    ] = legacy_registration.DEFAULT_REGISTRATION_CACHE_MAX_GIB,
-    registration_pair_file: Annotated[
-        Path | None,
-        typer.Option("--registration-pair-file", exists=True, dir_okay=False, readable=True),
-    ] = None,
-    groupwise_transform: Annotated[str, typer.Option("--groupwise-transform")] = legacy_registration.MVS_GROUPWISE_TRANSFORM,
-    mvs_post_quality_filter: Annotated[
-        bool,
-        typer.Option("--mvs-post-quality-filter/--no-mvs-post-quality-filter"),
-    ] = True,
-    mvs_post_quality_threshold: Annotated[
-        float,
-        typer.Option("--mvs-post-quality-threshold", min=0.0),
-    ] = legacy_registration.MVS_POST_QUALITY_THRESHOLD,
-    channel: Annotated[list[int] | None, typer.Option("--channel", min=0)] = None,
-    reference_registration_input: Annotated[
-        Path | None,
-        typer.Option("--reference-registration-input", exists=True, dir_okay=False, readable=True),
-    ] = None,
-    reference_geometry_mode: Annotated[str, typer.Option("--reference-geometry-mode")] = "none",
-    reference_xy_prior_weight: Annotated[float | None, typer.Option("--reference-xy-prior-weight", min=0.0)] = None,
-    reference_initial_alignment: Annotated[str, typer.Option("--reference-initial-alignment")] = "none",
-    shared_geometry_tracks: Annotated[str | None, typer.Option("--shared-geometry-tracks")] = None,
-    log_file: Annotated[Path | None, typer.Option("--log-file")] = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
-) -> None:
-    register_tiles(
-        run_dir=run_dir,
-        position_input=position_input,
-        registration_output=registration_output,
-        level=level,
-        registration_pair_mode=registration_pair_mode,
-        robust_boundary_qc_dir=robust_boundary_qc_dir,
-        registration_plots_dir=registration_plots_dir,
-        skip_registration_plots=skip_registration_plots,
-        dask_num_workers=dask_num_workers,
-        pairwise_jobs=pairwise_jobs,
-        registration_cache_max_gib=registration_cache_max_gib,
-        registration_pair_file=registration_pair_file,
-        groupwise_transform=groupwise_transform,
-        mvs_post_quality_filter=mvs_post_quality_filter,
-        mvs_post_quality_threshold=mvs_post_quality_threshold,
-        reference_registration_input=reference_registration_input,
-        reference_geometry_mode=reference_geometry_mode,
-        reference_xy_prior_weight=reference_xy_prior_weight,
-        reference_initial_alignment=reference_initial_alignment,
-        shared_geometry_tracks=(
-            tuple(item.strip() for item in shared_geometry_tracks.split(",") if item.strip())
-            if shared_geometry_tracks is not None
-            else None
-        ),
-        channels=tuple(channel) if channel is not None else None,
-        log_file=log_file,
-        dry_run=dry_run,
-    )
-
-
 @app.command("mvs-edge-audit")
 def mvs_edge_audit(
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output: Annotated[Path | None, typer.Option("--output")] = None,
 ) -> None:
     audit = mvs_used_edge_audit(load_mvs_registration(registration_input))
@@ -688,13 +1039,19 @@ def mvs_edge_audit(
 
 @app.command("mvs-refine-level0")
 def mvs_refine_level0(
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_registration: Annotated[Path, typer.Option("--output-registration")],
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
     patch_shape_zyx: Annotated[str, typer.Option("--patch-shape-zyx")] = "12,320,320",
     span_entire_seam: Annotated[bool, typer.Option("--span-entire-seam/--scout-patches")] = False,
-    patches_per_edge: Annotated[int, typer.Option("--patches-per-edge", min=1)] = DEFAULT_LEVEL0_PATCHES_PER_EDGE,
-    retry_patches_per_edge: Annotated[int, typer.Option("--retry-patches-per-edge", min=1)] = DEFAULT_LEVEL0_RETRY_PATCHES_PER_EDGE,
+    patches_per_edge: Annotated[
+        int, typer.Option("--patches-per-edge", min=1)
+    ] = DEFAULT_LEVEL0_PATCHES_PER_EDGE,
+    retry_patches_per_edge: Annotated[
+        int, typer.Option("--retry-patches-per-edge", min=1)
+    ] = DEFAULT_LEVEL0_RETRY_PATCHES_PER_EDGE,
     min_inliers: Annotated[int, typer.Option("--min-inliers", min=1)] = 3,
     max_phase_shift_zyx: Annotated[str, typer.Option("--max-phase-shift-zyx")] = "3,64,64",
     phase_highpass_sigma_zyx: Annotated[str, typer.Option("--phase-highpass-sigma-zyx")] = "0,10,10",
@@ -722,7 +1079,9 @@ def mvs_refine_level0(
         typer.Option("--fallback-level2-weight-scale", min=0.0),
     ] = DEFAULT_LEVEL0_FALLBACK_LEVEL2_WEIGHT_SCALE,
     contact_sheet: Annotated[bool, typer.Option("--contact-sheet/--no-contact-sheet")] = True,
-    contact_sheet_output_dir: Annotated[Path | None, typer.Option("--contact-sheet-output-dir", file_okay=False)] = None,
+    contact_sheet_output_dir: Annotated[
+        Path | None, typer.Option("--contact-sheet-output-dir", file_okay=False)
+    ] = None,
     contact_sheet_max_panels: Annotated[int, typer.Option("--contact-sheet-max-panels", min=1)] = 128,
 ) -> None:
     refined, _diagnostics = refine_mvs_registration_level0(
@@ -786,7 +1145,9 @@ def rechunk_ome_tiff(
 
 @app.command("mvs-score-gradient-ncc")
 def mvs_score_gradient_ncc(
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output: Annotated[Path, typer.Option("--output")],
     summary_output: Annotated[Path | None, typer.Option("--summary-output")] = None,
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
@@ -839,9 +1200,19 @@ def mvs_score_gradient_ncc(
 @app.command()
 def fuse(
     input_dir: Annotated[Path, typer.Argument()],
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
-    output: Annotated[Path, typer.Option("--output")],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="Canonical output directory, or an explicit .ome.zarr/.zarr base path.",
+        ),
+    ],
     channel: Annotated[list[int] | None, typer.Option("--channel", min=0)] = None,
     flatfield_dir_by_source_view: Annotated[
         list[str] | None,
@@ -852,19 +1223,46 @@ def fuse(
         str,
         typer.Option("--fusion-weight-mode"),
     ] = "content-preibisch-coarse",
-    batch_size: Annotated[int, typer.Option("--batch-size", min=1)] = 4,
+    batch_size: Annotated[int, typer.Option("--batch-size", min=1)] = 1,
     basic_cache_disk_dir: Annotated[
         Path | None,
         typer.Option("--basic-cache-disk-dir", file_okay=False),
     ] = None,
     output_chunksize_zyx: Annotated[
-        str | None,
+        str,
         typer.Option("--output-chunksize-zyx", help="Fusion output chunk size as z,y,x."),
-    ] = None,
+    ] = ",".join(str(value) for value in DEFAULT_OUTPUT_CHUNKSIZE_ZYX),
     output_grid_template: Annotated[
         Path | None,
-        typer.Option("--output-grid-template", exists=True, file_okay=False, help="OME-Zarr whose scale-0 grid is reused."),
+        typer.Option(
+            "--output-grid-template",
+            exists=True,
+            file_okay=False,
+            help="OME-Zarr whose scale-0 grid is reused.",
+        ),
     ] = None,
+    output_grid_template_level: Annotated[
+        int,
+        typer.Option(
+            "--output-grid-template-level", min=0, help="Pyramid level to reuse from --output-grid-template."
+        ),
+    ] = 0,
+    output_codec: Annotated[
+        Literal["auto", "zstd", "jpegxr"],
+        typer.Option(
+            "--output-codec",
+            help="auto uses JPEG-XR for native level 0 and Zstd for downsampled preview output.",
+        ),
+    ] = "auto",
+    zstd_level: Annotated[int, typer.Option("--zstd-level", min=-7, max=22)] = 3,
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (DEFAULT_JPEGXR_LEVEL),
+    resume_fusion: Annotated[
+        bool,
+        typer.Option(
+            "--resume-fusion",
+            help="Resume only a preserved temporary fusion whose inputs and pixel-affecting settings match.",
+        ),
+    ] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
     fuse_tiles(
@@ -878,17 +1276,22 @@ def fuse(
         fusion_weight_mode=fusion_weight_mode,
         batch_size=batch_size,
         basic_cache_disk_dir=basic_cache_disk_dir,
-        output_chunksize_zyx=(
-            None if output_chunksize_zyx is None else _parse_int_zyx(output_chunksize_zyx, "--output-chunksize-zyx")
-        ),
+        output_chunksize_zyx=_parse_int_zyx(output_chunksize_zyx, "--output-chunksize-zyx"),
         output_grid_template=output_grid_template,
+        output_grid_template_level=output_grid_template_level,
+        output_codec=output_codec,
+        zstd_level=zstd_level,
+        jpegxr_level=jpegxr_level,
+        resume_fusion=resume_fusion,
         dry_run=dry_run,
     )
 
 
 @app.command("subtract-channel")
 def subtract_channel(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     output_position: Annotated[Path | None, typer.Option("--output-position")] = None,
     registration_input: Annotated[
@@ -952,15 +1355,25 @@ def subtract_channel(
 def pyramid(
     ome_zarr: Annotated[list[Path], typer.Argument()],
     template: Annotated[Path | None, typer.Option("--template", exists=True, file_okay=False)] = None,
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (DEFAULT_JPEGXR_LEVEL),
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
-    add_pyramids(ome_zarrs=ome_zarr, template=template, dry_run=dry_run)
+    add_pyramids(
+        ome_zarrs=ome_zarr,
+        template=template,
+        jpegxr_level=jpegxr_level,
+        dry_run=dry_run,
+    )
 
 
 @app.command()
 def qc(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
     level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_LEVEL,
@@ -981,10 +1394,14 @@ def qc(
 @app.command("fused-tile-index-qc")
 def fused_tile_index_qc(
     fused_zarr: Annotated[Path, typer.Argument(exists=True, file_okay=False, readable=True)],
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output: Annotated[Path | None, typer.Option("--output", dir_okay=False)] = None,
     level: Annotated[int, typer.Option("--level", min=0)] = 2,
     z_index: Annotated[int | None, typer.Option("--z-index", min=0)] = None,
+    draw_labels: Annotated[bool, typer.Option("--labels/--no-labels")] = True,
+    draw_markers: Annotated[bool, typer.Option("--markers/--no-markers")] = True,
 ) -> None:
     path = render_fused_tile_index_overlay(
         fused_zarr=fused_zarr,
@@ -992,14 +1409,20 @@ def fused_tile_index_qc(
         output=output,
         level=level,
         z_index=z_index,
+        draw_labels=draw_labels,
+        draw_markers=draw_markers,
     )
     typer.echo(path.resolve())
 
 
 @app.command("live-fusion-preview")
 def live_fusion_preview(
-    source_zarr: Annotated[Path | None, typer.Option("--zarr", exists=True, file_okay=False, readable=True)] = None,
-    log_path: Annotated[Path | None, typer.Option("--log", exists=True, dir_okay=False, readable=True)] = None,
+    source_zarr: Annotated[
+        Path | None, typer.Option("--zarr", exists=True, file_okay=False, readable=True)
+    ] = None,
+    log_path: Annotated[
+        Path | None, typer.Option("--log", exists=True, dir_okay=False, readable=True)
+    ] = None,
     output: Annotated[Path | None, typer.Option("--output", dir_okay=False)] = None,
     output_dir: Annotated[Path | None, typer.Option("--output-dir", file_okay=False)] = None,
     level: Annotated[int, typer.Option("--level", min=0)] = 0,
@@ -1034,7 +1457,9 @@ def live_fusion_preview(
 
 @app.command("fused-xyz-overlay-qc")
 def fused_xyz_overlay_qc(
-    reference_zarr: Annotated[Path, typer.Option("--reference-zarr", exists=True, file_okay=False, readable=True)],
+    reference_zarr: Annotated[
+        Path, typer.Option("--reference-zarr", exists=True, file_okay=False, readable=True)
+    ],
     moving_zarr: Annotated[Path, typer.Option("--moving-zarr", exists=True, file_okay=False, readable=True)],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     level: Annotated[int, typer.Option("--level", min=0)] = 0,
@@ -1054,8 +1479,12 @@ def fused_xyz_overlay_qc(
 
 @app.command("registration-center-z-spotcheck")
 def registration_center_z_spotcheck(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
-    registration_input: Annotated[Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
+    registration_input: Annotated[
+        Path, typer.Option("--registration-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     channel: Annotated[list[int] | None, typer.Option("--channel", min=0)] = None,
     level: Annotated[int, typer.Option("--level", min=0)] = 4,
@@ -1077,9 +1506,88 @@ def registration_center_z_spotcheck(
         typer.echo(path.resolve())
 
 
+@app.command("ome-metadata-dumb-stitch")
+def ome_metadata_dumb_stitch(
+    input_dir: Annotated[
+        list[str] | None,
+        typer.Option("--input-dir", help="Repeatable VIEW=DIR source tile directory entry."),
+    ] = None,
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)] = Path(
+        "ome-metadata-dumb-stitch-qc"
+    ),
+    channels: Annotated[str, typer.Option("--channels", help="Comma-separated channel indexes.")] = "0,1",
+    basic_dir: Annotated[
+        Path | None, typer.Option("--basic-dir", exists=True, file_okay=False, readable=True)
+    ] = None,
+    level: Annotated[int, typer.Option("--level", min=0, help="OME-Zarr pyramid level to render.")] = 0,
+    center_z_index: Annotated[
+        int | None,
+        typer.Option(
+            "--center-z-index", min=0, help="Z index at the selected level; defaults to its center."
+        ),
+    ] = None,
+    output_prefix: Annotated[str, typer.Option("--output-prefix")] = "ome_metadata_dumb_stitch",
+    draw_tile_labels: Annotated[bool, typer.Option("--draw-tile-labels/--no-draw-tile-labels")] = False,
+    draw_tile_outlines: Annotated[bool, typer.Option("--draw-tile-outlines/--no-draw-tile-outlines")] = False,
+    write_tiff: Annotated[
+        bool,
+        typer.Option(
+            "--write-tiff/--no-write-tiff",
+            help=(
+                "Also write tiled native-intensity OME-TIFF mosaics; raw outputs are exact uint16, "
+                "and corrected outputs remain float32."
+            ),
+        ),
+    ] = False,
+) -> None:
+    if not input_dir:
+        raise typer.BadParameter("Pass at least one --input-dir VIEW=DIR entry")
+    input_dirs_by_view: dict[str, Path] = {}
+    for value in input_dir:
+        try:
+            view, path = parse_ome_metadata_dumb_stitch_view_dir(value)
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+        if view in input_dirs_by_view:
+            raise typer.BadParameter(f"Duplicate --input-dir view {view!r}")
+        if not path.is_dir():
+            raise typer.BadParameter(f"--input-dir {view} path is not a directory: {path}")
+        input_dirs_by_view[view] = path
+    try:
+        parsed_channels = parse_ome_metadata_dumb_stitch_channels(channels)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    result = render_ome_metadata_dumb_stitch(
+        input_dirs_by_view=input_dirs_by_view,
+        output_dir=output_dir,
+        channels=parsed_channels,
+        basic_dir=basic_dir,
+        level=level,
+        center_z_index=center_z_index,
+        output_prefix=output_prefix,
+        draw_tile_labels=draw_tile_labels,
+        draw_tile_outlines=draw_tile_outlines,
+        write_tiff=write_tiff,
+        progress=_log_progress,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "manifest": str(result.manifest_path.resolve()),
+                "contact_sheet": str(result.contact_sheet_path.resolve()),
+                "outputs": [str(path.resolve()) for path in result.output_paths],
+            },
+            indent=2,
+        )
+    )
+
+
 @app.command("track-z-diagnostics")
 def track_z_diagnostics(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     reference_channel: Annotated[int, typer.Option("--reference-channel", min=0)] = 3,
     level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_LEVEL,
@@ -1108,14 +1616,18 @@ def align_lr_dumb_stitch(
     left_dir: Annotated[Path, typer.Option("--left-dir", exists=True, file_okay=False, readable=True)],
     right_dir: Annotated[Path, typer.Option("--right-dir", exists=True, file_okay=False, readable=True)],
     output_prefix: Annotated[Path, typer.Option("--output-prefix")],
-    overlap_fraction: Annotated[float, typer.Option("--overlap-fraction", min=0.0, max=0.999)] = DEFAULT_OVERLAP_FRACTION,
+    overlap_fraction: Annotated[
+        float, typer.Option("--overlap-fraction", min=0.0, max=0.999)
+    ] = DEFAULT_OVERLAP_FRACTION,
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
     level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_LR_ALIGNMENT_LEVEL,
     search_margin_px: Annotated[int, typer.Option("--search-margin-px", min=0)] = 64,
     phase_upsample_factor: Annotated[int, typer.Option("--phase-upsample-factor", min=1)] = 10,
     seam_fraction: Annotated[float, typer.Option("--seam-fraction", min=0.0, max=1.0)] = 0.10,
     z_slab_planes: Annotated[int, typer.Option("--z-slab-planes", min=1)] = DEFAULT_Z_SLAB_PLANES,
-    phase_downsample_zyx: Annotated[str, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(DEFAULT_PHASE_DOWNSAMPLE_ZYX),
+    phase_downsample_zyx: Annotated[str, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(
+        DEFAULT_PHASE_DOWNSAMPLE_ZYX
+    ),
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
     paths = run_lr_dumb_stitch_alignment(
@@ -1137,7 +1649,9 @@ def align_lr_dumb_stitch(
 
 @app.command("tile-phase-align")
 def tile_phase_align(
-    reference_position: Annotated[Path, typer.Option("--reference-position", exists=True, dir_okay=False, readable=True)],
+    reference_position: Annotated[
+        Path, typer.Option("--reference-position", exists=True, dir_okay=False, readable=True)
+    ],
     output_position: Annotated[Path, typer.Option("--output-position")],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     reference_channel: Annotated[int, typer.Option("--reference-channel", min=0)] = 3,
@@ -1163,12 +1677,18 @@ def tile_phase_align(
     ] = "phase",
     affine_init_level: Annotated[int, typer.Option("--affine-init-level", min=0)] = 2,
     affine_init_z_samples: Annotated[int, typer.Option("--affine-init-z-samples", min=1)] = 200,
-    affine_refine_crop_shape_zyx: Annotated[str, typer.Option("--affine-refine-crop-shape-zyx")] = "200,480,480",
+    affine_refine_crop_shape_zyx: Annotated[
+        str, typer.Option("--affine-refine-crop-shape-zyx")
+    ] = "200,480,480",
     affine_max_iterations: Annotated[int, typer.Option("--affine-max-iterations", min=0)] = 20,
-    affine_contact_sheet: Annotated[bool, typer.Option("--affine-contact-sheet/--no-affine-contact-sheet")] = True,
+    affine_contact_sheet: Annotated[
+        bool, typer.Option("--affine-contact-sheet/--no-affine-contact-sheet")
+    ] = True,
     affine_fit_mode: Annotated[
         Literal["rigid", "affine-12dof"],
-        typer.Option("--affine-fit-mode", help="Transform family for affine-mode cross-channel registration."),
+        typer.Option(
+            "--affine-fit-mode", help="Transform family for affine-mode cross-channel registration."
+        ),
     ] = "rigid",
     affine_tile_order: Annotated[
         Literal["input", "grid-fanout"],
@@ -1236,7 +1756,9 @@ def align_405_to_488_refine_level0(
     native_patch_shape_zyx: Annotated[str, typer.Option("--native-patch-shape-zyx")] = "12,320,320",
     upsample_factor: Annotated[int, typer.Option("--upsample-factor", min=1)] = 10,
     workers: Annotated[int, typer.Option("--workers", min=1)] = 1,
-    script_dir: Annotated[Path, typer.Option("--script-dir", exists=True, file_okay=False, readable=True)] = ...,
+    script_dir: Annotated[
+        Path, typer.Option("--script-dir", exists=True, file_okay=False, readable=True)
+    ] = ...,
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
     command = refine_405_488_level0_anchors(
@@ -1254,12 +1776,16 @@ def align_405_to_488_refine_level0(
 
 @align_405_to_488_app.command("measure-stage3-mattes")
 def align_405_to_488_measure_stage3_mattes(
-    records_jsonl: Annotated[Path, typer.Option("--records-jsonl", exists=True, dir_okay=False, readable=True)],
+    records_jsonl: Annotated[
+        Path, typer.Option("--records-jsonl", exists=True, dir_okay=False, readable=True)
+    ],
     reference_position: Annotated[
         Path,
         typer.Option("--reference-position", exists=True, dir_okay=False, readable=True),
     ],
-    moving_position: Annotated[Path, typer.Option("--moving-position", exists=True, dir_okay=False, readable=True)],
+    moving_position: Annotated[
+        Path, typer.Option("--moving-position", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     preserve_moving_geometry: Annotated[
         bool,
@@ -1270,7 +1796,9 @@ def align_405_to_488_measure_stage3_mattes(
     ] = True,
     candidate_source: Annotated[
         Literal["seed_rows", "structure_tensor"],
-        typer.Option("--candidate-source", help="Use seed_rows for current workflow fidelity, or structure_tensor."),
+        typer.Option(
+            "--candidate-source", help="Use seed_rows for current workflow fidelity, or structure_tensor."
+        ),
     ] = "seed_rows",
     level: Annotated[int, typer.Option("--level", min=0)] = 3,
     patch_shape_zyx: Annotated[str, typer.Option("--patch-shape-zyx")] = "12,160,160",
@@ -1290,7 +1818,9 @@ def align_405_to_488_measure_stage3_mattes(
     ] = 0.001,
     candidate_pool_size: Annotated[int, typer.Option("--candidate-pool-size", min=1)] = 36,
     edge_inset_fraction: Annotated[float, typer.Option("--edge-inset-fraction", min=0.0, max=0.49)] = 0.0,
-    inlier_threshold_level_px_zyx: Annotated[str, typer.Option("--inlier-threshold-level-px-zyx")] = "3,12,12",
+    inlier_threshold_level_px_zyx: Annotated[
+        str, typer.Option("--inlier-threshold-level-px-zyx")
+    ] = "3,12,12",
 ) -> None:
     output = measure_405_to_488_mattes_anchors(
         records_jsonl=records_jsonl,
@@ -1343,12 +1873,16 @@ def align_405_to_488_recover_mvs_seams(
 @align_405_to_488_app.command("optimize")
 def align_405_to_488_optimize(
     anchor_table: Annotated[Path, typer.Option("--anchor-table", exists=True, dir_okay=False, readable=True)],
-    phase_position: Annotated[Path, typer.Option("--phase-position", exists=True, dir_okay=False, readable=True)],
+    phase_position: Annotated[
+        Path, typer.Option("--phase-position", exists=True, dir_okay=False, readable=True)
+    ],
     source_405_registration: Annotated[
         Path,
         typer.Option("--source-405-registration", exists=True, dir_okay=False, readable=True),
     ],
-    seam_residuals: Annotated[Path, typer.Option("--seam-residuals", exists=True, dir_okay=False, readable=True)],
+    seam_residuals: Annotated[
+        Path, typer.Option("--seam-residuals", exists=True, dir_okay=False, readable=True)
+    ],
     output_position: Annotated[Path, typer.Option("--output-position")],
     output_registration: Annotated[Path, typer.Option("--output-registration")],
     diagnostics: Annotated[Path, typer.Option("--diagnostics")],
@@ -1374,12 +1908,16 @@ def align_405_to_488_optimize(
 
 @align_405_to_488_app.command("render-candidate-grid")
 def align_405_to_488_render_candidate_grid(
-    position_input: Annotated[Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)],
+    position_input: Annotated[
+        Path, typer.Option("--position-input", exists=True, dir_okay=False, readable=True)
+    ],
     registration_input: Annotated[
         Path,
         typer.Option("--registration-input", exists=True, dir_okay=False, readable=True),
     ],
-    candidate_json: Annotated[Path, typer.Option("--candidate-json", exists=True, dir_okay=False, readable=True)],
+    candidate_json: Annotated[
+        Path, typer.Option("--candidate-json", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
     level: Annotated[int, typer.Option("--level", min=0)] = 4,
@@ -1403,19 +1941,27 @@ def align_405_to_488_render_candidate_grid(
 
 @align_405_to_488_app.command("run")
 def align_405_to_488_run(
-    all_tiles_json: Annotated[Path, typer.Option("--all-tiles-json", exists=True, dir_okay=False, readable=True)],
+    all_tiles_json: Annotated[
+        Path, typer.Option("--all-tiles-json", exists=True, dir_okay=False, readable=True)
+    ],
     coarse_anchor_table: Annotated[
         Path,
         typer.Option("--coarse-anchor-table", exists=True, dir_okay=False, readable=True),
     ],
-    phase_position: Annotated[Path, typer.Option("--phase-position", exists=True, dir_okay=False, readable=True)],
+    phase_position: Annotated[
+        Path, typer.Option("--phase-position", exists=True, dir_okay=False, readable=True)
+    ],
     source_405_registration: Annotated[
         Path,
         typer.Option("--source-405-registration", exists=True, dir_okay=False, readable=True),
     ],
-    seam_residuals: Annotated[Path, typer.Option("--seam-residuals", exists=True, dir_okay=False, readable=True)],
+    seam_residuals: Annotated[
+        Path, typer.Option("--seam-residuals", exists=True, dir_okay=False, readable=True)
+    ],
     output_dir: Annotated[Path, typer.Option("--output-dir")],
-    script_dir: Annotated[Path, typer.Option("--script-dir", exists=True, file_okay=False, readable=True)] = ...,
+    script_dir: Annotated[
+        Path, typer.Option("--script-dir", exists=True, file_okay=False, readable=True)
+    ] = ...,
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,
 ) -> None:
     commands = run_405_to_488_workflow(
@@ -1437,23 +1983,37 @@ def run_tltr(
     left_dir: Annotated[Path, typer.Option("--left-dir", exists=True, file_okay=False, readable=True)],
     right_dir: Annotated[Path, typer.Option("--right-dir", exists=True, file_okay=False, readable=True)],
     output_prefix: Annotated[Path, typer.Option("--output-prefix")],
-    overlap_fraction: Annotated[float, typer.Option("--overlap-fraction", min=0.0, max=0.999)] = DEFAULT_OVERLAP_FRACTION,
+    overlap_fraction: Annotated[
+        float, typer.Option("--overlap-fraction", min=0.0, max=0.999)
+    ] = DEFAULT_OVERLAP_FRACTION,
     channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
     level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_LEVEL,
-    rough_phase_level: Annotated[int, typer.Option("--rough-phase-level", min=0)] = DEFAULT_LR_ALIGNMENT_LEVEL,
+    rough_phase_level: Annotated[
+        int, typer.Option("--rough-phase-level", min=0)
+    ] = DEFAULT_LR_ALIGNMENT_LEVEL,
     search_margin_px: Annotated[int, typer.Option("--search-margin-px", min=0)] = 64,
     phase_upsample_factor: Annotated[int, typer.Option("--phase-upsample-factor", min=1)] = 10,
     seam_fraction: Annotated[float, typer.Option("--seam-fraction", min=0.0, max=1.0)] = 0.10,
     z_slab_planes: Annotated[int, typer.Option("--z-slab-planes", min=1)] = DEFAULT_Z_SLAB_PLANES,
-    phase_downsample_zyx: Annotated[str, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(DEFAULT_PHASE_DOWNSAMPLE_ZYX),
-    registration_pair_mode: Annotated[str, typer.Option("--registration-pair-mode")] = legacy_registration.DEFAULT_REGISTRATION_PAIR_MODE,
+    phase_downsample_zyx: Annotated[str, typer.Option("--phase-downsample-zyx")] = _format_int_zyx(
+        DEFAULT_PHASE_DOWNSAMPLE_ZYX
+    ),
+    registration_pair_mode: Annotated[
+        str, typer.Option("--registration-pair-mode")
+    ] = legacy_registration.DEFAULT_REGISTRATION_PAIR_MODE,
     registration_pair_file: Annotated[
         Path | None,
         typer.Option("--registration-pair-file", exists=True, dir_okay=False, readable=True),
     ] = None,
-    skip_registration_plots: Annotated[bool, typer.Option("--skip-registration-plots/--registration-plots")] = True,
-    dask_registration_workers: Annotated[int | None, typer.Option("--dask-registration-workers", min=1)] = None,
-    pairwise_jobs: Annotated[int | None, typer.Option("--pairwise-jobs", min=0)] = legacy_registration.DEFAULT_N_PARALLEL_PAIRWISE_REGS,
+    skip_registration_plots: Annotated[
+        bool, typer.Option("--skip-registration-plots/--registration-plots")
+    ] = True,
+    dask_registration_workers: Annotated[
+        int | None, typer.Option("--dask-registration-workers", min=1)
+    ] = None,
+    pairwise_jobs: Annotated[
+        int | None, typer.Option("--pairwise-jobs", min=0)
+    ] = legacy_registration.DEFAULT_N_PARALLEL_PAIRWISE_REGS,
     fuse_output: Annotated[bool, typer.Option("--fuse/--no-fuse")] = False,
     pyramid_output: Annotated[bool, typer.Option("--pyramid/--no-pyramid")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run/--run")] = False,

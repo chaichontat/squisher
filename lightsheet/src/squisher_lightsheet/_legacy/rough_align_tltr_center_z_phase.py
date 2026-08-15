@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from squisher_lightsheet import ngff
 from squisher_lightsheet import phase_metrics
 from squisher_lightsheet import qc as qc_core
 from squisher_lightsheet.tiff import choose_tiff_source_level, spatial_shape_array_zyx_from_axes
@@ -78,6 +79,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def tile_shape_and_axes(path: Path) -> tuple[np.ndarray, str]:
+    if path.suffix == ".zarr":
+        import zarr
+
+        root = zarr.open(str(path), mode="r")
+        zarray = ngff.level_array(root, context=path)
+        shape = tuple(int(value) for value in zarray.shape)
+        axes = ngff.axes(root, zarray)
+        if axes == "CZYX":
+            return np.asarray(shape[1:4], dtype=np.int64), axes
+        if axes == "ZYX":
+            return np.asarray(shape, dtype=np.int64), axes
+        raise ValueError(f"{path} has unsupported axes {axes!r}")
+
     import tifffile
 
     with tifffile.TiffFile(path) as tif:
@@ -93,11 +107,31 @@ def tile_shape_and_axes(path: Path) -> tuple[np.ndarray, str]:
 
 def base_zarr_array(zarr_obj: Any) -> Any:
     """Return the base-resolution array from array or grouped OME-TIFF stores."""
-    if hasattr(zarr_obj, "shape"):
-        return zarr_obj
-    if hasattr(zarr_obj, "keys") and "0" in zarr_obj:
-        return zarr_obj["0"]
-    raise TypeError(f"Expected zarr array or group with base array '0', got {type(zarr_obj).__name__}")
+    return ngff.level_array(zarr_obj)
+
+
+def zarr_axes(zarray: Any) -> str:
+    attrs = dict(getattr(zarray, "attrs", {}) or {})
+    dimensions = attrs.get("_ARRAY_DIMENSIONS")
+    if dimensions:
+        return "".join(str(dim)[0].upper() for dim in dimensions)
+    return "CZYX" if len(zarray.shape) == 4 else "ZYX"
+
+
+def sampled_source_array(tile: TileRecord, desired_factor: np.ndarray) -> tuple[Any, np.ndarray, Any | None]:
+    import dask.array as da
+    import zarr
+
+    if tile.path.suffix == ".zarr":
+        zarray = base_zarr_array(zarr.open(str(tile.path), mode="r"))
+        return da.from_zarr(zarray), np.ones(3, dtype=np.int64), None
+
+    import tifffile
+
+    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
+    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    zarray = base_zarr_array(zarr.open(store, mode="r"))
+    return da.from_zarr(zarray), source_factor, store
 
 
 def source_slices_for_factor(
@@ -176,16 +210,9 @@ def build_geometry(tiles: list[TileRecord], *, level: int) -> CanvasGeometry:
 
 
 def sampled_center_z_plane(tile: TileRecord, *, channel: int, level_factor: int) -> np.ndarray:
-    import dask.array as da
-    import tifffile
-    import zarr
-
     desired_factor = np.asarray([1, level_factor, level_factor], dtype=np.int64)
-    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    array, source_factor, store = sampled_source_array(tile, desired_factor)
     try:
-        zarray = base_zarr_array(zarr.open(store, mode="r"))
-        array = da.from_zarr(zarray)
         source_shape_zyx = spatial_shape_array_zyx_from_axes(tuple(array.shape), tile.axes)
         z_index = int(round((tile.shape_zyx[0] // 2) / max(int(source_factor[0]), 1)))
         z_index = min(max(z_index, 0), int(source_shape_zyx[0]) - 1)
@@ -214,16 +241,9 @@ def sampled_center_z_plane(tile: TileRecord, *, channel: int, level_factor: int)
 
 
 def sampled_tile_volume(tile: TileRecord, *, channel: int, level_factor: int) -> np.ndarray:
-    import dask.array as da
-    import tifffile
-    import zarr
-
     desired_factor = np.asarray([level_factor, level_factor, level_factor], dtype=np.int64)
-    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    array, source_factor, store = sampled_source_array(tile, desired_factor)
     try:
-        zarray = base_zarr_array(zarr.open(store, mode="r"))
-        array = da.from_zarr(zarray)
         z_slice, y_slice, x_slice = source_slices_for_factor(
             tile,
             source_factor_zyx=source_factor,
@@ -246,6 +266,46 @@ def sampled_tile_volume(tile: TileRecord, *, channel: int, level_factor: int) ->
             close()
 
 
+def sampled_tile_volume_z_range(
+    tile: TileRecord,
+    *,
+    channel: int,
+    level_factor: int,
+    sampled_z_start: int,
+    sampled_z_stop: int,
+) -> np.ndarray:
+    if sampled_z_start < 0 or sampled_z_stop <= sampled_z_start:
+        raise ValueError(f"Invalid sampled z range [{sampled_z_start}, {sampled_z_stop}) for tile {tile.tile}")
+    desired_factor = np.asarray([level_factor, level_factor, level_factor], dtype=np.int64)
+    array, source_factor, store = sampled_source_array(tile, desired_factor)
+    try:
+        z_slice, y_slice, x_slice = source_slices_for_factor(
+            tile,
+            source_factor_zyx=source_factor,
+            desired_factor_zyx=desired_factor,
+        )
+        source_shape_zyx = spatial_shape_array_zyx_from_axes(tuple(array.shape), tile.axes)
+        sampled_z_size = len(range(*z_slice.indices(int(source_shape_zyx[0]))))
+        sampled_z_stop = min(int(sampled_z_stop), sampled_z_size)
+        if sampled_z_stop <= sampled_z_start:
+            return np.zeros((0, 0, 0), dtype=np.float32)
+        if tile.axes == "CZYX":
+            if channel < 0 or channel >= int(array.shape[0]):
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
+            volume = array[channel, z_slice, y_slice, x_slice][sampled_z_start:sampled_z_stop]
+        elif tile.axes == "ZYX":
+            if channel != 0:
+                raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")
+            volume = array[z_slice, y_slice, x_slice][sampled_z_start:sampled_z_stop]
+        else:
+            raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
+        return np.asarray(volume.compute(), dtype=np.float32)
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
 def sampled_tile_center_z_slab(
     tile: TileRecord,
     *,
@@ -254,10 +314,6 @@ def sampled_tile_center_z_slab(
     source_z_stop: int,
     yx_level_factor: int,
 ) -> np.ndarray:
-    import dask.array as da
-    import tifffile
-    import zarr
-
     if source_z_start < 0 or source_z_stop > int(tile.shape_zyx[0]) or source_z_stop <= source_z_start:
         raise ValueError(
             f"Invalid source z slab [{source_z_start}, {source_z_stop}) for tile {tile.tile} "
@@ -265,11 +321,8 @@ def sampled_tile_center_z_slab(
         )
 
     desired_factor = np.asarray([1, yx_level_factor, yx_level_factor], dtype=np.int64)
-    source_level, source_factor = choose_tiff_source_level(tile.path, desired_factor)
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
+    array, source_factor, store = sampled_source_array(tile, desired_factor)
     try:
-        zarray = base_zarr_array(zarr.open(store, mode="r"))
-        array = da.from_zarr(zarray)
         source_shape_zyx = spatial_shape_array_zyx_from_axes(tuple(array.shape), tile.axes)
         source_z_start = int(np.floor(source_z_start / max(int(source_factor[0]), 1)))
         source_z_stop = int(np.ceil(source_z_stop / max(int(source_factor[0]), 1)))
@@ -358,27 +411,54 @@ def render_xz_projection_canvases(
     *,
     geometry: CanvasGeometry,
     channel: int,
+    z_range_px: tuple[int, int] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
-    images = {side: np.zeros((int(geometry.shape_zyx[0]), int(geometry.shape_zyx[2])), dtype=np.float32) for side in SIDES}
-    coverage = {side: np.zeros((int(geometry.shape_zyx[0]), int(geometry.shape_zyx[2])), dtype=bool) for side in SIDES}
+    if z_range_px is None:
+        z_start_px = 0
+        z_stop_px = int(geometry.shape_zyx[0])
+    else:
+        z_start_px = max(0, min(int(geometry.shape_zyx[0]), int(z_range_px[0])))
+        z_stop_px = max(z_start_px, min(int(geometry.shape_zyx[0]), int(z_range_px[1])))
+    images = {side: np.zeros((z_stop_px - z_start_px, int(geometry.shape_zyx[2])), dtype=np.float32) for side in SIDES}
+    coverage = {side: np.zeros((z_stop_px - z_start_px, int(geometry.shape_zyx[2])), dtype=bool) for side in SIDES}
     rows = []
     for tile in tiles:
         start_um, _stop_um = tile_bounds_zyx_um(tile)
         start_zyx = np.rint((start_um - geometry.global_min_zyx_um) / geometry.level_spacing_zyx_um).astype(int)
-        volume = sampled_tile_volume(tile, channel=channel, level_factor=geometry.level_factor)
+        sampled_z_size = int(np.ceil(int(tile.shape_zyx[0]) / int(geometry.level_factor)))
+        tile_z_start = int(start_zyx[0])
+        tile_z_stop = tile_z_start + sampled_z_size
+        read_z_start = max(tile_z_start, z_start_px)
+        read_z_stop = min(tile_z_stop, z_stop_px)
+        if read_z_stop <= read_z_start:
+            continue
+        volume = sampled_tile_volume_z_range(
+            tile,
+            channel=channel,
+            level_factor=geometry.level_factor,
+            sampled_z_start=read_z_start - tile_z_start,
+            sampled_z_stop=read_z_stop - tile_z_start,
+        )
         projection = volume.max(axis=1)
-        start_zx = (int(start_zyx[0]), int(start_zyx[2]))
+        start_zx = (int(read_z_start - z_start_px), int(start_zyx[2]))
         place_max(images[tile.side], projection, start_zx)
         place_max(coverage[tile.side], np.ones(projection.shape, dtype=bool), start_zx)
         rows.append(
             {
                 "tile": tile.tile,
                 "side": tile.side,
-                "level_start_zx": [start_zx[0], start_zx[1]],
+                "level_start_zx": [int(read_z_start), int(start_zyx[2])],
+                "phase_canvas_start_zx": [start_zx[0], start_zx[1]],
+                "sampled_z_range": [int(read_z_start - tile_z_start), int(read_z_stop - tile_z_start)],
                 "sampled_shape_zx": [int(projection.shape[0]), int(projection.shape[1])],
             }
         )
-        print(f"placed-xz {tile.tile} side={tile.side} start_zx={list(start_zx)} shape={list(projection.shape)}", flush=True)
+        print(
+            f"placed-xz {tile.tile} side={tile.side} level_start_zx={[int(read_z_start), int(start_zyx[2])]} "
+            f"phase_start_zx={list(start_zx)} sampled_z_range={[int(read_z_start - tile_z_start), int(read_z_stop - tile_z_start)]} "
+            f"shape={list(projection.shape)}",
+            flush=True,
+        )
     return images, coverage, rows
 
 
@@ -502,10 +582,10 @@ def seam_band_mask(
     left_start, left_stop = side_bounds["L"]
     seam_um = left_start if centers["R"] < centers["L"] else left_stop
     if overlap_fraction and overlap_um:
-        band_um = abs(float(overlap_um)) * seam_fraction / abs(float(overlap_fraction))
+        requested_band_um = abs(float(overlap_um)) * seam_fraction / abs(float(overlap_fraction))
     else:
-        band_um = min(left_stop - left_start, side_bounds["R"][1] - side_bounds["R"][0]) * seam_fraction
-    band_um = min(float(band_um), overlap_stop - overlap_start)
+        requested_band_um = min(left_stop - left_start, side_bounds["R"][1] - side_bounds["R"][0]) * seam_fraction
+    band_um = min(float(requested_band_um), overlap_stop - overlap_start)
 
     if abs(seam_um - overlap_start) <= abs(seam_um - overlap_stop):
         band_start_um = overlap_start
@@ -527,7 +607,7 @@ def seam_band_mask(
         "seam_um": float(seam_um),
         "seam_fraction": float(seam_fraction),
         "seam_band_um": float(band_stop_um - band_start_um),
-        "seam_band_um_requested": float(band_um),
+        "seam_band_um_requested": float(requested_band_um),
         "overlap_um": float(overlap_stop - overlap_start),
         "seam_band_range_um": [float(band_start_um), float(band_stop_um)],
         "seam_band_range_px": [int(start_px), int(stop_px)],
@@ -643,28 +723,42 @@ def estimate_shift_px(
         phase_coverage = {side: side_coverage & phase_mask for side, side_coverage in coverage.items()}
     overlap = phase_coverage["L"] & phase_coverage["R"]
     if crop_to_overlap:
-        crop_slices = expanded_bbox(overlap, margin=0 if phase_mask is not None else search_margin_px)
+        crop_basis = phase_coverage["L"] | phase_coverage["R"] if phase_mask is not None else overlap
+        crop_slices = expanded_bbox(crop_basis, margin=0 if phase_mask is not None else search_margin_px)
     else:
         crop_slices = tuple(slice(0, size) for size in images["L"].shape)
     fixed = normalize_for_phase(images["L"][crop_slices], phase_coverage["L"][crop_slices])
     moving = normalize_for_phase(images["R"][crop_slices], phase_coverage["R"][crop_slices])
-    shift, error, phase = phase_cross_correlation(
-        fixed,
-        moving,
-        upsample_factor=upsample_factor,
-        normalization="phase",
-    )
+    fixed_mask = phase_coverage["L"][crop_slices]
+    moving_mask = phase_coverage["R"][crop_slices]
+    if phase_mask is not None:
+        shift, error, phase = phase_cross_correlation(
+            fixed,
+            moving,
+            reference_mask=fixed_mask,
+            moving_mask=moving_mask,
+            overlap_ratio=0.05,
+        )
+        phase_mode = "masked"
+    else:
+        shift, error, phase = phase_cross_correlation(
+            fixed,
+            moving,
+            upsample_factor=upsample_factor,
+            normalization="phase",
+        )
+        phase_mode = "unmasked"
     shift = np.asarray(shift, dtype=np.float64)
     shifted = ndimage.shift(moving, shift=shift, order=1, mode="constant", cval=0.0, prefilter=False)
-    common = phase_coverage["L"][crop_slices] & ndimage.shift(
-        phase_coverage["R"][crop_slices].astype(np.float32),
+    common = fixed_mask & ndimage.shift(
+        moving_mask.astype(np.float32),
         shift=shift,
         order=0,
         mode="constant",
         cval=0.0,
         prefilter=False,
     ).astype(bool)
-    before_corr = corrcoef_on_mask(fixed, moving, phase_coverage["L"][crop_slices] & phase_coverage["R"][crop_slices])
+    before_corr = corrcoef_on_mask(fixed, moving, fixed_mask & moving_mask)
     after_corr = corrcoef_on_mask(fixed, shifted, common)
     axis_suffix = "".join(axes)
     details = {
@@ -672,9 +766,12 @@ def estimate_shift_px(
         f"crop_{axis_suffix}": [[axis_slice.start, axis_slice.stop] for axis_slice in crop_slices],
         "overlap_pixels": int(overlap.sum()),
         "phase_mask_pixels": None if phase_mask is None else int(phase_mask.sum()),
+        "phase_valid_pixels": None if phase_mask is None else {side: int(phase_coverage[side].sum()) for side in SIDES},
         "crop_to_overlap": bool(crop_to_overlap),
         "search_margin_px": int(search_margin_px),
         "upsample_factor": int(upsample_factor),
+        "phase_mode": phase_mode,
+        "masked_overlap_ratio": 0.05 if phase_mask is not None else None,
         "phase_error": float(error),
         "phase": float(phase),
         "corr_before": before_corr,

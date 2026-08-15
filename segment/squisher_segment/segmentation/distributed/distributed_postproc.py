@@ -83,12 +83,12 @@ Output zarr (post-processed masks)
 Usage
 -----
 CLI:
-    python -m fishtools.segmentation.distributed.distributed_postproc \\
+    python -m squisher_segment.segmentation.distributed.distributed_postproc \\
         run /path/to/segmentation.zarr \\
         --blocksize 512 --sigma \"1,2,2\" --v-min 8000
 
 Programmatic:
-    from fishtools.segmentation.distributed.distributed_postproc import distributed_postproc
+    from squisher_segment.segmentation.distributed.distributed_postproc import distributed_postproc
     result = distributed_postproc(input_zarr, write_path, sigma=(1, 2, 2), V_min=8000, ...)
 """
 
@@ -107,7 +107,7 @@ import zarr
 from loguru import logger
 from numpy.typing import NDArray
 
-from fishtools.segment.postproc3d import (  # noqa: F401
+from squisher_segment.segment.postproc3d import (  # noqa: F401
     absorb_encircled_rois,
     compute_metadata_and_adjacency,
     donate_small_cells,
@@ -115,8 +115,8 @@ from fishtools.segment.postproc3d import (  # noqa: F401
     gaussian_smooth_labels_cupy,
     relabel_connected_components,
 )
-from fishtools.segmentation.distributed.gpu_cluster import cluster, myGPUCluster, myLocalCluster
-from fishtools.segmentation.distributed.merge_utils import (
+from squisher_segment.segmentation.distributed.gpu_cluster import cluster, myGPUCluster, myLocalCluster
+from squisher_segment.segmentation.distributed.merge_utils import (
     block_faces,
     get_block_crops,
     get_nblocks,
@@ -248,7 +248,7 @@ def process_postproc_block(
         )
     except ImportError:
         # Fall back to CPU if CuPy/CUDA not available
-        from fishtools.segment.postproc3d import gaussian_smooth_labels
+        from squisher_segment.segment.postproc3d import gaussian_smooth_labels
 
         masks = gaussian_smooth_labels(
             masks,

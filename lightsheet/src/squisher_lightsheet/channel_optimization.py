@@ -54,10 +54,6 @@ def tile_records_by_name(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(record["tile"]): record for record in payload["tiles"]}
 
 
-def moving_tile_to_reference_tile(tile: str, *, moving_token: str, reference_token: str) -> str:
-    return tile.replace(moving_token, reference_token)
-
-
 def load_direct_constraints(
     tile_phase_summary: dict[str, Any],
     reference_position: dict[str, Any],
@@ -66,6 +62,7 @@ def load_direct_constraints(
     moving_token: str,
     reference_token: str,
 ) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
+    del moving_token, reference_token
     reference_by_tile = tile_records_by_name(reference_position)
     measurements = {
         str(record["tile"]): record
@@ -83,11 +80,9 @@ def load_direct_constraints(
     for tile in tile_names:
         measurement = measurements[tile]
         index = tile_index[tile]
-        reference_tile = measurement.get("reference_tile") or moving_tile_to_reference_tile(
-            tile,
-            moving_token=moving_token,
-            reference_token=reference_token,
-        )
+        reference_tile = measurement.get("reference_tile")
+        if not reference_tile:
+            raise ValueError(f"Direct tile-phase measurement for {tile} is missing reference_tile")
         if reference_tile not in reference_by_tile:
             raise ValueError(f"Reference position is missing {reference_tile} for {tile}")
         scale = record_scale_um(reference_by_tile[reference_tile])

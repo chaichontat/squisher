@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 
+from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL
+
 from squisher_lightsheet.legacy_runner import run_legacy_script
 
 
@@ -190,8 +192,14 @@ def copy_xy_downsampled(
     raise ValueError(f"Expected axes ZYX or CZYX, got {axes!r}")
 
 
-def add_pyramids(*, ome_zarrs: list[Path], template: Path | None = None, dry_run: bool = False) -> str:
-    args = []
+def add_pyramids(
+    *,
+    ome_zarrs: list[Path],
+    template: Path | None = None,
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
+    dry_run: bool = False,
+) -> str:
+    args = ["--jpegxr-level", str(jpegxr_level)]
     if template is not None:
         args.extend(["--template", str(template)])
     args.extend(str(path) for path in ome_zarrs)

@@ -30,9 +30,15 @@ def render_phase_canvases(
     channel: int,
     phase_plane: str,
     z_slab_planes: int,
+    xz_z_range_px: tuple[int, int] | None = None,
 ):
     if phase_plane == "xz":
-        images, coverage, rows = legacy.render_xz_projection_canvases(tiles, geometry=geometry, channel=channel)
+        images, coverage, rows = legacy.render_xz_projection_canvases(
+            tiles,
+            geometry=geometry,
+            channel=channel,
+            z_range_px=xz_z_range_px,
+        )
         return images, coverage, rows, None
     if phase_plane == "zyx":
         return legacy.render_center_z_slab_canvases(
@@ -103,12 +109,14 @@ def downsample_phase_zyx(
     images: dict[str, np.ndarray],
     coverage: dict[str, np.ndarray],
     *,
+    phase_axes: tuple[str, ...],
     factors_zyx: tuple[int, int, int],
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     if factors_zyx == (1, 1, 1):
         return images, coverage
     if min(factors_zyx) < 1:
         raise ValueError("phase_downsample_zyx values must be >= 1")
+    axis_factors = {"z": factors_zyx[0], "y": factors_zyx[1], "x": factors_zyx[2]}
 
     downsampled_images = {}
     downsampled_coverage = {}
@@ -116,7 +124,7 @@ def downsample_phase_zyx(
         image = images[side]
         mask = coverage[side]
         if image.ndim == 2:
-            factors = factors_zyx[1:3]
+            factors = tuple(axis_factors[axis] for axis in phase_axes)
         elif image.ndim == 3:
             factors = factors_zyx
         else:
@@ -124,6 +132,14 @@ def downsample_phase_zyx(
         downsampled_images[side] = downsample_axis_blocks(image, factors, reducer="mean")
         downsampled_coverage[side] = downsample_axis_blocks(mask, factors, reducer="any")
     return downsampled_images, downsampled_coverage
+
+
+def downsample_phase_mask(mask: np.ndarray, *, phase_axes: tuple[str, ...], factors_zyx: tuple[int, int, int]) -> np.ndarray:
+    axis_factors = {"z": factors_zyx[0], "y": factors_zyx[1], "x": factors_zyx[2]}
+    factors = tuple(axis_factors[axis] for axis in phase_axes)
+    if all(factor == 1 for factor in factors):
+        return mask
+    return downsample_axis_blocks(mask, factors, reducer="any")
 
 
 def expand_downsampled_shift(
@@ -291,14 +307,51 @@ def rough_phase_align(
     geometry = legacy.build_geometry(tiles, level=level)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    phase_mask = None
+    seam_details = None
+    xz_z_range_px = None
+    if phase_plane == "xz":
+        diagnostics = payload.get("diagnostics", {})
+        seam_details_overlap_um = diagnostics.get("overlap_um") or diagnostics.get("z_overlap_um")
+        seam_details_overlap_fraction = diagnostics.get("overlap_fraction") or diagnostics.get("z_overlap_fraction")
+        _full_phase_mask, seam_details = legacy.seam_band_mask(
+            tiles,
+            geometry=geometry,
+            axes=phase_axes,
+            seam_fraction=seam_fraction,
+            overlap_um=seam_details_overlap_um,
+            overlap_fraction=seam_details_overlap_fraction,
+        )
+        seam_um = float(seam_details["seam_um"])
+        read_band_um = float(seam_details["seam_band_um_requested"])
+        read_start_um = seam_um - read_band_um / 2.0
+        read_stop_um = seam_um + read_band_um / 2.0
+        z_start = int(np.floor((read_start_um - geometry.global_min_zyx_um[0]) / geometry.level_spacing_zyx_um[0]))
+        z_stop = int(np.ceil((read_stop_um - geometry.global_min_zyx_um[0]) / geometry.level_spacing_zyx_um[0]))
+        z_start = max(0, min(int(geometry.shape_zyx[0]), z_start))
+        z_stop = max(z_start, min(int(geometry.shape_zyx[0]), z_stop))
+        xz_z_range_px = (z_start, z_stop)
+        seam_details = {
+            **seam_details,
+            "phase_read_band_um": float(read_stop_um - read_start_um),
+            "phase_read_band_range_um": [float(read_start_um), float(read_stop_um)],
+            "phase_read_band_range_px": [int(z_start), int(z_stop)],
+        }
+
     images, coverage, tile_rows, slab_details = render_phase_canvases(
         tiles,
         geometry=geometry,
         channel=channel,
         phase_plane=phase_plane,
         z_slab_planes=z_slab_planes,
+        xz_z_range_px=xz_z_range_px,
     )
-    phase_images, phase_coverage = downsample_phase_zyx(images, coverage, factors_zyx=phase_downsample_zyx)
+    phase_images, phase_coverage = downsample_phase_zyx(
+        images,
+        coverage,
+        phase_axes=phase_axes,
+        factors_zyx=phase_downsample_zyx,
+    )
     iso_tag = "_isoZ" if phase_plane == "xz" else ""
     initial_overlay = output_dir / f"level{level}_metadata_initial_{phase_plane}{iso_tag}_yellowOverlay_ch{channel}.png"
     if phase_plane == "zyx":
@@ -323,20 +376,9 @@ def rough_phase_align(
         y_scale=overlay_y_scale(geometry, phase_plane),
     )
 
-    phase_mask = None
-    seam_details = None
     if phase_plane == "xz":
-        diagnostics = payload.get("diagnostics", {})
-        seam_details_overlap_um = diagnostics.get("overlap_um") or diagnostics.get("z_overlap_um")
-        seam_details_overlap_fraction = diagnostics.get("overlap_fraction") or diagnostics.get("z_overlap_fraction")
-        phase_mask, seam_details = legacy.seam_band_mask(
-            tiles,
-            geometry=geometry,
-            axes=phase_axes,
-            seam_fraction=seam_fraction,
-            overlap_um=seam_details_overlap_um,
-            overlap_fraction=seam_details_overlap_fraction,
-        )
+        phase_mask = np.ones_like(images["L"], dtype=bool)
+        phase_mask = downsample_phase_mask(phase_mask, phase_axes=phase_axes, factors_zyx=phase_downsample_zyx)
 
     shift_px, phase_details = legacy.estimate_shift_px(
         phase_images,
@@ -383,28 +425,15 @@ def rough_phase_align(
     output_position.write_text(json.dumps(updated, indent=2) + "\n")
 
     if phase_plane == "xz":
-        shifted_tiles = legacy.load_tiles(updated)
-        shifted_geometry = legacy.build_geometry(shifted_tiles, level=level)
-        shifted_projections, projection_tile_rows = legacy.render_global_projection_canvases(
-            shifted_tiles,
-            geometry=shifted_geometry,
-            channel=channel,
-        )
-        shifted_tile_rows = projection_tile_rows
-        shifted_images = {
-            "L": shifted_projections["L"]["xz"],
-            "R": shifted_projections["R"]["xz"],
+        shifted_geometry = geometry
+        shifted_images = shifted_phase_images(phase_images, shift_px=shift_px)
+        shifted_tile_rows = tile_rows
+        projection_tile_rows = tile_rows
+        z_display_scale = float(geometry.level_spacing_zyx_um[0] / geometry.level_spacing_zyx_um[1])
+        projection_overlay_paths = {
+            "xz_seam": str((output_dir / f"level{level}_phase_corrected_{phase_plane}{iso_tag}_yellowOverlay_ch{channel}.png").resolve())
         }
-        z_display_scale = float(shifted_geometry.level_spacing_zyx_um[0] / shifted_geometry.level_spacing_zyx_um[1])
-        projection_outputs, projection_contact_sheet = legacy.write_global_projection_outputs(
-            output_dir,
-            projections=shifted_projections,
-            level=level,
-            channel=channel,
-            z_display_scale=z_display_scale,
-        )
-        projection_overlay_paths = {name.lower(): str(path.resolve()) for name, path in projection_outputs}
-        projection_contact_sheet_path = str(projection_contact_sheet.resolve())
+        projection_contact_sheet_path = None
         corrected_overlap_details = None
     elif phase_plane == "zyx":
         shifted_geometry = geometry

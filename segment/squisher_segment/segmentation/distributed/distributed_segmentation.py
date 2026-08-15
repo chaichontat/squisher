@@ -1,5 +1,6 @@
 import csv
 import datetime
+import hashlib
 import json
 import logging
 from contextlib import contextmanager
@@ -12,7 +13,7 @@ import time
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import cellpose.io
 import cupy as cp
@@ -26,15 +27,15 @@ import click
 import zarr
 from numpy.typing import NDArray
 
-from fishtools.segment.normalize import sample_percentile
-from fishtools.segmentation.distributed.cache_utils import (
+from squisher_segment.segment.normalize import sample_percentile
+from squisher_segment.segmentation.distributed.cache_utils import (
     read_nonempty_cache,
     read_normalization_cache,
     write_nonempty_cache,
     write_normalization_cache,
 )
-from fishtools.segmentation.distributed.gpu_cluster import cluster, myLocalCluster
-from fishtools.segmentation.distributed.merge_utils import (
+from squisher_segment.segmentation.distributed.gpu_cluster import cluster, myLocalCluster
+from squisher_segment.segmentation.distributed.merge_utils import (
     block_faces,
     bounding_boxes_in_global_coordinates,
     get_block_crops,
@@ -44,10 +45,11 @@ from fishtools.segmentation.distributed.merge_utils import (
     remove_overlaps,
     stitch_labels,
     create_zarr_array,
+    decode_block_global_labels,
     label_zarr_codecs,
 )
-from fishtools.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
-from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
+from squisher_segment.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
+from squisher_segment.segmentation.distributed.tiling import solve_internal_xy_for_tiles
 
 # Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
 # during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
@@ -125,7 +127,7 @@ def _retire_worker_after_error(*, reason: str) -> None:
     except ValueError:
         return
 
-    setattr(worker, "_fishtools_fatal_error", True)
+    setattr(worker, "_squisher_segment_fatal_error", True)
 
     loop = getattr(worker, "loop", None)
     if loop is None:
@@ -241,8 +243,6 @@ def _load_intermediate_state(temp_dir: Path) -> tuple[list, list, list, list[tup
 
 def compute_model_md5(model_path: Path) -> str:
     """MD5 hash of model file. Matches `md5sum <file>` CLI output."""
-    import hashlib
-
     h = hashlib.md5()
     with open(model_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -250,75 +250,117 @@ def compute_model_md5(model_path: Path) -> str:
     return h.hexdigest()
 
 
-def save_run_config(
-    path: Path,
-    model_kwargs: dict[str, Any],
-    eval_kwargs: dict[str, Any],
-    blocksize: tuple[int, ...],
-    input_shape: tuple[int, ...],
-    overlap: int,
-    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
-) -> None:
-    """Save run configuration for resume validation."""
-    model_path = Path(model_kwargs["pretrained_model"])
-    config = {
-        "model_md5": compute_model_md5(model_path),
-        "model_path": str(model_path),
-        "model_kwargs": model_kwargs,
-        "eval_kwargs": eval_kwargs,
-        "blocksize": list(blocksize),
-        "overlap": overlap,
-        "input_shape": list(input_shape),
-        "preprocessing_steps": [f[0].__name__ for f in preprocessing_steps],
-        "created_at": datetime.datetime.now().isoformat(),
-    }
-    path.write_text(json.dumps(config, indent=2, cls=NumpyEncoder))
-
-
 def _normalize_for_comparison(obj: Any) -> Any:
     """Normalize objects for comparison (convert numpy arrays to lists)."""
     return json.loads(json.dumps(obj, cls=NumpyEncoder))
 
 
-def validate_run_config(
-    path: Path,
+def _identity_digest(identity: dict[str, Any]) -> str:
+    normalized = _normalize_for_comparison(identity)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _preprocessing_identity(
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "callable": f"{function.__module__}.{function.__qualname__}",
+            "kwargs": kwargs,
+        }
+        for function, kwargs in preprocessing_steps
+    ]
+
+
+def _build_run_identity(
+    *,
+    input_identity: dict[str, Any],
+    channel_indices: tuple[int, ...],
     model_kwargs: dict[str, Any],
     eval_kwargs: dict[str, Any],
     blocksize: tuple[int, ...],
-    input_shape: tuple[int, ...],
     overlap: int,
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
-) -> None:
-    """Validate current config matches saved config. Raises on mismatch."""
-    saved = json.loads(path.read_text())
-    current_md5 = compute_model_md5(Path(model_kwargs["pretrained_model"]))
+) -> dict[str, Any]:
+    model_path = Path(model_kwargs["pretrained_model"])
+    return _normalize_for_comparison(
+        {
+            "schema_version": 1,
+            "input": input_identity,
+            "channel_indices": list(channel_indices),
+            "model_md5": compute_model_md5(model_path),
+            "model_kwargs": model_kwargs,
+            "eval_kwargs": eval_kwargs,
+            "blocksize": list(blocksize),
+            "overlap": overlap,
+            "preprocessing_steps": _preprocessing_identity(preprocessing_steps),
+            "cellpose_version": version("cellpose"),
+        }
+    )
 
-    # Normalize current values for comparison (numpy arrays -> lists)
-    current_model_kwargs = _normalize_for_comparison(model_kwargs)
-    current_eval_kwargs = _normalize_for_comparison(eval_kwargs)
 
-    errors = []
-    if saved["model_md5"] != current_md5:
-        errors.append(f"model_md5: {saved['model_md5']} != {current_md5}")
-    if saved["model_kwargs"] != current_model_kwargs:
-        errors.append(f"model_kwargs differ: {saved['model_kwargs']} != {current_model_kwargs}")
-    if saved["eval_kwargs"] != current_eval_kwargs:
-        errors.append(f"eval_kwargs differ: {saved['eval_kwargs']} != {current_eval_kwargs}")
-    if saved["blocksize"] != list(blocksize):
-        errors.append(f"blocksize: {saved['blocksize']} != {list(blocksize)}")
-    if saved["overlap"] != overlap:
-        errors.append(f"overlap: {saved['overlap']} != {overlap}")
-    if saved["input_shape"] != list(input_shape):
-        errors.append(f"input_shape: {saved['input_shape']} != {list(input_shape)}")
+def save_run_config(path: Path, run_identity: dict[str, Any]) -> None:
+    payload = {
+        "run_identity": _normalize_for_comparison(run_identity),
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2, cls=NumpyEncoder))
 
-    current_pp = [f[0].__name__ for f in preprocessing_steps]
-    if saved["preprocessing_steps"] != current_pp:
-        errors.append(f"preprocessing_steps: {saved['preprocessing_steps']} != {current_pp}")
 
-    if errors:
-        raise ValueError("Cannot resume - config mismatch:\n" + "\n".join(errors))
+def load_run_identity(path: Path) -> dict[str, Any]:
+    try:
+        identity = json.loads(path.read_text())["run_identity"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Invalid run configuration at {path}") from exc
+    if not isinstance(identity, dict):
+        raise ValueError(f"Invalid run identity at {path}")
+    return identity
 
-    logger.info(f"Config validated - model MD5 matches (verify: md5sum {model_kwargs['pretrained_model']})")
+
+def validate_run_config(path: Path, run_identity: dict[str, Any]) -> None:
+    saved = load_run_identity(path)
+    current = _normalize_for_comparison(run_identity)
+    if saved != current:
+        raise ValueError(
+            "Cannot resume: input, channels, model, or evaluation configuration changed. "
+            "Use --overwrite to start a new run."
+        )
+
+
+def completion_marker_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".done")
+
+
+def write_completion_marker(output_path: Path, run_identity: dict[str, Any]) -> None:
+    marker = completion_marker_path(output_path)
+    marker.write_text(
+        json.dumps(
+            {
+                "run_key": _identity_digest(run_identity),
+                "run_identity": _normalize_for_comparison(run_identity),
+                "completed_at": datetime.datetime.now().isoformat(),
+            },
+            indent=2,
+        )
+    )
+
+
+def completed_run_matches(output_path: Path, run_identity: dict[str, Any]) -> bool:
+    marker = completion_marker_path(output_path)
+    if not marker.exists():
+        return False
+    try:
+        payload = json.loads(marker.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid completion marker {marker}; use --overwrite to replace it.") from exc
+    if payload.get("run_key") != _identity_digest(run_identity):
+        raise FileExistsError(
+            f"Completed output {output_path} belongs to a different run; use --overwrite to replace it."
+        )
+    if not output_path.exists():
+        raise RuntimeError(f"Completion marker {marker} exists but output {output_path} is missing.")
+    return True
 
 
 def load_checkpoint(path: Path) -> set[tuple[int, ...]]:
@@ -498,6 +540,58 @@ def format_slice(s: slice | tuple[slice, ...]) -> str:
     return ":".join(parts).rstrip(":")
 
 
+def _resolve_channel_selection(
+    input_zarr: zarr.Array,
+    channels: str | None,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    raw_names = input_zarr.attrs.get("key")
+    if not isinstance(raw_names, (list, tuple)):
+        raise ValueError("Input Zarr attribute 'key' must be a list of channel names.")
+    names = tuple(str(name) for name in raw_names)
+    if len(names) != input_zarr.shape[-1]:
+        raise ValueError(
+            f"Input Zarr has {input_zarr.shape[-1]} channels but attribute 'key' has {len(names)} names."
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("Input Zarr channel names in attribute 'key' must be unique.")
+
+    if channels is None:
+        return tuple(range(len(names))), names
+
+    selected_names = tuple(name.strip() for name in channels.split(","))
+    if any(not name for name in selected_names):
+        raise ValueError("--channels must contain one or more non-empty channel names.")
+    if len(set(selected_names)) != len(selected_names):
+        raise ValueError("--channels cannot select the same channel more than once.")
+    missing = [name for name in selected_names if name not in names]
+    if missing:
+        raise ValueError(f"Channel names {missing} not found in {list(names)}")
+    return tuple(names.index(name) for name in selected_names), selected_names
+
+
+def _read_input_crop(
+    input_zarr: zarr.Array,
+    crop: tuple[slice, ...],
+    channel_indices: tuple[int, ...],
+) -> NDArray[Any]:
+    selection = crop[:-1] + (list(channel_indices),)
+    return np.asarray(input_zarr.get_orthogonal_selection(selection))
+
+
+def _segmentation_block_crops(
+    input_shape: tuple[int, ...],
+    blocksize: tuple[int, ...],
+    overlap: int,
+    mask: NDArray[Any] | None,
+) -> tuple[list[tuple[int, ...]], list[tuple[slice, ...]]]:
+    if len(input_shape) != 4 or len(blocksize) != 4:
+        raise ValueError("Distributed segmentation requires ZYXC input and block sizes.")
+    if input_shape[-1] != blocksize[-1]:
+        raise ValueError("The selected channel axis must fit in exactly one block.")
+    overlap_by_axis = np.array((overlap, overlap, overlap, 0), dtype=int)
+    return get_block_crops(input_shape, np.asarray(blocksize), overlap_by_axis, mask)
+
+
 ######################## the function to run on each block ####################
 
 
@@ -517,6 +611,7 @@ def process_block(
     checkpoint_path: Path | None = None,
     stagger_seconds: float = 0.0,
     workers_per_gpu: int = 4,
+    channel_indices: tuple[int, ...] | None = None,
 ) -> (
     tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
     | tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]
@@ -550,7 +645,7 @@ def process_block(
     except ValueError:
         worker = None
 
-    if worker is not None and getattr(worker, "_fishtools_fatal_error", False):
+    if worker is not None and getattr(worker, "_squisher_segment_fatal_error", False):
         raise RuntimeError("Worker previously hit a fatal error; refusing further work")
 
     if worker is not None:
@@ -565,6 +660,7 @@ def process_block(
         segmentation_3d = read_preprocess_and_segment(
             input_zarr,
             crop,
+            channel_indices,
             preprocessing_steps,
             model_kwargs,
             eval_kwargs,
@@ -618,7 +714,7 @@ def process_block(
             f"Worker {worker_name} FAILED BLOCK: {block_index}\tREGION: [{format_slice(crop)}]\n{exc!r}"
         )
         if worker is not None:
-            _retire_worker_after_error(reason=f"fishtools process_block failed: {exc!r}")
+            _retire_worker_after_error(reason=f"squisher_segment process_block failed: {exc!r}")
         raise
 
 
@@ -628,6 +724,7 @@ def process_block(
 def read_preprocess_and_segment(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
+    channel_indices: tuple[int, ...] | None,
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
     model_kwargs: dict[str, Any],
     eval_kwargs: dict[str, Any],
@@ -642,7 +739,7 @@ def read_preprocess_and_segment(
     if preprocessing_steps is None:
         preprocessing_steps = []
 
-    image = input_zarr[crop]
+    image = input_zarr[crop] if channel_indices is None else _read_input_crop(input_zarr, crop, channel_indices)
     for pp_step in preprocessing_steps:
         pp_step[1]["crop"] = crop
         image = pp_step[0](image, **pp_step[1])
@@ -697,6 +794,8 @@ def distributed_eval(
     temporary_directory: Path | None = None,
     cellpose_only: bool = False,
     stagger_seconds: float = 0.0,
+    channel_indices: tuple[int, ...] | None = None,
+    run_identity: dict[str, Any] | None = None,
 ) -> tuple[zarr.Array, list[tuple[slice, ...]]] | None:
     """
     Evaluate a cellpose model on overlapping blocks of a big image.
@@ -808,25 +907,68 @@ def distributed_eval(
     if cluster_kwargs is None:
         cluster_kwargs = {}
     if temporary_directory is None:
-        base_parent = Path(write_path).parent if isinstance(write_path, (str, Path)) else Path.cwd()
-        temporary_directory = base_parent / "cellpose_temp"
+        temporary_directory = Path(write_path).parent / "cellpose_temp"
+    temporary_directory = Path(temporary_directory)
+    if input_zarr.ndim != 4:
+        raise ValueError(f"Distributed segmentation requires ZYXC input; got shape {input_zarr.shape}.")
+    if channel_indices is None:
+        channel_indices = tuple(range(input_zarr.shape[-1]))
+    if not channel_indices or len(set(channel_indices)) != len(channel_indices):
+        raise ValueError("channel_indices must contain unique selected channels.")
+    if min(channel_indices) < 0 or max(channel_indices) >= input_zarr.shape[-1]:
+        raise ValueError(f"channel_indices {channel_indices} are invalid for shape {input_zarr.shape}.")
+    selected_shape = input_zarr.shape[:-1] + (len(channel_indices),)
+    if blocksize[-1] != len(channel_indices):
+        raise ValueError("blocksize channel extent must equal the number of selected channels.")
+    if run_identity is None:
+        run_identity = _normalize_for_comparison(
+            {
+                "schema_version": 1,
+                "input": {
+                    "shape": list(input_zarr.shape),
+                    "chunks": list(input_zarr.chunks),
+                    "dtype": str(input_zarr.dtype),
+                    "attrs": dict(input_zarr.attrs),
+                },
+                "channel_indices": list(channel_indices),
+                "model_kwargs": model_kwargs,
+                "eval_kwargs": eval_kwargs,
+                "blocksize": list(blocksize),
+                "preprocessing_steps": _preprocessing_identity(preprocessing_steps),
+            }
+        )
+
+    run_config_path = temporary_directory / "run_config.json"
+    is_resume = run_config_path.exists()
+    if is_resume:
+        validate_run_config(run_config_path, run_identity)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     worker_logs_dirname = f"dask_worker_logs_{timestamp}"
-    base_dir = Path(temporary_directory).parent
+    base_dir = temporary_directory.parent
     worker_logs_dir = base_dir / worker_logs_dirname
     worker_logs_dir.mkdir(parents=True, exist_ok=True)
 
-    if "diameter" not in eval_kwargs.keys():
+    if "diameter" not in eval_kwargs:
         raise ValueError("Diameter must be set in eval_kwargs")
 
     overlap = eval_kwargs["diameter"] * 2
-    block_indices, block_crops = get_block_crops(input_zarr.shape, blocksize, overlap, mask)
+    block_indices, block_crops = _segmentation_block_crops(
+        selected_shape,
+        blocksize,
+        overlap,
+        mask,
+    )
     assert cluster is not None
 
-    def check_block_has_data(crop: tuple[slice, ...], zarr_array: zarr.Array, threshold: int = 0) -> bool:
+    def check_block_has_data(
+        crop: tuple[slice, ...],
+        zarr_array: zarr.Array,
+        selected_channels: tuple[int, ...],
+        threshold: int = 0,
+    ) -> bool:
         """Check if a given crop in a Zarr array contains any data above threshold."""
-        data_slice = zarr_array[crop]
+        data_slice = _read_input_crop(zarr_array, crop, selected_channels)
         return data_slice.any() if threshold == 0 else (data_slice > threshold).any()
 
     # GPU preflight probe to confirm worker pinning
@@ -844,19 +986,18 @@ def distributed_eval(
         except Exception as e:
             logger.warning(f"GPU probe failed: {e!r}")
 
-    offset = 0
-    n = None
-
-    path_nonempty = Path(write_path).parent / "nonempty.json"
-    idxs = read_nonempty_cache(path_nonempty, blocksize)
+    path_nonempty = temporary_directory / "nonempty.json"
+    run_key = _identity_digest(run_identity)
+    idxs = read_nonempty_cache(path_nonempty, blocksize, run_key)
     if idxs is not None:
         logger.info(f"Loaded cached non-empty block indices ({len(idxs)} entries) from {path_nonempty}.")
     else:
         logger.info("Non-empty cache miss or invalidated; re-scanning input for non-zero blocks.")
         check_futures = cluster.client.map(
             check_block_has_data,
-            block_crops[offset : None if n is None else offset + n],
+            block_crops,
             zarr_array=input_zarr,
+            selected_channels=channel_indices,
             threshold=1,
         )
 
@@ -879,8 +1020,9 @@ def distributed_eval(
                     )
         logger.info(f"Checked non-zero blocks: {total_tiles}/{total_tiles}")
 
-        idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
-        write_nonempty_cache(path_nonempty, blocksize, idxs)
+        idxs = [i for i, is_non_zero in enumerate(non_zero_results) if is_non_zero]
+        temporary_directory.mkdir(parents=True, exist_ok=True)
+        write_nonempty_cache(path_nonempty, blocksize, run_key, idxs)
         logger.info(f"Persisted {len(idxs)} non-empty block indices to {path_nonempty}")
 
     final_block_indices, final_block_crops = (
@@ -895,41 +1037,20 @@ def distributed_eval(
     output_shape = input_zarr.shape[:-1]
     output_blocksize = blocksize[:-1]
 
-    Path(temporary_directory).mkdir(parents=True, exist_ok=True)
+    temporary_directory.mkdir(parents=True, exist_ok=True)
     assert temporary_directory.exists()
-    temp_zarr_path = Path(temporary_directory) / "segmentation_unstitched.zarr"
-    checkpoint_path = Path(temporary_directory) / "checkpoint.jsonl"
-    run_config_path = Path(temporary_directory) / "run_config.json"
-
-    # Detect resume vs fresh start
-    is_resume = run_config_path.exists()
+    temp_zarr_path = temporary_directory / "segmentation_unstitched.zarr"
+    checkpoint_path = temporary_directory / "checkpoint.jsonl"
 
     if is_resume:
         if not temp_zarr_path.exists():
             raise RuntimeError(f"Cannot resume: temp_zarr missing at {temp_zarr_path}")
-        validate_run_config(
-            run_config_path,
-            model_kwargs,
-            eval_kwargs,
-            blocksize,
-            input_zarr.shape,
-            overlap,
-            preprocessing_steps,
-        )
         completed_indices = load_checkpoint(checkpoint_path)
         logger.info(
             f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed"
         )
     else:
-        save_run_config(
-            run_config_path,
-            model_kwargs,
-            eval_kwargs,
-            blocksize,
-            input_zarr.shape,
-            overlap,
-            preprocessing_steps,
-        )
+        save_run_config(run_config_path, run_identity)
         completed_indices = set()
         logger.info(f"Fresh run - saving config to {run_config_path}")
 
@@ -980,6 +1101,7 @@ def distributed_eval(
             checkpoint_path=checkpoint_path,
             stagger_seconds=stagger_seconds,
             workers_per_gpu=workers_per_gpu,
+            channel_indices=channel_indices,
         )
 
         with progress_bar(len(remaining_block_indices)) as submit:
@@ -1002,15 +1124,13 @@ def distributed_eval(
                 f"First failures:\n{preview}"
             )
 
-    # Reconstruct faces/boxes from temp_zarr for ALL blocks (handles resume case)
     logger.info("Computing faces and bounding boxes from temp_zarr...")
     results = []
-    for block_idx, block_crop in zip(final_block_indices, final_block_crops):
-        # Get the trimmed crop (without overlap)
-        spatial_crop = block_crop[:-1]  # ZYX slices
+    for block_crop in final_block_crops:
+        spatial_crop = block_crop[:-1]
         spatial_blocksize = blocksize[:-1]
         trimmed_crop = []
-        for axis, (slc, bs) in enumerate(zip(spatial_crop, spatial_blocksize)):
+        for slc, bs in zip(spatial_crop, spatial_blocksize):
             start = slc.start if slc.start == 0 else slc.start + overlap
             stop = min(start + bs, slc.stop)
             trimmed_crop.append(slice(start, stop))
@@ -1018,9 +1138,8 @@ def distributed_eval(
 
         seg_block = temp_zarr[trimmed_crop]
         faces = block_faces(seg_block, shrink=True)
-        boxes = bounding_boxes_in_global_coordinates(seg_block, trimmed_crop)
-        unique_ids = cp.asnumpy(cp.unique(cp.asarray(seg_block)))
-        box_ids = unique_ids[unique_ids != 0]
+        local_labels, box_ids = decode_block_global_labels(seg_block)
+        boxes = bounding_boxes_in_global_coordinates(local_labels, trimmed_crop)
         results.append((faces, boxes, box_ids))
 
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
@@ -1037,7 +1156,7 @@ def distributed_eval(
 
     # Save intermediate state for potential separate stitching
     _save_intermediate_state(
-        Path(temporary_directory),
+        temporary_directory,
         faces_list,
         boxes_list,
         box_ids_list,
@@ -1067,7 +1186,7 @@ def distributed_eval(
         )
         cluster.scale(32)
 
-    new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
+    new_labeling_path = temporary_directory / "new_labeling.npy"
     final_seg_zarr, new_labeling = stitch_labels(
         block_indices=non_empty_indices,
         faces_list=faces_list,
@@ -1156,12 +1275,8 @@ def _run_single_input(
 
     base_dir = input_path.parent
 
-    if not overwrite and (base_dir / "segmentation.done").exists():
-        logger.warning(f"{base_dir}: segmentation already exists. Skipping.")
-        return
-
-    IS_CELLPOSE_SAM = version("cellpose").startswith("4.") or "dev" in version("cellpose")
-    if not IS_CELLPOSE_SAM:
+    cellpose_version = version("cellpose")
+    if not (cellpose_version.startswith("4.") or "dev" in cellpose_version):
         raise RuntimeError("This script requires Cellpose version 4.x for SAM backend support.")
 
     resolved_config_path = config_path
@@ -1174,16 +1289,9 @@ def _run_single_input(
     backend = config.get("backend", "sam").lower()
     if backend not in {"sam", "unet"}:
         raise ValueError("backend must be one of {'sam', 'unet'}.")
-    using_sam_backend = backend == "sam"
-
     zarr_output_path = base_dir / f"output_segmentation-{backend}.zarr"
     temporary_directory = base_dir / "cellpose_temp"
 
-    if overwrite and temporary_directory.exists():
-        logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
-        shutil.rmtree(temporary_directory)
-
-    (base_dir / "segmentation.done").unlink(missing_ok=True)
     ortho_weights = config.get("ortho_weights", [3, 1.0, 1.0])
     diameter = config.get("diameter", 30)
     cellpose_model_kwargs = {
@@ -1191,14 +1299,12 @@ def _run_single_input(
         "gpu": True,
         "backend": backend,
     }
-    if using_sam_backend and IS_CELLPOSE_SAM:
-        ...
-    else:
-        cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho", None)
+    if backend == "unet":
+        cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho")
 
     local_cluster_kwargs = {
-        "workers_per_gpu": int(8 if backend == "unet" else workers_per_gpu),
-        "threads_per_worker": int(threads_per_worker),
+        "workers_per_gpu": 8 if backend == "unet" else workers_per_gpu,
+        "threads_per_worker": threads_per_worker,
     }
     if use_localcuda and workers_per_gpu <= 1:
         local_cluster_kwargs.update(
@@ -1210,31 +1316,27 @@ def _run_single_input(
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
-    foreground_mask = None
     input_zarr_array = zarr.open_array(input_path, mode="r")
-
-    key = cast(str, input_zarr_array.attrs["key"])
-    if channels is None:
-        channels_list = list(range(1, input_zarr_array.shape[3] + 1))
-        logger.info(f"No channels specified. Using all channels: {channels_list}")
-    else:
-        try:
-            channels_list = [key.index(c) + 1 for c in channels.split(",")]
-            logger.info(f"Using channels: {channels}")
-            if len(channels_list) != len(key):
-                logger.warning(
-                    f"Selected channels {channels_list} do not match total channels {list(range(1, input_zarr_array.shape[3] + 1))}"
-                )
-        except ValueError:
-            raise ValueError(f"Channel names {channels} not found in {key}")
-    del channels
+    if input_zarr_array.ndim != 4:
+        raise ValueError(f"Input Zarr must have ZYXC shape; got {input_zarr_array.shape}.")
+    channel_indices, channel_names = _resolve_channel_selection(input_zarr_array, channels)
+    source_channels = [index + 1 for index in channel_indices]
+    logger.info(f"Using channels in requested order: {list(channel_names)}")
+    input_identity = {
+        "path": str(input_path.resolve()),
+        "shape": list(input_zarr_array.shape),
+        "chunks": list(input_zarr_array.chunks),
+        "dtype": str(input_zarr_array.dtype),
+        "attrs": dict(input_zarr_array.attrs),
+    }
+    input_key = _identity_digest(input_identity)
 
     if backend == "unet":
         processing_blocksize = (
             input_zarr_array.shape[0],
             224,
             224 * 4,
-            len(channels_list),
+            len(source_channels),
         )
     else:
         ny_target = target_ny if target_ny is not None else 2
@@ -1252,25 +1354,28 @@ def _run_single_input(
             input_zarr_array.shape[0],
             by,
             bx,
-            len(channels_list),
+            len(source_channels),
         )
         logger.info(
             f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})"
         )
     normalization_path = base_dir / "normalization.json"
-    normalization = read_normalization_cache(normalization_path)
+    cached_normalization = read_normalization_cache(normalization_path, input_key)
     lowhigh_selected: NDArray[np.float64] | None = None
 
-    if normalization is not None:
+    if cached_normalization is not None:
         try:
-            lowhigh_selected = np.array([normalization[str(ch)] for ch in channels_list], dtype=np.float64)
+            lowhigh_selected = np.array(
+                [cached_normalization[str(ch)] for ch in source_channels],
+                dtype=np.float64,
+            )
         except KeyError:
             logger.info("Normalization cache missing requested channels; recomputing.")
     if lowhigh_selected is None:
         logger.info("Calculating normalization percentiles (cache miss).")
         perc, _ = sample_percentile(
             input_zarr_array,
-            channels=channels_list,
+            channels=source_channels,
             block=(256, 1024),
             n=30,
             low=1,
@@ -1279,7 +1384,8 @@ def _run_single_input(
         lowhigh_selected = np.asarray(perc, dtype=float)
         write_normalization_cache(
             normalization_path,
-            {str(ch): lh.tolist() for ch, lh in zip(channels_list, lowhigh_selected)},
+            input_key,
+            {str(ch): lh.tolist() for ch, lh in zip(source_channels, lowhigh_selected)},
         )
         logger.info(f"Saved normalization thresholds to {normalization_path}")
 
@@ -1293,12 +1399,12 @@ def _run_single_input(
     normalization = {"lowhigh": lowhigh_eval.tolist()}
     logger.info(f"Normalization params (requested order): {normalization}")
 
-    channels_for_cellpose = list(channels_list)
+    channels_for_cellpose = list(range(1, len(channel_indices) + 1))
     if len(channels_for_cellpose) == 1:
         channels_for_cellpose = [channels_for_cellpose[0], channels_for_cellpose[0]]
 
     cellpose_eval_kwargs = {
-        "diameter": config.get("diameter", 30),
+        "diameter": diameter,
         "batch_size": 16 if backend == "unet" else 1,
         "normalize": normalization,
         "flow_threshold": 0,
@@ -1312,21 +1418,41 @@ def _run_single_input(
         "channel_axis": 3,
         "use_kde_clustering": True,
     }
-    if using_sam_backend:
+    if backend == "sam":
         cellpose_eval_kwargs["z_axis"] = 0
-        if not IS_CELLPOSE_SAM:
-            cellpose_eval_kwargs["channels"] = channels_for_cellpose
     else:
         cellpose_eval_kwargs["channels"] = channels_for_cellpose
     if ortho_weights is not None:
         cellpose_eval_kwargs["ortho_weights"] = ortho_weights
+
+    run_identity = _build_run_identity(
+        input_identity=input_identity,
+        channel_indices=channel_indices,
+        model_kwargs=cellpose_model_kwargs,
+        eval_kwargs=cellpose_eval_kwargs,
+        blocksize=processing_blocksize,
+        overlap=int(cellpose_eval_kwargs["diameter"] * 2),
+        preprocessing_steps=preprocessing_pipeline,
+    )
+    if overwrite:
+        completion_marker_path(zarr_output_path).unlink(missing_ok=True)
+        if temporary_directory.exists():
+            logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
+            shutil.rmtree(temporary_directory)
+    elif completed_run_matches(zarr_output_path, run_identity):
+        logger.info(f"Completed output already matches this run: {zarr_output_path}")
+        return
+    elif zarr_output_path.exists() and not (temporary_directory / "run_config.json").exists():
+        raise FileExistsError(
+            f"Output {zarr_output_path} exists without resumable state; use --overwrite to replace it."
+        )
 
     logger.info("Starting distributed Cellpose evaluation…")
     result = distributed_eval(
         input_zarr=input_zarr_array,
         blocksize=processing_blocksize,
         write_path=zarr_output_path,
-        mask=foreground_mask,
+        mask=None,
         preprocessing_steps=preprocessing_pipeline,
         model_kwargs=cellpose_model_kwargs,
         eval_kwargs=cellpose_eval_kwargs,
@@ -1334,6 +1460,8 @@ def _run_single_input(
         temporary_directory=temporary_directory,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
+        channel_indices=channel_indices,
+        run_identity=run_identity,
     )
 
     if cellpose_only:
@@ -1343,7 +1471,7 @@ def _run_single_input(
         return
 
     final_segmentation_zarr, final_bounding_boxes = result
-    (zarr_output_path.parent / "segmentation.done").touch()
+    write_completion_marker(zarr_output_path, run_identity)
     shutil.rmtree(temporary_directory)
     logger.info("Run Finished")
     logger.info(f"Final segmentation saved to: {zarr_output_path}")
@@ -1443,7 +1571,8 @@ def run(
 @click.argument("temp_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("output_path", type=click.Path(path_type=Path))
 @click.option("--cleanup/--no-cleanup", default=True, show_default=True, help="Remove temp directory after successful stitching.")
-def stitch(temp_dir: Path, output_path: Path, cleanup: bool) -> None:
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing output.")
+def stitch(temp_dir: Path, output_path: Path, cleanup: bool, overwrite: bool) -> None:
     """
     Stitch pre-computed cellpose results into final segmentation.
 
@@ -1456,15 +1585,23 @@ def stitch(temp_dir: Path, output_path: Path, cleanup: bool) -> None:
         raise FileNotFoundError(f"No segmentation_unstitched.zarr found in {temp_dir}")
     if not (temp_dir / "intermediate_state.npz").exists():
         raise FileNotFoundError(f"No intermediate_state.npz found in {temp_dir}")
+    run_identity = load_run_identity(temp_dir / "run_config.json")
+    if overwrite:
+        completion_marker_path(output_path).unlink(missing_ok=True)
+    elif completed_run_matches(output_path, run_identity):
+        logger.info(f"Completed output already matches this run: {output_path}")
+        return
+    elif output_path.exists():
+        raise FileExistsError(f"Output {output_path} already exists; use --overwrite to replace it.")
 
     logger.info(f"Stitching segmentation from {temp_dir}")
     final_zarr, final_boxes = stitch_segmentation(temp_dir, output_path)
+    write_completion_marker(output_path, run_identity)
 
     if cleanup:
         shutil.rmtree(temp_dir)
         logger.info(f"Cleaned up temp directory: {temp_dir}")
 
-    (output_path.parent / "segmentation.done").touch()
     logger.info("Stitching complete")
     logger.info(f"Final segmentation saved to: {output_path}")
     logger.info(f"Output Zarr shape: {final_zarr.shape}, dtype: {final_zarr.dtype}")

@@ -31,12 +31,18 @@ from typing import Any
 
 from loguru import logger
 import numpy as np
+from squisher.jpegxr_zarr import (
+    DEFAULT_JPEGXR_LEVEL,
+    jpegxr_plane_chunk_shape,
+    jpegxr_sharding_codec,
+    register_jpegxr_codec,
+)
 from squisher_lightsheet.parsing import parse_source_view_path_entry
+from squisher_lightsheet import ngff
 from squisher_lightsheet import pyramid as pyramid_core
 from squisher_lightsheet import qc as qc_core
 from squisher_lightsheet import seams as seam_core
 from squisher_lightsheet.tiff import tiff_series_level_count
-from zarr.abc.codec import ArrayBytesCodec
 
 
 try:
@@ -67,13 +73,10 @@ NATIVE_REG3D_RIGID_METHOD = 2
 NATIVE_REG3D_MAX_ITERATIONS = 300
 NATIVE_REG3D_FTOL = 1e-4
 NGFF_VERSION = "0.5"
-ZSTD_LEVEL = 0
-DEFAULT_JPEGXR_LEVEL = 0.7
-JPEGXR_CODEC_NAME = "fishtools.jpegxr"
-_JPEGXR_CODEC_REGISTERED = False
 _LOG_FILE_SINK_ID: int | None = None
 _FUSION_VIEW_CANDIDATE_PLAN_PATHS: dict[str, str] = {}
 _MVS_VIEW_CANDIDATE_PLANS: dict[str, dict[tuple[int, ...], list[int]]] = {}
+FUSION_RESUME_ALGORITHM = "v1"
 
 
 @dataclass(frozen=True)
@@ -121,23 +124,48 @@ def inplace_mvs_normalize_weights_context():
 
     original = mvs_weights.normalize_weights
 
-    def normalize_weights_inplace(weights):
-        try:
-            import cupy as cp
-        except ImportError:  # pragma: no cover - depends on runtime environment
-            cp = None
-
-        xp = cp if cp is not None and isinstance(weights, cp.ndarray) else np
-        wsum = xp.nansum(weights, axis=0)
-        xp.copyto(wsum, 1, where=wsum == 0)
-        xp.divide(weights, wsum, out=weights)
-        return weights
-
     try:
         mvs_weights.normalize_weights = normalize_weights_inplace
         yield
     finally:
         mvs_weights.normalize_weights = original
+
+
+def normalize_weights_inplace(weights):
+    try:
+        import cupy as cp
+    except ImportError:  # pragma: no cover - depends on runtime environment
+        cp = None
+
+    xp = cp if cp is not None and isinstance(weights, cp.ndarray) else np
+    wsum = xp.nansum(weights, axis=0)
+    xp.copyto(wsum, 1, where=wsum == 0)
+    xp.divide(weights, wsum, out=weights)
+    return weights
+
+
+def inplace_weighted_average_fusion(
+    transformed_views,
+    blending_weights,
+    fusion_weights=None,
+):
+    """Fuse fresh MVS work arrays without allocating full-stack products.
+
+    ``multiview_stitcher.fuse_np`` owns these two stacks and does not read
+    either after the fusion function returns. Mutating them preserves its
+    weighted-average arithmetic while bounding peak GPU memory.
+    """
+    try:
+        import cupy as cp
+    except ImportError:  # pragma: no cover - depends on runtime environment
+        cp = None
+
+    xp = cp if cp is not None and isinstance(transformed_views, cp.ndarray) else np
+    if fusion_weights is not None:
+        xp.multiply(blending_weights, fusion_weights, out=blending_weights)
+        normalize_weights_inplace(blending_weights)
+    xp.multiply(transformed_views, blending_weights, out=transformed_views)
+    return xp.nansum(transformed_views, axis=0).astype(transformed_views[0].dtype)
 
 
 def basic_array_fingerprint(array: np.ndarray) -> str:
@@ -336,84 +364,6 @@ def fusion_weight_config(
         }
 
     raise ValueError(f"Unsupported fusion weight mode {args.fusion_weight_mode!r}")
-
-
-@dataclass(frozen=True)
-class JpegxrZarrV3Codec(ArrayBytesCodec):
-    """Zarr v3 array-to-bytes JPEG-XR codec for 2D image-plane chunks."""
-
-    is_fixed_size = False
-    level: float = DEFAULT_JPEGXR_LEVEL
-    photometric: str = "minisblack"
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]):
-        if data.get("name") != JPEGXR_CODEC_NAME:
-            raise ValueError(f"Expected codec name {JPEGXR_CODEC_NAME!r}, got {data.get('name')!r}")
-        configuration = data.get("configuration") or {}
-        return cls(**configuration)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": JPEGXR_CODEC_NAME,
-            "configuration": {
-                "level": self.level,
-                "photometric": self.photometric,
-            },
-        }
-
-    def validate(self, *, shape, dtype, chunk_grid) -> None:
-        del shape, dtype
-        chunk_shape = tuple(chunk_grid.chunk_shape)
-        if len(chunk_shape) < 2 or any(size != 1 for size in chunk_shape[:-2]):
-            raise ValueError(
-                "JPEG-XR Zarr v3 output requires image-plane chunks with all "
-                f"non-y/x chunk axes set to 1; got chunk_shape={chunk_shape}"
-            )
-
-    def _encode_sync(self, chunk_array, chunk_spec):
-        import imagecodecs
-        import numpy as np
-
-        plane = np.asarray(chunk_array.as_ndarray_like())
-        while plane.ndim > 2:
-            if plane.shape[0] != 1:
-                raise ValueError(f"JPEG-XR chunk axes before y/x must be singleton, got {plane.shape}")
-            plane = plane[0]
-        encoded = imagecodecs.jpegxr_encode(
-            np.ascontiguousarray(plane),
-            level=self.level,
-            photometric=self.photometric,
-        )
-        return chunk_spec.prototype.buffer.from_bytes(encoded)
-
-    async def _encode_single(self, chunk_array, chunk_spec):
-        return self._encode_sync(chunk_array, chunk_spec)
-
-    def _decode_sync(self, chunk_bytes, chunk_spec):
-        import imagecodecs
-        import numpy as np
-
-        decoded = np.asarray(imagecodecs.jpegxr_decode(chunk_bytes.to_bytes()))
-        decoded = decoded.reshape(chunk_spec.shape)
-        return chunk_spec.prototype.nd_buffer.from_ndarray_like(decoded)
-
-    async def _decode_single(self, chunk_bytes, chunk_spec):
-        return self._decode_sync(chunk_bytes, chunk_spec)
-
-    def compute_encoded_size(self, input_byte_length: int, chunk_spec) -> int:
-        del input_byte_length, chunk_spec
-        raise NotImplementedError
-
-
-def register_jpegxr_zarr_v3_codec() -> None:
-    global _JPEGXR_CODEC_REGISTERED
-    if _JPEGXR_CODEC_REGISTERED:
-        return
-    from zarr.registry import register_codec
-
-    register_codec(JPEGXR_CODEC_NAME, JpegxrZarrV3Codec)
-    _JPEGXR_CODEC_REGISTERED = True
 
 
 def configure_log_file(path: Path | None) -> None:
@@ -875,20 +825,7 @@ def is_ome_zarr_path(path: Path) -> bool:
 
 
 def _ome_zarr_dataset_paths(group: Any) -> list[str]:
-    attrs = dict(group.attrs)
-    multiscales = attrs.get("multiscales")
-    if isinstance(multiscales, list) and multiscales:
-        datasets = multiscales[0].get("datasets")
-        if isinstance(datasets, list):
-            paths = [record.get("path") for record in datasets if isinstance(record, dict)]
-            paths = [str(path) for path in paths if isinstance(path, str) and path]
-            if paths:
-                return paths
-
-    def sort_key(value: str) -> tuple[int, int | str]:
-        return (0, int(value)) if value.isdigit() else (1, value)
-
-    return sorted((str(key) for key in group.keys()), key=sort_key)
+    return ngff.dataset_paths(group)
 
 
 def _ome_zarr_level_count(path: Path) -> int:
@@ -911,21 +848,9 @@ def _open_ome_zarr_level_array(path: Path, *, source_level: int = 0):
 
 
 def _ome_zarr_axes(group: Any, array: Any) -> str:
-    raw_dims = array.attrs.get("_ARRAY_DIMENSIONS")
-    if isinstance(raw_dims, list) and raw_dims:
-        names = [str(dim).lower() for dim in raw_dims]
-    else:
-        names = []
-        multiscales = dict(group.attrs).get("multiscales")
-        if isinstance(multiscales, list) and multiscales:
-            raw_axes = multiscales[0].get("axes")
-            if isinstance(raw_axes, list):
-                for axis in raw_axes:
-                    if isinstance(axis, dict) and isinstance(axis.get("name"), str):
-                        names.append(axis["name"].lower())
-    axes = "".join(name.upper() for name in names)
+    axes = ngff.axes(group, array)
     if axes not in {"ZYX", "CZYX"}:
-        raise ValueError(f"Expected OME-Zarr axes ZYX or CZYX, got {axes or names!r}")
+        raise ValueError(f"Expected OME-Zarr axes ZYX or CZYX, got {axes!r}")
     return axes
 
 
@@ -934,34 +859,15 @@ def _ome_zarr_scale_translation(
     dataset_index: int,
     axes: str,
 ) -> tuple[dict[str, float], dict[str, float], bool]:
-    axis_names = [axis.lower() for axis in axes]
-    spacing = {"z": 1.0, "y": 1.0, "x": 1.0}
-    translation = {"z": 0.0, "y": 0.0, "x": 0.0}
-    has_scale = False
-    multiscales = dict(group.attrs).get("multiscales")
-    if not isinstance(multiscales, list) or not multiscales:
-        return spacing, translation, has_scale
-    datasets = multiscales[0].get("datasets")
-    if not isinstance(datasets, list) or dataset_index >= len(datasets):
-        return spacing, translation, has_scale
-    dataset = datasets[dataset_index]
-    if not isinstance(dataset, dict):
-        return spacing, translation, has_scale
-    transforms = dataset.get("coordinateTransformations", [])
-    if not isinstance(transforms, list):
-        return spacing, translation, has_scale
-    for transform in transforms:
-        if not isinstance(transform, dict):
-            continue
-        transform_type = transform.get("type")
-        values = transform.get(transform_type) if transform_type in {"scale", "translation"} else None
-        if not isinstance(values, list) or len(values) != len(axis_names):
-            continue
-        target = spacing if transform_type == "scale" else translation
-        for dim in ("z", "y", "x"):
-            if dim in axis_names:
-                target[dim] = float(values[axis_names.index(dim)])
-        has_scale |= transform_type == "scale"
+    axis_names, scale_values, translation_values, has_scale, _has_translation = ngff.scale_translation(
+        group, dataset_index=dataset_index
+    )
+    if "".join(axis_names).upper() != axes:
+        raise ValueError(f"OME-Zarr transform axes {axis_names} differ from array axes {axes!r}")
+    scales = dict(zip(axis_names, scale_values, strict=True))
+    translations = dict(zip(axis_names, translation_values, strict=True))
+    spacing = {dim: scales.get(dim, 1.0) for dim in ("z", "y", "x")}
+    translation = {dim: translations.get(dim, 0.0) for dim in ("z", "y", "x")}
     return spacing, translation, has_scale
 
 
@@ -1518,6 +1424,10 @@ def resolve_position_tile_path(
     candidates = []
     if input_dir is not None:
         candidates.append(input_dir / tile_path.name)
+        for suffix in (".ome.tif", ".ome.tiff"):
+            if tile_path.name.endswith(suffix):
+                candidates.append(input_dir / f"{tile_path.name[: -len(suffix)]}.ome.zarr")
+                break
     candidates.append(tile_path if tile_path.is_absolute() else position_input.parent / tile_path)
     for candidate in candidates:
         if candidate.exists():
@@ -3026,17 +2936,12 @@ def solve_tile_corrections_with_residual_rejection(
 
 
 def seam_graph_edge_quality(constraints: list[BoundaryConstraint]) -> float:
-    values = [
-        constraint.gradient_component_ncc_after
+    weights = [
+        max(float(constraint.weight), 0.0)
         for constraint in constraints
-        if constraint.gradient_component_ncc_after is not None
-        and math.isfinite(constraint.gradient_component_ncc_after)
+        if math.isfinite(float(constraint.weight))
     ]
-    if values:
-        quality = float(np.median(values))
-    else:
-        weights = [max(float(constraint.weight), 0.0) for constraint in constraints]
-        quality = float(np.median(weights)) if weights else 0.01
+    quality = float(np.median(weights)) if weights else 0.01
     if any(constraint.edge_status == "downweighted_no_inlier_cluster" for constraint in constraints):
         quality *= 0.25
     return min(0.99, max(0.01, quality))
@@ -4219,6 +4124,9 @@ def print_plan(
     dask_num_workers: int | None,
     registration_read_chunk_z: int,
     registration_cache_max_gib: float | None,
+    jpegxr_level: float,
+    output_codec: str,
+    zstd_level: int,
 ) -> None:
     first = tiles[0]
     channel_count = tile_channel_count(first) if selected_channels is None else len(selected_channels)
@@ -4229,7 +4137,8 @@ def print_plan(
     if not register_only:
         log(f"Output zarr base: {output}")
         log(f"Fusion backend: {FUSION_BACKEND}")
-        log(f"Fusion output format: OME-NGFF {NGFF_VERSION} / Zarr v3, zstd level {ZSTD_LEVEL}")
+        codec_description = f"Zstd level {zstd_level}" if output_codec == "zstd" else f"JPEG-XR level {jpegxr_level}"
+        log(f"Fusion output format: OME-NGFF {NGFF_VERSION} / Zarr v3, {codec_description}")
     if register or register_only:
         log(f"Registration binning (z, y, x): {registration_binning or 'auto'}")
         log(f"Registration resolution level: {reg_res_level if reg_res_level is not None else 'auto'}")
@@ -4482,12 +4391,23 @@ def channel_output_path(output: Path, channel: int, *, separate_channels: bool) 
 
     name = output.name
     if name.endswith(".ome.zarr"):
-        name = f"{name.removesuffix('.ome.zarr')}.ch{channel}.ome.zarr"
+        suffix = ".ome.zarr"
     elif name.endswith(".zarr"):
-        name = f"{name.removesuffix('.zarr')}.ch{channel}.zarr"
+        suffix = ".zarr"
     else:
-        name = f"{name}.ch{channel}.zarr"
-    return output.with_name(name)
+        return output.with_name(f"{name}.ch{channel}.zarr")
+
+    stem = name.removesuffix(suffix)
+    _base, separator, qualified_channel = stem.rpartition(".ch")
+    if separator and qualified_channel.isdigit():
+        existing_channel = int(qualified_channel)
+        if existing_channel != channel:
+            raise ValueError(
+                f"Fusion output {output} already targets channel {existing_channel}; "
+                f"cannot use it for channel {channel}"
+            )
+        return output
+    return output.with_name(f"{stem}.ch{channel}{suffix}")
 
 
 def insert_track_suffix(path: Path, track_slug_value: str) -> Path:
@@ -5906,20 +5826,18 @@ def fusion_output_spacing(base_spacing: dict[str, float], fusion_level: int) -> 
     return {dim: float(value) * factor for dim, value in base_spacing.items()}
 
 
-def output_stack_properties_from_ome_zarr_template(template: Path, output_spacing: dict[str, float]) -> dict[str, dict[str, float | int]]:
+def output_stack_properties_from_ome_zarr_template(
+    template: Path,
+    output_spacing: dict[str, float],
+    *,
+    level: int = 0,
+) -> dict[str, dict[str, float | int]]:
     import zarr
 
     group = zarr.open_group(str(template), mode="r")
-    try:
-        scale0 = group["0"]
-    except KeyError as exc:
-        raise ValueError(f"{template} does not contain OME-Zarr scale '0'") from exc
-
-    ome = group.attrs.get("ome")
-    if not isinstance(ome, dict):
-        raise ValueError(f"{template} root attrs do not contain NGFF 0.5 'ome' metadata")
-    multiscales = ome.get("multiscales")
-    if not isinstance(multiscales, list) or not multiscales:
+    template_array = ngff.level_array(group, level=level, context=template)
+    multiscales = ngff.multiscales(group)
+    if not multiscales:
         raise ValueError(f"{template} root attrs do not contain an OME multiscales entry")
     axes = multiscales[0].get("axes")
     if not isinstance(axes, list):
@@ -5928,42 +5846,27 @@ def output_stack_properties_from_ome_zarr_template(template: Path, output_spacin
     if dims != ["z", "y", "x"]:
         raise ValueError(f"{template} scale-0 template must have z/y/x axes, got {dims}")
 
-    datasets = multiscales[0].get("datasets")
-    if not isinstance(datasets, list):
-        raise ValueError(f"{template} OME multiscales entry does not contain datasets")
-    scale0_dataset = next((dataset for dataset in datasets if dataset.get("path") == "0"), None)
-    if not isinstance(scale0_dataset, dict):
-        raise ValueError(f"{template} OME multiscales entry does not describe dataset path '0'")
-
-    translation: dict[str, float] | None = None
-    scale: dict[str, float] | None = None
-    transforms = scale0_dataset.get("coordinateTransformations")
-    if isinstance(transforms, list):
-        for transform in transforms:
-            if not isinstance(transform, dict):
-                continue
-            values = transform.get("translation") if transform.get("type") == "translation" else transform.get("scale")
-            if not isinstance(values, list) or len(values) != len(dims):
-                continue
-            if transform.get("type") == "translation":
-                translation = dict(zip(dims, (float(value) for value in values), strict=True))
-            elif transform.get("type") == "scale":
-                scale = dict(zip(dims, (float(value) for value in values), strict=True))
-
-    if translation is None:
+    transform_dims, scale_values, translation_values, has_scale, has_translation = ngff.scale_translation(
+        group, dataset_index=level
+    )
+    if transform_dims != dims:
+        raise ValueError(f"{template} transform axes {transform_dims} differ from array axes {dims}")
+    if not has_translation:
         raise ValueError(f"{template} scale-0 metadata does not contain a translation transform")
-    if scale is not None:
+    translation = dict(zip(dims, translation_values, strict=True))
+    if has_scale:
+        scale = dict(zip(dims, scale_values, strict=True))
         for dim in dims:
             if not np.isclose(scale[dim], output_spacing[dim]):
                 raise ValueError(
-                    f"{template} scale-0 {dim} spacing {scale[dim]} does not match requested fusion spacing "
+                    f"{template} level {level} {dim} spacing {scale[dim]} does not match requested fusion spacing "
                     f"{output_spacing[dim]}"
                 )
 
     return {
         "origin": translation,
         "spacing": {dim: float(output_spacing[dim]) for dim in dims},
-        "shape": dict(zip(dims, (int(size) for size in scale0.shape), strict=True)),
+        "shape": dict(zip(dims, (int(size) for size in template_array.shape), strict=True)),
     }
 
 
@@ -6466,7 +6369,19 @@ def zarr_chunk_file_path(scale0_path: Path, block_id: Any) -> Path:
     return scale0_path / ".".join(coords)
 
 
-def resume_fusion_batch_func(batch_func, *, scale0_path: Path):
+def fusion_block_marker_path(marker_dir: Path, block_id: Any) -> Path:
+    return marker_dir / ("-".join(str(int(value)) for value in block_id) + ".complete")
+
+
+def mark_fusion_block_complete(marker_dir: Path, block_id: Any) -> None:
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = fusion_block_marker_path(marker_dir, block_id)
+    temporary = marker.with_suffix(f".complete.{os.getpid()}.tmp")
+    temporary.write_text("complete\n")
+    temporary.replace(marker)
+
+
+def resume_fusion_batch_func(batch_func, *, scale0_path: Path, marker_dir: Path):
     state = {"seen": 0, "skipped": 0, "processed": 0}
 
     def process_only_missing_blocks(fuse_chunk, batch, **kwargs):
@@ -6474,7 +6389,10 @@ def resume_fusion_batch_func(batch_func, *, scale0_path: Path):
         missing = []
         skipped_now = 0
         for block_id in batch:
-            if zarr_chunk_file_path(scale0_path, block_id).is_file():
+            if (
+                zarr_chunk_file_path(scale0_path, block_id).is_file()
+                and fusion_block_marker_path(marker_dir, block_id).is_file()
+            ):
                 skipped_now += 1
             else:
                 missing.append(block_id)
@@ -6493,8 +6411,12 @@ def resume_fusion_batch_func(batch_func, *, scale0_path: Path):
         if batch_func is None:
             for block_id in missing:
                 fuse_chunk(block_id)
+                mark_fusion_block_complete(marker_dir, block_id)
             return None
-        return batch_func(fuse_chunk, missing, **kwargs)
+        result = batch_func(fuse_chunk, missing, **kwargs)
+        for block_id in missing:
+            mark_fusion_block_complete(marker_dir, block_id)
+        return result
 
     return process_only_missing_blocks
 
@@ -6507,16 +6429,165 @@ def fusion_output_from_temp_root(temp_root: Path, channel_output: Path) -> Path:
     return temp_root / channel_output.name
 
 
-def find_latest_fusion_temp_workspace(channel_output: Path) -> Path | None:
+def fusion_resume_plan_path(temp_root: Path) -> Path:
+    return temp_root / "fusion-resume-plan.json"
+
+
+def write_fusion_resume_plan(temp_root: Path, plan: dict[str, Any]) -> None:
+    path = fusion_resume_plan_path(temp_root)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(plan, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    temp_path.replace(path)
+
+
+def create_fusion_temp_workspace(channel_output: Path) -> Path:
+    channel_output.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=fusion_temp_workspace_prefix(channel_output),
+            dir=channel_output.parent,
+        )
+    )
+
+
+def find_latest_fusion_temp_workspace(
+    channel_output: Path,
+    *,
+    expected_plan: dict[str, Any],
+) -> Path | None:
     prefix = fusion_temp_workspace_prefix(channel_output)
     candidates = []
     for path in channel_output.parent.glob(f"{prefix}*"):
         fusion_output = fusion_output_from_temp_root(path, channel_output)
-        if path.is_dir() and (fusion_output / "0").exists():
+        plan_path = fusion_resume_plan_path(path)
+        if not path.is_dir() or not (fusion_output / "0").exists() or not plan_path.is_file():
+            continue
+        try:
+            recorded_plan = json.loads(plan_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            log(f"Ignoring unreadable fusion resume plan {plan_path}: {exc}")
+            continue
+        if recorded_plan == expected_plan:
             candidates.append(path)
+        else:
+            log(f"Ignoring fusion temporary workspace with a different run plan: {path}")
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def file_resume_identity(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    resolved = path.resolve()
+    stat = resolved.stat() if resolved.exists() else None
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
+    return {
+        "path": str(resolved),
+        "sha256": digest,
+        "mtime_ns": None if stat is None else stat.st_mtime_ns,
+    }
+
+
+def source_tile_resume_identity(path: Path, *, require_completion: bool) -> dict[str, Any]:
+    resolved = path.resolve()
+    if resolved.is_file():
+        stat = resolved.stat()
+        return {
+            "path": str(resolved),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    root_metadata = resolved / ("zarr.json" if (resolved / "zarr.json").is_file() else ".zattrs")
+    level0_metadata = ome_zarr_array_metadata_path(resolved / "0")
+    completion = resolved / "squisher.complete.json"
+    if require_completion and not completion.is_file():
+        raise ValueError(
+            f"Cannot safely resume fusion from {resolved}: missing squisher.complete.json"
+        )
+    return {
+        "path": str(resolved),
+        "root_metadata": file_resume_identity(root_metadata),
+        "level0_metadata": file_resume_identity(level0_metadata),
+        "completion": file_resume_identity(completion) if completion.is_file() else None,
+    }
+
+
+def fusion_resume_plan(
+    *,
+    channel: int,
+    input_dir: Path,
+    position_input: Path | None,
+    registration_input: Path | None,
+    output_grid_template: Path | None,
+    output_grid_template_level: int,
+    source_tiles: list[TileMetadata],
+    output_spacing: dict[str, float],
+    output_stack_properties: dict[str, Any],
+    output_chunksize: dict[str, int],
+    weights_func_kwargs: dict[str, Any] | None,
+    blending_widths: dict[str, float],
+    inverse_flatfield: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Describe the inputs and resolved settings that determine fused pixels."""
+    if isinstance(inverse_flatfield, dict):
+        flatfield_identity = {
+            str(key): basic_array_fingerprint(np.asarray(value))
+            for key, value in sorted(inverse_flatfield.items())
+        }
+    elif inverse_flatfield is None:
+        flatfield_identity = None
+    else:
+        flatfield_identity = basic_array_fingerprint(np.asarray(inverse_flatfield))
+    template_metadata = None
+    if output_grid_template is not None:
+        root_metadata = output_grid_template / (
+            "zarr.json" if (output_grid_template / "zarr.json").is_file() else ".zattrs"
+        )
+        template_level = ome_zarr_array_metadata_path(output_grid_template / str(output_grid_template_level))
+        template_metadata = {
+            "path": str(output_grid_template.resolve()),
+            "level": output_grid_template_level,
+            "root": file_resume_identity(root_metadata),
+            "array": file_resume_identity(template_level),
+        }
+    return {
+        "artifact_type": "squisher_lightsheet.fusion_resume_plan.v1",
+        "algorithm": FUSION_RESUME_ALGORITHM,
+        "channel": channel,
+        "input_dir": str(input_dir.resolve()),
+        "position_input": file_resume_identity(position_input),
+        "registration_input": file_resume_identity(registration_input),
+        "output_grid_template": template_metadata,
+        "source_tiles": [
+            {
+                "source": source_tile_resume_identity(
+                    tile.path,
+                    require_completion=args.resume_fusion,
+                ),
+                "shape": list(tile.shape),
+                "axes": tile.axes,
+                "spacing": tile.spacing,
+                "translation": tile.translation,
+                "stage_scale": tile.stage_scale,
+                "source_view": tile.source_view,
+            }
+            for tile in source_tiles
+        ],
+        "output_spacing": output_spacing,
+        "output_stack_properties": json_safe(output_stack_properties),
+        "output_chunksize": output_chunksize,
+        "fusion_weight_mode": args.fusion_weight_mode,
+        "fusion_weight_arguments": json_safe(weights_func_kwargs),
+        "blending_widths": json_safe(blending_widths),
+        "flatfield": flatfield_identity,
+        "fusion_level": args.fusion_level,
+        "output_codec": args.output_codec,
+        "zstd_level": args.zstd_level,
+        "jpegxr_level": args.jpegxr_level,
+        "view_candidate_culling": not args.disable_view_candidate_culling,
+    }
 
 
 def validate_resumable_scale0_array(
@@ -6704,6 +6775,7 @@ def run_mvs_fuse_chunk_loky_worker_once(
 
     import cupy as cp
 
+    register_jpegxr_codec()
     with cp.cuda.Device(device):
         output_zarr_array = zarr.open_array(payload["output_zarr_url"], mode="r+")
         output_chunk_size_bytes = int(
@@ -6846,26 +6918,45 @@ def run_mvs_fuse_chunk_loky_worker_once(
         misc_utils.clear_cupy_memory()
 
 
-def zarr_v3_array_creation_kwargs(dims: tuple[str, ...]) -> dict[str, Any]:
-    from zarr.codecs import BytesCodec, ZstdCodec
+def zarr_v3_array_creation_kwargs(
+    dims: tuple[str, ...],
+    chunks: tuple[int, ...],
+    *,
+    jpegxr_level: float,
+    output_codec: str = "zstd",
+    zstd_level: int = 3,
+) -> dict[str, Any]:
+    if output_codec == "zstd":
+        from zarr.codecs import BytesCodec, ZstdCodec
 
+        return {"dimension_names": dims, "codecs": [BytesCodec(), ZstdCodec(level=zstd_level)]}
+    if output_codec != "jpegxr":
+        raise ValueError(f"Unsupported output codec {output_codec!r}")
+    inner_chunks = jpegxr_plane_chunk_shape(chunks, dims)
     return {
         "dimension_names": dims,
-        "codecs": [BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
+        "codecs": [jpegxr_sharding_codec(inner_chunks, level=jpegxr_level)],
     }
 
 
-def zarr_v3_sharded_array_creation_kwargs(dims: tuple[str, ...], chunks: tuple[int, ...]) -> dict[str, Any]:
-    from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
+def zarr_v3_sharded_array_creation_kwargs(
+    dims: tuple[str, ...],
+    chunks: tuple[int, ...],
+    *,
+    jpegxr_level: float,
+    output_codec: str = "zstd",
+    zstd_level: int = 3,
+) -> dict[str, Any]:
+    if output_codec == "zstd":
+        from zarr.codecs import BytesCodec, ZstdCodec
 
+        return {"dimension_names": dims, "codecs": [BytesCodec(), ZstdCodec(level=zstd_level)]}
+    if output_codec != "jpegxr":
+        raise ValueError(f"Unsupported output codec {output_codec!r}")
+    inner_chunks = jpegxr_plane_chunk_shape(chunks, dims)
     return {
         "dimension_names": dims,
-        "codecs": [
-            ShardingCodec(
-                chunk_shape=chunks,
-                codecs=[BytesCodec(endian="little"), ZstdCodec(level=ZSTD_LEVEL)],
-            )
-        ],
+        "codecs": [jpegxr_sharding_codec(inner_chunks, level=jpegxr_level)],
     }
 
 
@@ -7014,41 +7105,53 @@ def block_reduce_mean_gpu(block: np.ndarray, factors: tuple[int, ...], dtype: np
     return cp.asnumpy(reduced.astype(dtype, copy=False))
 
 
-def write_zstd_downsampled_level(
+def write_downsampled_level(
     source_array: Any,
     destination: Path,
     *,
     dataset_path: str,
     dimension_names: tuple[str, ...],
     factors: dict[str, int],
+    jpegxr_level: float,
+    output_codec: str,
+    zstd_level: int,
 ) -> None:
     import zarr
 
     factor_tuple = tuple(int(factors[dim]) for dim in dimension_names)
     shape = tuple(int(size) // factor for size, factor in zip(source_array.shape, factor_tuple, strict=True))
     inner_chunks = downsampled_chunks(tuple(int(chunk) for chunk in source_array.chunks), shape, factor_tuple)
+    if output_codec == "jpegxr":
+        inner_chunks = jpegxr_plane_chunk_shape(inner_chunks, dimension_names)
     source_storage_chunks = tuple(int(chunk) for chunk in (source_array.metadata.shards or source_array.chunks))
     shard_chunks = pyramid_shard_chunks(source_storage_chunks, shape, inner_chunks)
+    storage_chunks = shard_chunks if output_codec == "jpegxr" else inner_chunks
     destination_array_path = destination / dataset_path
     destination_array_path.parent.mkdir(parents=True, exist_ok=True)
     destination_array = zarr.open(
         str(destination_array_path),
         mode="w",
         shape=shape,
-        chunks=shard_chunks,
+        chunks=storage_chunks,
         dtype=source_array.dtype,
         zarr_format=3,
-        **zarr_v3_sharded_array_creation_kwargs(dimension_names, inner_chunks),
+        **zarr_v3_sharded_array_creation_kwargs(
+            dimension_names,
+            inner_chunks,
+            jpegxr_level=jpegxr_level,
+            output_codec=output_codec,
+            zstd_level=zstd_level,
+        ),
     )
 
-    n_chunks = chunk_count(shape, shard_chunks)
+    n_chunks = chunk_count(shape, storage_chunks)
     inner_chunk_count = chunk_count(shape, inner_chunks)
     log(
         f"Writing pyramid level {dataset_path} from completed Zarr level: "
-        f"shape={shape}, factors={factors}, shard_chunks={shard_chunks}, inner_chunks={inner_chunks}, "
-        f"shards_total={n_chunks}, inner_chunks_total={inner_chunk_count}"
+        f"shape={shape}, factors={factors}, storage_chunks={storage_chunks}, inner_chunks={inner_chunks}, "
+        f"storage_chunks_total={n_chunks}, inner_chunks_total={inner_chunk_count}, codec={output_codec}"
     )
-    for chunk_index, selection in enumerate(chunk_slices(shape, shard_chunks), start=1):
+    for chunk_index, selection in enumerate(chunk_slices(shape, storage_chunks), start=1):
         source_selection = tuple(
             slice(
                 part.start * factor,
@@ -7065,7 +7168,13 @@ def write_zstd_downsampled_level(
             log(f"Writing pyramid level {dataset_path}: {chunk_index}/{n_chunks} shard(s)")
 
 
-def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
+def build_ome_zarr_pyramid_from_scale0(
+    output: Path,
+    *,
+    jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
+    output_codec: str = "zstd",
+    zstd_level: int = 3,
+) -> None:
     import zarr
 
     group = zarr.open_group(str(output), mode="a", zarr_format=3)
@@ -7126,12 +7235,15 @@ def build_ome_zarr_pyramid_from_scale0(output: Path) -> None:
     log(f"Building completed-fusion Zarr pyramid for {output}: levels={len(abs_factors)}")
     previous_array = source_array
     for level_index, factors in enumerate(level_factors, start=1):
-        write_zstd_downsampled_level(
+        write_downsampled_level(
             previous_array,
             output,
             dataset_path=str(level_index),
             dimension_names=dimension_names,
             factors=factors,
+            jpegxr_level=jpegxr_level,
+            output_codec=output_codec,
+            zstd_level=zstd_level,
         )
         previous_array = zarr.open_array(str(output / str(level_index)), mode="r", zarr_format=3)
     group.attrs.update(destination_attrs)
@@ -7177,6 +7289,42 @@ def mark_ome_zarr_complete(output: Path) -> None:
 
     group = zarr.open_group(str(output), mode="a", zarr_format=3)
     group.attrs["squisher_complete"] = True
+
+
+def write_runtime_fusion_input_artifact(
+    path: Path,
+    tiles: list[TileMetadata],
+    *,
+    artifact_type: str,
+) -> None:
+    """Snapshot resolved tile metadata when no persisted position artifact was supplied."""
+    payload = {
+        "schema_version": 1,
+        "artifact_type": artifact_type,
+        "tiles": [
+            {
+                "path": str(tile.path.resolve()),
+                "shape": list(tile.shape),
+                "axes": tile.axes,
+                "spacing_um": tile.spacing,
+                "translation_um": tile.translation,
+                "stage_scale_um": tile.stage_scale,
+                "channels": list(tile.channels),
+                "tracks": [
+                    {
+                        "slug": track.slug,
+                        "track_id": track.track_id,
+                        "channels": list(track.channels),
+                        "channel_names": list(track.channel_names),
+                    }
+                    for track in tile.tracks
+                ],
+                "source_view": tile.source_view,
+            }
+            for tile in tiles
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
 def cleanup_or_preserve_fusion_workspace(temp_root: Path | None, *, completed: bool) -> None:
@@ -7473,7 +7621,7 @@ def write_center_z_thumbnail(
     from PIL import Image
     import zarr
 
-    register_jpegxr_zarr_v3_codec()
+    register_jpegxr_codec()
     array = zarr.open(str(output / "0"), mode="r")
     dims = ome_zarr_scale0_dimension_names(output, len(array.shape))
     if "z" not in dims:
@@ -7856,12 +8004,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs=3,
         metavar=("Z", "Y", "X"),
-        default=(8, 1024, 1024),
+        default=(12, 960, 960),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--jpegxr-level",
+        type=float,
+        default=DEFAULT_JPEGXR_LEVEL,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--output-codec",
+        choices=("zstd", "jpegxr"),
+        default="zstd",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--zstd-level",
+        type=int,
+        default=3,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output-grid-template",
         type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--output-grid-template-level",
+        type=int,
+        default=0,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -7873,7 +8045,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=parse_batch_size,
-        default="auto",
+        default=1,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -8200,10 +8372,15 @@ def run_stitch_once(
     channels_to_fuse = channels_to_fuse_for_tiles(tiles, selected_channels)
     log(f"Channels to fuse separately: {channels_to_fuse}")
     output_chunksize = output_chunksize_arg(args.output_chunksize)
+    if not 0.0 <= args.jpegxr_level <= 1.0:
+        raise ValueError(f"--jpegxr-level must be between 0 and 1, got {args.jpegxr_level}")
+    if not -7 <= args.zstd_level <= 22:
+        raise ValueError(f"--zstd-level must be between -7 and 22, got {args.zstd_level}")
     log(f"Requested fusion output chunksize: {output_chunksize}")
     nominal_output_spacing = fusion_output_spacing(tiles[0].spacing, args.fusion_level)
     log(f"Fusion output level: {args.fusion_level}; nominal output spacing: {nominal_output_spacing}")
     output_grid_template = getattr(args, "output_grid_template", None)
+    output_grid_template_level = int(getattr(args, "output_grid_template_level", 0))
 
     registration_binning = None
     if args.registration_binning is not None:
@@ -8252,6 +8429,9 @@ def run_stitch_once(
         dask_num_workers,
         registration_read_chunk_z,
         registration_cache_max_gib,
+        args.jpegxr_level,
+        args.output_codec,
+        args.zstd_level,
     )
     if should_run_coarse and len(coarse_reg_res_levels) > 1:
         log(f"Hierarchical coarse registration levels: {coarse_reg_res_levels}")
@@ -8280,7 +8460,10 @@ def run_stitch_once(
 
     log("Imported multiview-stitcher fusion/registration modules")
     log(f"Fusion batch settings: n_batch={args.batch_size}, threaded_jobs={args.batch_jobs}")
-    log(f"Final fusion compressor: zstd level {ZSTD_LEVEL}")
+    if args.output_codec == "zstd":
+        log(f"Final fusion codec: standard Zstd level {args.zstd_level}")
+    else:
+        log(f"Final fusion codec: JPEG-XR level {args.jpegxr_level} with CRC32C")
 
     transform_key = TRANSFORM_KEY
     params = None
@@ -8634,8 +8817,9 @@ def run_stitch_once(
             template_output_stack_properties = output_stack_properties_from_ome_zarr_template(
                 output_grid_template,
                 output_spacing,
+                level=output_grid_template_level,
             )
-            log(f"Fusion output grid template: {output_grid_template}")
+            log(f"Fusion output grid template: {output_grid_template} level {output_grid_template_level}")
             log(f"Template output stack properties: {template_output_stack_properties}")
         temp_root = None
         fusion_completed = False
@@ -8668,23 +8852,6 @@ def run_stitch_once(
             log(f"Checking channel output path does not already exist: {channel_output}")
             raise_if_output_exists(channel_output)
 
-            if args.resume_fusion:
-                temp_root = find_latest_fusion_temp_workspace(channel_output)
-                if temp_root is not None:
-                    fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
-                    log(f"Channel {channel} will resume temporary fusion output {fusion_output}")
-                else:
-                    log(f"Channel {channel} has no resumable temporary fusion workspace; starting a new one")
-            if temp_root is None:
-                temp_root = Path(
-                    tempfile.mkdtemp(
-                        prefix=fusion_temp_workspace_prefix(channel_output),
-                        dir=channel_output.parent,
-                    )
-                )
-                fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
-                log(f"Channel {channel} will fuse to temporary output {fusion_output}")
-
             inverse_flatfield = None
             apply_flatfield = flatfield_dir is not None or bool(flatfield_dirs_by_source_view)
             if apply_flatfield:
@@ -8714,6 +8881,37 @@ def run_stitch_once(
                 default_width_voxels_zyx=tuple(float(value) for value in args.fusion_blend_width_voxels),
                 max_overlap_fraction=args.fusion_blend_max_overlap_fraction,
             )
+            resume_plan = fusion_resume_plan(
+                channel=channel,
+                input_dir=input_dir,
+                position_input=Path(args.position_input) if args.position_input else None,
+                registration_input=registration_input,
+                output_grid_template=output_grid_template,
+                output_grid_template_level=output_grid_template_level,
+                source_tiles=source_tiles,
+                output_spacing=output_spacing,
+                output_stack_properties=output_stack_properties,
+                output_chunksize=resolved_chunksize,
+                weights_func_kwargs=weights_func_kwargs,
+                blending_widths=blending_widths,
+                inverse_flatfield=inverse_flatfield,
+                args=args,
+            )
+            if args.resume_fusion:
+                temp_root = find_latest_fusion_temp_workspace(
+                    channel_output,
+                    expected_plan=resume_plan,
+                )
+                if temp_root is not None:
+                    fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
+                    log(f"Channel {channel} will resume temporary fusion output {fusion_output}")
+                else:
+                    log(f"Channel {channel} has no matching resumable workspace; starting a new one")
+            if temp_root is None:
+                temp_root = create_fusion_temp_workspace(channel_output)
+                write_fusion_resume_plan(temp_root, resume_plan)
+                fusion_output = fusion_output_from_temp_root(temp_root, channel_output)
+                log(f"Channel {channel} will fuse to temporary output {fusion_output}")
             log(f"Resolved fusion batch settings: n_batch={resolved_batch_size}, threaded_jobs={args.batch_jobs}")
             if weights_func_kwargs is None:
                 log("Fusion weights: geometric border/valid-support weights only")
@@ -8768,6 +8966,8 @@ def run_stitch_once(
             else:
                 log("Fusion defers CuPy cleanup until the fusion context exits")
             log(f"Fusion blending widths (physical units): {blending_widths}")
+            candidate_plan_path = None
+            candidate_summary = {"enabled": False}
             if args.disable_view_candidate_culling:
                 log("Fusion per-block view-candidate culling disabled; workers will receive all views")
                 allowed_fusion_blocks = transformed_source_block_ids(
@@ -8778,8 +8978,6 @@ def run_stitch_once(
                     blending_widths=blending_widths,
                 )
             else:
-                from multiview_stitcher.fusion import _core as fusion_core
-
                 candidate_map, candidate_summary = direct_fusion_view_candidate_plan(
                     sims,
                     transform_key=transform_key,
@@ -8787,7 +8985,7 @@ def run_stitch_once(
                     output_chunksize=resolved_chunksize,
                     weights_func=weights_func,
                     weights_func_kwargs=weights_func_kwargs,
-                    fusion_func=fusion_core.weighted_average_fusion,
+                    fusion_func=inplace_weighted_average_fusion,
                     fusion_func_kwargs=None,
                     interpolation_order=1,
                 )
@@ -8820,7 +9018,11 @@ def run_stitch_once(
             )
             batch_func = culling_fusion_batch_func(batch_func, allowed_fusion_blocks)
             if args.resume_fusion:
-                batch_func = resume_fusion_batch_func(batch_func, scale0_path=fusion_output / "0")
+                batch_func = resume_fusion_batch_func(
+                    batch_func,
+                    scale0_path=fusion_output / "0",
+                    marker_dir=temp_root / "completed-fusion-blocks",
+                )
                 log(f"Fusion resume enabled: completed output chunks under {fusion_output / '0'} will be skipped")
             import dask
 
@@ -8882,6 +9084,7 @@ def run_stitch_once(
                         fusion.fuse(
                             images=sims,
                             transform_key=transform_key,
+                            fusion_func=inplace_weighted_average_fusion,
                             output_stack_properties=output_stack_properties,
                             output_chunksize=resolved_chunksize,
                             blending_widths=blending_widths,
@@ -8892,7 +9095,16 @@ def run_stitch_once(
                                 "ome_zarr": True,
                                 "ngff_version": NGFF_VERSION,
                                 "overwrite": False,
-                                "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(tuple(sims[0].dims)),
+                                "zarr_array_creation_kwargs": zarr_v3_array_creation_kwargs(
+                                    tuple(sims[0].dims),
+                                    tuple(
+                                        int(resolved_chunksize[dim]) if dim in resolved_chunksize else 1
+                                        for dim in sims[0].dims
+                                    ),
+                                    jpegxr_level=args.jpegxr_level,
+                                    output_codec=args.output_codec,
+                                    zstd_level=args.zstd_level,
+                                ),
                             },
                             batch_options={
                                 "n_batch": resolved_batch_size,
@@ -8910,8 +9122,83 @@ def run_stitch_once(
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
             )
             with heartbeat(f"completed Zarr pyramid channel {channel}"):
-                build_ome_zarr_pyramid_from_scale0(fusion_output)
-            mark_ome_zarr_complete(fusion_output)
+                build_ome_zarr_pyramid_from_scale0(
+                    fusion_output,
+                    jpegxr_level=args.jpegxr_level,
+                    output_codec=args.output_codec,
+                    zstd_level=args.zstd_level,
+                )
+            from squisher_lightsheet.fusion_provenance import write_fusion_provenance
+
+            provenance_position_input = Path(args.position_input).resolve() if args.position_input else None
+            if provenance_position_input is None:
+                provenance_position_input = temp_root / "runtime.positions.json"
+                write_runtime_fusion_input_artifact(
+                    provenance_position_input,
+                    source_tiles,
+                    artifact_type="squisher_lightsheet.runtime_fusion_positions.v1",
+                )
+            provenance_registration_input = registration_input
+            if (
+                provenance_registration_input is None
+                and params is not None
+                and registration_output.is_file()
+            ):
+                provenance_registration_input = registration_output
+            if provenance_registration_input is None:
+                provenance_registration_input = temp_root / "runtime.registration.json"
+                write_runtime_fusion_input_artifact(
+                    provenance_registration_input,
+                    source_tiles,
+                    artifact_type="squisher_lightsheet.runtime_unregistered_fusion.v1",
+                )
+            requested_provenance_settings = {
+                key: value
+                for key, value in vars(args).items()
+                if key not in {"log_file", "dry_run"}
+            }
+            resolved_provenance_settings = {
+                "backend": FUSION_BACKEND,
+                "source_level_counts": source_level_summary,
+                "source_orientation_counts": dict(sorted(orientation_patterns.items())),
+                "source_count": len(source_tiles),
+                "output_spacing_um": output_spacing,
+                "output_stack_properties": output_stack_properties,
+                "output_chunksize": resolved_chunksize,
+                "batch_size": resolved_batch_size,
+                "weight_mode": args.fusion_weight_mode,
+                "weight_arguments": weights_func_kwargs,
+                "blending_widths": blending_widths,
+                "candidate_plan": candidate_summary,
+                "candidate_blocks": len(allowed_fusion_blocks),
+                "total_output_blocks": total_fusion_blocks,
+                "flatfield_applied": apply_flatfield,
+                "output_codec": args.output_codec,
+                "zstd_level": args.zstd_level,
+                "jpegxr_level": args.jpegxr_level,
+            }
+            additional_json_inputs = (
+                {"fusion_candidate_plan": candidate_plan_path}
+                if candidate_plan_path is not None
+                else None
+            )
+            write_fusion_provenance(
+                output=fusion_output,
+                input_dir=input_dir,
+                position_input=provenance_position_input,
+                registration_input=provenance_registration_input,
+                channel=channel,
+                requested_settings=requested_provenance_settings,
+                resolved_settings=resolved_provenance_settings,
+                output_grid_template=output_grid_template,
+                output_grid_template_level=output_grid_template_level,
+                flatfield_dirs=(
+                    tuple(flatfield_dirs_by_source_view.values())
+                    if flatfield_dirs_by_source_view
+                    else (() if flatfield_dir is None else (flatfield_dir,))
+                ),
+                additional_json_inputs=additional_json_inputs,
+            )
             log(
                 "Fusion output after completed-Zarr pyramid write: "
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
@@ -9079,6 +9366,7 @@ def run_shared_reference_geometry_registration(
 
 
 def main() -> int:
+    register_jpegxr_codec()
     args = parse_args()
     root = Path.cwd()
     configure_writable_caches(root)

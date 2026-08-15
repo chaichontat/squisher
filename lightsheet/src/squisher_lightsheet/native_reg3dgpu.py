@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ from numpy.ctypeslib import ndpointer
 
 DEFAULT_LIB_DIR = Path("/home/chaichontat/microImageLib/bin/linux")
 ZYX_TO_XYZ = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=np.float32)
+MATTES_OPTIMIZE_TRANSLATION_AND_SHEAR = 0
+MATTES_OPTIMIZE_TRANSLATION_FIXED_SHEAR = 1
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,33 @@ def zyx_to_xyz_3x4(matrix_zyx: np.ndarray, translation_zyx: np.ndarray) -> np.nd
 
 
 
+def register_method6_device(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    fixed_mask_zyx: Any | None = None,
+    lib_dir: Path = DEFAULT_LIB_DIR,
+    ftol: float = 1e-4,
+    max_iterations: int = 300,
+    device: int = 0,
+    initial_matrix_xyz_3x4: np.ndarray | None = None,
+    aff_pivot_zyx: np.ndarray | None = None,
+) -> NativeReg3DDeviceResult:
+    """Run Method 6 with an optional zyx voxel pivot for both optimization stages."""
+    return _register_ncc_affine_device(
+        fixed_zyx,
+        moving_zyx,
+        method=6,
+        fixed_mask_zyx=fixed_mask_zyx,
+        lib_dir=lib_dir,
+        ftol=ftol,
+        max_iterations=max_iterations,
+        device=device,
+        initial_matrix_xyz_3x4=initial_matrix_xyz_3x4,
+        aff_pivot_zyx=aff_pivot_zyx,
+    )
+
+
 def register_method8_device(
     fixed_zyx: Any,
     moving_zyx: Any,
@@ -60,12 +90,46 @@ def register_method8_device(
     initial_matrix_xyz_3x4: np.ndarray | None = None,
     method8_zero_z_shear: bool = False,
 ) -> NativeReg3DDeviceResult:
+    return _register_ncc_affine_device(
+        fixed_zyx,
+        moving_zyx,
+        method=8,
+        fixed_mask_zyx=fixed_mask_zyx,
+        lib_dir=lib_dir,
+        ftol=ftol,
+        max_iterations=max_iterations,
+        device=device,
+        initial_matrix_xyz_3x4=initial_matrix_xyz_3x4,
+        method8_zero_z_shear=method8_zero_z_shear,
+    )
+
+
+def _register_ncc_affine_device(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    method: int,
+    fixed_mask_zyx: Any | None,
+    lib_dir: Path,
+    ftol: float,
+    max_iterations: int,
+    device: int,
+    initial_matrix_xyz_3x4: np.ndarray | None,
+    method8_zero_z_shear: bool = False,
+    aff_pivot_zyx: np.ndarray | None = None,
+) -> NativeReg3DDeviceResult:
     import cupy as cp
 
+    if method not in (6, 8):
+        raise ValueError(f"NCC affine device method must be 6 or 8, got {method}")
+    if method != 8 and method8_zero_z_shear:
+        raise ValueError("method8_zero_z_shear is only valid for Method 8")
+    if method != 6 and aff_pivot_zyx is not None:
+        raise ValueError("aff_pivot_zyx is only valid for Method 6")
     fixed = _require_cupy_float32_zyx(fixed_zyx, name="fixed_zyx", device=device)
     moving = _require_cupy_float32_zyx(moving_zyx, name="moving_zyx", device=device)
     if fixed.shape != moving.shape:
-        raise ValueError(f"reg_3dgpu_method8_device requires same-shaped crops, got {fixed.shape} and {moving.shape}")
+        raise ValueError(f"Method {method} requires same-shaped crops, got {fixed.shape} and {moving.shape}")
     fixed_mask = (
         None
         if fixed_mask_zyx is None
@@ -82,17 +146,26 @@ def register_method8_device(
     )
     z, y, x = fixed.shape
     size_xyz = np.array([x, y, z], dtype=np.uint32)
+    pivot_xyz = None
+    if aff_pivot_zyx is not None:
+        pivot_zyx = np.asarray(aff_pivot_zyx, dtype=np.float32)
+        if pivot_zyx.shape != (3,):
+            raise ValueError(f"aff_pivot_zyx must have shape (3,), got {pivot_zyx.shape}")
+        if not np.all(np.isfinite(pivot_zyx)):
+            raise ValueError(f"aff_pivot_zyx must be finite, got {pivot_zyx.tolist()}")
+        pivot_xyz = np.ascontiguousarray(pivot_zyx[::-1])
     records = np.zeros(11, dtype=np.float32)
     lib = _load_libapi(lib_dir)
     use_mask = fixed_mask is not None
-    function_name = "reg_3dgpu_method8_mask_device" if use_mask else "reg_3dgpu_method8_device"
+    function_name = f"reg_3dgpu_method{method}{'_mask' if use_mask else ''}_device"
     if not hasattr(lib, function_name):
         raise RuntimeError(f"{Path(lib_dir) / 'libapi.so'} does not export {function_name}")
-    _set_method8_zero_z_shear(
-        lib,
-        enabled=method8_zero_z_shear,
-        lib_path=Path(lib_dir) / "libapi.so",
-    )
+    if method == 8:
+        _set_method8_zero_z_shear(
+            lib,
+            enabled=method8_zero_z_shear,
+            lib_path=Path(lib_dir) / "libapi.so",
+        )
     common_args = (
         ctypes.c_void_p(int(registered.data.ptr)),
         tmx,
@@ -100,7 +173,7 @@ def register_method8_device(
         ctypes.c_void_p(int(moving.data.ptr)),
     )
     if use_mask:
-        return_code = lib.reg_3dgpu_method8_mask_device(
+        args = [
             *common_args,
             ctypes.c_void_p(int(fixed_mask.data.ptr)),
             size_xyz,
@@ -110,10 +183,9 @@ def register_method8_device(
             int(max_iterations),
             0,
             int(device),
-            records,
-        )
+        ]
     else:
-        return_code = lib.reg_3dgpu_method8_device(
+        args = [
             *common_args,
             size_xyz,
             size_xyz,
@@ -122,8 +194,169 @@ def register_method8_device(
             int(max_iterations),
             0,
             int(device),
-            records,
+        ]
+    if method == 6:
+        args.append(
+            None
+            if pivot_xyz is None
+            else pivot_xyz.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         )
+    return_code = getattr(lib, function_name)(*args, records)
+    cp.cuda.Device(device).synchronize()
+    matrix_zyx, offset_zyx = _tmx_xyz_to_zyx(tmx)
+    return NativeReg3DDeviceResult(
+        registered_zyx=registered,
+        matrix_zyx=matrix_zyx,
+        offset_zyx=offset_zyx,
+        matrix_xyz_3x4=tmx.reshape(3, 4).copy(),
+        records=records.copy(),
+        return_code=int(return_code),
+    )
+
+
+def register_method10_mattes_device(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    fixed_mask_zyx: Any | None = None,
+    lib_dir: Path = DEFAULT_LIB_DIR,
+    ftol: float = 1e-4,
+    max_iterations: int = 300,
+    device: int = 0,
+    histogram_bins: int = 50,
+    sample_count: int = 100_000,
+    initial_matrix_xyz_3x4: np.ndarray | None = None,
+    translation_only: bool = False,
+) -> NativeReg3DDeviceResult:
+    """Run Mattes registration, optionally preserving the initial symmetric shear."""
+    return _register_mattes_device(
+        fixed_zyx,
+        moving_zyx,
+        method=10,
+        fixed_mask_zyx=fixed_mask_zyx,
+        lib_dir=lib_dir,
+        ftol=ftol,
+        max_iterations=max_iterations,
+        device=device,
+        histogram_bins=histogram_bins,
+        sample_count=sample_count,
+        initial_matrix_xyz_3x4=initial_matrix_xyz_3x4,
+        translation_only=translation_only,
+    )
+
+
+def register_method11_mattes_device(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    fixed_mask_zyx: Any | None = None,
+    lib_dir: Path = DEFAULT_LIB_DIR,
+    ftol: float = 1e-4,
+    max_iterations: int = 300,
+    device: int = 0,
+    histogram_bins: int = 50,
+    sample_count: int = 100_000,
+    initial_matrix_xyz_3x4: np.ndarray | None = None,
+    translation_only: bool = False,
+) -> NativeReg3DDeviceResult:
+    """Run Method 11 Mattes registration with GPU-native sample preparation."""
+    return _register_mattes_device(
+        fixed_zyx,
+        moving_zyx,
+        method=11,
+        fixed_mask_zyx=fixed_mask_zyx,
+        lib_dir=lib_dir,
+        ftol=ftol,
+        max_iterations=max_iterations,
+        device=device,
+        histogram_bins=histogram_bins,
+        sample_count=sample_count,
+        initial_matrix_xyz_3x4=initial_matrix_xyz_3x4,
+        translation_only=translation_only,
+    )
+
+
+def _register_mattes_device(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    method: int,
+    fixed_mask_zyx: Any | None,
+    lib_dir: Path,
+    ftol: float,
+    max_iterations: int,
+    device: int,
+    histogram_bins: int,
+    sample_count: int,
+    initial_matrix_xyz_3x4: np.ndarray | None,
+    translation_only: bool,
+) -> NativeReg3DDeviceResult:
+    import cupy as cp
+
+    if method not in (10, 11):
+        raise ValueError(f"Mattes method must be 10 or 11, got {method}")
+    if histogram_bins < 6:
+        raise ValueError("histogram_bins must be >= 6")
+    if sample_count < histogram_bins:
+        raise ValueError("sample_count must be >= histogram_bins")
+    if translation_only and initial_matrix_xyz_3x4 is None:
+        raise ValueError("translation_only requires initial_matrix_xyz_3x4")
+    fixed = _require_cupy_float32_zyx(fixed_zyx, name="fixed_zyx", device=device)
+    moving = _require_cupy_float32_zyx(moving_zyx, name="moving_zyx", device=device)
+    if fixed.shape != moving.shape:
+        raise ValueError(f"Method {method} requires same-shaped crops, got {fixed.shape} and {moving.shape}")
+    fixed_mask = (
+        None
+        if fixed_mask_zyx is None
+        else _require_cupy_mask_float32_zyx(fixed_mask_zyx, name="fixed_mask_zyx", device=device)
+    )
+    if fixed_mask is not None and fixed_mask.shape != fixed.shape:
+        raise ValueError(f"fixed_mask_zyx must match fixed_zyx shape, got {fixed_mask.shape} and {fixed.shape}")
+
+    registered = cp.empty_like(fixed)
+    has_initial_matrix = initial_matrix_xyz_3x4 is not None
+    tmx = (
+        np.array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0], dtype=np.float32)
+        if not has_initial_matrix
+        else np.asarray(initial_matrix_xyz_3x4, dtype=np.float32).reshape(12).copy()
+    )
+    z, y, x = fixed.shape
+    size_xyz = np.array([x, y, z], dtype=np.uint32)
+    records = np.zeros(11, dtype=np.float32)
+    lib = _load_libapi(lib_dir)
+    use_mask = fixed_mask is not None
+    function_name = f"reg_3dgpu_method{method}_mattes{'_mask' if use_mask else ''}_device"
+    if not hasattr(lib, function_name):
+        raise RuntimeError(f"{Path(lib_dir) / 'libapi.so'} does not export {function_name}")
+    common_args = (
+        ctypes.c_void_p(int(registered.data.ptr)),
+        tmx,
+        ctypes.c_void_p(int(fixed.data.ptr)),
+        ctypes.c_void_p(int(moving.data.ptr)),
+    )
+    trailing_args = (
+        size_xyz,
+        size_xyz,
+        int(has_initial_matrix),
+        ctypes.c_float(ftol),
+        int(max_iterations),
+        0,
+        int(device),
+        int(histogram_bins),
+        int(sample_count),
+        MATTES_OPTIMIZE_TRANSLATION_FIXED_SHEAR
+        if translation_only
+        else MATTES_OPTIMIZE_TRANSLATION_AND_SHEAR,
+        records,
+    )
+    if use_mask:
+        return_code = getattr(lib, function_name)(
+            *common_args,
+            ctypes.c_void_p(int(fixed_mask.data.ptr)),
+            *trailing_args,
+        )
+    else:
+        return_code = getattr(lib, function_name)(*common_args, *trailing_args)
     cp.cuda.Device(device).synchronize()
     matrix_zyx, offset_zyx = _tmx_xyz_to_zyx(tmx)
     return NativeReg3DDeviceResult(
@@ -140,7 +373,7 @@ def _require_cupy_float32_zyx(array: Any, *, name: str, device: int) -> Any:
     import cupy as cp
 
     if not isinstance(array, cp.ndarray):
-        raise TypeError(f"{name} must be a CuPy ndarray for reg_3dgpu_method8_device")
+        raise TypeError(f"{name} must be a CuPy ndarray for device registration")
     if array.ndim != 3:
         raise ValueError(f"{name} must be a 3D zyx array, got ndim={array.ndim}")
     if array.dtype != cp.float32:
@@ -154,7 +387,7 @@ def _require_cupy_mask_float32_zyx(array: Any, *, name: str, device: int) -> Any
     import cupy as cp
 
     if not isinstance(array, cp.ndarray):
-        raise TypeError(f"{name} must be a CuPy ndarray for reg_3dgpu_method8_mask_device")
+        raise TypeError(f"{name} must be a CuPy ndarray for masked device registration")
     if array.ndim != 3:
         raise ValueError(f"{name} must be a 3D zyx array, got ndim={array.ndim}")
     if array.device.id != int(device):
@@ -332,6 +565,9 @@ def _load_libapi(lib_dir: Path) -> ctypes.CDLL:
     lib_dir = Path(lib_dir)
     dependency_dirs = [
         lib_dir,
+        Path(sys.prefix) / "lib",
+        Path(sys.prefix) / "targets" / "x86_64-linux" / "lib",
+        *sorted((Path(sys.prefix) / "lib").glob("python*/site-packages/nvidia/*/lib")),
         *(Path(path) for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path),
     ]
     cuda_path = os.environ.get("CUDA_PATH")
@@ -409,15 +645,52 @@ def _load_libapi(lib_dir: Path) -> ctypes.CDLL:
         ctypes.c_int,
         ndpointer(np.float32, flags="C_CONTIGUOUS"),
     ]
-    lib.reg_3dgpu_method8_device.restype = ctypes.c_int
-    lib.reg_3dgpu_method8_device.argtypes = method8_device_argtypes
-    if hasattr(lib, "reg_3dgpu_method8_mask_device"):
-        lib.reg_3dgpu_method8_mask_device.restype = ctypes.c_int
-        lib.reg_3dgpu_method8_mask_device.argtypes = [
-            *method8_device_argtypes[:4],
-            ctypes.c_void_p,
-            *method8_device_argtypes[4:],
-        ]
+    for method in (6, 8):
+        device_argtypes = (
+            [
+                *method8_device_argtypes[:-1],
+                ctypes.POINTER(ctypes.c_float),
+                method8_device_argtypes[-1],
+            ]
+            if method == 6
+            else method8_device_argtypes
+        )
+        function_name = f"reg_3dgpu_method{method}_device"
+        if hasattr(lib, function_name):
+            function = getattr(lib, function_name)
+            function.restype = ctypes.c_int
+            function.argtypes = device_argtypes
+        mask_function_name = f"reg_3dgpu_method{method}_mask_device"
+        if hasattr(lib, mask_function_name):
+            mask_function = getattr(lib, mask_function_name)
+            mask_function.restype = ctypes.c_int
+            mask_function.argtypes = [
+                *device_argtypes[:4],
+                ctypes.c_void_p,
+                *device_argtypes[4:],
+            ]
+    method10_device_argtypes = [
+        *method8_device_argtypes[:-1],
+        ctypes.c_uint,
+        ctypes.c_ulonglong,
+        ctypes.c_int,
+        method8_device_argtypes[-1],
+    ]
+    for method in (10, 11):
+        function_name = f"reg_3dgpu_method{method}_mattes_device"
+        if hasattr(lib, function_name):
+            function = getattr(lib, function_name)
+            function.restype = ctypes.c_int
+            function.argtypes = method10_device_argtypes
+        mask_function_name = f"reg_3dgpu_method{method}_mattes_mask_device"
+        if hasattr(lib, mask_function_name):
+            mask_function = getattr(lib, mask_function_name)
+            mask_function.restype = ctypes.c_int
+            mask_function.argtypes = [
+                *method10_device_argtypes[:4],
+                ctypes.c_void_p,
+                *method10_device_argtypes[4:],
+            ]
     return lib
 
 

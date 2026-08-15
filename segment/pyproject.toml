@@ -17,11 +17,15 @@ dependencies = [
     "distributed",
     "imagecodecs",
     "loguru>=0.7",
+    "natsort>=8.4",
     "numba",
     "numpy>=1.25,<2.5",
+    "opencv-python-headless>=4.13",
+    "pydantic>=2.12",
     "rich>=13.7",
     "scikit-image>=0.25",
     "scipy",
+    "squisher",
     "tifffile",
     "typer>=0.15",
     "torch",
@@ -29,11 +33,14 @@ dependencies = [
     "pyyaml",
 ]
 
+[tool.uv.sources]
+squisher = { workspace = true }
+
 [project.scripts]
-squisher-segment = "fishtools.cli:main"
+squisher-segment = "squisher_segment.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["fishtools"]
+packages = ["squisher_segment"]
 
 [tool.ruff]
 line-length = 110

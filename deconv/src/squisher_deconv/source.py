@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+from xml.etree import ElementTree
 
 import numpy as np
 import tifffile
@@ -28,7 +29,15 @@ class TiffLogicalSource:
     def open(cls, path: Path, *, channels: int, metadata_mode: str = "full") -> "TiffLogicalSource":
         if metadata_mode not in {"full", "summary"}:
             raise ValueError(f"Unsupported metadata_mode={metadata_mode!r}; expected 'full' or 'summary'.")
-        metadata = read_source_metadata(path) if metadata_mode == "full" else _read_summary_metadata(path)
+        if metadata_mode == "summary":
+            with tifffile.TiffFile(path) as tif:
+                metadata, axes = _summary_metadata(path, tif=tif)
+            page_count = None
+        else:
+            metadata = read_source_metadata(path)
+            with tifffile.TiffFile(path) as tif:
+                page_count = len(tif.pages)
+                axes = tif.series[0].axes
         shape = metadata.raw_shape
         if len(shape) < 3:
             raise ValueError(f"{path} must have at least flattened planes plus Y/X, got shape {shape}")
@@ -36,10 +45,7 @@ class TiffLogicalSource:
         plane_count = int(np.prod(shape[:-2]))
         if plane_count % channels:
             raise ValueError(f"{path} has {plane_count} plane(s), not divisible by channels={channels}")
-        with tifffile.TiffFile(path) as tif:
-            page_count = len(tif.pages)
-            axes = tif.series[0].axes
-        if page_count != plane_count:
+        if page_count is not None and page_count != plane_count:
             raise ValueError(
                 f"{path} exposes {page_count} TIFF page(s), but its shaped data declares {plane_count} "
                 "flattened plane(s). squisher-deconv requires one page per flattened z/channel plane "
@@ -77,21 +83,30 @@ class TiffLogicalSource:
                 window = tif.asarray(key=page_keys)
         return window.reshape(stop - start, self.channels, self.height, self.width)
 
+    def page_key(self, *, channel: int, z: int) -> int:
+        if not 0 <= channel < self.channels:
+            raise ValueError(f"Channel {channel} is outside channel count {self.channels}")
+        if not 0 <= z < self.z_count:
+            raise ValueError(f"Z index {z} is outside z_count={self.z_count}")
+        if self._c_axis is None:
+            return z * self.channels + channel
+        if self._z_axis is None:
+            raise RuntimeError("Explicit channel-axis sources must also have a z axis.")
+        index = [0] * len(self._leading_shape)
+        index[self._z_axis] = z
+        index[self._c_axis] = channel
+        return int(np.ravel_multi_index(tuple(index), self._leading_shape))
+
     def _page_keys(self, start: int, stop: int) -> list[int]:
         if self._c_axis is None:
             flat_start = start * self.channels
             flat_stop = stop * self.channels
             return list(range(flat_start, flat_stop))
-        if self._z_axis is None:
-            raise RuntimeError("Explicit channel-axis sources must also have a z axis.")
-        keys: list[int] = []
-        for z_index in range(start, stop):
-            for channel in range(self.channels):
-                index = [0] * len(self._leading_shape)
-                index[self._z_axis] = z_index
-                index[self._c_axis] = channel
-                keys.append(int(np.ravel_multi_index(tuple(index), self._leading_shape)))
-        return keys
+        return [
+            self.page_key(channel=channel, z=z_index)
+            for z_index in range(start, stop)
+            for channel in range(self.channels)
+        ]
 
 
 def _logical_axes(
@@ -124,23 +139,69 @@ def _is_contiguous(keys: list[int]) -> bool:
     return keys == list(range(keys[0], keys[-1] + 1))
 
 
-def _read_summary_metadata(path: Path) -> SourceMetadata:
-    with tifffile.TiffFile(path) as tif:
-        series = tif.series[0]
-        payload = {
-            "metadata_mode": "summary",
-            "raw_shape": tuple(int(v) for v in series.shape),
-            "raw_dtype": str(series.dtype),
-            "axes": series.axes,
-            "page_count": len(tif.pages),
-        }
+def _summary_metadata(path: Path, *, tif: tifffile.TiffFile) -> tuple[SourceMetadata, str]:
+    ome_xml = tif.ome_metadata
+    if ome_xml is None:
+        raise ValueError(f"{path} is missing OME-XML metadata; summary inspection requires OME-TIFF input.")
+    raw_shape, axes = _ome_pixels_shape(path, ome_xml=ome_xml)
+    raw_dtype = str(tif.pages[0].dtype)
+    payload = {
+        "metadata_mode": "summary",
+        "raw_shape": raw_shape,
+        "raw_dtype": raw_dtype,
+        "axes": axes,
+        "page_count_validated": False,
+    }
     encoded = json_dumps_strict(payload, context=f"Summary source metadata for {path}").encode("utf-8")
     return SourceMetadata(
         shaped_metadata=[],
         imagej_metadata=None,
         ome_xml=None,
-        tags={"axes": payload["axes"], "page_count": payload["page_count"], "metadata_mode": "summary"},
-        raw_shape=payload["raw_shape"],
-        raw_dtype=payload["raw_dtype"],
+        tags={
+            "axes": payload["axes"],
+            "metadata_mode": "summary",
+            "page_count_validated": False,
+        },
+        raw_shape=raw_shape,
+        raw_dtype=raw_dtype,
         metadata_hash=hashlib.sha256(encoded).hexdigest(),
-    )
+    ), axes
+
+
+def _ome_pixels_shape(path: Path, *, ome_xml: str) -> tuple[tuple[int, ...], str]:
+    try:
+        root = ElementTree.fromstring(ome_xml)
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"Invalid OME-XML metadata in {path}: {exc}") from exc
+    pixels = next((element for element in root.iter() if _local_name(element.tag) == "Pixels"), None)
+    if pixels is None:
+        raise ValueError(f"OME-XML metadata in {path} does not contain a Pixels element.")
+
+    order = pixels.attrib.get("DimensionOrder")
+    if order is None or not order.startswith("XY"):
+        raise ValueError(f"OME-XML metadata in {path} has unsupported DimensionOrder={order!r}.")
+    sizes = {
+        axis: _ome_axis_size(path, pixels=pixels, axis=axis)
+        for axis in ("X", "Y", "Z", "C", "T")
+    }
+    leading_axes = [axis for axis in reversed(order[2:]) if sizes[axis] > 1]
+    axes = "".join(leading_axes) + "YX"
+    raw_shape = tuple(sizes[axis] for axis in leading_axes) + (sizes["Y"], sizes["X"])
+    return raw_shape, axes
+
+
+def _ome_axis_size(path: Path, *, pixels: ElementTree.Element, axis: str) -> int:
+    value = pixels.attrib.get(f"Size{axis}")
+    if value is None:
+        raise ValueError(f"OME-XML metadata in {path} is missing Size{axis}.")
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid Size{axis} in {path}: {value!r}") from exc
+    if size < 1:
+        raise ValueError(f"Invalid Size{axis} in {path}: {size}")
+    return size
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]

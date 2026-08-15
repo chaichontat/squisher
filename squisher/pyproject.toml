@@ -24,6 +24,9 @@ dependencies = [
 [project.scripts]
 squisher = "squisher:main"
 
+[project.entry-points."zarr.codecs"]
+"squisher.jpegxr" = "squisher.jpegxr_zarr:JpegxrCodec"
+
 [build-system]
 requires = ["uv_build>=0.8.22,<0.9.0"]
 build-backend = "uv_build"

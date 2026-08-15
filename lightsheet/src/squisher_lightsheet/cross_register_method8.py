@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from squisher_lightsheet._legacy.rough_align_tltr_center_z_phase import TileRecord
 from squisher_lightsheet.channel_affine import (
     _block_mean_downsample_zyx_cupy,
     _corr_gpu,
@@ -31,7 +32,6 @@ from squisher_lightsheet.channel_affine import (
 )
 from squisher_lightsheet.native_reg3dgpu import DEFAULT_LIB_DIR, register_method8_device, zyx_to_xyz_3x4
 from squisher_lightsheet.tile_phase import (
-    DIMENSIONS,
     _open_tile_level_array,
     flattened_channel_count,
     raw_axis_slice_for_oriented_slice,
@@ -143,19 +143,17 @@ def quadrant_z_windows(
 
 def preseeded_level0_model(
     *,
-    fixed_record: dict[str, Any],
-    moving_record: dict[str, Any],
+    fixed_tile: TileRecord,
+    moving_tile: TileRecord,
     preseed_matrix_zyx: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    fixed_tile = tile_record_from_position_record(fixed_record)
-    moving_tile = tile_record_from_position_record(moving_record)
     if tuple(fixed_tile.shape_zyx.tolist()) != tuple(moving_tile.shape_zyx.tolist()):
         raise ValueError(
             f"fixed/moving logical tile shapes differ for {fixed_tile.tile}: "
             f"{fixed_tile.shape_zyx.tolist()} vs {moving_tile.shape_zyx.tolist()}"
         )
-    fixed_origin_um = np.asarray([fixed_record["translation_um"][dim] for dim in DIMENSIONS], dtype=np.float64)
-    moving_origin_um = np.asarray([moving_record["translation_um"][dim] for dim in DIMENSIONS], dtype=np.float64)
+    fixed_origin_um = np.asarray(fixed_tile.translation_zyx_um, dtype=np.float64)
+    moving_origin_um = np.asarray(moving_tile.translation_zyx_um, dtype=np.float64)
     fixed_scale_um = np.abs(np.asarray(fixed_tile.scale_zyx_um, dtype=np.float64))
     moving_scale_um = np.abs(np.asarray(moving_tile.scale_zyx_um, dtype=np.float64))
     fixed_center = (np.asarray(fixed_tile.shape_zyx, dtype=np.float64) - 1.0) / 2.0
@@ -634,8 +632,8 @@ def _build_tasks(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[d
             tasks.append(
                 {
                     "task_index": task_index,
-                    "fixed_record": fixed_record,
-                    "moving_record": moving_record,
+                    "fixed_tile": fixed_tile,
+                    "moving_tile": moving_tile,
                     "fixed_channel": int(args.fixed_channel),
                     "moving_channel": int(args.moving_channel),
                     "preseed_matrix_zyx": preseed_matrix.tolist(),
@@ -668,16 +666,14 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
     physical_device = int(task["device"])
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_device)
     started = time.perf_counter()
-    fixed_record = task["fixed_record"]
-    moving_record = task["moving_record"]
-    fixed_tile = tile_record_from_position_record(fixed_record)
-    moving_tile = tile_record_from_position_record(moving_record)
+    fixed_tile = task["fixed_tile"]
+    moving_tile = task["moving_tile"]
     window = task["window"]
     original_fixed_start = np.asarray(window["fixed_start_zyx"], dtype=np.int64)
     original_fixed_stop = np.asarray(window["fixed_stop_zyx"], dtype=np.int64)
     full_matrix, full_translation = preseeded_level0_model(
-        fixed_record=fixed_record,
-        moving_record=moving_record,
+        fixed_tile=fixed_tile,
+        moving_tile=moving_tile,
         preseed_matrix_zyx=np.asarray(task["preseed_matrix_zyx"], dtype=np.float64),
     )
     initialization_source = str(task.get("initialization_source", "preseed"))
@@ -1014,8 +1010,8 @@ def _native_process_error_row(task: dict[str, Any], exitcode: int | None) -> dic
     return {
         "schema_version": 1,
         "artifact_type": "lightsheet.image10_image14_tile_quadrant_method8_window.v1",
-        "fixed_tile": task["fixed_record"]["tile"],
-        "moving_tile": task["moving_record"]["tile"],
+        "fixed_tile": task["fixed_tile"].tile,
+        "moving_tile": task["moving_tile"].tile,
         "quadrant": task["window"]["quadrant"],
         "fixed_start_zyx": task["window"]["fixed_start_zyx"],
         "status": "error",

@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 import numpy as np
+from squisher.jpegxr_zarr import register_jpegxr_codec
 from squisher_lightsheet import qc as qc_core
 
 
@@ -72,6 +73,7 @@ def parse_args(
     parser.add_argument("--skip-global-projections", action="store_true")
     parser.add_argument("--full-affine-planes", action="store_true", help="Render QC planes by resampling through the full affine.")
     parser.add_argument("--center-z-only", action="store_true", help="For --full-affine-planes, render only the center-z XY PNG.")
+    parser.add_argument("--draw-tile-labels", action="store_true")
     return parser.parse_args()
 
 
@@ -265,6 +267,11 @@ def compact_tile_label(tile_name: str) -> str:
     return stem
 
 
+def tile_index_label(tile_name: str) -> str:
+    stem = tile_name.removesuffix(".ome.zarr").removesuffix(".ome.tif").removesuffix(".tif")
+    return stem.rsplit(".", 1)[-1]
+
+
 def draw_overlay_labels(image: Any, labels: list[OverlayLabel], *, y_scale: float = 1.0) -> None:
     from PIL import ImageDraw
 
@@ -334,7 +341,7 @@ def global_projection_labels(tile_name: str, start_zyx: np.ndarray, block_shape:
 
 def plane_label(tile_name: str, start_yx: tuple[int, int], image_shape_yx: tuple[int, int]) -> OverlayLabel:
     return OverlayLabel(
-        compact_tile_label(tile_name),
+        tile_index_label(tile_name),
         (
             float(start_yx[0]) + float(image_shape_yx[0]) / 2.0,
             float(start_yx[1]) + float(image_shape_yx[1]) / 2.0,
@@ -497,6 +504,7 @@ def render_full_affine_planes(
     center_y_um: float,
     z_display_scale: float,
     center_z_only: bool = False,
+    draw_tile_labels: bool = False,
 ) -> tuple[list[str], Path, list[dict[str, Any]]]:
     xy_canvases = {side: np.zeros((geometry.shape_zyx[1], geometry.shape_zyx[2]), dtype=np.float32) for side in SIDES}
     xz_canvases = (
@@ -523,7 +531,8 @@ def render_full_affine_planes(
         )
         if in_xy:
             place_max(xy_canvases[side], xy, xy_start)
-            xy_labels.append(plane_label(tile.path.name, xy_start, xy.shape))
+            if draw_tile_labels:
+                xy_labels.append(plane_label(tile.path.name, xy_start, xy.shape))
         in_xz = False
         if xz_canvases is not None:
             xz, xz_start, in_xz = sample_full_affine_plane(
@@ -537,7 +546,8 @@ def render_full_affine_planes(
             )
             if in_xz:
                 place_max(xz_canvases[side], xz, xz_start)
-                xz_labels.append(plane_label(tile.path.name, xz_start, xz.shape))
+                if draw_tile_labels:
+                    xz_labels.append(plane_label(tile.path.name, xz_start, xz.shape))
         metadata_rows.append(
             {
                 "tile": tile.path.name,
@@ -582,6 +592,7 @@ def main(
     default_registration_input: Path | None = None,
     default_output_dir: Path | None = None,
 ) -> int:
+    register_jpegxr_codec()
     args = parse_args(
         default_position_input=default_position_input,
         default_registration_input=default_registration_input,
@@ -633,6 +644,7 @@ def main(
             center_y_um=center_y_um,
             z_display_scale=z_display_scale,
             center_z_only=bool(args.center_z_only),
+            draw_tile_labels=bool(args.draw_tile_labels),
         )
         summary = {
             "position_input": str(args.position_input.resolve()),

@@ -310,7 +310,10 @@ def _deconv_channel_count(source: Path) -> int:
     if not sidecar.exists():
         return 1
     payload = json.loads(sidecar.read_text())
-    channels = int(payload.get("provenance", {}).get("channels", 1))
+    try:
+        channels = int(payload["provenance"]["run_settings"]["channels"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{sidecar} is missing a valid provenance.run_settings.channels value") from error
     if channels < 1:
         raise ValueError(f"{sidecar} records invalid channel count {channels}")
     return channels

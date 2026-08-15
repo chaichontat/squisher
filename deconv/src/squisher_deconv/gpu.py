@@ -39,7 +39,7 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
         import cupy as cp
 
         cp.cuda.Device(device).use()
-        _initialize_cupy_allocator(cp)
+        self._memory_pool, self._pinned_memory_pool = _initialize_cupy_allocator(cp)
         self._cp = cp
         self._device = int(device)
         self._iterations = int(iterations)
@@ -86,6 +86,12 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
             raise ValueError(f"Invalid core slice [{core_start}, {core_stop}) for input shape {volume.shape}")
         result = self._deconvolve_gpu(volume)
         return _quantize_global_gpu(result[core_start:core_stop], scaling, cp=self._cp)
+
+    def release_memory(self) -> None:
+        """Release unused CuPy blocks before retrying with a smaller slab."""
+        self._cp.cuda.Device(self._device).use()
+        self._memory_pool.free_all_blocks()
+        self._pinned_memory_pool.free_all_blocks()
 
     def _deconvolve_gpu(self, volume: np.ndarray) -> Any:
         if volume.ndim != 4:
@@ -149,12 +155,13 @@ def _conda_cuda_target(prefix: Path) -> Path | None:
     return None
 
 
-def _initialize_cupy_allocator(cp: Any) -> None:
+def _initialize_cupy_allocator(cp: Any) -> tuple[Any, Any]:
     cuda = cp.cuda
     pool = cuda.MemoryPool()
     cuda.set_allocator(pool.malloc)
     pinned_pool = cuda.PinnedMemoryPool()
     cuda.set_pinned_memory_allocator(pinned_pool.malloc)
+    return pool, pinned_pool
 
 
 def _load_basic_profiles(paths: Sequence[Path], *, cp: Any) -> tuple[Any, Any]:

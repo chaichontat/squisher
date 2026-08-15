@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
@@ -9,7 +10,47 @@ import pytest
 import zarr
 
 from squisher_lightsheet import qc
+from squisher_lightsheet._legacy import render_lr_level4_registration_qc as legacy_qc
 from squisher_lightsheet.qc import side_by_tile
+
+
+def test_registration_qc_registers_jpegxr_before_parsing(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class StopAfterParse(RuntimeError):
+        pass
+
+    def fake_parse_args(**_kwargs):
+        calls.append("parse")
+        raise StopAfterParse
+
+    monkeypatch.setattr(legacy_qc, "register_jpegxr_codec", lambda: calls.append("register"), raising=False)
+    monkeypatch.setattr(legacy_qc, "parse_args", fake_parse_args)
+
+    with pytest.raises(StopAfterParse):
+        legacy_qc.main()
+
+    assert calls == ["register", "parse"]
+
+
+def test_registration_qc_tile_labels_are_opt_in(tmp_path, monkeypatch) -> None:
+    defaults = {
+        "default_position_input": tmp_path / "positions.json",
+        "default_registration_input": tmp_path / "registration.json",
+        "default_output_dir": tmp_path / "output",
+    }
+    monkeypatch.setattr(sys, "argv", ["qc"])
+    assert legacy_qc.parse_args(**defaults).draw_tile_labels is False
+
+    monkeypatch.setattr(sys, "argv", ["qc", "--draw-tile-labels"])
+    assert legacy_qc.parse_args(**defaults).draw_tile_labels is True
+
+
+def test_full_affine_plane_label_uses_tile_index_only() -> None:
+    label = legacy_qc.plane_label("234-405-5.019.ome.zarr", (10, 20), (40, 60))
+
+    assert label.text == "019"
+    assert label.yx == (30.0, 50.0)
 
 
 def test_side_lookup_uses_resolved_paths_for_duplicate_basenames() -> None:
@@ -124,6 +165,112 @@ def test_render_fused_tile_index_overlay_uses_ngff_level_coordinates(tmp_path) -
     assert summary["drawn_count"] == 2
     assert [record["label"] for record in summary["records"]] == ["0", "1"]
     np.testing.assert_allclose(summary["records"][0]["center_level_zyx"], [1.0, 5.0, 6.0])
+
+
+def test_render_fused_tile_index_overlay_can_omit_text_labels(tmp_path) -> None:
+    fused = tmp_path / "fused.ome.zarr"
+    root = zarr.open_group(fused, mode="w")
+    array = root.create_array("0", shape=(1, 24, 24), chunks=(1, 12, 12), dtype="uint16")
+    array[:] = 100
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0, 1.0, 1.0]},
+                            {"type": "translation", "translation": [0.0, 0.0, 0.0]},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    registration = tmp_path / "registration.json"
+    registration.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "Image_10.123.ome.zarr",
+                        "shape": [1, 2, 2],
+                        "stage_translation_um": {"z": -0.5, "y": 11.0, "x": 11.0},
+                        "stage_scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                        "registered_affine": {"matrix": np.eye(4).tolist()},
+                    }
+                ]
+            }
+        )
+    )
+
+    output = qc.render_fused_tile_index_overlay(
+        fused_zarr=fused,
+        registration_input=registration,
+        draw_labels=False,
+        level=0,
+    )
+
+    pixels = np.asarray(Image.open(output))
+    assert not np.any(np.all(pixels == (255, 255, 255), axis=-1))
+    assert np.any(np.all(pixels == (255, 210, 0), axis=-1))
+    assert json.loads(output.with_suffix(".json").read_text())["labels"] == "none"
+
+
+def test_render_fused_tile_index_overlay_can_omit_tile_markers(tmp_path) -> None:
+    fused = tmp_path / "fused.ome.zarr"
+    root = zarr.open_group(fused, mode="w")
+    array = root.create_array("0", shape=(1, 24, 24), chunks=(1, 12, 12), dtype="uint16")
+    array[:] = 100
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0, 1.0, 1.0]},
+                            {"type": "translation", "translation": [0.0, 0.0, 0.0]},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    registration = tmp_path / "registration.json"
+    registration.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "Image_10.123.ome.zarr",
+                        "shape": [1, 2, 2],
+                        "stage_translation_um": {"z": -0.5, "y": 11.0, "x": 11.0},
+                        "stage_scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                        "registered_affine": {"matrix": np.eye(4).tolist()},
+                    }
+                ]
+            }
+        )
+    )
+
+    output = qc.render_fused_tile_index_overlay(
+        fused_zarr=fused,
+        registration_input=registration,
+        draw_labels=False,
+        draw_markers=False,
+        level=0,
+    )
+
+    pixels = np.asarray(Image.open(output))
+    assert not np.any(np.all(pixels == (255, 210, 0), axis=-1))
+    summary = json.loads(output.with_suffix(".json").read_text())
+    assert summary["labels"] == "none"
+    assert summary["markers"] == "none"
 
 
 def test_render_fused_xyz_overlay_qc_writes_native_contact_sheets(tmp_path) -> None:

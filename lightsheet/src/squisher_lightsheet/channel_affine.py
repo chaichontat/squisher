@@ -1809,6 +1809,47 @@ def _model_to_fit_downsample(
     return scale @ matrix @ inverse_scale, scale @ translation
 
 
+def moving_xy_center_slab_z_pivot_in_fit_zyx(
+    *,
+    moving_full_shape_zyx: np.ndarray,
+    moving_crop_start_zyx: np.ndarray,
+    crop_shape_zyx: np.ndarray,
+    local_matrix_zyx: np.ndarray,
+    local_translation_zyx: np.ndarray,
+    fit_downsample_zyx: tuple[int, int, int],
+) -> np.ndarray:
+    """Map the moving-image XY center and current slab Z center into the fit crop.
+
+    The local affine is the centered moving-to-fixed model for the
+    undownsampled crops, so it already incorporates the fixed crop start.
+    Block means represent input block centers; the final conversion therefore
+    includes the half-block offset rather than only dividing by the factor.
+    """
+    full_shape = np.asarray(moving_full_shape_zyx, dtype=np.float64)
+    moving_start = np.asarray(moving_crop_start_zyx, dtype=np.float64)
+    crop_shape = np.asarray(crop_shape_zyx, dtype=np.int64)
+    matrix = np.asarray(local_matrix_zyx, dtype=np.float64)
+    translation = np.asarray(local_translation_zyx, dtype=np.float64)
+    factors = np.asarray(_validate_fit_downsample_zyx(fit_downsample_zyx), dtype=np.float64)
+    if full_shape.shape != (3,) or moving_start.shape != (3,) or crop_shape.shape != (3,):
+        raise ValueError("moving shape, crop start, and crop shape must be zyx vectors")
+    if matrix.shape != (3, 3) or translation.shape != (3,):
+        raise ValueError("local affine must contain a 3x3 matrix and a zyx translation")
+    if np.any(full_shape < 1) or np.any(crop_shape < 1):
+        raise ValueError("moving and crop shapes must be positive")
+    if np.any(crop_shape % factors.astype(np.int64)):
+        raise ValueError(
+            f"crop_shape_zyx={crop_shape.tolist()} must be divisible by fit_downsample_zyx={factors.astype(int).tolist()}"
+        )
+
+    crop_center = (crop_shape.astype(np.float64) - 1.0) / 2.0
+    moving_pivot_local = (full_shape - 1.0) / 2.0 - moving_start
+    moving_pivot_local[0] = crop_center[0]
+    fixed_center_local = matrix @ (moving_pivot_local - crop_center) + crop_center + translation
+    block_center_offset = (factors - 1.0) / 2.0
+    return ((fixed_center_local - block_center_offset) / factors).astype(np.float32)
+
+
 def _native_pull_from_fit_downsample(
     matrix_zyx: np.ndarray,
     offset_zyx: np.ndarray,

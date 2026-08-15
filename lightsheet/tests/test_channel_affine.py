@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -461,6 +462,178 @@ def test_native_method8_device_accepts_cupy_buffers() -> None:
     np.testing.assert_allclose(np.diag(result.matrix_xyz_3x4[:, :3]), [1.0, 1.0, 1.0], atol=1e-5)
 
 
+def test_native_method6_device_accepts_masked_cupy_buffers() -> None:
+    _skip_without_cuda()
+    cp = pytest.importorskip("cupy")
+    z, y, x = 6, 7, 8
+    zz, yy, xx = np.indices((z, y, x), dtype=np.float32)
+    fixed = (
+        0.17 * (xx + 1)
+        + 0.11 * (yy * yy + 1)
+        + 0.07 * (zz + 3)
+        + 0.03 * ((xx * yy + zz) % 5)
+    ).astype(np.float32)
+    fixed_gpu = cp.ascontiguousarray(cp.asarray(fixed))
+    moving_gpu = cp.ascontiguousarray(cp.asarray(fixed))
+    fixed_mask_gpu = cp.ones_like(fixed_gpu)
+    fixed_mask_gpu[:, :2, :2] = 0.0
+
+    result = native_reg3dgpu.register_method6_device(
+        fixed_gpu,
+        moving_gpu,
+        fixed_mask_zyx=fixed_mask_gpu,
+        max_iterations=3,
+        ftol=1e-2,
+        device=0,
+    )
+
+    assert result.return_code == 0
+    assert isinstance(result.registered_zyx, cp.ndarray)
+    assert result.registered_zyx.shape == fixed.shape
+    assert bool(cp.asnumpy(cp.isfinite(result.registered_zyx).all()))
+    assert np.all(np.isfinite(result.matrix_xyz_3x4))
+    assert np.all(np.isfinite(result.records[1:4]))
+
+
+def test_native_method6_device_matches_host_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    _skip_without_cuda()
+    cp = pytest.importorskip("cupy")
+    z, y, x = 6, 7, 8
+    zz, yy, xx = np.indices((z, y, x), dtype=np.float32)
+    fixed = (
+        0.17 * (xx + 1)
+        + 0.11 * (yy * yy + 1)
+        + 0.07 * (zz + 3)
+        + 0.03 * ((xx * yy + zz) % 5)
+    ).astype(np.float32)
+    fixed_gpu = cp.ascontiguousarray(cp.asarray(fixed))
+    moving_gpu = cp.ascontiguousarray(cp.asarray(fixed))
+    pivot_zyx = np.asarray([1.25, 2.5, 3.75], dtype=np.float32)
+    host = native_reg3dgpu._run_reg_3dgpu(
+        fixed,
+        fixed,
+        aff_method=6,
+        lib_dir=native_reg3dgpu.DEFAULT_LIB_DIR,
+        ftol=1e-2,
+        max_iterations=3,
+        device=0,
+        tmx_only=False,
+        aff_pivot_zyx=pivot_zyx,
+    )
+
+    def reject_host_copy(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Method 6 device inputs must not be copied to host")
+
+    monkeypatch.setattr(cp, "asnumpy", reject_host_copy)
+    device = native_reg3dgpu.register_method6_device(
+        fixed_gpu,
+        moving_gpu,
+        max_iterations=3,
+        ftol=1e-2,
+        device=0,
+        aff_pivot_zyx=pivot_zyx,
+    )
+
+    assert host.return_code == device.return_code == 0
+    np.testing.assert_allclose(device.matrix_xyz_3x4, host.matrix_xyz_3x4, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(device.records[1:4], host.records[1:4], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(device.registered_zyx.get(), host.registered_zyx, rtol=1e-6, atol=1e-6)
+
+
+def _mattes_device_fixture(cp: Any) -> tuple[Any, Any, Any]:
+    zz, yy, xx = np.indices((12, 12, 12), dtype=np.float32)
+    dx = (xx - np.float32(0.43 * 12)) / np.float32(12)
+    dy = (yy - np.float32(0.51 * 12)) / np.float32(12)
+    dz = (zz - np.float32(0.47 * 12)) / np.float32(12)
+    fixed = (
+        np.exp(-35.0 * (dx * dx + dy * dy + dz * dz))
+        + 0.35 * np.sin(0.71 * xx + 0.31 * yy + 0.17 * zz)
+        + 0.2 * np.cos(0.23 * xx - 0.53 * zz)
+    ).astype(np.float32)
+    moving = (np.exp(fixed) + 0.1 * fixed).astype(np.float32)
+    mask = np.ones_like(fixed)
+    mask[:, 0, :] = 0.0
+    mask[:, :, 0] = 0.0
+    fixed[0, 0, 3] = np.nan
+    mask[0, 0, 5] = np.nan
+    return (
+        cp.ascontiguousarray(cp.asarray(fixed)),
+        cp.ascontiguousarray(cp.asarray(moving)),
+        cp.ascontiguousarray(cp.asarray(mask)),
+    )
+
+
+def test_native_method10_mattes_device_accepts_masked_cupy_buffers() -> None:
+    _skip_without_cuda()
+    cp = pytest.importorskip("cupy")
+    fixed_gpu, moving_gpu, fixed_mask_gpu = _mattes_device_fixture(cp)
+
+    result = native_reg3dgpu.register_method10_mattes_device(
+        fixed_gpu,
+        moving_gpu,
+        fixed_mask_zyx=fixed_mask_gpu,
+        histogram_bins=16,
+        sample_count=1_024,
+        max_iterations=5,
+        ftol=1e-2,
+        device=0,
+    )
+
+    assert result.return_code == 0
+    assert isinstance(result.registered_zyx, cp.ndarray)
+    assert result.registered_zyx.shape == fixed_gpu.shape
+    assert bool(cp.asnumpy(cp.isfinite(result.registered_zyx).all()))
+
+
+def test_native_method10_translation_only_preserves_initial_shear() -> None:
+    _skip_without_cuda()
+    cp = pytest.importorskip("cupy")
+    fixed_gpu, moving_gpu, fixed_mask_gpu = _mattes_device_fixture(cp)
+    initial_matrix_zyx = np.asarray(
+        [[1.0, 0.015, -0.01], [0.015, 1.0, 0.02], [-0.01, 0.02, 1.0]],
+        dtype=np.float32,
+    )
+    initial = native_reg3dgpu.zyx_to_xyz_3x4(initial_matrix_zyx, np.asarray([0.5, -0.25, 0.75]))
+
+    result = native_reg3dgpu.register_method10_mattes_device(
+        fixed_gpu,
+        moving_gpu,
+        fixed_mask_zyx=fixed_mask_gpu,
+        histogram_bins=16,
+        sample_count=1_024,
+        max_iterations=5,
+        ftol=1e-2,
+        device=0,
+        initial_matrix_xyz_3x4=initial,
+        translation_only=True,
+    )
+
+    assert result.return_code == 0
+    np.testing.assert_array_equal(result.matrix_zyx, initial_matrix_zyx)
+
+
+def test_native_method11_mattes_device_accepts_masked_cupy_buffers() -> None:
+    _skip_without_cuda()
+    cp = pytest.importorskip("cupy")
+    fixed_gpu, moving_gpu, fixed_mask_gpu = _mattes_device_fixture(cp)
+
+    result = native_reg3dgpu.register_method11_mattes_device(
+        fixed_gpu,
+        moving_gpu,
+        fixed_mask_zyx=fixed_mask_gpu,
+        histogram_bins=16,
+        sample_count=1_024,
+        max_iterations=5,
+        ftol=1e-2,
+        device=0,
+    )
+
+    assert result.return_code == 0
+    assert isinstance(result.registered_zyx, cp.ndarray)
+    assert result.registered_zyx.shape == fixed_gpu.shape
+    assert bool(cp.asnumpy(cp.isfinite(result.registered_zyx).all()))
+
+
 def test_moving_crop_start_uses_inverse_affine() -> None:
     start = moving_crop_start_for_fixed_crop(
         fixed_start_zyx=np.asarray([100, 240, 240]),
@@ -472,6 +645,51 @@ def test_moving_crop_start_uses_inverse_affine() -> None:
     )
 
     np.testing.assert_array_equal(start, [100, 52, 322])
+
+
+def test_xy_center_slab_z_pivot_maps_forward_affine_into_fit_crop() -> None:
+    full_shape = np.asarray([101, 201, 301])
+    moving_start = np.asarray([11, 37, 83])
+    fixed_start = np.asarray([23, 41, 59])
+    crop_shape = np.asarray([40, 80, 120])
+    factors = (2, 4, 5)
+    matrix = np.asarray(
+        [[1.0, 0.1, -0.02], [-0.04, 0.98, 0.03], [0.02, -0.01, 1.01]],
+        dtype=np.float64,
+    )
+    global_offset = np.asarray([7.0, -13.0, 19.0])
+    crop_center = (crop_shape - 1.0) / 2.0
+    local_offset = global_offset + matrix @ moving_start - fixed_start
+    local_translation = local_offset - crop_center + matrix @ crop_center
+
+    pivot = channel_affine.moving_xy_center_slab_z_pivot_in_fit_zyx(
+        moving_full_shape_zyx=full_shape,
+        moving_crop_start_zyx=moving_start,
+        crop_shape_zyx=crop_shape,
+        local_matrix_zyx=matrix,
+        local_translation_zyx=local_translation,
+        fit_downsample_zyx=factors,
+    )
+
+    moving_pivot = (full_shape - 1.0) / 2.0
+    moving_pivot[0] = moving_start[0] + crop_center[0]
+    fixed_center = matrix @ moving_pivot + global_offset
+    block_center_offset = (np.asarray(factors) - 1.0) / 2.0
+    expected = (fixed_center - fixed_start - block_center_offset) / np.asarray(factors)
+    np.testing.assert_allclose(pivot, expected, rtol=0.0, atol=1e-6)
+
+
+def test_xy_center_slab_z_pivot_respects_chopped_crop_and_block_centers() -> None:
+    pivot = channel_affine.moving_xy_center_slab_z_pivot_in_fit_zyx(
+        moving_full_shape_zyx=np.asarray([101, 201, 301]),
+        moving_crop_start_zyx=np.asarray([10, 40, 90]),
+        crop_shape_zyx=np.asarray([40, 80, 120]),
+        local_matrix_zyx=np.eye(3),
+        local_translation_zyx=np.zeros(3),
+        fit_downsample_zyx=(2, 4, 5),
+    )
+
+    np.testing.assert_allclose(pivot, [9.5, 14.625, 11.6], rtol=0.0, atol=1e-6)
 
 
 def test_content_crop_selection_prefers_high_content_supported_window() -> None:

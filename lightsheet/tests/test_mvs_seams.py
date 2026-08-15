@@ -583,15 +583,23 @@ def test_cached_zarr_reader_uses_multiscales_dataset_paths(tmp_path) -> None:
     level1 = level0[:, ::2, ::2] + 1000
     root = zarr.open_group(str(path), mode="w", zarr_format=3)
     for name, data in (("scale0", level0), ("scale1", level1)):
-        array = root.create_array(name, shape=data.shape, dtype=data.dtype, chunks=(2, 4, 4))
+        array = root.create_array(
+            name,
+            shape=data.shape,
+            dtype=data.dtype,
+            chunks=(2, 4, 4),
+            dimension_names=("z", "y", "x"),
+        )
         array[:] = data
-        array.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
-    root.attrs["multiscales"] = [
-        {
-            "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
-            "datasets": [{"path": "scale0"}, {"path": "scale1"}],
-        }
-    ]
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [{"path": "scale0"}, {"path": "scale1"}],
+            }
+        ],
+    }
 
     cache = mvs_seams._ImageLevelReaderCache()
     try:

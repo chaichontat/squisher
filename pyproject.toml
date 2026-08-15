@@ -1,2 +1,5 @@
 [tool.uv.workspace]
 members = ["squisher", "lightsheet", "lightsheet-psf", "deconv", "segment"]
+
+[tool.uv]
+override-dependencies = ["scipy>=1.16.0"]

@@ -15,7 +15,7 @@ from numpy.random import Generator
 from scipy.ndimage import zoom
 from tifffile import imwrite
 
-from fishtools.segment.extract_support import ProgressReporter, progress_reporter, wrap_progress
+from squisher_segment.segment.extract_support import ProgressReporter, progress_reporter, wrap_progress
 
 """Shared helpers for the `segment.extract` module."""
 

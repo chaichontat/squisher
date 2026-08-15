@@ -20,33 +20,13 @@ References:
 """
 
 import logging
-import re
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import distributed
 from distributed import WorkerPlugin
 
-
-_PLAN_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
-
-
-def sanitize_device_name(name: str) -> str:
-    sanitized = _PLAN_SANITIZE_PATTERN.sub("_", name).strip("_")
-    return sanitized or "cuda"
-
-
-def plan_path_for_device(model_path: Path, device_name: str) -> Path:
-    return model_path.with_name(f"{model_path.name}-{sanitize_device_name(device_name)}.plan")
-
-
-def _is_cellpose_sam() -> bool:
-    try:
-        cellpose_version = version("cellpose")
-    except PackageNotFoundError:
-        return False
-    return cellpose_version.startswith("4.") or "dev" in cellpose_version
+from squisher_segment.segment.model_artifacts import plan_path_for_device
 
 
 def _get_worker_logger() -> logging.Logger:
@@ -69,12 +49,10 @@ def _get_worker_logger() -> logging.Logger:
 
 
 def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
-    """Instantiate a PackedCellpose model, preferring TensorRT plans when available."""
+    """Instantiate a packed Cellpose model from the required TensorRT plan."""
     import torch
     from cellpose.contrib.packed_infer import (
-        PackedCellposeModel,
         PackedCellposeModelTRT,
-        PackedCellposeUNetModel,
         PackedCellposeUNetModelTRT,
     )
 
@@ -88,44 +66,30 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
         raise ValueError("model_kwargs must include 'pretrained_model'.")
 
     pretrained_path = Path(pretrained_model)
-    resolved_kwargs["pretrained_model"] = str(pretrained_path)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. TensorRT requires CUDA.")
     if torch.cuda.device_count() == 0:
         raise RuntimeError("No CUDA devices found. TensorRT requires a GPU.")
 
-    device_index = 0
-    device_name = torch.cuda.get_device_name(device_index)
+    device_name = torch.cuda.get_device_name(0)
     plan_candidate = plan_path_for_device(pretrained_path, device_name)
 
-    plan_selection: tuple[Path, str] | None = None
-    if plan_candidate.is_file():
-        plan_selection = (plan_candidate, device_name)
+    if not plan_candidate.is_file():
+        raise FileNotFoundError(
+            f"TensorRT plan required. Expected plan at {plan_candidate} for the current GPU."
+        )
 
-    backend_to_classes = {
-        "sam": (PackedCellposeModel, PackedCellposeModelTRT),
-        "unet": (PackedCellposeUNetModel, PackedCellposeUNetModelTRT),
-    }
-    base_cls, trt_cls = backend_to_classes[backend]
-
-    if plan_selection is not None:
-        plan_path, device_name = plan_selection
-        _get_worker_logger().info(f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'")
-        trt_kwargs = dict(resolved_kwargs)
-        trt_kwargs["pretrained_model"] = str(plan_path)
-        trt_kwargs.setdefault("gpu", True)
-        return trt_cls(**trt_kwargs)
-
-    raise FileNotFoundError(
-        f"TensorRT plan required. Expected plan at {plan_candidate} for the current GPU."
+    _get_worker_logger().info(
+        f"Using TensorRT plan {plan_candidate.name} for CUDA device '{device_name}'"
     )
-
-    if backend == "sam" and _is_cellpose_sam():
-        resolved_kwargs.pop("pretrained_model_ortho", None)
-
+    resolved_kwargs["pretrained_model"] = str(plan_candidate)
     resolved_kwargs.setdefault("gpu", True)
-    return base_cls(**resolved_kwargs)
+    trt_class = {
+        "sam": PackedCellposeModelTRT,
+        "unet": PackedCellposeUNetModelTRT,
+    }[backend]
+    return trt_class(**resolved_kwargs)
 
 
 def get_cached_model(model_kwargs: dict[str, Any]):

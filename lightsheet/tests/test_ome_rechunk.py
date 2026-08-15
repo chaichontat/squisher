@@ -64,7 +64,9 @@ def test_rechunk_ome_tiff_uses_deconv_sidecar_channels_for_flattened_zyx(tmp_pat
     data = np.arange(2 * 5 * 9 * 10, dtype=np.uint16).reshape(10, 9, 10)
     source = tmp_path / "tile0.ome.tif"
     tifffile.imwrite(source, data, metadata={"axes": "ZYX"})
-    source.with_suffix(".deconv.json").write_text(json.dumps({"provenance": {"channels": 2}}))
+    source.with_suffix(".deconv.json").write_text(
+        json.dumps({"provenance": {"run_settings": {"channels": 2}}})
+    )
 
     summary = rechunk_ome_tiffs(
         inputs=[source],
