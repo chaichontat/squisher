@@ -1,4 +1,5 @@
 import json
+import warnings
 from pathlib import Path
 
 import dask
@@ -6,6 +7,7 @@ import numpy as np
 import pytest
 import zarr
 from click.testing import CliRunner as ClickCliRunner
+from dask.array.core import PerformanceWarning
 from typer.testing import CliRunner as TyperCliRunner
 
 from squisher_segment.cli import app
@@ -889,6 +891,64 @@ def test_relabel_write_preserves_large_zarr_chunks(tmp_path: Path) -> None:
 
     output = zarr.open_array(tmp_path / "output.zarr", mode="r")
     np.testing.assert_array_equal(output[:], data)
+
+
+def test_relabel_write_owns_each_ragged_zarr_chunk(tmp_path: Path) -> None:
+    data = np.arange(13 * 100 * 100, dtype=np.uint32).reshape(13, 100, 100)
+    temp = zarr.create_array(
+        tmp_path / "temp.zarr",
+        data=data,
+        chunks=(6, 70, 50),
+    )
+    lut_path = tmp_path / "labels.npy"
+    np.save(lut_path, np.arange(data.size, dtype=np.uint32))
+
+    with (
+        dask.config.set({"array.chunk-size": "1KiB"}),
+        warnings.catch_warnings(),
+    ):
+        warnings.simplefilter("error", PerformanceWarning)
+        merge_utils.relabel_and_write(
+            temp,
+            lut_path,
+            tmp_path / "output.zarr",
+        )
+
+    output = zarr.open_array(tmp_path / "output.zarr", mode="r")
+    np.testing.assert_array_equal(output[:], data)
+
+
+def test_writer_rechunks_to_ragged_destination_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = np.zeros((13, 100, 100), dtype=np.uint32)
+    source = dask.array.from_array(data, chunks=(5, 40, 40))
+    output = zarr.create_array(
+        tmp_path / "output.zarr",
+        shape=data.shape,
+        chunks=(6, 70, 50),
+        dtype=data.dtype,
+    )
+    captured: dict[str, object] = {}
+
+    def capture_store(
+        array: dask.array.Array,
+        target: zarr.Array,
+        *,
+        lock: bool,
+    ) -> None:
+        captured.update(chunks=array.chunks, target=target, lock=lock)
+
+    monkeypatch.setattr(dask.array.Array, "store", capture_store)
+
+    merge_utils.write_dask_to_zarr(source, output)
+
+    assert captured == {
+        "chunks": ((6, 6, 1), (70, 30), (50, 50)),
+        "target": output,
+        "lock": False,
+    }
 
 
 def test_sparse_global_labels_decode_to_bounded_block_labels() -> None:

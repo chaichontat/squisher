@@ -67,9 +67,7 @@ def create_zarr_array(
 
 def write_dask_to_zarr(array: dask.array.Array, output: zarr.Array) -> None:
     """Write whole Zarr chunks so concurrent tasks cannot clobber partial writes."""
-    chunk_nbytes = int(np.prod(output.chunks, dtype=np.int64)) * output.dtype.itemsize
-    with dask.config.set({"array.chunk-size": chunk_nbytes}):
-        dask.array.to_zarr(array, output, overwrite=False)
+    array.rechunk(output.chunks).store(output, lock=False)
 
 
 logger = logging.getLogger(__name__)
