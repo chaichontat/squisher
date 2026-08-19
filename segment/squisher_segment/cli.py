@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Annotated
 
@@ -64,8 +63,16 @@ def segment_run(
     threads_per_worker: Annotated[int, typer.Option(help="Threads per worker.")] = 1,
     use_localcuda: Annotated[bool, typer.Option("--use-localcuda/--no-use-localcuda", help="Use dask-cuda LocalCUDACluster when workers_per_gpu<=1.")] = False,
     n_workers: Annotated[int | None, typer.Option(help="LocalCUDACluster worker count.")] = None,
+    target_nz: Annotated[int | None, typer.Option(help="Desired internal Cellpose nz tiles.")] = None,
     target_ny: Annotated[int | None, typer.Option(help="Desired internal Cellpose ny tiles.")] = None,
     target_nx: Annotated[int | None, typer.Option(help="Desired internal Cellpose nx tiles.")] = None,
+    assume_nonempty: Annotated[
+        bool,
+        typer.Option(
+            "--assume-nonempty/--scan-nonempty",
+            help="On a nonempty-cache miss, process every planned block without scanning input.",
+        ),
+    ] = False,
     cellpose_only: Annotated[bool, typer.Option("--cellpose-only/--no-cellpose-only", help="Stop after Cellpose inference.")] = False,
     stagger_seconds: Annotated[float, typer.Option(help="Seconds to stagger worker starts on one GPU.")] = 5.0,
 ) -> None:
@@ -82,8 +89,10 @@ def segment_run(
         threads_per_worker=threads_per_worker,
         use_localcuda=use_localcuda,
         n_workers=n_workers,
+        target_nz=target_nz,
         target_ny=target_ny,
         target_nx=target_nx,
+        assume_nonempty=assume_nonempty,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
     )
@@ -99,23 +108,7 @@ def segment_stitch(
     from squisher_segment.segmentation.distributed import distributed_segmentation as segment_mod
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
-    if not (temp_dir / "segmentation_unstitched.zarr").exists():
-        raise FileNotFoundError(f"No segmentation_unstitched.zarr found in {temp_dir}")
-    if not (temp_dir / "intermediate_state.npz").exists():
-        raise FileNotFoundError(f"No intermediate_state.npz found in {temp_dir}")
-    run_identity = segment_mod.load_run_identity(temp_dir / "run_config.json")
-    if overwrite:
-        segment_mod.completion_marker_path(output_path).unlink(missing_ok=True)
-    elif segment_mod.completed_run_matches(output_path, run_identity):
-        logging.getLogger(__name__).info(f"Completed output already matches this run: {output_path}")
-        return
-    elif output_path.exists():
-        raise FileExistsError(f"Output {output_path} already exists; use --overwrite to replace it.")
-
-    segment_mod.stitch_segmentation(temp_dir, output_path)
-    segment_mod.write_completion_marker(output_path, run_identity)
-    if cleanup:
-        shutil.rmtree(temp_dir)
+    segment_mod._run_stitch(temp_dir, output_path, cleanup=cleanup, overwrite=overwrite)
 
 
 @postproc_app.command("run")
@@ -161,6 +154,10 @@ def extract(
     n: Annotated[int, typer.Option(help="Number of sampled tiles/slices for ortho and Zarr modes.")] = 50,
     z_crops_per_file: Annotated[int, typer.Option(help="Random XY crops per Z plane for TIFF z mode.")] = 1,
     anisotropy: Annotated[int, typer.Option(help="Z/YX anisotropy for ortho mode.")] = 6,
+    ortho_depth: Annotated[
+        int | None,
+        typer.Option(help="Exact native Z-plane depth for content-sampled Zarr ortho crops."),
+    ] = None,
     channels: Annotated[str | None, typer.Option(help="Comma-separated channel indices or names.")] = None,
     crop: Annotated[int, typer.Option(help="Pixels to crop from spatial borders before sampling.")] = 0,
     threads: Annotated[int, typer.Option(help="Worker threads for extraction.")] = 8,
@@ -186,6 +183,7 @@ def extract(
         n=n,
         z_crops_per_file=z_crops_per_file,
         anisotropy=anisotropy,
+        ortho_depth=ortho_depth,
         channels=channels,
         crop=crop,
         threads=threads,

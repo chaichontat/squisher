@@ -31,6 +31,7 @@ def run_extract(
     masks: Path | None,
     enrich_boundaries: Path | None,
     aux_channel_stack: Path | None = None,
+    ortho_depth: int | None = None,
 ) -> None:
     """Extract segmentation candidate TIFFs from one registered TIFF or Zarr volume."""
     mode = mode.lower().strip()
@@ -46,6 +47,13 @@ def run_extract(
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
     use_zarr = _is_zarr_path(input_path)
+    if ortho_depth is not None:
+        if mode != "ortho" or not use_zarr:
+            raise click.BadParameter("--ortho-depth is only valid for ortho extraction from Zarr input.")
+        if ortho_depth < 1:
+            raise click.BadParameter("--ortho-depth must be a positive integer.")
+        if enrich_boundaries is not None:
+            raise click.BadParameter("--ortho-depth cannot be combined with --enrich-boundaries.")
     upscale_value = normalize_numeric_options(
         mode=mode,
         dz=dz,
@@ -84,4 +92,5 @@ def run_extract(
         label=label_value,
         masks=masks,
         enrich_boundaries=enrich_boundaries,
+        ortho_depth=ortho_depth,
     )

@@ -65,6 +65,7 @@ class ExtractionConfig:
     upscale: float
     seed: int | None
     threads: int
+    ortho_depth: int | None = None
 
 
 @dataclass

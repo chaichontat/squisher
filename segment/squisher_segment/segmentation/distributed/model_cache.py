@@ -26,7 +26,11 @@ from typing import Any
 import distributed
 from distributed import WorkerPlugin
 
-from squisher_segment.segment.model_artifacts import plan_path_for_device
+from squisher_segment.segment.model_artifacts import (
+    file_sha256,
+    plan_path_for_device,
+    runtime_source_sha256,
+)
 
 
 def _get_worker_logger() -> logging.Logger:
@@ -51,15 +55,12 @@ def _get_worker_logger() -> logging.Logger:
 def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     """Instantiate a packed Cellpose model from the required TensorRT plan."""
     import torch
-    from cellpose.contrib.packed_infer import (
-        PackedCellposeModelTRT,
-        PackedCellposeUNetModelTRT,
-    )
+    from cellpose.contrib.packed_infer import PackedCellposeModelTRT
 
     resolved_kwargs = dict(model_kwargs)
     backend = resolved_kwargs.pop("backend", "sam").lower()
-    if backend not in {"sam", "unet"}:
-        raise ValueError("backend must be either 'sam' or 'unet'.")
+    if backend != "sam":
+        raise ValueError("Distributed segmentation supports only the SAM backend.")
 
     pretrained_model = resolved_kwargs.get("pretrained_model")
     if pretrained_model is None:
@@ -85,11 +86,40 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     )
     resolved_kwargs["pretrained_model"] = str(plan_candidate)
     resolved_kwargs.setdefault("gpu", True)
-    trt_class = {
-        "sam": PackedCellposeModelTRT,
-        "unet": PackedCellposeUNetModelTRT,
-    }[backend]
-    return trt_class(**resolved_kwargs)
+    return PackedCellposeModelTRT(**resolved_kwargs)
+
+
+def _validate_worker_plan(
+    model_kwargs: dict[str, Any],
+    trt_plans: list[dict[str, Any]],
+) -> None:
+    """Ensure this worker's selected device plan is represented in run identity."""
+    import torch
+
+    device_name = torch.cuda.get_device_name(0)
+    plan_path = plan_path_for_device(Path(model_kwargs["pretrained_model"]), device_name).resolve()
+    expected = next(
+        (plan for plan in trt_plans if plan.get("device_name") == device_name),
+        None,
+    )
+    plan_stat = plan_path.stat()
+    if (
+        expected is None
+        or expected.get("path") != str(plan_path)
+        or expected.get("size") != plan_stat.st_size
+        or expected.get("mtime_ns") != plan_stat.st_mtime_ns
+        or expected.get("sha256") != file_sha256(plan_path)
+    ):
+        raise RuntimeError(
+            f"Worker device '{device_name}' selected unrecorded TensorRT plan {plan_path}."
+        )
+
+
+def _validate_worker_sources(expected: dict[str, str]) -> None:
+    actual = runtime_source_sha256()
+    if actual != expected:
+        changed = sorted(name for name in set(actual) | set(expected) if actual.get(name) != expected.get(name))
+        raise RuntimeError(f"Worker inference source differs from run identity: {changed}")
 
 
 def get_cached_model(model_kwargs: dict[str, Any]):
@@ -100,13 +130,19 @@ def get_cached_model(model_kwargs: dict[str, Any]):
     """
     worker = distributed.get_worker()
 
-    if hasattr(worker, "cellpose_model"):
+    if hasattr(worker, "cellpose_model") and getattr(
+        worker, "cellpose_model_kwargs", None
+    ) == model_kwargs:
         return worker.cellpose_model
+
+    if hasattr(worker, "cellpose_model"):
+        del worker.cellpose_model
 
     # Fallback: build and cache (handles case where plugin wasn't registered)
     _get_worker_logger().warning(f"Worker {worker.name}: Model not cached, building fresh")
     model = _build_packed_cellpose_model(model_kwargs)
     worker.cellpose_model = model
+    worker.cellpose_model_kwargs = dict(model_kwargs)
     return model
 
 
@@ -124,21 +160,39 @@ class CellposeModelPlugin(WorkerPlugin):
 
     name = "cellpose-model-cache"
 
-    def __init__(self, model_kwargs: dict[str, Any]):
+    def __init__(
+        self,
+        model_kwargs: dict[str, Any],
+        artifact_key: str,
+        trt_plans: list[dict[str, Any]],
+        source_sha256: dict[str, str],
+    ):
         self.model_kwargs = model_kwargs
+        self.artifact_key = artifact_key
+        self.trt_plans = trt_plans
+        self.source_sha256 = source_sha256
 
     def setup(self, worker):
         """Initialize model when worker starts. Stores on worker.cellpose_model."""
         wlog = _get_worker_logger()
-        if hasattr(worker, "cellpose_model"):
+        _validate_worker_plan(self.model_kwargs, self.trt_plans)
+        _validate_worker_sources(self.source_sha256)
+        if (
+            hasattr(worker, "cellpose_model")
+            and getattr(worker, "cellpose_model_kwargs", None) == self.model_kwargs
+            and getattr(worker, "cellpose_model_artifact_key", None) == self.artifact_key
+        ):
             wlog.info(f"Worker {worker.name}: Model already initialized, skipping")
             return
+        if hasattr(worker, "cellpose_model"):
+            wlog.info(f"Worker {worker.name}: Replacing cached model for new run identity")
+            del worker.cellpose_model
 
-        backend = self.model_kwargs.get("backend", "sam")
-        wlog.info(f"Worker {worker.name}: Initializing CellPose model (backend={backend})")
+        wlog.info(f"Worker {worker.name}: Initializing CellPose SAM model")
         model = _build_packed_cellpose_model(self.model_kwargs)
         worker.cellpose_model = model
-        worker.cellpose_model_kwargs = self.model_kwargs
+        worker.cellpose_model_kwargs = dict(self.model_kwargs)
+        worker.cellpose_model_artifact_key = self.artifact_key
         wlog.info(f"Worker {worker.name}: Model cached on worker.cellpose_model")
 
     def teardown(self, worker):

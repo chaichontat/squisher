@@ -125,6 +125,7 @@ from squisher_segment.segmentation.distributed.merge_utils import (
     stitch_labels,
     create_zarr_array,
     label_zarr_codecs,
+    write_dask_to_zarr,
 )
 
 
@@ -590,7 +591,7 @@ def distributed_postproc(
             overwrite=True,
             codecs=label_zarr_codecs(np.uint32),
         )
-        dask.array.to_zarr(dask.array.from_zarr(temp_zarr), out, overwrite=False)
+        write_dask_to_zarr(dask.array.from_zarr(temp_zarr), out)
         _copy_zarr_metadata(
             input_zarr, write_path, input_path=input_path, postproc_params={**postproc_kwargs, "margin": margin}
         )

@@ -47,6 +47,23 @@ be modified in place while a run is resumable; use `--overwrite` after changing
 input chunk contents. `segment stitch` also requires `--overwrite` before it
 will replace an existing output.
 
+Both modes first reuse a matching nonempty-block cache. On a cache miss, the
+default scans planned blocks and skips empty input. Use `--assume-nonempty` only
+when every planned block is worth segmenting; on a cache miss, it skips that
+scan and sends every block to Cellpose without writing an occupancy cache. The
+selection policy is part of the run identity, so switching modes requires
+`--overwrite`, while scan-produced nonempty caches persist beside the temporary
+run directory and remain reusable across modes. Direct API masks are identified
+by shape, dtype, and content hash so cached block positions cannot cross masks.
+This run-identity schema change also requires pre-feature resumable runs to be
+restarted with `--overwrite`.
+
+Distributed segmentation uses the SAM TensorRT backend. `--target-nz`,
+`--target-ny`, and `--target-nx` control the
+number of internal 256-pixel Cellpose tiles along each spatial axis. XY uses
+`(ny, nx)`, XZ uses `(nz, nx)`, and YZ uses `(nz, ny)`. The resolved ZYX core
+shape is part of the run identity and also determines temporary label chunks.
+
 ## Training configuration
 
 Create `TRAINING_ROOT/models/MODEL_NAME.json` before running `train`. A minimal

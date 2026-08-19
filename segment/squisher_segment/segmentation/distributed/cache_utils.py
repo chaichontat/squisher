@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,32 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Durably replace a small metadata file without exposing partial JSON."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".tmp-",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(text)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def read_nonempty_cache(
@@ -41,7 +69,7 @@ def write_nonempty_cache(
     idxs: list[int],
 ) -> None:
     payload = {"idxs": idxs, "block_size": list(blocksize), "run_key": run_key}
-    path.write_text(json.dumps(payload, indent=2))
+    atomic_write_text(path, json.dumps(payload, indent=2))
 
 
 def read_normalization_cache(path: Path, input_key: str) -> dict[str, Any] | None:
@@ -61,6 +89,10 @@ def write_normalization_cache(
     path: Path,
     input_key: str,
     normalization: dict[str, Any],
+    *,
+    settings: dict[str, Any] | None = None,
 ) -> None:
     payload = {"input_key": input_key, "channels": normalization}
-    path.write_text(json.dumps(payload, indent=2, cls=NumpyEncoder))
+    if settings is not None:
+        payload["settings"] = settings
+    atomic_write_text(path, json.dumps(payload, indent=2, cls=NumpyEncoder))

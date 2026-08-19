@@ -59,12 +59,12 @@ def _find_raw_for_target_tiles(
     if padded_max < padded_min:
         raise ValueError(f"No padded size range for n_target={n_target}")
 
-    if axis == "y":
+    if axis in {"z", "y"}:
         mapper = _padded_from_raw_y
     elif axis == "x":
         mapper = _padded_from_raw_x
     else:
-        raise ValueError("axis must be 'y' or 'x'")
+        raise ValueError("axis must be 'z', 'y', or 'x'")
 
     raw_upper = max(bsize, padded_max + search_margin)
     best_raw: int | None = None
@@ -113,3 +113,34 @@ def solve_internal_xy_for_tiles(
         axis="x",
     )
     return Ly_raw, Lx_raw
+
+
+def solve_internal_zyx_for_tiles(
+    nz_target: int,
+    ny_target: int,
+    nx_target: int,
+    *,
+    bsize: int = 256,
+    tile_overlap: float = 0.1,
+) -> tuple[int, int, int]:
+    """Solve raw ZYX extents for target tiles in Cellpose's orthogonal planes.
+
+    XY uses ``(ny, nx)``, XZ uses ``(nz, nx)``, and YZ uses ``(nz, ny)``.
+    Z is therefore mapped through the same first in-plane padding rule as Y.
+    """
+    if nz_target <= 0 or ny_target <= 0 or nx_target <= 0:
+        raise ValueError("nz_target, ny_target, and nx_target must be positive")
+
+    Lz_raw, _ = _find_raw_for_target_tiles(
+        nz_target,
+        bsize=bsize,
+        tile_overlap=tile_overlap,
+        axis="z",
+    )
+    Ly_raw, Lx_raw = solve_internal_xy_for_tiles(
+        ny_target,
+        nx_target,
+        bsize=bsize,
+        tile_overlap=tile_overlap,
+    )
+    return Lz_raw, Ly_raw, Lx_raw

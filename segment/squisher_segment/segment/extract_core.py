@@ -880,6 +880,103 @@ def _fill_requested_ortho_strips(
     return caches
 
 
+def _fill_requested_ortho_block(
+    *,
+    vol: Volume,
+    mask_vol: MaskLike | None,
+    other_vol: Volume | None,
+    requests: list[OrthoSliceRequest],
+    selected_indices: list[int],
+    aux_channel_vols: list[Volume] | None = None,
+) -> list[OrthoStripCache]:
+    """Read one bounded ZYX block per source and derive its ortho strips.
+
+    All requests must belong to one sampled content crop and therefore share
+    one Z window. This keeps reads bounded while avoiding repeated decoding of
+    overlapping compressed chunks for neighboring ZX and ZY slices.
+    """
+    if not requests:
+        return []
+
+    z_len, y_len, x_len = (int(size) for size in vol.shape[:3])
+    z_bounds = {_ortho_request_z_bounds(request, z_len) for request in requests}
+    if len(z_bounds) != 1:
+        raise ValueError("Blocked ortho requests must share one Z crop window.")
+    z_start, z_stop = z_bounds.pop()
+
+    y_starts: list[int] = []
+    y_stops: list[int] = []
+    x_starts: list[int] = []
+    x_stops: list[int] = []
+    for request in requests:
+        if request.axis == "y":
+            x_start, x_stop, x_step = request.perpendicular_slice.indices(x_len)
+            if x_step != 1 or x_stop <= x_start:
+                raise ValueError("Blocked ortho perpendicular slices must be non-empty with step 1.")
+            y_starts.append(request.position)
+            y_stops.append(request.position + 1)
+            x_starts.append(x_start)
+            x_stops.append(x_stop)
+        else:
+            y_start, y_stop, y_step = request.perpendicular_slice.indices(y_len)
+            if y_step != 1 or y_stop <= y_start:
+                raise ValueError("Blocked ortho perpendicular slices must be non-empty with step 1.")
+            y_starts.append(y_start)
+            y_stops.append(y_stop)
+            x_starts.append(request.position)
+            x_stops.append(request.position + 1)
+
+    y_start, y_stop = min(y_starts), max(y_stops)
+    x_start, x_stop = min(x_starts), max(x_stops)
+    z_slice = slice(z_start, z_stop)
+    y_slice = slice(y_start, y_stop)
+    x_slice = slice(x_start, x_stop)
+
+    cancel_event = get_cancel_event()
+    if cancel_event.is_set():
+        raise TaskCancelledException("Cancelled by user")
+    primary_block = np.asarray(vol[z_slice, y_slice, x_slice, :])
+    channel_blocks = [primary_block[..., channel] for channel in selected_indices]
+    for aux_vol in aux_channel_vols or []:
+        if cancel_event.is_set():
+            raise TaskCancelledException("Cancelled by user")
+        aux_block = np.asarray(aux_vol[z_slice, y_slice, x_slice, :])
+        channel_blocks.extend(aux_block[..., channel] for channel in range(int(aux_block.shape[-1])))
+    if other_vol is not None:
+        if cancel_event.is_set():
+            raise TaskCancelledException("Cancelled by user")
+        other_block = np.asarray(other_vol[z_slice, y_slice, x_slice, :])
+        channel_blocks.append(other_block.max(axis=-1))
+
+    if cancel_event.is_set():
+        raise TaskCancelledException("Cancelled by user")
+    mask_block = None if mask_vol is None else np.asarray(mask_vol[z_slice, y_slice, x_slice])
+    caches: list[OrthoStripCache] = []
+    for request in requests:
+        if request.axis == "y":
+            local_y = request.position - y_start
+            request_x_start, request_x_stop, _step = request.perpendicular_slice.indices(x_len)
+            local_x_start = request_x_start - x_start
+            local_x_stop = request_x_stop - x_start
+            strips = [block[:, local_y, local_x_start:local_x_stop] for block in channel_blocks]
+            mask_strip = None if mask_block is None else mask_block[:, local_y, local_x_start:local_x_stop]
+        else:
+            request_y_start, request_y_stop, _step = request.perpendicular_slice.indices(y_len)
+            local_y_start = request_y_start - y_start
+            local_y_stop = request_y_stop - y_start
+            local_x = request.position - x_start
+            strips = [block[:, local_y_start:local_y_stop, local_x] for block in channel_blocks]
+            mask_strip = None if mask_block is None else mask_block[:, local_y_start:local_y_stop, local_x]
+        caches.append(
+            OrthoStripCache(
+                request=request,
+                channel_strips=[np.asarray(strip, dtype=np.float32) for strip in strips],
+                mask_strip=None if mask_strip is None else np.asarray(mask_strip).copy(),
+            )
+        )
+    return caches
+
+
 def _ortho_request_z_bounds(request: OrthoSliceRequest, z_len: int) -> tuple[int, int]:
     if request.z_slice is None:
         return 0, z_len
@@ -898,6 +995,16 @@ def _z_crop_slice_around(center: int, *, z_len: int, context_pairs: int = Z_CONT
     start = max(0, center - context_pairs)
     stop = min(z_len, center + context_pairs + 1)
     return slice(start, stop)
+
+
+def _fixed_depth_z_slice(center: int, *, z_len: int, depth: int) -> slice:
+    """Return an exact-depth Z window, shifting inward at volume boundaries."""
+    if depth < 1:
+        raise ValueError("Ortho depth must be a positive integer.")
+    if depth > z_len:
+        raise ValueError(f"Ortho depth {depth} cannot exceed volume depth {z_len}.")
+    start = min(max(0, center - depth // 2), z_len - depth)
+    return slice(start, start + depth)
 
 
 def _z_candidates_around(
@@ -978,6 +1085,7 @@ def _write_requested_ortho_slices(
     channels_arg: str | None,
     progress: ProgressReporter | Callable[[], int | None] | None,
     aux_channel_vols: list[Volume] | None = None,
+    read_as_block: bool = False,
 ) -> None:
     if not requests:
         return
@@ -986,7 +1094,8 @@ def _write_requested_ortho_slices(
     out_dir.mkdir(parents=True, exist_ok=True)
     resize_factors = (anisotropy * upscale, upscale)
     reporter = _normalize_reporter(progress)
-    caches = _fill_requested_ortho_strips(
+    fill_requests = _fill_requested_ortho_block if read_as_block else _fill_requested_ortho_strips
+    caches = fill_requests(
         vol=vol,
         mask_vol=mask_vol,
         other_vol=other_vol,
@@ -1022,6 +1131,7 @@ def _execute_extraction(
     upscale: float,
     seed: int | None,
     max_from_path: Path | None,
+    ortho_depth: int | None = None,
     aux_channel_stack: Path | None = None,
     explicit_mask_path: Path | None = None,
     enrich_boundaries: Path | None = None,
@@ -1037,6 +1147,7 @@ def _execute_extraction(
         upscale=upscale,
         seed=seed,
         threads=threads,
+        ortho_depth=ortho_depth,
     )
 
     files = files[:config.n]
@@ -1352,9 +1463,12 @@ def _execute_zarr_ortho_extraction(
 ) -> None:
     rng = np.random.default_rng(config.seed)
     logger.info(f"[{label}] Random seed: {config.seed if config.seed is not None else 'system entropy'}")
+    if config.ortho_depth is not None:
+        logger.info(f"[{label}] Native ortho Z depth: {config.ortho_depth}")
 
     slice_jobs: list[SliceJob] = []
     content_crops_by_file: dict[Path, list[RandomContentCrop]] = {}
+    content_batches_by_file: dict[Path, list[list[SliceJob]]] = {}
     enrich_mask_vol: MaskLike | None = None
     if enrich_boundaries is not None:
         enrich_mask_vol = _open_mask_volume(enrich_boundaries)
@@ -1502,8 +1616,17 @@ def _execute_zarr_ortho_extraction(
                     base_x = sample.x0 + ZARR_TILE_SIZE // 2
                     x_slice = slice(sample.x0, sample.x0 + ZARR_TILE_SIZE)
                     y_slice = slice(sample.y0, sample.y0 + ZARR_TILE_SIZE)
-                    z_slice = _z_crop_slice_around(sample.z_index, z_len=vol.shape[0])
+                    z_slice = (
+                        _z_crop_slice_around(sample.z_index, z_len=vol.shape[0])
+                        if config.ortho_depth is None
+                        else _fixed_depth_z_slice(
+                            sample.z_index,
+                            z_len=vol.shape[0],
+                            depth=config.ortho_depth,
+                        )
+                    )
 
+                    sample_jobs: list[SliceJob] = []
                     expanded_y = _expand_positions_with_context(
                         [base_y],
                         crop=config.crop,
@@ -1512,7 +1635,7 @@ def _execute_zarr_ortho_extraction(
                         context_pairs=25,
                     )
                     for yi in expanded_y:
-                        slice_jobs.append(
+                        sample_jobs.append(
                             SliceJob(
                                 file=f,
                                 vol=vol,
@@ -1537,7 +1660,7 @@ def _execute_zarr_ortho_extraction(
                         context_pairs=25,
                     )
                     for xi in expanded_x:
-                        slice_jobs.append(
+                        sample_jobs.append(
                             SliceJob(
                                 file=f,
                                 vol=vol,
@@ -1553,6 +1676,8 @@ def _execute_zarr_ortho_extraction(
                                 z_slice=z_slice,
                             )
                         )
+                    slice_jobs.extend(sample_jobs)
+                    content_batches_by_file.setdefault(f, []).append(sample_jobs)
 
     logger.info(f"[{label}] Processing {len(slice_jobs)} ortho slices")
 
@@ -1563,31 +1688,34 @@ def _execute_zarr_ortho_extraction(
     with progress_reporter(len(slice_jobs)) as progress_update:
         for file_jobs in jobs_by_file.values():
             first_job = file_jobs[0]
-            requests = [
-                _ortho_output_request(
-                    file_stem=job.file.stem,
-                    roi=label,
-                    out_dir=out_dir,
-                    axis=job.axis,
-                    position=job.position,
-                    perpendicular_slice=job.perpendicular_slice,
-                    z_slice=job.z_slice,
+            job_batches = content_batches_by_file.get(first_job.file, [file_jobs])
+            for job_batch in job_batches:
+                requests = [
+                    _ortho_output_request(
+                        file_stem=job.file.stem,
+                        roi=label,
+                        out_dir=out_dir,
+                        axis=job.axis,
+                        position=job.position,
+                        perpendicular_slice=job.perpendicular_slice,
+                        z_slice=job.z_slice,
+                    )
+                    for job in job_batch
+                ]
+                _write_requested_ortho_slices(
+                    vol=first_job.vol,
+                    mask_vol=first_job.mask_vol,
+                    other_vol=first_job.other_vol,
+                    requests=requests,
+                    selected_indices=first_job.selected_indices,
+                    out_names=first_job.out_names,
+                    anisotropy=config.anisotropy,
+                    upscale=config.upscale,
+                    channels_arg=config.channels,
+                    progress=progress_update,
+                    aux_channel_vols=first_job.aux_channel_vols,
+                    read_as_block=first_job.file in content_batches_by_file,
                 )
-                for job in file_jobs
-            ]
-            _write_requested_ortho_slices(
-                vol=first_job.vol,
-                mask_vol=first_job.mask_vol,
-                other_vol=first_job.other_vol,
-                requests=requests,
-                selected_indices=first_job.selected_indices,
-                out_names=first_job.out_names,
-                anisotropy=config.anisotropy,
-                upscale=config.upscale,
-                channels_arg=config.channels,
-                progress=progress_update,
-                aux_channel_vols=first_job.aux_channel_vols,
-            )
 
     for file_jobs in jobs_by_file.values():
         first_job = file_jobs[0]
@@ -2022,6 +2150,7 @@ def run_single_file_extract(
     label: str,
     masks: Path | None,
     enrich_boundaries: Path | None,
+    ortho_depth: int | None = None,
 ) -> None:
     files = [registered]
 
@@ -2043,6 +2172,7 @@ def run_single_file_extract(
         upscale=upscale,
         seed=seed,
         max_from_path=max_from_path,
+        ortho_depth=ortho_depth,
         aux_channel_stack=aux_channel_stack,
         explicit_mask_path=masks,
         enrich_boundaries=enrich_boundaries,

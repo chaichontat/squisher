@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from typer.testing import CliRunner
 
+import squisher_segment.cli as cli_module
 import squisher_segment.segment.extract_core as extract_core
 from squisher_segment.segment.extract_core import (
     ContentEstimationVolume,
@@ -15,7 +17,9 @@ from squisher_segment.segment.extract_core import (
     RandomContentCrop,
     SingleChannelMaskArray,
     ZarrBackedTiffVolume,
+    _fill_requested_ortho_block,
     _fill_requested_ortho_strips,
+    _fixed_depth_z_slice,
     _open_aux_channel_volumes,
     _open_volume,
     _contentful_z_candidates_around,
@@ -30,6 +34,28 @@ from squisher_segment.segment.extract_helpers import _expand_positions_with_cont
 
 def _write_tiff(path: Path, data: np.ndarray, axes: str) -> None:
     tifffile.imwrite(path, data, metadata={"axes": axes}, photometric="minisblack")
+
+
+def test_extract_cli_forwards_ortho_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+
+    def fake_run_extract(_input_path: Path, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli_module, "run_extract", fake_run_extract)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["extract", str(input_path), "--mode", "ortho", "--ortho-depth", "64"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["ortho_depth"] == 64
 
 
 def test_lazy_tiff_normalizes_zcyx_and_czyx(tmp_path: Path) -> None:
@@ -226,6 +252,59 @@ def test_ortho_zarr_reads_only_requested_slab_windows() -> None:
     np.testing.assert_array_equal(caches[1].channel_strips[0], data[:, 0:2, 3, 1])
 
 
+def test_content_ortho_reads_one_block_per_source() -> None:
+    class RecordingVolume:
+        def __init__(self, data: np.ndarray) -> None:
+            self.data = data
+            self.shape = data.shape
+            self.ndim = data.ndim
+            self.keys = []
+
+        def __getitem__(self, key):
+            self.keys.append(key)
+            return self.data[key]
+
+    primary_data = np.arange(4 * 6 * 7 * 2, dtype=np.uint16).reshape(4, 6, 7, 2)
+    aux_data = primary_data[..., :1] + 1000
+    primary = RecordingVolume(primary_data)
+    aux = RecordingVolume(aux_data)
+    requests = [
+        OrthoSliceRequest(
+            axis="y",
+            position=2,
+            perpendicular_slice=slice(2, 6),
+            out_file=Path("y.tif"),
+            axes="CZX",
+            z_slice=slice(1, 4),
+        ),
+        OrthoSliceRequest(
+            axis="x",
+            position=4,
+            perpendicular_slice=slice(1, 5),
+            out_file=Path("x.tif"),
+            axes="CZY",
+            z_slice=slice(1, 4),
+        ),
+    ]
+
+    caches = _fill_requested_ortho_block(
+        vol=primary,
+        mask_vol=None,
+        other_vol=None,
+        requests=requests,
+        selected_indices=[1],
+        aux_channel_vols=[aux],
+    )
+
+    expected_key = (slice(1, 4), slice(1, 5), slice(2, 6), slice(None))
+    assert primary.keys == [expected_key]
+    assert aux.keys == [expected_key]
+    np.testing.assert_array_equal(caches[0].channel_strips[0], primary_data[1:4, 2, 2:6, 1])
+    np.testing.assert_array_equal(caches[0].channel_strips[1], aux_data[1:4, 2, 2:6, 0])
+    np.testing.assert_array_equal(caches[1].channel_strips[0], primary_data[1:4, 1:5, 4, 1])
+    np.testing.assert_array_equal(caches[1].channel_strips[1], aux_data[1:4, 1:5, 4, 0])
+
+
 def test_ortho_appends_auxiliary_channels_from_matching_stack() -> None:
     primary = np.arange(2 * 4 * 5 * 1, dtype=np.uint16).reshape(2, 4, 5, 1)
     aux = np.zeros((2, 4, 5, 2), dtype=np.uint16)
@@ -308,6 +387,15 @@ def test_content_ortho_z_crop_uses_25_adjacent_planes_each_direction() -> None:
 def test_content_ortho_z_crop_clips_at_volume_bounds() -> None:
     assert _z_crop_slice_around(10, z_len=300) == slice(0, 36)
     assert _z_crop_slice_around(290, z_len=300) == slice(265, 300)
+
+
+def test_fixed_depth_z_slice_stays_exact_at_volume_bounds() -> None:
+    assert _fixed_depth_z_slice(150, z_len=300, depth=100) == slice(100, 200)
+    assert _fixed_depth_z_slice(10, z_len=300, depth=100) == slice(0, 100)
+    assert _fixed_depth_z_slice(290, z_len=300, depth=100) == slice(200, 300)
+
+    with pytest.raises(ValueError, match="cannot exceed volume depth"):
+        _fixed_depth_z_slice(100, z_len=300, depth=301)
 
 
 def test_z_candidates_around_uses_25_adjacent_planes_each_direction() -> None:

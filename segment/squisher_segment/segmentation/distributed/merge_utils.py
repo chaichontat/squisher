@@ -64,6 +64,14 @@ def create_zarr_array(
         config={"write_empty_chunks": False},
     )
 
+
+def write_dask_to_zarr(array: dask.array.Array, output: zarr.Array) -> None:
+    """Write whole Zarr chunks so concurrent tasks cannot clobber partial writes."""
+    chunk_nbytes = int(np.prod(output.chunks, dtype=np.int64)) * output.dtype.itemsize
+    with dask.config.set({"array.chunk-size": chunk_nbytes}):
+        dask.array.to_zarr(array, output, overwrite=False)
+
+
 logger = logging.getLogger(__name__)
 GLOBAL_LABEL_BITS = 16
 
@@ -174,7 +182,7 @@ def relabel_and_write(
         overwrite=True,
         codecs=label_zarr_codecs(np.uint32),
     )
-    dask.array.to_zarr(relabeled, out, overwrite=False)
+    write_dask_to_zarr(relabeled, out)
 
 
 def get_block_crops(
