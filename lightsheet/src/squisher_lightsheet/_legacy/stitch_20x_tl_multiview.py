@@ -42,7 +42,13 @@ from squisher_lightsheet import ngff
 from squisher_lightsheet import pyramid as pyramid_core
 from squisher_lightsheet import qc as qc_core
 from squisher_lightsheet import seams as seam_core
+from squisher_lightsheet import tile_input
 from squisher_lightsheet.tiff import tiff_series_level_count
+from squisher_lightsheet.tiff_input import (
+    ReopenableTiffStore,
+    TiffInputHandler,
+    clear_reopenable_tiff_backend_cache,
+)
 
 
 try:
@@ -148,6 +154,8 @@ def inplace_weighted_average_fusion(
     transformed_views,
     blending_weights,
     fusion_weights=None,
+    *,
+    intensity_threshold: float | None = None,
 ):
     """Fuse fresh MVS work arrays without allocating full-stack products.
 
@@ -163,6 +171,9 @@ def inplace_weighted_average_fusion(
     xp = cp if cp is not None and isinstance(transformed_views, cp.ndarray) else np
     if fusion_weights is not None:
         xp.multiply(blending_weights, fusion_weights, out=blending_weights)
+    if intensity_threshold is not None:
+        xp.multiply(blending_weights, transformed_views > intensity_threshold, out=blending_weights)
+    if fusion_weights is not None or intensity_threshold is not None:
         normalize_weights_inplace(blending_weights)
     xp.multiply(transformed_views, blending_weights, out=transformed_views)
     return xp.nansum(transformed_views, axis=0).astype(transformed_views[0].dtype)
@@ -723,18 +734,23 @@ def unique_ordered(values: list[str]) -> list[str]:
 def normalized_czyx_shape(axes: str, shape: tuple[int, ...]) -> tuple[int, int, int, int]:
     if axes == "CZYX":
         return tuple(int(value) for value in shape)
+    if axes == "ZCYX":
+        z_count, channel_count, height, width = shape
+        return (int(channel_count), int(z_count), int(height), int(width))
     if axes == "ZYX":
         z_count, height, width = shape
         return (1, int(z_count), int(height), int(width))
-    raise ValueError(f"Expected CZYX or ZYX axes, got {axes}")
+    raise ValueError(f"Expected CZYX, ZCYX, or ZYX axes, got {axes}")
 
 
 def tile_channel_count(tile: "TileMetadata") -> int:
     if tile.axes == "CZYX":
         return int(tile.shape[0])
+    if tile.axes == "ZCYX":
+        return int(tile.shape[1])
     if tile.axes == "ZYX":
         return 1
-    raise ValueError(f"Expected CZYX or ZYX axes, got {tile.axes}")
+    raise ValueError(f"Expected CZYX, ZCYX, or ZYX axes, got {tile.axes}")
 
 
 def parse_track_metadata(
@@ -821,7 +837,7 @@ def parse_track_metadata(
 
 
 def is_ome_zarr_path(path: Path) -> bool:
-    return path.is_dir() and (path.name.endswith(".zarr") or (path / "zarr.json").exists() or (path / ".zgroup").exists())
+    return tile_input.is_ome_zarr_path(path)
 
 
 def _ome_zarr_dataset_paths(group: Any) -> list[str]:
@@ -833,18 +849,6 @@ def _ome_zarr_level_count(path: Path) -> int:
 
     group = zarr.open_group(str(path), mode="r")
     return len(_ome_zarr_dataset_paths(group))
-
-
-def _open_ome_zarr_level_array(path: Path, *, source_level: int = 0):
-    import zarr
-
-    group = zarr.open_group(str(path), mode="r")
-    dataset_paths = _ome_zarr_dataset_paths(group)
-    if not dataset_paths:
-        raise ValueError(f"{path} does not contain any OME-Zarr datasets")
-    if source_level < 0 or source_level >= len(dataset_paths):
-        raise ValueError(f"{path} has {len(dataset_paths)} OME-Zarr level(s), cannot open level {source_level}")
-    return group[dataset_paths[source_level]]
 
 
 def _ome_zarr_axes(group: Any, array: Any) -> str:
@@ -1118,14 +1122,16 @@ def validate_tiles_metadata(
     channels = {tile.channels for tile in tiles}
     tracks = {tile.tracks for tile in tiles}
 
-    if not axes <= {"CZYX", "ZYX"}:
-        raise ValueError(f"Expected all tiles to have CZYX or ZYX axes, found {sorted(axes)}")
+    if not axes <= {"CZYX", "ZCYX", "ZYX"}:
+        raise ValueError(f"Expected all tiles to have CZYX, ZCYX, or ZYX axes, found {sorted(axes)}")
     if len(axes) != 1:
         raise ValueError(f"Expected all tiles to have the same axes, found {sorted(axes)}")
     if require_same_shape and len(shapes) != 1:
         raise ValueError(f"Expected all tiles to have the same shape, found {sorted(shapes)}")
     if axes == {"CZYX"}:
         c_yx_shapes = {(tile.shape[0], tile.shape[2], tile.shape[3]) for tile in tiles}
+    elif axes == {"ZCYX"}:
+        c_yx_shapes = {(tile.shape[1], tile.shape[2], tile.shape[3]) for tile in tiles}
     else:
         c_yx_shapes = {(1, tile.shape[1], tile.shape[2]) for tile in tiles}
     if not require_same_shape and require_same_yx_when_variable and len(c_yx_shapes) != 1:
@@ -1177,19 +1183,11 @@ def tile_stage_scale(tile: TileMetadata) -> dict[str, float]:
 
 
 def _shape_zyx_from_axes(axes: str, shape: tuple[int, ...]) -> tuple[int, int, int]:
-    if axes == "CZYX":
-        return (int(shape[1]), int(shape[2]), int(shape[3]))
-    if axes == "ZYX":
-        return (int(shape[0]), int(shape[1]), int(shape[2]))
-    raise ValueError(f"Expected CZYX or ZYX axes, got {axes}")
+    return tile_input.spatial_shape_zyx(shape, axes)
 
 
 def source_axes_from_shape(tile_axes: str, source_shape: tuple[int, ...]) -> str:
-    if len(source_shape) == len(tile_axes):
-        return tile_axes
-    if tile_axes == "CZYX" and len(source_shape) == 3:
-        return "ZYX"
-    raise ValueError(f"Expected source shape rank to match {tile_axes} or ZYX, got shape {source_shape}")
+    return tile_input.source_axes(tile_axes, source_shape)
 
 
 def tile_shape_zyx(tile: TileMetadata) -> tuple[int, int, int]:
@@ -3652,12 +3650,18 @@ def read_registered_center_z_plane(
                     f"Channel {channel} is outside {source_tile.path} channel count {source_tile.shape[0]}"
                 )
             plane = array[channel, source_z, y_slice, x_slice]
+        elif source_tile.axes == "ZCYX":
+            if channel < 0 or channel >= source_tile.shape[1]:
+                raise ValueError(
+                    f"Channel {channel} is outside {source_tile.path} channel count {source_tile.shape[1]}"
+                )
+            plane = array[source_z, channel, y_slice, x_slice]
         elif source_tile.axes == "ZYX":
             if channel != 0:
                 raise ValueError(f"Channel {channel} is outside single-channel tile {source_tile.path}")
             plane = array[source_z, y_slice, x_slice]
         else:
-            raise ValueError(f"Expected CZYX or ZYX axes in {source_tile.path}, got {source_tile.axes}")
+            raise ValueError(f"Expected CZYX, ZCYX, or ZYX axes in {source_tile.path}, got {source_tile.axes}")
 
         start_zyx = np.rint((start_um - global_min_zyx_um) / target_spacing_zyx_um).astype(int)
         metadata = {
@@ -4181,12 +4185,19 @@ def channel_labels_for_tiles(tiles: list[TileMetadata]) -> list[str]:
     return channel_labels
 
 
-def open_tile_array(tile: TileMetadata, *, source_level: int = 0):
-    import zarr
-
+def open_tile_array(
+    tile: TileMetadata,
+    *,
+    source_level: int = 0,
+    tiff_inputs: TiffInputHandler | None = None,
+):
     start = time.perf_counter()
-    if is_ome_zarr_path(tile.path):
-        zarray = _open_ome_zarr_level_array(tile.path, source_level=source_level)
+    zarray, store = tile_input.open_array(
+        tile.path,
+        source_level=source_level,
+        tiff_inputs=tiff_inputs,
+    )
+    if store is None:
         log(
             "Opened OME-Zarr array: "
             f"tile={tile.path.name}, source={tile.path.name}, level={source_level}, "
@@ -4195,11 +4206,6 @@ def open_tile_array(tile: TileMetadata, *, source_level: int = 0):
             f"dtype={zarray.dtype}, elapsed={time.perf_counter() - start:.3f}s"
         )
         return zarray, None
-
-    import tifffile
-
-    store = tifffile.imread(tile.path, aszarr=True, level=source_level)
-    zarray = zarr.open(store, mode="r")
     log(
         "Opened TIFF as zarr-backed array: "
         f"tile={tile.path.name}, source={tile.path.name}, level={source_level}, "
@@ -4215,19 +4221,13 @@ def open_fusion_tile_array(
     channel: int,
     *,
     source_level: int = 0,
+    tiff_inputs: TiffInputHandler | None = None,
 ):
-    zarray, store = open_tile_array(tile, source_level=source_level)
-    axes = tile.axes
-    shape = tuple(int(value) for value in zarray.shape)
-    if axes == "ZYX" and channel != 0:
-        raise ValueError(f"Channel {channel} out of range for single-channel ZYX tile {tile.path}")
-    if axes == "CZYX":
-        channel_count = int(shape[0])
-        if not 0 <= channel < channel_count:
-            raise ValueError(f"Channel {channel} out of range for CZYX tile {tile.path}")
-    if axes not in {"ZYX", "CZYX"}:
-        raise ValueError(f"Expected CZYX or ZYX axes in {tile.path}, got {axes}")
-    return zarray, store, axes, shape
+    array, store = open_tile_array(tile, source_level=source_level, tiff_inputs=tiff_inputs)
+    shape = tuple(int(value) for value in array.shape)
+    axes = tile_input.source_axes(tile.axes, shape)
+    tile_input.validate_channel(tile.path, shape, axes, channel)
+    return array, store, axes, shape
 
 
 def open_registration_tile_array(
@@ -4243,6 +4243,7 @@ def open_registration_tile_array(
     zarr_chunks = tuple(int(chunk) for chunk in zarray.chunks)
     source_shape = tuple(int(value) for value in zarray.shape)
     source_tile = fusion_tile_for_source_array(tile, source_shape, source_level=source_level)
+    tile_input.validate_channel(tile.path, source_shape, source_tile.axes, channel)
     if source_tile.axes == "CZYX":
         read_chunks = (
             1,
@@ -4251,16 +4252,23 @@ def open_registration_tile_array(
             zarr_chunks[3],
         )
         return da.from_zarr(zarray, chunks=read_chunks)[channel : channel + 1, :, :, :], store, source_tile
+    if source_tile.axes == "ZCYX":
+        read_chunks = (
+            min(read_chunk_z, source_tile.shape[0]),
+            1,
+            zarr_chunks[2],
+            zarr_chunks[3],
+        )
+        czyx = da.from_zarr(zarray, chunks=read_chunks)[:, channel : channel + 1, :, :].transpose(1, 0, 2, 3)
+        return czyx, store, source_tile
     if source_tile.axes == "ZYX":
-        if channel != 0:
-            raise ValueError(f"Channel {channel} out of range for single-channel ZYX tile {tile.path}")
         read_chunks = (
             min(read_chunk_z, source_tile.shape[0]),
             zarr_chunks[1],
             zarr_chunks[2],
         )
         return da.from_zarr(zarray, chunks=read_chunks)[None, :, :, :], store, source_tile
-    raise ValueError(f"Expected CZYX or ZYX axes in {tile.path}, got {source_tile.axes}")
+    raise ValueError(f"Expected CZYX, ZCYX, or ZYX axes in {tile.path}, got {source_tile.axes}")
 
 
 def build_registration_msims(
@@ -4306,15 +4314,21 @@ def build_registration_msims(
     return msims, stores, channel_labels[channel]
 
 
-def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: int = 0):
+def build_fusion_sims(
+    tiles: list[TileMetadata],
+    channel: int,
+    *,
+    fusion_level: int = 0,
+    assume_shared_tiff_schema: bool = False,
+):
     from multiview_stitcher import spatial_image_utils as si_utils
-
     start = time.perf_counter()
     sims = []
     stores = []
     source_tiles = []
     channel_labels = channel_labels_for_tiles(tiles)
     source_level_counts: Counter[tuple[int, int]] = Counter()
+    tiff_inputs = TiffInputHandler() if assume_shared_tiff_schema else None
 
     log(f"Fusion sim build start: tiles={len(tiles)}, channel={channel}, requested_level={fusion_level}")
     for tile_index, tile in enumerate(tiles, start=1):
@@ -4331,6 +4345,7 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
             tile,
             channel,
             source_level=source_level,
+            tiff_inputs=tiff_inputs,
         )
         stores.append(store)
         source_level_counts[(source_level, available_levels)] += 1
@@ -4340,17 +4355,20 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
             source_level=source_level,
         )
         source_tiles.append(source_tile)
-        if source_axes == "ZYX":
-            dims = ["z", "y", "x"]
-        else:
-            dims = ["c", "z", "y", "x"]
+        dims = tuple(axis.lower() for axis in source_axes)
+        if "C" in source_axes:
+            # Select before get_sim_from_array adds virtual t/c axes. Selecting
+            # afterward makes xarray materialize TIFF-backed ZCYX inputs.
+            source_dims = tuple("_source_c" if axis == "C" else axis.lower() for axis in source_axes)
+            array = si_utils._zarr_array_to_dataarray(array, dims=source_dims).isel(_source_c=channel)
+            dims = ("z", "y", "x")
         sim = si_utils.get_sim_from_array(
             array,
             dims=dims,
             scale=tile_sim_scale(source_tile),
             translation=tile_sim_translation(source_tile),
             transform_key=TRANSFORM_KEY,
-            c_coords=channel_labels,
+            c_coords=[channel_labels[channel]],
         )
         stage_scale = tile_stage_scale(source_tile)
         flip_axes = tuple(dim for dim in ("z", "y", "x") if stage_scale[dim] < 0)
@@ -4363,7 +4381,9 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
         # Scalar selection preserves the original TIFF channel index in
         # multiview-stitcher's zarr-backed serializer. Drop singleton t too:
         # the package otherwise deep-copies TIFF stores while iterating over t.
-        selected = sim.isel(c=channel, t=0)
+        selected = sim.isel(c=0, t=0)
+        if "C" in source_axes:
+            selected.attrs["source_channel_index"] = channel
         if flip_axes and not si_utils.is_xarray_zarr_backed(selected):
             raise RuntimeError(
                 f"Fusion tile {tile.path} requires {flip_axes} reflection but lost direct Zarr backing"
@@ -4372,6 +4392,8 @@ def build_fusion_sims(tiles: list[TileMetadata], channel: int, *, fusion_level: 
         if tile.source_view is not None:
             selected.attrs["source_view"] = tile.source_view
         sims.append(selected)
+        if isinstance(store, ReopenableTiffStore):
+            store.release_backend()
         elapsed = time.perf_counter() - tile_start
         total_elapsed = time.perf_counter() - start
         log(
@@ -6317,9 +6339,21 @@ def direct_zarr_block_entry(
         )
         if overlap[0] is None:
             continue
+        tile_info = si_utils.serialize_zarr_backed_sim(sim)
+        source_channel_index = sim.attrs.get("source_channel_index")
+        if source_channel_index is not None:
+            source_channel_dims = [
+                dim for dim in tile_info["zarr_dims"] if dim in {"c", "_source_c"}
+            ]
+            if len(source_channel_dims) != 1:
+                raise ValueError(
+                    "Expected exactly one backing channel dimension for fusion source "
+                    f"{sim.attrs.get('basic_tile_cache_key', '<unknown>')}, got {source_channel_dims}"
+                )
+            tile_info["isel_dropped"][source_channel_dims[0]] = int(source_channel_index)
         views.append(
             {
-                "tile_info": si_utils.serialize_zarr_backed_sim(sim),
+                "tile_info": tile_info,
                 "tile_overlap_bb": overlap[0],
                 "sparam": sparam,
                 "view_bb": view_bb,
@@ -6580,6 +6614,7 @@ def fusion_resume_plan(
         "output_chunksize": output_chunksize,
         "fusion_weight_mode": args.fusion_weight_mode,
         "fusion_weight_arguments": json_safe(weights_func_kwargs),
+        "fusion_intensity_threshold": args.fusion_intensity_threshold,
         "blending_widths": json_safe(blending_widths),
         "flatfield": flatfield_identity,
         "fusion_level": args.fusion_level,
@@ -6599,7 +6634,9 @@ def validate_resumable_scale0_array(
     scale0_path: Path,
 ) -> None:
     actual_shape = tuple(int(value) for value in array.shape)
-    actual_chunks = tuple(int(value) for value in array.chunks)
+    metadata = getattr(array, "metadata", None)
+    storage_chunks = getattr(metadata, "shards", None) or array.chunks
+    actual_chunks = tuple(int(value) for value in storage_chunks)
     actual_dtype = np.dtype(array.dtype)
     if actual_shape != tuple(int(value) for value in expected_shape):
         raise ValueError(f"{scale0_path} resume shape mismatch: {actual_shape} != {expected_shape}")
@@ -6684,6 +6721,7 @@ def mvs_fuse_chunk_payload(fuse_chunk) -> dict[str, Any] | None:
 
 
 _MVS_FUSE_CHUNK_WORKER_PAYLOADS: dict[str, dict[str, Any]] = {}
+_MVS_FUSE_CHUNK_PAYLOAD_OWNERS: dict[str, tuple[int, int]] = {}
 
 
 def mvs_fuse_chunk_payload_cache_path(payload: dict[str, Any]) -> Path:
@@ -6700,11 +6738,25 @@ def write_mvs_fuse_chunk_payload_cache(payload: dict[str, Any]) -> str:
     from joblib.externals import cloudpickle
 
     path = mvs_fuse_chunk_payload_cache_path(payload)
+    fuse_kwargs = payload.get("fuse_kwargs")
+    images = None if not isinstance(fuse_kwargs, dict) else fuse_kwargs.get("images", fuse_kwargs.get("sims"))
+    owner = (id(fuse_kwargs), id(images))
+    path_key = str(path)
+    previous_owner = _MVS_FUSE_CHUNK_PAYLOAD_OWNERS.get(path_key)
+    if previous_owner == owner and path.is_file():
+        return path_key
+    if previous_owner is not None:
+        raise RuntimeError(
+            "Fusion worker payload owner changed for an active output: "
+            f"path={path}, previous_owner={previous_owner}, current_owner={owner}"
+        )
+    clear_reopenable_tiff_backend_cache()
     tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     with tmp_path.open("wb") as handle:
         cloudpickle.dump(payload, handle)
     os.replace(tmp_path, path)
-    return str(path)
+    _MVS_FUSE_CHUNK_PAYLOAD_OWNERS[path_key] = owner
+    return path_key
 
 
 def load_mvs_fuse_chunk_payload(payload_cache_path: str) -> dict[str, Any]:
@@ -7122,6 +7174,7 @@ def write_downsampled_level(
     shape = tuple(int(size) // factor for size, factor in zip(source_array.shape, factor_tuple, strict=True))
     inner_chunks = downsampled_chunks(tuple(int(chunk) for chunk in source_array.chunks), shape, factor_tuple)
     if output_codec == "jpegxr":
+        register_jpegxr_codec()
         inner_chunks = jpegxr_plane_chunk_shape(inner_chunks, dimension_names)
     source_storage_chunks = tuple(int(chunk) for chunk in (source_array.metadata.shards or source_array.chunks))
     shard_chunks = pyramid_shard_chunks(source_storage_chunks, shape, inner_chunks)
@@ -8060,6 +8113,16 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--skip-pyramid",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--assume-shared-tiff-schema",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--disable-view-candidate-culling",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -8068,6 +8131,11 @@ def parse_args() -> argparse.Namespace:
         "--fusion-weight-mode",
         choices=("geometric", "content-dct", "content-preibisch", "content-preibisch-coarse"),
         default="content-preibisch-coarse",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--fusion-intensity-threshold",
+        type=parse_nonnegative_float,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -8779,6 +8847,7 @@ def run_stitch_once(
             tiles,
             channel,
             fusion_level=args.fusion_level,
+            assume_shared_tiff_schema=args.assume_shared_tiff_schema,
         )
         zarr_backed_count = sum(si_utils.is_xarray_zarr_backed(sim) for sim in sims)
         orientation_patterns = Counter(
@@ -8875,6 +8944,11 @@ def run_stitch_once(
                 resolved_chunksize,
             )
             weights_func, weights_func_kwargs = fusion_weight_config(args, resolved_chunksize)
+            fusion_func_kwargs = (
+                None
+                if args.fusion_intensity_threshold is None
+                else {"intensity_threshold": float(args.fusion_intensity_threshold)}
+            )
             blending_widths = narrow_fusion_blending_widths(
                 source_tiles,
                 params,
@@ -8917,6 +8991,11 @@ def run_stitch_once(
                 log("Fusion weights: geometric border/valid-support weights only")
             else:
                 log(f"Fusion weights: {args.fusion_weight_mode} quality weights {weights_func_kwargs}")
+            if args.fusion_intensity_threshold is not None:
+                log(
+                    "Fusion source intensity threshold: "
+                    f"values <= {args.fusion_intensity_threshold:g} contribute zero weight"
+                )
             if apply_flatfield:
                 basic_cache_max_bytes = (
                     None if args.basic_cache_max_gib is None else int(args.basic_cache_max_gib * 1024**3)
@@ -8986,7 +9065,7 @@ def run_stitch_once(
                     weights_func=weights_func,
                     weights_func_kwargs=weights_func_kwargs,
                     fusion_func=inplace_weighted_average_fusion,
-                    fusion_func_kwargs=None,
+                    fusion_func_kwargs=fusion_func_kwargs,
                     interpolation_order=1,
                 )
                 if not candidate_map:
@@ -9085,6 +9164,7 @@ def run_stitch_once(
                             images=sims,
                             transform_key=transform_key,
                             fusion_func=inplace_weighted_average_fusion,
+                            fusion_func_kwargs=fusion_func_kwargs,
                             output_stack_properties=output_stack_properties,
                             output_chunksize=resolved_chunksize,
                             blending_widths=blending_widths,
@@ -9121,13 +9201,16 @@ def run_stitch_once(
                 "Fusion scale0 output after package write: "
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
             )
-            with heartbeat(f"completed Zarr pyramid channel {channel}"):
-                build_ome_zarr_pyramid_from_scale0(
-                    fusion_output,
-                    jpegxr_level=args.jpegxr_level,
-                    output_codec=args.output_codec,
-                    zstd_level=args.zstd_level,
-                )
+            if args.skip_pyramid:
+                log(f"Skipping Zarr pyramid for channel {channel}; keeping scale 0 only")
+            else:
+                with heartbeat(f"completed Zarr pyramid channel {channel}"):
+                    build_ome_zarr_pyramid_from_scale0(
+                        fusion_output,
+                        jpegxr_level=args.jpegxr_level,
+                        output_codec=args.output_codec,
+                        zstd_level=args.zstd_level,
+                    )
             from squisher_lightsheet.fusion_provenance import write_fusion_provenance
 
             provenance_position_input = Path(args.position_input).resolve() if args.position_input else None
@@ -9168,6 +9251,7 @@ def run_stitch_once(
                 "batch_size": resolved_batch_size,
                 "weight_mode": args.fusion_weight_mode,
                 "weight_arguments": weights_func_kwargs,
+                "intensity_threshold": args.fusion_intensity_threshold,
                 "blending_widths": blending_widths,
                 "candidate_plan": candidate_summary,
                 "candidate_blocks": len(allowed_fusion_blocks),
@@ -9200,7 +9284,7 @@ def run_stitch_once(
                 additional_json_inputs=additional_json_inputs,
             )
             log(
-                "Fusion output after completed-Zarr pyramid write: "
+                "Fusion output before final move: "
                 f"{format_filesystem_progress(fusion_output, filesystem_progress_snapshot(fusion_output))}"
             )
             if channel_output.exists():
@@ -9213,8 +9297,11 @@ def run_stitch_once(
             close_stores(stores)
             log(f"Closed TIFF stores for channel {channel}")
 
-        thumbnail_path = write_center_z_thumbnail(channel_output, registration_input=registration_input)
-        log(f"Wrote center-z thumbnail {thumbnail_path}")
+        if args.skip_pyramid:
+            log(f"Skipping full-resolution center-z thumbnail for scale-0-only output {channel_output}")
+        else:
+            thumbnail_path = write_center_z_thumbnail(channel_output, registration_input=registration_input)
+            log(f"Wrote center-z thumbnail {thumbnail_path}")
         log(f"Wrote {channel_output} ({channel_label})")
     return 0
 

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 
 from squisher_lightsheet import channel_subtraction
@@ -18,7 +19,8 @@ class DummyStore:
         self.closed = True
 
 
-def test_subtract_channel_tiles_writes_cropped_parseable_position_file(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("axes", ["CZYX", "ZCYX"])
+def test_subtract_channel_tiles_writes_cropped_parseable_position_file(monkeypatch, tmp_path, axes) -> None:
     source_tile = tmp_path / "tile.ome.tif"
     plane_count = 4 * 3
     tifffile.imwrite(
@@ -74,18 +76,20 @@ def test_subtract_channel_tiles_writes_cropped_parseable_position_file(monkeypat
         )
         + "\n"
     )
+    data = np.zeros((4, 3, 6, 6), dtype=np.uint16)
+    data[2] = 100
+    data[3] = 20
+    if axes == "ZCYX":
+        data = data.transpose(1, 0, 2, 3)
     tile = legacy.TileMetadata(
         path=source_tile,
-        shape=(4, 3, 6, 6),
-        axes="CZYX",
+        shape=data.shape,
+        axes=axes,
         spacing={"z": 1.0, "y": 0.5, "x": 0.25},
         translation={"z": 10.0, "y": 20.0, "x": 30.0},
         channels=("0", "1", "2", "3"),
         tracks=(legacy.TrackMetadata(slug="track0", track_id="all", channels=(0, 1, 2, 3), channel_names=("0", "1", "2", "3")),),
     )
-    data = np.zeros((4, 3, 6, 6), dtype=np.uint16)
-    data[2] = 100
-    data[3] = 20
     store = DummyStore()
 
     monkeypatch.setattr(channel_subtraction.legacy, "read_position_input_tiles", lambda _path: [tile])

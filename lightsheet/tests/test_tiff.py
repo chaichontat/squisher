@@ -13,8 +13,9 @@ from squisher_lightsheet.tiff import (
 )
 
 
-def test_spatial_shape_zyx_from_axes_supports_czyx_and_zyx() -> None:
+def test_spatial_shape_zyx_from_axes_supports_czyx_zcyx_and_zyx() -> None:
     assert spatial_shape_zyx_from_axes((2, 3, 4, 5), "CZYX") == (3, 4, 5)
+    assert spatial_shape_zyx_from_axes((3, 2, 4, 5), "ZCYX") == (3, 4, 5)
     assert spatial_shape_zyx_from_axes((3, 4, 5), "ZYX") == (3, 4, 5)
     np.testing.assert_array_equal(
         spatial_shape_array_zyx_from_axes((2, 3, 4, 5), "CZYX"),
@@ -23,7 +24,7 @@ def test_spatial_shape_zyx_from_axes_supports_czyx_and_zyx() -> None:
 
 
 def test_spatial_shape_zyx_from_axes_rejects_unsupported_axes() -> None:
-    with pytest.raises(ValueError, match="Expected CZYX or ZYX axes"):
+    with pytest.raises(ValueError, match="Expected CZYX, ZCYX, or ZYX shape"):
         spatial_shape_zyx_from_axes((3, 4), "YX")
 
 

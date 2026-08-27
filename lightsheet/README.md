@@ -10,6 +10,28 @@ coordinate contracts, QC gates, and canonical final output layout.
 uv run --package squisher-lightsheet lightsheet --help
 ```
 
+## Fusion input contract
+
+Fusion accepts local OME-Zarr directories and TIFF files that `tifffile` can
+open as read-only Zarr stores. An OME-Zarr input must contain NGFF
+`multiscales` datasets. A TIFF input may use any compression supported by the
+installed `tifffile` codecs, including JPEG-XR.
+
+Source arrays must use `ZYX`, `CZYX`, or `ZCYX` axes. `ZYX` is single-channel;
+the other layouts use the declared `C` axis. A pyramid level may omit a
+singleton channel axis and expose `ZYX`, but other rank changes are rejected.
+
+The position and registration inputs own physical spacing, tile translation,
+channel labels, and orientation. The reader does not infer geometry or align
+channels.
+
+The shared-schema TIFF path assumes that every tile has the same axes, shape,
+dtype, chunk or strip layout, codecs, and pyramid structure. It reads one TIFF
+schema per requested level and applies it to the remaining tiles without
+opening their headers. Use this path only for controlled acquisitions. Pixel
+reads remain lazy, although a compressed strip may decode more data than the
+requested slice.
+
 ## WGACtrl-405-L2 Run Record (2026-07-10)
 
 The commands below record the processing sequence launched for

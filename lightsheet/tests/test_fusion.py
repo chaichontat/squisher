@@ -18,6 +18,7 @@ from squisher_lightsheet.fusion import (
     temporary_basic_disk_cache_dir,
 )
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
+from squisher_lightsheet import tiff_input
 
 
 def write_basic_sampling_manifest(
@@ -89,6 +90,23 @@ def test_fusion_resume_rejects_workspace_without_plan(tmp_path: Path) -> None:
             expected_plan={"plan": "matching"},
         )
         is None
+    )
+
+
+def test_fusion_resume_validates_outer_shards() -> None:
+    array = Namespace(
+        shape=(24, 960, 960),
+        chunks=(1, 960, 960),
+        dtype=np.dtype("uint16"),
+        metadata=Namespace(shards=(12, 960, 960)),
+    )
+
+    legacy.validate_resumable_scale0_array(
+        array,
+        expected_shape=(24, 960, 960),
+        expected_chunks=(12, 960, 960),
+        expected_dtype=np.uint16,
+        scale0_path=Path("scale0"),
     )
 
 
@@ -277,6 +295,25 @@ def test_inplace_weighted_average_matches_mvs(with_fusion_weights: bool) -> None
     else:
         assert not np.array_equal(blending_input, blending, equal_nan=True)
         np.testing.assert_array_equal(fusion_weights, fusion_weights_input)
+
+
+def test_inplace_weighted_average_excludes_values_at_or_below_threshold() -> None:
+    transformed = np.asarray(
+        [
+            [[25.0, 75.0, 50.0]],
+            [[100.0, 40.0, np.nan]],
+        ],
+        dtype=np.float32,
+    )
+    blending = np.full(transformed.shape, 0.5, dtype=np.float32)
+
+    actual = legacy.inplace_weighted_average_fusion(
+        transformed,
+        blending,
+        intensity_threshold=50.0,
+    )
+
+    np.testing.assert_array_equal(actual, np.asarray([[100.0, 75.0, 0.0]], dtype=np.float32))
 
 
 def test_fuse_normalizes_canonical_output_dir(monkeypatch) -> None:
@@ -602,6 +639,26 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
     args = legacy.parse_args()
 
     assert args.flatfield_dir == flatfield_dir
+
+
+def test_legacy_fusion_accepts_hidden_intensity_threshold(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stitch", str(tmp_path / "tiles"), "--fusion-intensity-threshold", "50"],
+    )
+
+    args = legacy.parse_args()
+
+    assert args.fusion_intensity_threshold == 50.0
+
+
+def test_legacy_fusion_accepts_hidden_skip_pyramid(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sys, "argv", ["stitch", str(tmp_path / "tiles"), "--skip-pyramid"])
+
+    args = legacy.parse_args()
+
+    assert args.skip_pyramid is True
 
 
 def test_profile_fusion_skip_requires_max_batches() -> None:
@@ -1198,35 +1255,218 @@ def test_registration_input_reads_ome_zarr_tile_metadata_from_registration_scale
     assert [tile.translation["z"] for tile in tiles] == [0.0, 10.0]
 
 
-def test_fusion_tile_reader_keeps_zarr_backed_optimized_path(tmp_path) -> None:
+def test_reopenable_tiff_store_is_lazy_and_picklable(tmp_path) -> None:
+    from joblib.externals import cloudpickle
+
     tifffile = pytest.importorskip("tifffile")
+    zarr = pytest.importorskip("zarr")
     data = np.arange(4 * 3 * 2, dtype=np.uint16).reshape(4, 3, 2)
     path = tmp_path / "tile.ome.tif"
     tifffile.imwrite(path, data, metadata={"axes": "ZYX"})
+
+    store = cloudpickle.loads(cloudpickle.dumps(tiff_input.ReopenableTiffStore(path)))
+    assert store._backend is None
+    try:
+        np.testing.assert_array_equal(zarr.open(store, mode="r")[:], data)
+    finally:
+        store.close()
+
+
+def test_reopenable_tiff_store_lru_bounds_live_backends(tmp_path, monkeypatch) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    zarr = pytest.importorskip("zarr")
+    data = np.arange(4 * 3 * 2, dtype=np.uint16).reshape(4, 3, 2)
+    monkeypatch.setattr(tiff_input, "REOPENABLE_TIFF_BACKEND_CACHE_SIZE", 2)
+    tiff_input.clear_reopenable_tiff_backend_cache()
+    stores = []
+    arrays = []
+    for index in range(3):
+        path = tmp_path / f"tile-{index}.ome.tif"
+        tifffile.imwrite(path, data + index, metadata={"axes": "ZYX"})
+        store = tiff_input.ReopenableTiffStore(path)
+        stores.append(store)
+        arrays.append(zarr.open(store, mode="r"))
+
+    try:
+        np.testing.assert_array_equal(arrays[0][:], data)
+        np.testing.assert_array_equal(arrays[1][:], data + 1)
+        assert stores[0]._backend is not None
+        assert stores[1]._backend is not None
+
+        np.testing.assert_array_equal(arrays[2][:], data + 2)
+        assert stores[0]._backend is None
+        assert stores[1]._backend is not None
+        assert stores[2]._backend is not None
+        assert len(tiff_input._REOPENABLE_TIFF_BACKEND_CACHE) == 2
+
+        np.testing.assert_array_equal(arrays[0][:], data)
+        assert stores[0]._backend is not None
+        assert stores[1]._backend is None
+        assert stores[2]._backend is not None
+    finally:
+        legacy.close_stores(stores)
+        tiff_input.clear_reopenable_tiff_backend_cache()
+
+
+def test_worker_payload_is_written_once_for_stable_fusion_owner(tmp_path, monkeypatch) -> None:
+    from joblib.externals import cloudpickle
+
+    output = tmp_path / "fused.ome.zarr" / "0"
+    output.mkdir(parents=True)
+    owner = {"images": []}
+    payload = {
+        "output_zarr_url": str(output),
+        "fuse_kwargs": owner,
+    }
+    calls = 0
+    original_dump = cloudpickle.dump
+
+    def record_dump(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_dump(*args, **kwargs)
+
+    monkeypatch.setattr(cloudpickle, "dump", record_dump)
+    legacy._MVS_FUSE_CHUNK_PAYLOAD_OWNERS.clear()
+
+    first = legacy.write_mvs_fuse_chunk_payload_cache(payload)
+    second = legacy.write_mvs_fuse_chunk_payload_cache(payload)
+
+    assert first == second
+    assert calls == 1
+
+
+def test_worker_payload_excludes_parent_tiff_cache(tmp_path) -> None:
+    output = tmp_path / "fused.ome.zarr" / "0"
+    output.mkdir(parents=True)
+    store = tiff_input.ReopenableTiffStore(tmp_path / "tile.tif")
+    tiff_input._REOPENABLE_TIFF_BACKEND_CACHE[id(store)] = store
+    payload = {
+        "output_zarr_url": str(output),
+        "fuse_kwargs": {"images": []},
+    }
+    legacy._MVS_FUSE_CHUNK_PAYLOAD_OWNERS.clear()
+
+    legacy.write_mvs_fuse_chunk_payload_cache(payload)
+
+    assert not tiff_input._REOPENABLE_TIFF_BACKEND_CACHE
+
+
+def test_zcyx_tiff_routes_channels_for_registration_and_fusion(tmp_path) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    from multiview_stitcher.fusion import _core as fusion_core
+
+    data = np.arange(3 * 2 * 4 * 5, dtype=np.uint16).reshape(3, 2, 4, 5)
+    path = tmp_path / "tile.tif"
+    tifffile.imwrite(path, data, metadata={"axes": "ZCYX"})
     tile = legacy.TileMetadata(
         path=path,
         shape=data.shape,
-        axes="ZYX",
-        spacing={"z": 1.0, "y": 1.0, "x": 1.0},
-        translation={"z": 0.0, "y": 0.0, "x": 0.0},
-        channels=("0",),
+        axes="ZCYX",
+        spacing={"z": 0.6, "y": 0.108, "x": 0.108},
+        translation={"z": 0.0, "y": 1.0, "x": 2.0},
+        channels=("af", "edu"),
         tracks=(
             legacy.TrackMetadata(
                 slug="track0",
                 track_id="all",
-                channels=(0,),
-                channel_names=("0",),
+                channels=(0, 1),
+                channel_names=("af", "edu"),
             ),
         ),
     )
 
-    zarray, store, axes, shape = legacy.open_fusion_tile_array(tile, 0)
+    registration, registration_store, source_tile = legacy.open_registration_tile_array(
+        tile,
+        1,
+        read_chunk_z=2,
+    )
     try:
-        assert axes == "ZYX"
-        assert shape == data.shape
-        np.testing.assert_array_equal(zarray[:], data)
+        assert source_tile.axes == "ZCYX"
+        assert registration.shape == (1, 3, 4, 5)
+        np.testing.assert_array_equal(registration.compute()[0], data[:, 1])
     finally:
-        legacy.close_stores([store])
+        legacy.close_stores([registration_store])
+
+    sims, fusion_stores, label, _levels, source_tiles = legacy.build_fusion_sims(
+        [tile], 1, assume_shared_tiff_schema=True
+    )
+    try:
+        assert label == "edu"
+        assert source_tiles[0].axes == "ZCYX"
+        assert sims[0].dims == ("z", "y", "x")
+        assert si_utils.is_xarray_zarr_backed(sims[0])
+        assert fusion_stores[0]._backend is None
+        np.testing.assert_array_equal(np.asarray(si_utils._get_backend_data(sims[0])), data[:, 1])
+
+        stack_properties = si_utils.get_stack_properties_from_sim(sims[0])
+        chunk_shape = {dim: int(size) for dim, size in stack_properties["shape"].items()}
+        entry, _region = legacy.direct_zarr_block_entry(
+            sims=sims,
+            transform_key=legacy.TRANSFORM_KEY,
+            sim_coord_dict={},
+            block_key=(0, 0, 0),
+            output_stack_properties=stack_properties,
+            output_chunksize=chunk_shape,
+            output_chunk_shape=chunk_shape,
+            output_chunk_origin=stack_properties["origin"],
+            overlap_in_pixels={"z": 0, "y": 0, "x": 0},
+            interpolation_order=1,
+        )
+        fused = fusion_core._fuse_block_zarr_backed(
+            np.asarray(entry, dtype=object),
+            output_dtype=data.dtype,
+            sim_coord_dict={},
+            sdims=["z", "y", "x"],
+            fusion_func=fusion_core.weighted_average_fusion,
+            fusion_func_kwargs=None,
+            weights_func=None,
+            weights_func_kwargs=None,
+            overlap_in_pixels={"z": 0, "y": 0, "x": 0},
+            interpolation_order=1,
+            blending_widths=None,
+            shrink_distance=0,
+            trim_overlap=False,
+            backend=None,
+        )
+        np.testing.assert_array_equal(fused, data[:, 1])
+    finally:
+        legacy.close_stores(fusion_stores)
+
+
+def test_tiff_input_reuses_one_schema_and_reads_distinct_files(tmp_path, monkeypatch) -> None:
+    tifffile = pytest.importorskip("tifffile")
+    data = np.arange(3 * 2 * 4 * 5, dtype=np.uint16).reshape(3, 2, 4, 5)
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"tile-{index}.tif"
+        tifffile.imwrite(path, data + index, metadata={"axes": "ZCYX"})
+        paths.append(path)
+
+    calls = []
+    original_imread = tifffile.imread
+
+    def record_imread(*args, **kwargs):
+        calls.append(Path(args[0]))
+        return original_imread(*args, **kwargs)
+
+    monkeypatch.setattr(tifffile, "imread", record_imread)
+    handler = tiff_input.TiffInputHandler()
+    arrays = []
+    stores = []
+    for path in paths:
+        array, store = handler.open(path)
+        arrays.append(array)
+        stores.append(store)
+    stores[0].release_backend()
+
+    try:
+        assert calls == [paths[0]]
+        assert all(store._backend is None for store in stores)
+        np.testing.assert_array_equal(arrays[0][:], data)
+        np.testing.assert_array_equal(arrays[1][:], data + 1)
+    finally:
+        legacy.close_stores(stores)
 
 
 def test_fusion_tile_reader_opens_ome_zarr_directly(tmp_path) -> None:
@@ -1363,7 +1603,6 @@ def test_fusion_negative_stage_scale_uses_zarr_backed_orientation_affine(tmp_pat
             weights_func=None,
             weights_func_kwargs=None,
             overlap_in_pixels={"z": 0, "y": 0, "x": 0},
-            trim_overlap=True,
             interpolation_order=1,
             blending_widths=None,
             shrink_distance=0,
@@ -1478,7 +1717,7 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
         )
         calls = []
 
-        def fake_fuse_block(chunk_params_block, **_kwargs):
+        def fake_fuse_block(chunk_params_block, **kwargs):
             entry = np.asarray(chunk_params_block, dtype=object).item()
             shape = tuple(int(entry["output_bb"]["shape"][dim]) for dim in ("z", "y", "x"))
             calls.append((entry["block_key"], len(entry["views"]), shape))

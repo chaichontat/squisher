@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+from squisher_lightsheet.tile_input import spatial_shape_zyx
+
 
 def tiff_series_level_count(path: Path) -> int:
     import tifffile
@@ -14,11 +16,7 @@ def tiff_series_level_count(path: Path) -> int:
 
 
 def spatial_shape_zyx_from_axes(shape: tuple[int, ...], axes: str) -> tuple[int, int, int]:
-    if axes == "CZYX":
-        return int(shape[1]), int(shape[2]), int(shape[3])
-    if axes == "ZYX":
-        return int(shape[0]), int(shape[1]), int(shape[2])
-    raise ValueError(f"Expected CZYX or ZYX axes, got {axes!r}")
+    return spatial_shape_zyx(shape, axes)
 
 
 def spatial_shape_array_zyx_from_axes(shape: tuple[int, ...], axes: str) -> np.ndarray:

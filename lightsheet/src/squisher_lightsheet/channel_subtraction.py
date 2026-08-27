@@ -31,6 +31,7 @@ from typing import Any, Callable
 import numpy as np
 
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
+from squisher_lightsheet import tile_input
 
 
 DIMENSIONS = ("z", "y", "x")
@@ -58,26 +59,6 @@ class ChannelSubtractionResult:
     tile_count: int
     records: tuple[SubtractedTileRecord, ...]
     registration_output: Path | None = None
-
-
-def _shape_zyx(tile: legacy.TileMetadata, source_shape: tuple[int, ...]) -> tuple[int, int, int]:
-    if tile.axes == "CZYX":
-        return int(source_shape[1]), int(source_shape[2]), int(source_shape[3])
-    if tile.axes == "ZYX":
-        return int(source_shape[0]), int(source_shape[1]), int(source_shape[2])
-    raise ValueError(f"Expected CZYX or ZYX tile axes, got {tile.axes!r}")
-
-
-def _channel_view(array: Any, tile: legacy.TileMetadata, channel: int) -> Any:
-    if tile.axes == "CZYX":
-        if channel < 0 or channel >= int(array.shape[0]):
-            raise ValueError(f"{tile.path} does not have channel {channel}; shape={tuple(array.shape)}")
-        return array[channel]
-    if tile.axes == "ZYX":
-        if channel != 0:
-            raise ValueError(f"{tile.path} is single-channel ZYX; requested channel {channel}")
-        return array
-    raise ValueError(f"Expected CZYX or ZYX tile axes, got {tile.axes!r}")
 
 
 def _crop_translation_um(
@@ -437,9 +418,9 @@ def subtract_channel_tiles(
         try:
             source_shape = tuple(int(value) for value in array.shape)
             source_tile = legacy.fusion_tile_for_source_array(tile, source_shape, source_level=source_level)
-            source_shape_zyx = _shape_zyx(tile, source_shape)
-            target = _channel_view(array, tile, target_channel)
-            reference = _channel_view(array, tile, reference_channel)
+            source_shape_zyx = tile_input.spatial_shape_zyx(source_shape, source_tile.axes)
+            target = tile_input.channel_view(array, source_tile.axes, target_channel, path=tile.path)
+            reference = tile_input.channel_view(array, source_tile.axes, reference_channel, path=tile.path)
             output_path = _output_tile_path(
                 tile,
                 output_tile_dir,
