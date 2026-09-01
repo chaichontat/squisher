@@ -1,9 +1,12 @@
 # squisher monorepo
 
-This repository contains two Python projects:
+This repository contains five Python projects:
 
 - [`squisher/`](squisher/README.md): CZI compression and verification.
 - [`lightsheet/`](lightsheet/README.md): lightsheet stitching workflow commands.
+- [`lightsheet-psf/`](lightsheet-psf/README.md): lightsheet point-spread-function analysis.
+- [`deconv/`](deconv/README.md): GPU deconvolution tools.
+- [`segment/`](segment/README.md): Cellpose training and distributed segmentation.
 
 Use `squisher pyramid` to add fixed two-level TIFF SubIFD pyramids to existing
 OME-TIFF folders or files; see [`squisher/README.md`](squisher/README.md#usage).

@@ -1,4 +1,5 @@
 import json
+import pickle
 import warnings
 from pathlib import Path
 
@@ -39,6 +40,95 @@ def _runtime_artifacts(tag: str = "test") -> dict[str, object]:
     }
 
 
+def _input_identity(path: Path, array: zarr.Array) -> dict[str, object]:
+    return {
+        "path": str(path.resolve()),
+        "shape": list(array.shape),
+        "chunks": list(array.chunks),
+        "dtype": str(array.dtype),
+        "attrs": dict(array.attrs),
+    }
+
+
+def _write_ome_channel(path: Path, data: np.ndarray) -> None:
+    root = zarr.create_group(path)
+    array = root.create_array("0", data=data, chunks=(1, 2, 3))
+    array.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+    root.attrs.update(
+        {
+            "squisher_complete": True,
+            "ome": {
+                "multiscales": [
+                    {
+                        "axes": [{"name": axis} for axis in ("z", "y", "x")],
+                        "datasets": [{"path": "0"}],
+                    }
+                ]
+            },
+        }
+    )
+
+
+def test_registered_ome_manifest_reads_roi_and_survives_pickle(tmp_path: Path) -> None:
+    source_405 = tmp_path / "c405.ome.zarr"
+    source_561 = tmp_path / "c561.ome.zarr"
+    data_405 = np.arange(3 * 5 * 6, dtype=np.uint16).reshape(3, 5, 6)
+    data_561 = data_405 + 1000
+    _write_ome_channel(source_405, data_405)
+    _write_ome_channel(source_561, data_561)
+
+    manifest_path = tmp_path / "input.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "squisher_segment.registered_ome_input.v1",
+                "channels": ["405", "561"],
+                "sources": [
+                    {
+                        "channel": "405",
+                        "path": str(source_405),
+                        "root_metadata_sha256": segmentation.file_sha256(
+                            source_405 / "zarr.json"
+                        ),
+                    },
+                    {
+                        "channel": "561",
+                        "path": str(source_561),
+                        "root_metadata_sha256": segmentation.file_sha256(
+                            source_561 / "zarr.json"
+                        ),
+                    },
+                ],
+                "source_roi_zyx": [[1, 3], [1, 5], [2, 6]],
+                "shape": [2, 4, 4, 2],
+                "dtype": "uint16",
+            }
+        )
+    )
+
+    array, identity, provenance = segmentation._open_registered_ome_input(manifest_path)
+    restored = pickle.loads(pickle.dumps(array))
+
+    expected = np.stack(
+        [data_405[1:3, 1:5, 2:6], data_561[1:3, 1:5, 2:6]],
+        axis=-1,
+    )
+    np.testing.assert_array_equal(restored[:, :, :, :], expected)
+    np.testing.assert_array_equal(
+        restored.get_orthogonal_selection(
+            (slice(0, 1), slice(1, 3), slice(0, 2), [1, 0])
+        ),
+        expected[0:1, 1:3, 0:2][:, :, :, [1, 0]],
+    )
+    assert array.shape == (2, 4, 4, 2)
+    assert array.attrs["key"] == ["405", "561"]
+    assert identity["kind"] == "registered-ome-zarr"
+    assert {Path(item["path"]).name for item in provenance} == {
+        "input.json",
+        "zarr.json",
+    }
+
+
 def test_selected_channels_are_read_once_in_requested_order(tmp_path: Path) -> None:
     array, data = _write_input(tmp_path / "input.zarr")
     channel_indices, names = segmentation._resolve_channel_selection(array, "far-red,dna")
@@ -62,8 +152,69 @@ def test_selected_channels_are_read_once_in_requested_order(tmp_path: Path) -> N
     np.testing.assert_array_equal(selected, data[0:1, 0:2, 1:4][:, :, :, [2, 0]])
 
 
+def test_cellpose_input_is_masked_from_raw_561(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = np.zeros((1, 2, 3, 3), dtype=np.uint16)
+    data[..., 0] = 10
+    data[..., 2] = 30
+    data[0, 0, 1, 1] = 1000
+    data[0, 1, 2, 1] = 1001
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=data,
+        chunks=data.shape,
+    )
+    reads: list[tuple[int, ...]] = []
+    original_read = segmentation._read_input_crop
+
+    def record_read(zarr_array, crop, channel_indices):
+        reads.append(channel_indices)
+        return original_read(zarr_array, crop, channel_indices)
+
+    captured: dict[str, np.ndarray] = {}
+
+    class Model:
+        def eval(self, image: np.ndarray, **kwargs: object):
+            captured["image"] = image.copy()
+            return np.zeros(image.shape[:-1], dtype=np.uint32), [], None, None
+
+    def add_five(image: np.ndarray, *, crop: object = None) -> np.ndarray:
+        return image.astype(np.float32) + 5
+
+    monkeypatch.setattr(segmentation, "_read_input_crop", record_read)
+    monkeypatch.setattr(segmentation, "get_cached_model", lambda kwargs: Model())
+    monkeypatch.setattr(segmentation.cellpose.io, "logger_setup", lambda **kwargs: None)
+    monkeypatch.setattr(
+        segmentation.cp,
+        "get_default_memory_pool",
+        lambda: type("Pool", (), {"free_all_blocks": lambda self: None})(),
+    )
+
+    segmentation.read_preprocess_and_segment(
+        input_zarr,
+        (slice(0, 1), slice(0, 2), slice(0, 3), slice(0, 2)),
+        (2, 0),
+        1,
+        1000,
+        [(add_five, {})],
+        {},
+        {"normalize": {"lowhigh": [[-2.0, 40.0], [-3.0, 20.0]]}},
+        None,
+    )
+
+    expected = np.empty((1, 2, 3, 2), dtype=np.float32)
+    expected[..., 0] = -2.0
+    expected[..., 1] = -3.0
+    expected[0, 1, 2] = (35.0, 15.0)
+    assert reads == [(2, 0, 1)]
+    np.testing.assert_array_equal(captured["image"], expected)
+
+
 def test_sam_blocksize_targets_haloed_cellpose_crop() -> None:
     blocksize = segmentation._sam_processing_blocksize(
+        input_spatial_shape=(1_000, 1_000, 3_000),
         n_channels=3,
         diameter=30,
         target_nz=2,
@@ -91,6 +242,7 @@ def test_sam_blocksize_targets_haloed_cellpose_crop() -> None:
 
 def test_sam_target_nz_changes_only_z_block_extent() -> None:
     blocksize = segmentation._sam_processing_blocksize(
+        input_spatial_shape=(1_000, 1_000, 3_000),
         n_channels=3,
         diameter=30,
         target_nz=1,
@@ -101,7 +253,43 @@ def test_sam_target_nz_changes_only_z_block_extent() -> None:
     assert blocksize == (120, 280, 1_144, 3)
 
 
-def test_cellpose_eval_uses_required_unit_anisotropy() -> None:
+def test_sam_blocksize_avoids_tiny_subset_remainder() -> None:
+    blocksize = segmentation._sam_processing_blocksize(
+        input_spatial_shape=(2_470, 1_024, 1_024),
+        n_channels=3,
+        diameter=30,
+        target_nz=1,
+        target_ny=4,
+        target_nx=3,
+    )
+
+    block_indices, crops = segmentation._segmentation_block_crops(
+        (2_470, 1_024, 1_024, 3),
+        blocksize,
+        overlap=60,
+        mask=None,
+    )
+
+    assert blocksize == (120, 512, 512, 3)
+    assert len(block_indices) == 21 * 2 * 2
+    assert max(crop[1].stop - crop[1].start for crop in crops) <= 832
+    assert max(crop[2].stop - crop[2].start for crop in crops) <= 624
+
+
+def test_sam_blocksize_keeps_full_volume_interior_geometry() -> None:
+    blocksize = segmentation._sam_processing_blocksize(
+        input_spatial_shape=(2_470, 10_657, 7_871),
+        n_channels=3,
+        diameter=30,
+        target_nz=1,
+        target_ny=4,
+        target_nx=3,
+    )
+
+    assert blocksize == (120, 712, 504, 3)
+
+
+def test_cellpose_eval_uses_unit_anisotropy_and_masks_only() -> None:
     eval_kwargs = segmentation._build_cellpose_eval_kwargs(
         diameter=30,
         normalization={"lowhigh": [[0.0, 1.0]] * 3},
@@ -109,6 +297,7 @@ def test_cellpose_eval_uses_required_unit_anisotropy() -> None:
     )
 
     assert eval_kwargs["anisotropy"] == 1.0
+    assert eval_kwargs["return_flows"] is False
 
 
 def test_channel_selection_rejects_ambiguous_metadata(tmp_path: Path) -> None:
@@ -138,43 +327,18 @@ def test_run_state_is_bound_to_exact_identity(tmp_path: Path) -> None:
         segmentation.completed_run_matches(output_path, changed)
 
 
-def test_assume_nonempty_selects_all_blocks_without_input_reads(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class NoScanClient:
-        def map(self, *args: object, **kwargs: object) -> None:
-            raise AssertionError("dense-input selection must not submit scan futures")
-
-    crops = [
-        (slice(0, 2), slice(0, 4), slice(0, 4), slice(0, 1)),
-        (slice(0, 2), slice(2, 6), slice(0, 4), slice(0, 1)),
-        (slice(0, 2), slice(4, 8), slice(0, 4), slice(0, 1)),
-    ]
-    cache_path = tmp_path / "nonempty.json"
+def test_nonempty_rule_resolves_561_channel_and_threshold(tmp_path: Path) -> None:
     input_zarr, _ = _write_input(tmp_path / "input.zarr")
+    input_zarr.attrs["key"] = ["405", "561", "638"]
 
-    def fail_input_read(*args: object, **kwargs: object) -> None:
-        raise AssertionError("dense-input selection must not read input")
-
-    monkeypatch.setattr(segmentation, "_read_input_crop", fail_input_read)
-
-    selected = segmentation._select_input_blocks(
-        client=NoScanClient(),
-        block_crops=crops,
-        input_zarr=input_zarr,
-        channel_indices=(0,),
-        blocksize=(2, 4, 4, 1),
-        run_key="dense-run",
-        path_nonempty=cache_path,
-        assume_nonempty=True,
-    )
-
-    assert selected == [0, 1, 2]
-    assert not cache_path.exists()
+    assert segmentation._resolve_nonempty_rule(input_zarr, 750) == {
+        "channel": "561",
+        "channel_index": 1,
+        "threshold": 750,
+    }
 
 
-def test_default_scan_caches_qualifying_indices_for_assume_mode(
+def test_default_scan_caches_blocks_with_561_above_1000(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,15 +354,17 @@ def test_default_scan_caches_qualifying_indices_for_assume_mode(
 
     class ImmediateClient:
         thresholds: list[int] = []
+        channel_indices: list[int] = []
 
         def map(self, function, crops, **kwargs):
             self.thresholds.append(kwargs["threshold"])
+            self.channel_indices.append(kwargs["channel_index"])
             return [
                 ImmediateFuture(
                     function(
                         crop,
                         kwargs["zarr_array"],
-                        kwargs["selected_channels"],
+                        kwargs["channel_index"],
                         kwargs["threshold"],
                     )
                 )
@@ -207,11 +373,18 @@ def test_default_scan_caches_qualifying_indices_for_assume_mode(
 
     input_zarr = zarr.create_array(
         tmp_path / "scan-input.zarr",
-        data=np.array([0, 1, 2], dtype=np.uint16).reshape(1, 1, 3, 1),
-        chunks=(1, 1, 1, 1),
+        data=np.array(
+            [
+                [5000, 1000, 5000],
+                [5000, 1001, 5000],
+                [5000, 0, 5000],
+            ],
+            dtype=np.uint16,
+        ).reshape(1, 1, 3, 3),
+        chunks=(1, 1, 1, 3),
     )
     crops = [
-        (slice(0, 1), slice(0, 1), slice(i, i + 1), slice(0, 1))
+        (slice(0, 1), slice(0, 1), slice(i, i + 1), slice(0, 3))
         for i in range(3)
     ]
     reads: list[tuple[slice, ...]] = []
@@ -225,23 +398,23 @@ def test_default_scan_caches_qualifying_indices_for_assume_mode(
     monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
     client = ImmediateClient()
     cache_path = tmp_path / "nonempty.json"
-    blocksize = (1, 1, 1, 1)
 
     selected = segmentation._select_input_blocks(
         client=client,
         block_crops=crops,
         input_zarr=input_zarr,
-        channel_indices=(0,),
-        blocksize=blocksize,
+        nonempty_channel_index=1,
+        nonempty_threshold=1000,
+        blocksize=(1, 1, 1, 3),
         run_key="sparse-run",
         path_nonempty=cache_path,
-        assume_nonempty=False,
     )
 
-    assert client.thresholds == [1]
+    assert client.thresholds == [1000]
+    assert client.channel_indices == [1]
     assert reads == crops
-    assert selected == [2]
-    assert cache_utils.read_nonempty_cache(cache_path, blocksize, "sparse-run") == [2]
+    assert selected == [1]
+    assert cache_utils.read_nonempty_cache(cache_path, (1, 1, 1, 3), "sparse-run") == [1]
 
     class NoScanClient:
         def map(self, *args: object, **kwargs: object) -> None:
@@ -256,17 +429,115 @@ def test_default_scan_caches_qualifying_indices_for_assume_mode(
         client=NoScanClient(),
         block_crops=crops,
         input_zarr=input_zarr,
-        channel_indices=(0,),
-        blocksize=blocksize,
+        nonempty_channel_index=1,
+        nonempty_threshold=1000,
+        blocksize=(1, 1, 1, 3),
         run_key="sparse-run",
         path_nonempty=cache_path,
-        assume_nonempty=True,
     )
 
-    assert cached == [2]
+    assert cached == [1]
 
 
-def test_run_identity_distinguishes_block_selection_policy(tmp_path: Path) -> None:
+def test_distributed_eval_scans_block_cores_without_inference_halos(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SelectionChecked(RuntimeError):
+        pass
+
+    class Client:
+        def wait_for_workers(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def run(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {}
+
+    class Cluster:
+        client = Client()
+
+    data = np.zeros((1, 1, 6, 3), dtype=np.uint16)
+    data[0, 0, 2, 1] = 1001
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=data,
+        chunks=(1, 1, 2, 3),
+    )
+    input_zarr.attrs["key"] = ["405", "561", "638"]
+    model_path = tmp_path / "model"
+    model_path.write_bytes(b"model")
+    run_identity = segmentation._build_run_identity(
+        input_identity=_input_identity(tmp_path / "input.zarr", input_zarr),
+        channel_indices=(0,),
+        model_kwargs={"pretrained_model": str(model_path)},
+        eval_kwargs={"diameter": 1},
+        blocksize=(1, 1, 2, 1),
+        overlap=2,
+        preprocessing_steps=[],
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+        mask=None,
+        runtime_artifacts=_runtime_artifacts(),
+    )
+
+    def assert_core_crops(**kwargs: object) -> list[int]:
+        crops = kwargs["block_crops"]
+        assert isinstance(crops, list)
+        assert crops[0][2] == slice(0, 2)
+        assert not segmentation._check_block_has_data(crops[0], input_zarr, 1, 1000)
+        raise SelectionChecked
+
+    monkeypatch.setattr(segmentation, "_select_input_blocks", assert_core_crops)
+
+    with pytest.raises(SelectionChecked):
+        segmentation.distributed_eval.__wrapped__(
+            input_zarr=input_zarr,
+            blocksize=(1, 1, 2, 1),
+            write_path=tmp_path / "output.zarr",
+            model_kwargs={"pretrained_model": str(model_path)},
+            eval_kwargs={"diameter": 1},
+            cluster=Cluster(),
+            channel_indices=(0,),
+            run_identity=run_identity,
+        )
+
+
+def test_nonempty_scan_fails_instead_of_scheduling_unknown_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingFuture:
+        def add_done_callback(self, callback) -> None:
+            callback(self)
+
+        def result(self) -> bool:
+            raise OSError("read failed")
+
+    class FailingClient:
+        def map(self, *args: object, **kwargs: object) -> list[FailingFuture]:
+            return [FailingFuture()]
+
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        shape=(1, 1, 1, 3),
+        chunks=(1, 1, 1, 3),
+        dtype=np.uint16,
+    )
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+
+    with pytest.raises(RuntimeError, match="Foreground scan failed for block 0"):
+        segmentation._select_input_blocks(
+            client=FailingClient(),
+            block_crops=[(slice(0, 1),) * 3 + (slice(0, 3),)],
+            input_zarr=input_zarr,
+            nonempty_channel_index=1,
+            nonempty_threshold=1000,
+            blocksize=(1, 1, 1, 3),
+            run_key="failed-run",
+            path_nonempty=tmp_path / "nonempty.json",
+        )
+
+
+def test_nonempty_rule_changes_run_and_cache_identity(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     model_path.write_bytes(b"model")
     common = {
@@ -281,14 +552,54 @@ def test_run_identity_distinguishes_block_selection_policy(tmp_path: Path) -> No
         "runtime_artifacts": _runtime_artifacts(),
     }
 
-    scanned = segmentation._build_run_identity(**common, assume_nonempty=False)
-    dense = segmentation._build_run_identity(**common, assume_nonempty=True)
+    threshold_1000 = segmentation._build_run_identity(
+        **common,
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+    )
+    threshold_999 = segmentation._build_run_identity(
+        **common,
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 999},
+    )
 
-    assert scanned["block_selection"] == "cache-or-scan"
-    assert dense["block_selection"] == "cache-or-all"
-    assert scanned["schema_version"] == dense["schema_version"] == 3
-    assert segmentation._identity_digest(scanned) != segmentation._identity_digest(dense)
-    assert segmentation._nonempty_cache_key(scanned) == segmentation._nonempty_cache_key(dense)
+    assert threshold_1000["schema_version"] == threshold_999["schema_version"] == 4
+    assert segmentation._identity_digest(threshold_1000) != segmentation._identity_digest(
+        threshold_999
+    )
+    assert segmentation._nonempty_cache_key(threshold_1000) != segmentation._nonempty_cache_key(
+        threshold_999
+    )
+
+
+def test_nonempty_cache_ignores_inference_only_changes(tmp_path: Path) -> None:
+    model_a = tmp_path / "model-a"
+    model_b = tmp_path / "model-b"
+    model_a.write_bytes(b"a")
+    model_b.write_bytes(b"b")
+    common = {
+        "input_identity": {"path": "/data/input.zarr"},
+        "channel_indices": (0,),
+        "blocksize": (2, 4, 4, 1),
+        "overlap": 60,
+        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
+        "mask": None,
+    }
+    identity_a = segmentation._build_run_identity(
+        **common,
+        model_kwargs={"pretrained_model": str(model_a)},
+        eval_kwargs={"diameter": 30, "flow_threshold": 0},
+        preprocessing_steps=[],
+        runtime_artifacts=_runtime_artifacts("a"),
+    )
+    identity_b = segmentation._build_run_identity(
+        **common,
+        model_kwargs={"pretrained_model": str(model_b)},
+        eval_kwargs={"diameter": 30, "flow_threshold": 1},
+        preprocessing_steps=[(np.asarray, {})],
+        runtime_artifacts=_runtime_artifacts("b"),
+    )
+
+    assert segmentation._identity_digest(identity_a) != segmentation._identity_digest(identity_b)
+    assert segmentation._nonempty_cache_key(identity_a) == segmentation._nonempty_cache_key(identity_b)
 
 
 def test_mask_content_changes_run_and_nonempty_cache_identity(tmp_path: Path) -> None:
@@ -302,7 +613,7 @@ def test_mask_content_changes_run_and_nonempty_cache_identity(tmp_path: Path) ->
         "blocksize": (2, 4, 4, 1),
         "overlap": 60,
         "preprocessing_steps": [],
-        "assume_nonempty": False,
+        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
         "runtime_artifacts": _runtime_artifacts(),
     }
     mask_a = np.zeros((2, 2, 2), dtype=np.uint8)
@@ -319,10 +630,25 @@ def test_mask_content_changes_run_and_nonempty_cache_identity(tmp_path: Path) ->
     assert segmentation._nonempty_cache_key(identity_a) != segmentation._nonempty_cache_key(identity_b)
 
 
-def test_distributed_eval_rejects_conflicting_selection_identity(tmp_path: Path) -> None:
+def test_distributed_eval_rejects_conflicting_nonempty_rule(tmp_path: Path) -> None:
     input_zarr, _ = _write_input(tmp_path / "input.zarr")
+    input_zarr.attrs["key"] = ["405", "561", "638"]
+    model_path = tmp_path / "model"
+    model_path.write_bytes(b"model")
+    run_identity = segmentation._build_run_identity(
+        input_identity=_input_identity(tmp_path / "input.zarr", input_zarr),
+        channel_indices=(0,),
+        model_kwargs={"pretrained_model": str(model_path)},
+        eval_kwargs={"diameter": 1},
+        blocksize=(2, 4, 4, 1),
+        overlap=2,
+        preprocessing_steps=[],
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 999},
+        mask=None,
+        runtime_artifacts=_runtime_artifacts(),
+    )
 
-    with pytest.raises(ValueError, match="block_selection does not match"):
+    with pytest.raises(ValueError, match="nonempty_rule does not match"):
         segmentation.distributed_eval.__wrapped__(
             input_zarr=input_zarr,
             blocksize=(2, 4, 4, 1),
@@ -331,8 +657,40 @@ def test_distributed_eval_rejects_conflicting_selection_identity(tmp_path: Path)
             eval_kwargs={"diameter": 1},
             cluster=object(),
             channel_indices=(0,),
-            run_identity={"block_selection": "cache-or-scan"},
-            assume_nonempty=True,
+            run_identity=run_identity,
+        )
+
+
+def test_distributed_eval_rejects_identity_that_does_not_match_call(tmp_path: Path) -> None:
+    input_zarr, _ = _write_input(tmp_path / "input.zarr")
+    input_zarr.attrs["key"] = ["405", "561", "638"]
+    identity_model = tmp_path / "identity-model"
+    called_model = tmp_path / "called-model"
+    identity_model.write_bytes(b"identity")
+    called_model.write_bytes(b"called")
+    run_identity = segmentation._build_run_identity(
+        input_identity=_input_identity(tmp_path / "input.zarr", input_zarr),
+        channel_indices=(0,),
+        model_kwargs={"pretrained_model": str(identity_model)},
+        eval_kwargs={"diameter": 1},
+        blocksize=(2, 4, 4, 1),
+        overlap=2,
+        preprocessing_steps=[],
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+        mask=None,
+        runtime_artifacts=_runtime_artifacts(),
+    )
+
+    with pytest.raises(ValueError, match="run_identity does not match"):
+        segmentation.distributed_eval.__wrapped__(
+            input_zarr=input_zarr,
+            blocksize=(2, 4, 4, 1),
+            write_path=tmp_path / "output.zarr",
+            model_kwargs={"pretrained_model": str(called_model)},
+            eval_kwargs={"diameter": 1},
+            cluster=object(),
+            channel_indices=(0,),
+            run_identity=run_identity,
         )
 
 
@@ -349,53 +707,70 @@ def test_distributed_eval_rejects_conflicting_mask_identity(tmp_path: Path) -> N
             eval_kwargs={"diameter": 1},
             cluster=object(),
             channel_indices=(0,),
-            run_identity={"block_selection": "cache-or-scan", "mask": None},
-            assume_nonempty=False,
+            run_identity={"mask": None},
         )
 
 
-def test_typer_segment_run_propagates_assume_nonempty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_typer_segment_run_rejects_assume_nonempty(tmp_path: Path) -> None:
     input_path = tmp_path / "input.zarr"
     input_path.mkdir()
-    captured: dict[str, object] = {}
-
-    def fake_run_single_input(**kwargs: object) -> None:
-        captured.update(kwargs)
-
-    monkeypatch.setattr(segmentation, "_run_single_input", fake_run_single_input)
 
     result = TyperCliRunner().invoke(
         app,
         ["segment", "run", str(input_path), "--assume-nonempty"],
     )
 
-    assert result.exit_code == 0, result.output
-    assert captured["assume_nonempty"] is True
+    assert result.exit_code != 0
+    assert "No such option" in result.output
 
 
-def test_click_segment_run_propagates_assume_nonempty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_click_segment_run_rejects_assume_nonempty(tmp_path: Path) -> None:
     input_path = tmp_path / "input.zarr"
     input_path.mkdir()
-    captured: dict[str, object] = {}
-
-    def fake_run_single_input(**kwargs: object) -> None:
-        captured.update(kwargs)
-
-    monkeypatch.setattr(segmentation, "_run_single_input", fake_run_single_input)
 
     result = ClickCliRunner().invoke(
         segmentation.cli,
         ["run", str(input_path), "--assume-nonempty"],
     )
 
+    assert result.exit_code != 0
+    assert "No such option" in result.output
+
+
+def test_typer_segment_run_propagates_nonempty_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(
+        app,
+        ["segment", "run", str(input_path), "--nonempty-threshold", "750"],
+    )
+
     assert result.exit_code == 0, result.output
-    assert captured["assume_nonempty"] is True
+    assert captured["nonempty_threshold"] == 750
+
+
+def test_click_segment_run_propagates_nonempty_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = ClickCliRunner().invoke(
+        segmentation.cli,
+        ["run", str(input_path), "--nonempty-threshold", "750"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["nonempty_threshold"] == 750
 
 
 def test_typer_segment_stitch_propagates_transaction_options(
@@ -502,7 +877,7 @@ def test_trt_plan_content_is_part_of_run_identity(tmp_path: Path) -> None:
         "blocksize": (2, 4, 4, 1),
         "overlap": 60,
         "preprocessing_steps": [],
-        "assume_nonempty": False,
+        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
         "mask": None,
     }
 
@@ -585,12 +960,11 @@ def test_stitch_failure_never_exposes_partial_final_output(
         staged[0] = 1
         raise RuntimeError("stitch interrupted")
 
-    original_stitch = segmentation.stitch_labels
-    monkeypatch.setattr(segmentation, "stitch_labels", interrupted_stitch)
+    original_stitch = segmentation.stitch_label_pairs
+    monkeypatch.setattr(segmentation, "stitch_label_pairs", interrupted_stitch)
     with pytest.raises(RuntimeError, match="stitch interrupted"):
         segmentation._stitch_precomputed(
-            block_indices=[],
-            faces_list=[],
+            label_pairs=[],
             boxes_list=[],
             box_ids_list=[],
             temp_zarr=temp_zarr,
@@ -603,10 +977,9 @@ def test_stitch_failure_never_exposes_partial_final_output(
     assert not output_path.exists()
     assert segmentation._staged_output_path(output_path).exists()
 
-    monkeypatch.setattr(segmentation, "stitch_labels", original_stitch)
+    monkeypatch.setattr(segmentation, "stitch_label_pairs", original_stitch)
     final, boxes = segmentation._stitch_precomputed(
-        block_indices=[],
-        faces_list=[],
+        label_pairs=[],
         boxes_list=[],
         box_ids_list=[],
         temp_zarr=temp_zarr,
@@ -703,8 +1076,7 @@ def test_overwrite_promotion_failure_restores_prior_output(
 
     with pytest.raises(OSError, match="promotion interrupted"):
         segmentation._stitch_precomputed(
-            block_indices=[],
-            faces_list=[],
+            label_pairs=[],
             boxes_list=[],
             box_ids_list=[],
             temp_zarr=temp_zarr,
@@ -791,6 +1163,24 @@ def test_blank_preconfig_temp_zarr_is_recoverable_but_written_store_is_not(
         )
 
 
+def test_adopted_blank_temp_zarr_gets_run_config(tmp_path: Path) -> None:
+    path = tmp_path / "temp.zarr"
+    zarr.create_array(path, shape=(2, 3, 4), chunks=(1, 3, 4), dtype=np.uint32)
+    config_path = tmp_path / "run_config.json"
+    identity = {"schema_version": 4, "run": "adopted"}
+
+    recovered = segmentation._initialize_temp_zarr(
+        path=path,
+        shape=(2, 3, 4),
+        chunks=(1, 3, 4),
+        run_config_path=config_path,
+        run_identity=identity,
+    )
+
+    assert recovered.shape == (2, 3, 4)
+    assert segmentation.load_run_identity(config_path) == identity
+
+
 def test_run_stitch_replaces_output_transactionally_and_cleans_temp(tmp_path: Path) -> None:
     temp_dir = tmp_path / "temp"
     temp_dir.mkdir()
@@ -854,7 +1244,7 @@ def test_distributed_eval_requires_artifact_bound_identity(tmp_path: Path) -> No
             channel_indices=(0,),
         )
 
-    with pytest.raises(ValueError, match="complete schema-3"):
+    with pytest.raises(ValueError, match="complete schema-4"):
         segmentation.distributed_eval.__wrapped__(
             input_zarr=input_zarr,
             blocksize=(2, 4, 4, 1),
@@ -865,7 +1255,6 @@ def test_distributed_eval_requires_artifact_bound_identity(tmp_path: Path) -> No
             channel_indices=(0,),
             run_identity={
                 "schema_version": 3,
-                "block_selection": "cache-or-scan",
                 "mask": None,
                 "runtime_artifacts": {"trt_plans": []},
             },
@@ -937,8 +1326,16 @@ def test_writer_rechunks_to_ragged_destination_grid(
         target: zarr.Array,
         *,
         lock: bool,
+        scheduler: str,
+        num_workers: int,
     ) -> None:
-        captured.update(chunks=array.chunks, target=target, lock=lock)
+        captured.update(
+            chunks=array.chunks,
+            target=target,
+            lock=lock,
+            scheduler=scheduler,
+            num_workers=num_workers,
+        )
 
     monkeypatch.setattr(dask.array.Array, "store", capture_store)
 
@@ -948,6 +1345,8 @@ def test_writer_rechunks_to_ragged_destination_grid(
         "chunks": ((6, 6, 1), (70, 30), (50, 50)),
         "target": output,
         "lock": False,
+        "scheduler": "threads",
+        "num_workers": merge_utils.FINALIZE_WORKERS,
     }
 
 

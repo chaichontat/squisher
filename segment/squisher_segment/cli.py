@@ -53,9 +53,74 @@ def train(
     (models_path / f"{name}.trained.json").write_text(updated.model_dump_json(indent=2))
 
 
+@app.command("n4")
+def n4_correct(
+    input_path: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Channel-separated Lightsheet OME-Zarr input.",
+        ),
+    ],
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Corrected OME-Zarr output.")] = None,
+    field_level: Annotated[
+        int | None,
+        typer.Option(min=0, help="Pyramid level used to estimate the 3D field; defaults to coarsest."),
+    ] = None,
+    shrink: Annotated[int, typer.Option(min=1, help="N4 fitting shrink factor.")] = 4,
+    spline_lowres_px: Annotated[
+        tuple[float, float, float],
+        typer.Option(
+            min=0.000001,
+            help="B-spline spacing in shrink-downsampled level-0 Z Y X pixels.",
+        ),
+    ] = (24.0, 48.0, 48.0),
+    threshold: Annotated[
+        str | None,
+        typer.Option(help="Numeric foreground threshold; defaults to values greater than zero."),
+    ] = None,
+    unsharp: Annotated[
+        bool,
+        typer.Option("--unsharp/--no-unsharp", help="Apply optional radius-3 unsharp masking."),
+    ] = False,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Replace an existing completed output."),
+    ] = False,
+) -> None:
+    """Apply 3D N4 correction to a channel-separated Lightsheet OME-Zarr."""
+    from squisher_segment.segment import n4
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    try:
+        parsed_threshold = n4._parse_threshold(threshold)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--threshold") from exc
+    resolved_output = output or n4._default_n4_output_path(input_path)
+    config = n4.N4Config(
+        field_level=field_level,
+        shrink=shrink,
+        spline_lowres_px_zyx=spline_lowres_px,
+        threshold=parsed_threshold,
+        unsharp=unsharp,
+    )
+    written = n4.run_n4_ome_zarr(
+        input_path,
+        resolved_output,
+        config,
+        overwrite=overwrite,
+    )
+    typer.echo(written)
+
+
 @segment_app.command("run")
 def segment_run(
-    input_zarr: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Input fused .zarr volume.")],
+    input_zarr: Annotated[
+        Path,
+        typer.Argument(exists=True, help="Input ZYXC Zarr or registered-source JSON manifest."),
+    ],
     channels: Annotated[str | None, typer.Option(help="Comma-separated channel names to segment.")] = None,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing segmentation.")] = False,
     config_path: Annotated[Path | None, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Config JSON path.")] = None,
@@ -66,13 +131,13 @@ def segment_run(
     target_nz: Annotated[int | None, typer.Option(help="Desired internal Cellpose nz tiles.")] = None,
     target_ny: Annotated[int | None, typer.Option(help="Desired internal Cellpose ny tiles.")] = None,
     target_nx: Annotated[int | None, typer.Option(help="Desired internal Cellpose nx tiles.")] = None,
-    assume_nonempty: Annotated[
-        bool,
+    nonempty_threshold: Annotated[
+        int,
         typer.Option(
-            "--assume-nonempty/--scan-nonempty",
-            help="On a nonempty-cache miss, process every planned block without scanning input.",
+            min=0,
+            help="561 threshold for block scheduling and Cellpose input masking; values must be strictly greater.",
         ),
-    ] = False,
+    ] = 1000,
     cellpose_only: Annotated[bool, typer.Option("--cellpose-only/--no-cellpose-only", help="Stop after Cellpose inference.")] = False,
     stagger_seconds: Annotated[float, typer.Option(help="Seconds to stagger worker starts on one GPU.")] = 5.0,
 ) -> None:
@@ -92,7 +157,7 @@ def segment_run(
         target_nz=target_nz,
         target_ny=target_ny,
         target_nx=target_nx,
-        assume_nonempty=assume_nonempty,
+        nonempty_threshold=nonempty_threshold,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
     )
@@ -115,11 +180,14 @@ def segment_stitch(
 def postproc_run(
     input_zarr_path: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Input segmentation .zarr.")],
     output_path: Annotated[Path | None, typer.Option(help="Output postprocessed .zarr path.")] = None,
-    blocksize: Annotated[int, typer.Option(help="XY block size for tiled processing.")] = 1024,
+    blocksize: Annotated[
+        tuple[int, int, int] | None,
+        typer.Option(help="Optional Z Y X core block size; defaults to input chunks."),
+    ] = None,
     sigma: Annotated[str, typer.Option(help="Gaussian smoothing sigma; scalar or 'z,y,x'.")] = "1,2,2",
     v_min: Annotated[int, typer.Option("--v-min", help="Minimum volume for small cell donation.")] = 500,
-    margin: Annotated[int, typer.Option(help="Margin parameter; overlap is 2*margin.")] = 50,
-    workers_per_gpu: Annotated[int, typer.Option(help="Workers per GPU.")] = 4,
+    margin: Annotated[int, typer.Option(help="Margin parameter; overlap is 2*margin.")] = 30,
+    workers_per_gpu: Annotated[int, typer.Option(help="Workers per GPU.")] = 1,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")] = False,
 ) -> None:
     import zarr
@@ -130,18 +198,16 @@ def postproc_run(
     if resolved_output_path is None:
         sigma_str = sigma.replace(",", "-").replace(" ", "")
         resolved_output_path = input_zarr_path.parent / f"{input_zarr_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
-    if resolved_output_path.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists: {resolved_output_path}")
-
     postproc_mod.distributed_postproc(
         input_zarr=input_zarr,
         write_path=resolved_output_path,
-        blocksize=(input_zarr.shape[0], blocksize, blocksize),
+        blocksize=blocksize,
         margin=margin,
         sigma=postproc_mod._parse_sigma_option(sigma),
         V_min=v_min,
         input_path=input_zarr_path,
         cluster_kwargs={"workers_per_gpu": workers_per_gpu, "threads_per_worker": 1},
+        overwrite=overwrite,
     )
 
 
@@ -194,6 +260,45 @@ def extract(
         enrich_boundaries=enrich_boundaries,
         aux_channel_stack=aux_channel_stack,
     )
+
+
+@app.command("regionprops")
+def regionprops_command(
+    labels: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, help="Input 3-D label Zarr."),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Output Parquet; defaults beside labels."),
+    ] = None,
+    workers: Annotated[int, typer.Option(min=1, help="Parallel label-chunk workers.")] = 2,
+    offset_zyx: Annotated[
+        tuple[int, int, int],
+        typer.Option(min=0, help="Global Z Y X offset added to centroids and plane Z."),
+    ] = (0, 0, 0),
+    resume: Annotated[
+        bool,
+        typer.Option("--resume/--no-resume", help="Reuse matching completed chunk partials."),
+    ] = True,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Replace an existing output atomically."),
+    ] = False,
+) -> None:
+    """Measure chunk-parallel region properties without loading the full label volume."""
+    from squisher_segment.segment.regionprops import measure_zarr
+
+    resolved_output = output or labels.parent / "props.parquet"
+    written = measure_zarr(
+        labels,
+        resolved_output,
+        workers=workers,
+        offset_zyx=offset_zyx,
+        resume=resume,
+        overwrite=overwrite,
+    )
+    typer.echo(written)
 
 
 app.add_typer(segment_app, name="segment")

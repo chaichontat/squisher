@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache
 from json import JSONEncoder
 import os
 import pathlib
@@ -29,6 +31,11 @@ import zarr
 from numpy.typing import NDArray
 
 from squisher_segment.segment.normalize import sample_percentile
+from squisher_segment.segment.extract_core import (
+    _normalize_array_key,
+    _selector_indices,
+)
+from squisher.jpegxr_zarr import register_jpegxr_codec
 from squisher_segment.segmentation.distributed.cache_utils import (
     atomic_write_text,
     read_nonempty_cache,
@@ -45,15 +52,16 @@ from squisher_segment.segmentation.distributed.gpu_cluster import cluster, myLoc
 from squisher_segment.segmentation.distributed.merge_utils import (
     block_faces,
     bounding_boxes_in_global_coordinates,
+    find_label_pairs_across_boundary,
     get_block_crops,
     get_nblocks,
-    global_segment_ids,
-    merge_boxes_for_labels,
+    global_segment_id_remap,
     remove_overlaps,
-    stitch_labels,
     create_zarr_array,
     decode_block_global_labels,
     label_zarr_codecs,
+    merge_boxes_for_sparse_labels,
+    stitch_label_pairs,
 )
 from squisher_segment.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from squisher_segment.segmentation.distributed.tiling import solve_internal_zyx_for_tiles
@@ -72,6 +80,8 @@ dask.config.set({
 # when Dask serializes functions/objects that capture loggers with Rich handlers.
 # CLI commands set up their own Rich logging independently (causes duplicate progress bars).
 logger = logging.getLogger(__name__)
+NONEMPTY_CHANNEL_NAME = "561"
+DEFAULT_NONEMPTY_THRESHOLD = 1000
 
 
 class NumpyEncoder(JSONEncoder):
@@ -228,13 +238,15 @@ def _apply_startup_stagger(stagger_seconds: float, workers_per_gpu: int) -> None
 
 def _save_intermediate_state(
     temp_dir: Path,
-    faces_list: list,
+    label_pairs: list[NDArray[np.uint32]],
     boxes_list: list,
     box_ids_list: list,
     non_empty_indices: list[tuple[int, ...]],
 ) -> None:
     """Save cellpose results for later stitching."""
     path = temp_dir / "intermediate_state.npz"
+    pairs_array = np.empty(len(label_pairs), dtype=object)
+    pairs_array[:] = label_pairs
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -243,7 +255,7 @@ def _save_intermediate_state(
             temporary_path = Path(temporary_file.name)
             np.savez(
                 temporary_file,
-                faces=np.array(faces_list, dtype=object),
+                label_pairs=pairs_array,
                 boxes=np.array(boxes_list, dtype=object),
                 box_ids=np.array(box_ids_list, dtype=object),
                 non_empty_indices=np.array(non_empty_indices),
@@ -261,11 +273,85 @@ def _save_intermediate_state(
             temporary_path.unlink(missing_ok=True)
 
 
+def _overlap_sidecar_path(directory: Path, block_index: tuple[int, ...]) -> Path:
+    return directory / ("b-" + "-".join(str(value) for value in block_index[:3]) + ".npz")
+
+
+def _save_overlap_faces(
+    directory: Path,
+    block_index: tuple[int, ...],
+    faces: list[NDArray[Any]],
+) -> None:
+    """Atomically persist one block's trimmed, one-pixel faces."""
+    if len(faces) != 6:
+        raise ValueError(f"Expected six 3-D overlap faces; got {len(faces)}.")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = _overlap_sidecar_path(directory, block_index)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b", dir=directory, prefix=".tmp-", suffix=".npz", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            np.savez_compressed(
+                temporary_file,
+                **{f"face_{i}": np.asarray(face, dtype=np.uint32) for i, face in enumerate(faces)},
+            )
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(directory)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _load_overlap_face(
+    directory: Path,
+    block_index: tuple[int, ...],
+    face_index: int,
+) -> NDArray[np.uint32]:
+    path = _overlap_sidecar_path(directory, block_index)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing overlap evidence for block {block_index}: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        key = f"face_{face_index}"
+        if key not in data:
+            raise ValueError(f"Overlap sidecar {path} is missing {key}.")
+        return np.asarray(data[key], dtype=np.uint32)
+
+
+def _overlap_pairs_from_sidecars(
+    block_indices: list[tuple[int, ...]],
+    directory: Path,
+) -> list[NDArray[np.uint32]]:
+    """Stream neighboring faces and pair labels that touch across each boundary."""
+    available = {tuple(index) for index in block_indices}
+    pairs = []
+    for block_index in block_indices:
+        for axis in range(3):
+            neighbor = list(block_index)
+            neighbor[axis] += 1
+            neighbor_index = tuple(neighbor)
+            if neighbor_index not in available:
+                continue
+            first = _load_overlap_face(directory, block_index, 2 * axis + 1)
+            second = _load_overlap_face(directory, neighbor_index, 2 * axis)
+            paired = np.concatenate(
+                (np.moveaxis(first, axis, 0), np.moveaxis(second, axis, 0)),
+                axis=0,
+            )
+            matched = find_label_pairs_across_boundary(paired).astype(np.uint32, copy=False)
+            if matched.size:
+                pairs.append(matched)
+    return pairs
+
+
 def _load_intermediate_state(temp_dir: Path) -> tuple[list, list, list, list[tuple[int, ...]]]:
     """Load saved cellpose results for stitching."""
     data = np.load(temp_dir / "intermediate_state.npz", allow_pickle=True)
     return (
-        data["faces"].tolist(),
+        data["label_pairs"].tolist(),
         data["boxes"].tolist(),
         data["box_ids"].tolist(),
         [tuple(idx) for idx in data["non_empty_indices"]],
@@ -355,7 +441,7 @@ def _runtime_artifact_identity(
         device_count = min(device_count, max_devices)
 
     return {
-        "pipeline_revision": 1,
+        "pipeline_revision": 3,
         "squisher_segment_version": version("squisher-segment"),
         "trt_plans": _trt_plan_identity(
             model_path,
@@ -389,15 +475,18 @@ def _preprocessing_identity(
     ]
 
 
-def _block_selection_policy(assume_nonempty: bool) -> str:
-    return "cache-or-all" if assume_nonempty else "cache-or-scan"
-
-
 def _nonempty_cache_key(run_identity: dict[str, Any]) -> str:
-    """Bind observed occupancy to inputs and tiling, independent of fallback policy."""
-    cache_identity = _normalize_for_comparison(run_identity)
-    cache_identity.pop("block_selection", None)
-    return _identity_digest(cache_identity)
+    """Bind observed occupancy to inputs, tiling, and the foreground rule."""
+    blocksize = run_identity["blocksize"]
+    return _identity_digest(
+        {
+            "schema_version": 1,
+            "input": run_identity["input"],
+            "spatial_blocksize": blocksize[:-1],
+            "mask": run_identity.get("mask"),
+            "nonempty_rule": run_identity["nonempty_rule"],
+        }
+    )
 
 
 def _mask_identity(mask: NDArray[Any] | None) -> dict[str, Any] | None:
@@ -445,13 +534,14 @@ def _validate_run_identity_structure(run_identity: dict[str, Any]) -> dict[str, 
         "model_kwargs",
         "eval_kwargs",
         "blocksize",
+        "nonempty_rule",
         "preprocessing_steps",
         "runtime_artifacts",
     }
     missing = sorted(required - run_identity.keys())
-    if run_identity.get("schema_version") != 3 or missing:
+    if run_identity.get("schema_version") != 4 or missing:
         raise ValueError(
-            f"run_identity must be a complete schema-3 artifact-bound identity; missing {missing}."
+            f"run_identity must be a complete schema-4 artifact-bound identity; missing {missing}."
         )
     if not isinstance(run_identity["input"], dict) or not run_identity["input"]:
         raise ValueError("run_identity input must be a non-empty mapping.")
@@ -461,11 +551,78 @@ def _validate_run_identity_structure(run_identity: dict[str, Any]) -> dict[str, 
         run_identity["eval_kwargs"], dict
     ):
         raise ValueError("run_identity model_kwargs and eval_kwargs must be mappings.")
+    nonempty_rule = run_identity["nonempty_rule"]
+    if (
+        not isinstance(nonempty_rule, dict)
+        or not isinstance(nonempty_rule.get("channel"), str)
+        or not isinstance(nonempty_rule.get("channel_index"), int)
+        or not isinstance(nonempty_rule.get("threshold"), int)
+    ):
+        raise ValueError(
+            "run_identity nonempty_rule must define channel, channel_index, and threshold."
+        )
     runtime_artifacts = run_identity["runtime_artifacts"]
     if not isinstance(runtime_artifacts, dict):
         raise ValueError("run_identity runtime_artifacts must be a mapping.")
     _validate_runtime_artifacts(runtime_artifacts)
     return runtime_artifacts
+
+
+def _validate_run_identity_matches_call(
+    run_identity: dict[str, Any],
+    *,
+    input_zarr: zarr.Array,
+    channel_indices: tuple[int, ...],
+    model_kwargs: dict[str, Any],
+    eval_kwargs: dict[str, Any],
+    blocksize: tuple[int, ...],
+    overlap: int,
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+) -> None:
+    """Reject resumable identities that do not describe the current evaluation."""
+    model_path = model_kwargs.get("pretrained_model")
+    if not isinstance(model_path, (str, os.PathLike)):
+        raise ValueError("model_kwargs must include pretrained_model for resumable evaluation.")
+
+    input_identity = run_identity["input"]
+    expected = {
+        "channel_indices": list(channel_indices),
+        "model_sha256": file_sha256(Path(model_path)),
+        "model_kwargs": model_kwargs,
+        "eval_kwargs": eval_kwargs,
+        "blocksize": list(blocksize),
+        "overlap": overlap,
+        "preprocessing_steps": _preprocessing_identity(preprocessing_steps),
+        "cellpose_version": version("cellpose"),
+    }
+    mismatches = [
+        field
+        for field, value in expected.items()
+        if run_identity.get(field) != _normalize_for_comparison(value)
+    ]
+    input_schema = {
+        "shape": list(input_zarr.shape),
+        "chunks": list(input_zarr.chunks),
+        "dtype": str(input_zarr.dtype),
+        "attrs": dict(input_zarr.attrs),
+    }
+    if any(
+        input_identity.get(field) != _normalize_for_comparison(value)
+        for field, value in input_schema.items()
+    ):
+        mismatches.append("input")
+
+    store_root = getattr(getattr(input_zarr, "store", None), "root", None)
+    identity_path = input_identity.get("path")
+    if store_root is not None and isinstance(identity_path, str):
+        if Path(store_root).resolve() != Path(identity_path).resolve():
+            mismatches.append("input.path")
+
+    if mismatches:
+        raise ValueError(
+            "run_identity does not match the current evaluation: "
+            + ", ".join(sorted(set(mismatches)))
+        )
 
 
 def _build_run_identity(
@@ -477,7 +634,7 @@ def _build_run_identity(
     blocksize: tuple[int, ...],
     overlap: int,
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
-    assume_nonempty: bool,
+    nonempty_rule: dict[str, Any],
     mask: NDArray[Any] | None,
     runtime_artifacts: dict[str, Any],
 ) -> dict[str, Any]:
@@ -485,7 +642,7 @@ def _build_run_identity(
     model_path = Path(model_kwargs["pretrained_model"])
     return _normalize_for_comparison(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "input": input_identity,
             "channel_indices": list(channel_indices),
             "model_sha256": file_sha256(model_path),
@@ -493,7 +650,7 @@ def _build_run_identity(
             "eval_kwargs": eval_kwargs,
             "blocksize": list(blocksize),
             "overlap": overlap,
-            "block_selection": _block_selection_policy(assume_nonempty),
+            "nonempty_rule": nonempty_rule,
             "mask": _mask_identity(mask),
             "preprocessing_steps": _preprocessing_identity(preprocessing_steps),
             "cellpose_version": version("cellpose"),
@@ -567,6 +724,31 @@ def _open_blank_temp_zarr(
         raise RuntimeError(
             f"Temporary Zarr {path} contains data without a run configuration; use --overwrite."
         )
+    return array
+
+
+def _initialize_temp_zarr(
+    *,
+    path: Path,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    run_config_path: Path,
+    run_identity: dict[str, Any],
+) -> zarr.Array:
+    """Create or adopt a blank store, then persist its identity before any writes."""
+    if path.exists():
+        array = _open_blank_temp_zarr(path, shape=shape, chunks=chunks)
+    else:
+        array = create_zarr_array(
+            path,
+            shape=shape,
+            chunks=chunks,
+            dtype=np.uint32,
+            overwrite=False,
+            codecs=label_zarr_codecs(np.uint32),
+        )
+    save_run_config(run_config_path, run_identity)
+    logger.info(f"Fresh run - saved config to {run_config_path}")
     return array
 
 
@@ -815,6 +997,213 @@ def format_slice(s: slice | tuple[slice, ...]) -> str:
     return ":".join(parts).rstrip(":")
 
 
+@lru_cache(maxsize=32)
+def _open_registered_channel(source: str, dataset: str) -> zarr.Array:
+    """Open one source once per worker process."""
+    register_jpegxr_codec()
+    return zarr.open_array(Path(source) / dataset, mode="r")
+
+
+def _offset_roi_selector(selector: object, start: int, size: int) -> int | slice:
+    if isinstance(selector, np.integer | int):
+        index = int(selector)
+        if index < 0:
+            index += size
+        if not 0 <= index < size:
+            raise IndexError(f"index {selector} is out of bounds for axis with size {size}")
+        return start + index
+    if isinstance(selector, slice):
+        relative_start, relative_stop, step = selector.indices(size)
+        if step != 1:
+            raise IndexError("Registered OME-Zarr inputs support only unit-step spatial slices.")
+        return slice(start + relative_start, start + relative_stop)
+    raise IndexError(f"Unsupported registered OME-Zarr spatial selector {selector!r}.")
+
+
+@dataclass(frozen=True)
+class RegisteredOMEZarrInput:
+    """Present registered channel-separated OME-Zarrs as one cropped ZYXC array."""
+
+    sources: tuple[str, ...]
+    datasets: tuple[str, ...]
+    channel_names: tuple[str, ...]
+    roi_zyx: tuple[tuple[int, int], ...]
+    source_chunks: tuple[int, int, int]
+    dtype_name: str
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        spatial = tuple(stop - start for start, stop in self.roi_zyx)
+        return (*spatial, len(self.sources))
+
+    @property
+    def chunks(self) -> tuple[int, int, int, int]:
+        return (*self.source_chunks, len(self.sources))
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return np.dtype(self.dtype_name)
+
+    @property
+    def ndim(self) -> int:
+        return 4
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        return {"key": list(self.channel_names), "_ARRAY_DIMENSIONS": ["z", "y", "x", "c"]}
+
+    def __getitem__(self, key: object) -> NDArray[Any]:
+        selectors = _normalize_array_key(key, self.ndim)
+        spatial = tuple(
+            _offset_roi_selector(selector, start, stop - start)
+            for selector, (start, stop) in zip(selectors[:3], self.roi_zyx, strict=True)
+        )
+        channel_indices, result_channel_selector = _selector_indices(
+            selectors[3], len(self.sources)
+        )
+        channels = [
+            np.asarray(_open_registered_channel(self.sources[index], self.datasets[index])[spatial])
+            for index in channel_indices
+        ]
+        return np.stack(channels, axis=-1)[..., result_channel_selector]
+
+    def get_orthogonal_selection(self, selection: object) -> NDArray[Any]:
+        return self[selection]
+
+
+def _ome_level_zero(root: zarr.Group, source: Path) -> tuple[str, zarr.Array]:
+    attrs = dict(root.attrs)
+    ome = attrs.get("ome")
+    multiscales = ome.get("multiscales") if isinstance(ome, dict) else attrs.get("multiscales")
+    if not isinstance(multiscales, list) or len(multiscales) != 1:
+        raise ValueError(f"Source {source} must contain exactly one OME-Zarr multiscale image.")
+    multiscale = multiscales[0]
+    axes = multiscale.get("axes") if isinstance(multiscale, dict) else None
+    axis_names = tuple(
+        str(axis.get("name") if isinstance(axis, dict) else axis).lower()
+        for axis in axes or []
+    )
+    if axis_names != ("z", "y", "x"):
+        raise ValueError(f"Source {source} must have OME-Zarr ZYX axes; found {axis_names}.")
+    datasets = multiscale.get("datasets")
+    level_path = datasets[0].get("path") if isinstance(datasets, list) and datasets else None
+    if not isinstance(level_path, str) or not level_path:
+        raise ValueError(f"Source {source} has no level-0 OME-Zarr dataset path.")
+    return level_path, _open_registered_channel(str(source), level_path)
+
+
+def _provenance_record(path: Path) -> dict[str, str]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError(f"Required input provenance file is missing or empty: {path}")
+    return {"path": str(path.resolve()), "sha256": file_sha256(path)}
+
+
+def _open_registered_ome_input(
+    manifest_path: Path,
+) -> tuple[RegisteredOMEZarrInput, dict[str, Any], list[dict[str, str]]]:
+    """Build a lazy registered OME-Zarr input from a Cellpose input manifest."""
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid registered input manifest {manifest_path}.") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("artifact_type")
+        != "squisher_segment.registered_ome_input.v1"
+    ):
+        raise ValueError(f"Unsupported registered input manifest {manifest_path}.")
+
+    channels = manifest.get("channels")
+    sources = manifest.get("sources")
+    roi = manifest.get("source_roi_zyx")
+    if (
+        not isinstance(channels, list)
+        or not channels
+        or len(set(channels)) != len(channels)
+        or not isinstance(sources, list)
+        or len(sources) != len(channels)
+        or not isinstance(roi, list)
+        or len(roi) != 3
+    ):
+        raise ValueError(f"Registered input manifest {manifest_path} has invalid channels, sources, or ROI.")
+
+    source_paths: list[str] = []
+    dataset_paths: list[str] = []
+    source_arrays: list[zarr.Array] = []
+    provenance = [_provenance_record(manifest_path)]
+    source_identities = []
+    for channel, source_record in zip(channels, sources, strict=True):
+        if not isinstance(channel, str) or not isinstance(source_record, dict):
+            raise ValueError(f"Registered input manifest {manifest_path} has an invalid source record.")
+        if source_record.get("channel") != channel or not isinstance(source_record.get("path"), str):
+            raise ValueError(f"Registered input manifest source does not match channel {channel!r}.")
+        source = Path(source_record["path"])
+        if not source.is_absolute():
+            source = manifest_path.parent / source
+        source = source.resolve()
+        root = zarr.open_group(source, mode="r")
+        if root.attrs.get("squisher_complete") is not True:
+            raise ValueError(f"Source {source} is not marked complete.")
+        root_metadata = source / "zarr.json"
+        root_record = _provenance_record(root_metadata)
+        if source_record.get("root_metadata_sha256") != root_record["sha256"]:
+            raise ValueError(f"Source metadata changed since {manifest_path} was written: {source}")
+        level_path, array = _ome_level_zero(root, source)
+        source_paths.append(str(source))
+        dataset_paths.append(level_path)
+        source_arrays.append(array)
+        provenance.append(root_record)
+        source_identities.append(
+            {
+                "channel": channel,
+                "path": str(source),
+                "dataset": level_path,
+                "root_metadata_sha256": root_record["sha256"],
+                "shape": list(array.shape),
+                "chunks": list(array.chunks),
+                "dtype": str(array.dtype),
+            }
+        )
+
+    shapes = {tuple(int(value) for value in array.shape) for array in source_arrays}
+    dtypes = {np.dtype(array.dtype) for array in source_arrays}
+    if len(shapes) != 1 or len(dtypes) != 1:
+        raise ValueError(f"Registered OME-Zarr sources must have identical shape and dtype; got {shapes=} {dtypes=}.")
+    source_shape = next(iter(shapes))
+    if len(source_shape) != 3:
+        raise ValueError(f"Registered OME-Zarr sources must be ZYX; got {source_shape}.")
+    try:
+        roi_zyx = tuple((int(bounds[0]), int(bounds[1])) for bounds in roi)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"Registered input manifest {manifest_path} has an invalid ROI.") from exc
+    if any(start < 0 or stop <= start or stop > size for (start, stop), size in zip(roi_zyx, source_shape, strict=True)):
+        raise ValueError(f"Registered input ROI {roi_zyx} is outside source shape {source_shape}.")
+
+    logical_shape = [*(stop - start for start, stop in roi_zyx), len(channels)]
+    if manifest.get("shape") != logical_shape or manifest.get("dtype") != str(next(iter(dtypes))):
+        raise ValueError(f"Registered input manifest {manifest_path} shape or dtype does not match its sources.")
+    registered = RegisteredOMEZarrInput(
+        sources=tuple(source_paths),
+        datasets=tuple(dataset_paths),
+        channel_names=tuple(channels),
+        roi_zyx=roi_zyx,
+        source_chunks=tuple(int(value) for value in source_arrays[0].chunks),
+        dtype_name=str(source_arrays[0].dtype),
+    )
+    identity = {
+        "kind": "registered-ome-zarr",
+        "path": str(manifest_path.resolve()),
+        "shape": logical_shape,
+        "chunks": list(registered.chunks),
+        "dtype": str(registered.dtype),
+        "attrs": registered.attrs,
+        "roi_zyx": [list(bounds) for bounds in roi_zyx],
+        "sources": source_identities,
+        "provenance": provenance,
+    }
+    return registered, identity, provenance
+
+
 def _resolve_channel_selection(
     input_zarr: zarr.Array,
     channels: str | None,
@@ -844,6 +1233,22 @@ def _resolve_channel_selection(
     return tuple(names.index(name) for name in selected_names), selected_names
 
 
+def _resolve_nonempty_rule(input_zarr: zarr.Array, threshold: int) -> dict[str, Any]:
+    """Resolve the required 561 foreground rule against input channel metadata."""
+    if threshold < 0:
+        raise ValueError("nonempty_threshold must be non-negative.")
+    _, names = _resolve_channel_selection(input_zarr, None)
+    if NONEMPTY_CHANNEL_NAME not in names:
+        raise ValueError(
+            f"Input Zarr must contain channel {NONEMPTY_CHANNEL_NAME!r} for block selection."
+        )
+    return {
+        "channel": NONEMPTY_CHANNEL_NAME,
+        "channel_index": names.index(NONEMPTY_CHANNEL_NAME),
+        "threshold": threshold,
+    }
+
+
 def _read_input_crop(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
@@ -853,8 +1258,30 @@ def _read_input_crop(
     return np.asarray(input_zarr.get_orthogonal_selection(selection))
 
 
+def _fit_core_extent_to_input(
+    input_extent: int,
+    inference_extent: int,
+    overlap: int,
+) -> int:
+    """Fit one core axis without exceeding its Cellpose inference budget.
+
+    Boundary blocks need only one halo. For inputs that fit in one or two
+    boundary blocks, use that extra capacity to avoid a tiny final core.
+    Longer axes retain the largest safe two-halo interior core.
+    """
+    if input_extent <= inference_extent:
+        return input_extent
+
+    two_block_core = (input_extent + 1) // 2
+    if two_block_core + overlap <= inference_extent:
+        return two_block_core
+
+    return inference_extent - 2 * overlap
+
+
 def _sam_processing_blocksize(
     *,
+    input_spatial_shape: tuple[int, int, int],
     n_channels: int,
     diameter: int | float,
     target_nz: int | None,
@@ -874,12 +1301,16 @@ def _sam_processing_blocksize(
     )
     scale_back = float(diameter) / 30.0
     distributed_overlap = int(diameter * 2)
-    return (
-        int(Lz_inference * scale_back) - 2 * distributed_overlap,
-        int(Ly_inference * scale_back) - 2 * distributed_overlap,
-        int(Lx_inference * scale_back) - 2 * distributed_overlap,
-        n_channels,
+    inference_shape = (
+        int(Lz_inference * scale_back),
+        int(Ly_inference * scale_back),
+        int(Lx_inference * scale_back),
     )
+    spatial_blocksize = tuple(
+        _fit_core_extent_to_input(input_extent, inference_extent, distributed_overlap)
+        for input_extent, inference_extent in zip(input_spatial_shape, inference_shape, strict=True)
+    )
+    return (*spatial_blocksize, n_channels)
 
 
 def _build_cellpose_eval_kwargs(
@@ -901,6 +1332,7 @@ def _build_cellpose_eval_kwargs(
         "do_3D": True,
         "min_size": 500,
         "channel_axis": 3,
+        "return_flows": False,
         "use_kde_clustering": True,
         "z_axis": 0,
     }
@@ -923,15 +1355,22 @@ def _segmentation_block_crops(
     return get_block_crops(input_shape, np.asarray(blocksize), overlap_by_axis, mask)
 
 
+def _supports_resume(
+    input_shape: tuple[int, ...],
+    spatial_blocksize: tuple[int, ...],
+) -> bool:
+    return bool(get_nblocks(input_shape, np.asarray(spatial_blocksize))[0] == 1)
+
+
 def _check_block_has_data(
     crop: tuple[slice, ...],
     zarr_array: zarr.Array,
-    selected_channels: tuple[int, ...],
-    threshold: int = 0,
+    channel_index: int,
+    threshold: int,
 ) -> bool:
     """Return whether a planned crop contains input above the threshold."""
-    data_slice = _read_input_crop(zarr_array, crop, selected_channels)
-    return bool(data_slice.any() if threshold == 0 else (data_slice > threshold).any())
+    data_slice = _read_input_crop(zarr_array, crop, (channel_index,))
+    return bool((data_slice > threshold).any())
 
 
 def _select_input_blocks(
@@ -939,56 +1378,48 @@ def _select_input_blocks(
     client: Any,
     block_crops: list[tuple[slice, ...]],
     input_zarr: zarr.Array,
-    channel_indices: tuple[int, ...],
+    nonempty_channel_index: int,
+    nonempty_threshold: int,
     blocksize: tuple[int, ...],
     run_key: str,
     path_nonempty: Path,
-    assume_nonempty: bool,
 ) -> list[int]:
-    """Select planned blocks according to the run's explicit selection policy."""
+    """Select blocks whose foreground channel exceeds the required threshold."""
     idxs = read_nonempty_cache(path_nonempty, blocksize, run_key)
     if idxs is not None:
         logger.info(f"Loaded cached non-empty block indices ({len(idxs)} entries) from {path_nonempty}.")
         return idxs
 
-    if assume_nonempty:
-        # This selection is deterministic from the tiling plan, so the run config
-        # and checkpoint are sufficient for resume; a nonempty cache is unnecessary.
-        logger.info(
-            "Non-empty cache miss; assuming dense input and selecting every planned block "
-            "without an input scan."
-        )
-        return list(range(len(block_crops)))
-
-    logger.info("Non-empty cache miss or invalidated; re-scanning input for non-zero blocks.")
+    logger.info(
+        "Non-empty cache miss or invalidated; scanning channel %d for values > %d.",
+        nonempty_channel_index,
+        nonempty_threshold,
+    )
     check_futures = client.map(
         _check_block_has_data,
         block_crops,
         zarr_array=input_zarr,
-        selected_channels=channel_indices,
-        threshold=1,
+        channel_index=nonempty_channel_index,
+        threshold=nonempty_threshold,
     )
 
     total_tiles = len(check_futures)
-    logger.info(f"Checking non-zero blocks: 0/{total_tiles}")
-    non_zero_results: list[bool] = [True] * total_tiles
+    logger.info(f"Checking foreground blocks: 0/{total_tiles}")
+    has_foreground: list[bool] = [True] * total_tiles
     future_to_index = {fut: i for i, fut in enumerate(check_futures)}
     with progress_bar(total_tiles) as submit:
         [fut.add_done_callback(submit) for fut in check_futures]
         for fut in distributed.as_completed(check_futures):
             i = future_to_index.get(fut)
             if i is None:
-                logger.error("Non-zero block check produced an unknown future; treating as non-empty")
-                continue
+                raise RuntimeError("Foreground scan produced an unknown future.")
             try:
-                non_zero_results[i] = bool(fut.result())
+                has_foreground[i] = bool(fut.result())
             except Exception as exc:
-                logger.error(
-                    f"Non-zero block check failed for block_check[{i}]: {exc!r}; treating as non-empty"
-                )
-    logger.info(f"Checked non-zero blocks: {total_tiles}/{total_tiles}")
+                raise RuntimeError(f"Foreground scan failed for block {i}: {exc!r}") from exc
+    logger.info(f"Checked foreground blocks: {total_tiles}/{total_tiles}")
 
-    idxs = [i for i, is_non_zero in enumerate(non_zero_results) if is_non_zero]
+    idxs = [i for i, foreground in enumerate(has_foreground) if foreground]
     path_nonempty.parent.mkdir(parents=True, exist_ok=True)
     write_nonempty_cache(path_nonempty, blocksize, run_key, idxs)
     logger.info(f"Persisted {len(idxs)} non-empty block indices to {path_nonempty}")
@@ -1014,6 +1445,9 @@ def process_block(
     stagger_seconds: float = 0.0,
     workers_per_gpu: int = 4,
     channel_indices: tuple[int, ...] | None = None,
+    foreground_channel_index: int | None = None,
+    foreground_threshold: int | None = None,
+    overlap_directory: str | None = None,
 ) -> (
     tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
     | dict[str, Any]
@@ -1061,6 +1495,8 @@ def process_block(
             input_zarr,
             crop,
             channel_indices,
+            foreground_channel_index,
+            foreground_threshold,
             preprocessing_steps,
             model_kwargs,
             eval_kwargs,
@@ -1081,10 +1517,12 @@ def process_block(
 
         nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)
         block_index_3d = block_index[:-1]
-
-        segmentation_global_3d, _ = global_segment_ids(
-            segmentation_trimmed_3d, block_index_3d, nblocks_3d
+        remap = global_segment_id_remap(
+            int(segmentation_3d.max()),
+            block_index_3d,
+            nblocks_3d,
         )
+        segmentation_global_3d = remap[segmentation_trimmed_3d]
 
         if test_mode:
             boxes = bounding_boxes_in_global_coordinates(segmentation_trimmed_3d, crop_trimmed_3d)
@@ -1093,6 +1531,12 @@ def process_block(
             return (segmentation_global_3d, boxes, box_ids_for_this_block)
 
         output_zarr[crop_trimmed_3d] = segmentation_global_3d
+        if overlap_directory is not None:
+            _save_overlap_faces(
+                Path(overlap_directory),
+                block_index,
+                block_faces(segmentation_global_3d, shrink=True),
+            )
         return {
             "index": block_index,
             "worker": worker_name,
@@ -1115,24 +1559,72 @@ def read_preprocess_and_segment(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
     channel_indices: tuple[int, ...] | None,
+    foreground_channel_index: int | None,
+    foreground_threshold: int | None,
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
     model_kwargs: dict[str, Any],
     eval_kwargs: dict[str, Any],
     worker_logs_directory: str | None,
 ) -> NDArray[np.uint32]:
     """
-    Read block, apply preprocessing pipeline, and run Cellpose segmentation.
+    Read and preprocess a block, mask it from raw foreground, then run Cellpose.
 
     preprocessing_steps format: [(func, kwargs_dict), ...]
     Each func must accept (image, ..., crop=None). The crop kwarg is injected.
     """
     if preprocessing_steps is None:
         preprocessing_steps = []
+    if (foreground_channel_index is None) != (foreground_threshold is None):
+        raise ValueError(
+            "foreground_channel_index and foreground_threshold must be provided together."
+        )
 
-    image = input_zarr[crop] if channel_indices is None else _read_input_crop(input_zarr, crop, channel_indices)
+    model_channels = (
+        tuple(range(input_zarr.shape[-1]))
+        if channel_indices is None
+        else channel_indices
+    )
+    read_channels = model_channels
+    if (
+        foreground_channel_index is not None
+        and foreground_channel_index not in read_channels
+    ):
+        read_channels += (foreground_channel_index,)
+    raw = _read_input_crop(input_zarr, crop, read_channels)
+    background = None
+    if foreground_channel_index is not None:
+        background = raw[..., read_channels.index(foreground_channel_index)] <= foreground_threshold
+    if read_channels == model_channels:
+        image = raw
+    else:
+        image = raw[..., [read_channels.index(index) for index in model_channels]]
+
     for pp_step in preprocessing_steps:
         pp_step[1]["crop"] = crop
         image = pp_step[0](image, **pp_step[1])
+    if background is not None:
+        if image.shape[:-1] != background.shape:
+            raise ValueError(
+                "Preprocessing changed the spatial shape and invalidated the raw foreground mask: "
+                f"{background.shape} != {image.shape[:-1]}."
+            )
+        image = np.asarray(image, dtype=np.float32)
+        background_values = np.zeros(image.shape[-1], dtype=np.float32)
+        normalize = eval_kwargs.get("normalize")
+        if isinstance(normalize, dict) and normalize.get("lowhigh") is not None:
+            lowhigh = np.asarray(normalize["lowhigh"], dtype=np.float32)
+            if lowhigh.shape == (2,):
+                background_values.fill(lowhigh[0])
+            elif lowhigh.ndim == 2 and lowhigh.shape[1] == 2 and lowhigh.shape[0] >= image.shape[-1]:
+                background_values = lowhigh[: image.shape[-1], 0]
+            else:
+                raise ValueError(
+                    "Cellpose normalization lowhigh must have shape (2,) or at least "
+                    f"({image.shape[-1]}, 2); got {lowhigh.shape}."
+                )
+        for channel, value in enumerate(background_values):
+            np.copyto(image[..., channel], value, where=background)
+        del background
     log_file = None
     if worker_logs_directory is not None:
         log_file = f"dask_worker_{distributed.get_worker().name}.log"
@@ -1152,6 +1644,17 @@ def read_preprocess_and_segment(
         torch.cuda.empty_cache()
     cp.get_default_memory_pool().free_all_blocks()
     return masks
+
+
+def _block_metadata_from_temp(
+    temp_zarr: zarr.Array,
+    crop: tuple[slice, ...],
+) -> tuple[list[tuple[slice, ...]], NDArray[np.uint32]]:
+    """Decode one owned block and calculate its global boxes on a worker GPU."""
+    seg_block = temp_zarr[crop]
+    local_labels, box_ids = decode_block_global_labels(seg_block)
+    boxes = bounding_boxes_in_global_coordinates(local_labels, crop)
+    return boxes, box_ids
 
 
 def _wait_for_futures_collect_errors(
@@ -1203,7 +1706,7 @@ def distributed_eval(
     stagger_seconds: float = 0.0,
     channel_indices: tuple[int, ...] | None = None,
     run_identity: dict[str, Any] | None = None,
-    assume_nonempty: bool = False,
+    nonempty_threshold: int = DEFAULT_NONEMPTY_THRESHOLD,
     overwrite_output: bool = False,
 ) -> tuple[zarr.Array, list[tuple[slice, ...]]] | None:
     """
@@ -1329,24 +1832,34 @@ def distributed_eval(
     selected_shape = input_zarr.shape[:-1] + (len(channel_indices),)
     if blocksize[-1] != len(channel_indices):
         raise ValueError("blocksize channel extent must equal the number of selected channels.")
-    block_selection = _block_selection_policy(assume_nonempty)
     mask_identity = _mask_identity(mask)
     if run_identity is None:
         raise ValueError(
             "run_identity is required; build it with _build_run_identity so resume state "
             "is bound to model, TensorRT, input-provenance, and source artifacts."
         )
-    if run_identity.get("block_selection") != block_selection:
-        raise ValueError(
-            "run_identity block_selection does not match assume_nonempty; "
-            "build the identity with the same block-selection policy."
-        )
-    elif run_identity.get("mask") != mask_identity:
+    if run_identity.get("mask") != mask_identity:
         raise ValueError(
             "run_identity mask identity does not match the supplied mask; "
             "build the identity from the same mask."
         )
     runtime_artifacts = _validate_run_identity_structure(run_identity)
+    nonempty_rule = _resolve_nonempty_rule(input_zarr, nonempty_threshold)
+    if run_identity["nonempty_rule"] != nonempty_rule:
+        raise ValueError("run_identity nonempty_rule does not match the input 561 channel rule.")
+    if "diameter" not in eval_kwargs:
+        raise ValueError("Diameter must be set in eval_kwargs")
+    overlap = int(eval_kwargs["diameter"] * 2)
+    _validate_run_identity_matches_call(
+        run_identity,
+        input_zarr=input_zarr,
+        channel_indices=channel_indices,
+        model_kwargs=model_kwargs,
+        eval_kwargs=eval_kwargs,
+        blocksize=blocksize,
+        overlap=overlap,
+        preprocessing_steps=preprocessing_steps,
+    )
     trt_plans = runtime_artifacts.get("trt_plans")
     if not isinstance(trt_plans, list):
         raise ValueError("run_identity runtime_artifacts must include TensorRT plans.")
@@ -1354,7 +1867,6 @@ def distributed_eval(
 
     run_config_path = temporary_directory / "run_config.json"
     is_resume = run_config_path.exists()
-    blank_temp_zarr: zarr.Array | None = None
     if is_resume:
         validate_run_config(run_config_path, run_identity)
 
@@ -1364,16 +1876,22 @@ def distributed_eval(
     worker_logs_dir = base_dir / worker_logs_dirname
     worker_logs_dir.mkdir(parents=True, exist_ok=True)
 
-    if "diameter" not in eval_kwargs:
-        raise ValueError("Diameter must be set in eval_kwargs")
-
-    overlap = int(eval_kwargs["diameter"] * 2)
     block_indices, block_crops = _segmentation_block_crops(
         selected_shape,
         blocksize,
         overlap,
         mask,
     )
+    selection_indices, selection_crops = _segmentation_block_crops(
+        selected_shape,
+        blocksize,
+        0,
+        mask,
+    )
+    if selection_indices != block_indices:
+        raise RuntimeError("Foreground selection crops do not match the inference block grid.")
+    if is_resume and not _supports_resume(input_zarr.shape[:-1], blocksize[:-1]):
+        raise RuntimeError("Resume is currently supported only when Z fits in one block.")
     assert cluster is not None
 
     # GPU preflight probe to confirm worker pinning
@@ -1397,13 +1915,13 @@ def distributed_eval(
     run_key = _nonempty_cache_key(run_identity)
     idxs = _select_input_blocks(
         client=cluster.client,
-        block_crops=block_crops,
+        block_crops=selection_crops,
         input_zarr=input_zarr,
-        channel_indices=channel_indices,
+        nonempty_channel_index=nonempty_rule["channel_index"],
+        nonempty_threshold=nonempty_rule["threshold"],
         blocksize=blocksize,
         run_key=run_key,
         path_nonempty=path_nonempty,
-        assume_nonempty=assume_nonempty,
     )
 
     final_block_indices, final_block_crops = (
@@ -1411,7 +1929,7 @@ def distributed_eval(
         [block_crops[i] for i in idxs],
     )
     total_non_empty_blocks = len(final_block_indices)
-    del block_indices, block_crops
+    del block_indices, block_crops, selection_indices, selection_crops
 
     logger.info(f"Selected {len(final_block_indices)} blocks for segmentation.")
 
@@ -1422,26 +1940,32 @@ def distributed_eval(
     assert temporary_directory.exists()
     temp_zarr_path = temporary_directory / "segmentation_unstitched.zarr"
     checkpoint_path = temporary_directory / "checkpoint.jsonl"
+    overlap_directory = temporary_directory / "overlaps"
 
     if is_resume:
         if not temp_zarr_path.exists():
             raise RuntimeError(f"Cannot resume: temp_zarr missing at {temp_zarr_path}")
         completed_indices = load_checkpoint(checkpoint_path)
+        missing_sidecars = [
+            index
+            for index in completed_indices
+            if not _overlap_sidecar_path(overlap_directory, index).is_file()
+        ]
+        if missing_sidecars:
+            raise RuntimeError(
+                "Cannot resume: overlap evidence is missing for completed blocks "
+                f"{missing_sidecars[:10]}."
+            )
         logger.info(
             f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed"
         )
     else:
-        if temp_zarr_path.exists():
-            blank_temp_zarr = _open_blank_temp_zarr(
-                temp_zarr_path,
-                shape=output_shape,
-                chunks=output_blocksize,
-            )
         stale_paths = [
             path
             for path in (
                 checkpoint_path,
                 temporary_directory / "intermediate_state.npz",
+                overlap_directory,
             )
             if path.exists()
         ]
@@ -1451,6 +1975,19 @@ def distributed_eval(
                 f"configuration: {stale_paths}. Use --overwrite to replace them."
             )
         completed_indices = set()
+
+    if is_resume:
+        temp_zarr = zarr.open(temp_zarr_path, mode="r+")
+    else:
+        temp_zarr = _initialize_temp_zarr(
+            path=temp_zarr_path,
+            shape=output_shape,
+            chunks=output_blocksize,
+            run_config_path=run_config_path,
+            run_identity=run_identity,
+        )
+
+    overlap_directory.mkdir(parents=True, exist_ok=True)
 
     # Filter to remaining blocks
     remaining_block_indices = []
@@ -1463,22 +2000,6 @@ def distributed_eval(
     logger.info(
         f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)"
     )
-
-    if is_resume:
-        temp_zarr = zarr.open(temp_zarr_path, mode="r+")
-    elif blank_temp_zarr is not None:
-        temp_zarr = blank_temp_zarr
-    else:
-        temp_zarr = create_zarr_array(
-            temp_zarr_path,
-            shape=output_shape,  # Use 3D shape
-            chunks=output_blocksize,  # Use 3D chunks
-            dtype=np.uint32,
-            overwrite=True,
-            codecs=label_zarr_codecs(np.uint32),
-        )
-        save_run_config(run_config_path, run_identity)
-        logger.info(f"Fresh run - saved config to {run_config_path}")
 
     if not remaining_block_indices:
         logger.info("All blocks already completed, proceeding to merge")
@@ -1508,6 +2029,9 @@ def distributed_eval(
             stagger_seconds=stagger_seconds,
             workers_per_gpu=workers_per_gpu,
             channel_indices=channel_indices,
+            foreground_channel_index=nonempty_rule["channel_index"],
+            foreground_threshold=nonempty_rule["threshold"],
+            overlap_directory=str(overlap_directory),
         )
 
         with progress_bar(len(remaining_block_indices)) as submit:
@@ -1531,8 +2055,8 @@ def distributed_eval(
                 f"First failures:\n{preview}"
             )
 
-    logger.info("Computing faces and bounding boxes from temp_zarr...")
-    results = []
+    logger.info("Computing bounding boxes from temp_zarr...")
+    trimmed_crops = []
     for block_crop in final_block_crops:
         spatial_crop = block_crop[:-1]
         spatial_blocksize = blocksize[:-1]
@@ -1542,29 +2066,33 @@ def distributed_eval(
             stop = min(start + bs, slc.stop)
             trimmed_crop.append(slice(start, stop))
         trimmed_crop = tuple(trimmed_crop)
+        trimmed_crops.append(trimmed_crop)
 
-        seg_block = temp_zarr[trimmed_crop]
-        faces = block_faces(seg_block, shrink=True)
-        local_labels, box_ids = decode_block_global_labels(seg_block)
-        boxes = bounding_boxes_in_global_coordinates(local_labels, trimmed_crop)
-        results.append((faces, boxes, box_ids))
+    metadata_futures = cluster.client.map(
+        _block_metadata_from_temp,
+        trimmed_crops,
+        temp_zarr=temp_zarr,
+    )
+    results = cluster.client.gather(metadata_futures)
 
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.scale(0)
 
     # Filter to non-empty blocks only
-    faces_list, boxes_list, box_ids_list, non_empty_indices = [], [], [], []
-    for i, (faces, boxes, box_ids) in enumerate(results):
+    boxes_list, box_ids_list, non_empty_indices = [], [], []
+    for i, (boxes, box_ids) in enumerate(results):
         if len(box_ids) > 0:
-            faces_list.append(faces)
             boxes_list.append(boxes)
             box_ids_list.append(box_ids)
             non_empty_indices.append(final_block_indices[i])
 
+    label_pairs = _overlap_pairs_from_sidecars(final_block_indices, overlap_directory)
+    logger.info("Matched %d neighboring label-pair groups by face contact", len(label_pairs))
+
     # Save intermediate state for potential separate stitching
     _save_intermediate_state(
         temporary_directory,
-        faces_list,
+        label_pairs,
         boxes_list,
         box_ids_list,
         non_empty_indices,
@@ -1594,8 +2122,7 @@ def distributed_eval(
         cluster.scale(32)
 
     final_seg_zarr, merged_boxes = _stitch_precomputed(
-        block_indices=non_empty_indices,
-        faces_list=faces_list,
+        label_pairs=label_pairs,
         boxes_list=boxes_list,
         box_ids_list=box_ids_list,
         temp_zarr=temp_zarr,
@@ -1664,8 +2191,7 @@ def _remove_matching_temp(temp_dir: Path, run_identity: dict[str, Any]) -> None:
 
 def _stitch_precomputed(
     *,
-    block_indices: list[tuple[int, ...]],
-    faces_list: list,
+    label_pairs: list[NDArray[np.uint32]],
     boxes_list: list,
     box_ids_list: list,
     temp_zarr: zarr.Array,
@@ -1679,17 +2205,15 @@ def _stitch_precomputed(
         raise FileExistsError(f"Output {output_path} already exists; use --overwrite to replace it.")
 
     staged_path = _staged_output_path(output_path)
-    _, new_labeling = stitch_labels(
-        block_indices=block_indices,
-        faces_list=faces_list,
+    _, mapping = stitch_label_pairs(
+        label_pairs=label_pairs,
         box_ids_list=box_ids_list,
         temp_zarr=temp_zarr,
         write_path=staged_path,
-        lut_path=temp_dir / "new_labeling.npy",
-        pre_shrunk=True,
+        mapping_path=temp_dir / "new_labeling.npy",
     )
     staged_zarr = zarr.open_array(staged_path, mode="r+")
-    merged_boxes = merge_boxes_for_labels(boxes_list, box_ids_list, new_labeling)
+    merged_boxes = merge_boxes_for_sparse_labels(boxes_list, box_ids_list, mapping)
     if _zarr_schema(staged_zarr) != _zarr_schema(temp_zarr):
         raise RuntimeError(
             f"Staged output {staged_path} schema does not match temporary segmentation."
@@ -1741,14 +2265,13 @@ def stitch_segmentation(
 
     t0 = time.perf_counter()
     temp_zarr = zarr.open(temp_dir / "segmentation_unstitched.zarr", mode="r")
-    faces_list, boxes_list, box_ids_list, non_empty_indices = _load_intermediate_state(temp_dir)
+    label_pairs, boxes_list, box_ids_list, non_empty_indices = _load_intermediate_state(temp_dir)
     logger.info(f"Load intermediate state: {time.perf_counter() - t0:.2f}s")
     logger.info(f"Loaded {len(non_empty_indices)} non-empty blocks")
 
     run_identity = load_run_identity(temp_dir / "run_config.json")
     final_seg_zarr, merged_boxes = _stitch_precomputed(
-        block_indices=non_empty_indices,
-        faces_list=faces_list,
+        label_pairs=label_pairs,
         boxes_list=boxes_list,
         box_ids_list=box_ids_list,
         temp_zarr=temp_zarr,
@@ -1776,12 +2299,14 @@ def _run_single_input(
     target_nz: int | None,
     target_ny: int | None,
     target_nx: int | None,
-    assume_nonempty: bool,
+    nonempty_threshold: int,
     cellpose_only: bool,
     stagger_seconds: float,
 ) -> None:
-    if input_path.suffix != ".zarr" or not input_path.exists():
-        raise FileNotFoundError(f"Path {input_path} must be a '.zarr' store.")
+    if not input_path.exists() or input_path.suffix not in {".zarr", ".json"}:
+        raise FileNotFoundError(
+            f"Path {input_path} must be a ZYXC '.zarr' store or registered-source '.json' manifest."
+        )
 
     base_dir = input_path.parent
 
@@ -1823,30 +2348,37 @@ def _run_single_input(
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
-    input_zarr_array = zarr.open_array(input_path, mode="r")
+    if input_path.suffix == ".json":
+        input_zarr_array, input_identity, input_provenance = _open_registered_ome_input(
+            input_path
+        )
+    else:
+        input_zarr_array = zarr.open_array(input_path, mode="r")
+        input_schema = {
+            "shape": list(input_zarr_array.shape),
+            "chunks": list(input_zarr_array.chunks),
+            "dtype": str(input_zarr_array.dtype),
+        }
+        input_provenance = _input_provenance_identity(
+            input_path,
+            expected_schema=input_schema,
+        )
+        input_identity = {
+            "path": str(input_path.resolve()),
+            **input_schema,
+            "attrs": dict(input_zarr_array.attrs),
+            "provenance": input_provenance,
+        }
     if input_zarr_array.ndim != 4:
         raise ValueError(f"Input Zarr must have ZYXC shape; got {input_zarr_array.shape}.")
     channel_indices, channel_names = _resolve_channel_selection(input_zarr_array, channels)
+    nonempty_rule = _resolve_nonempty_rule(input_zarr_array, nonempty_threshold)
     source_channels = [index + 1 for index in channel_indices]
     logger.info(f"Using channels in requested order: {list(channel_names)}")
-    input_schema = {
-        "shape": list(input_zarr_array.shape),
-        "chunks": list(input_zarr_array.chunks),
-        "dtype": str(input_zarr_array.dtype),
-    }
-    input_provenance = _input_provenance_identity(
-        input_path,
-        expected_schema=input_schema,
-    )
-    input_identity = {
-        "path": str(input_path.resolve()),
-        **input_schema,
-        "attrs": dict(input_zarr_array.attrs),
-        "provenance": input_provenance,
-    }
     input_key = _identity_digest(input_identity)
 
     processing_blocksize = _sam_processing_blocksize(
+        input_spatial_shape=tuple(int(value) for value in input_zarr_array.shape[:-1]),
         n_channels=len(source_channels),
         diameter=diameter,
         target_nz=target_nz,
@@ -1934,7 +2466,7 @@ def _run_single_input(
         blocksize=processing_blocksize,
         overlap=int(cellpose_eval_kwargs["diameter"] * 2),
         preprocessing_steps=preprocessing_pipeline,
-        assume_nonempty=assume_nonempty,
+        nonempty_rule=nonempty_rule,
         mask=None,
         runtime_artifacts=_runtime_artifact_identity(
             Path(cellpose_model_kwargs["pretrained_model"]),
@@ -1964,7 +2496,11 @@ def _run_single_input(
             except ValueError as exc:
                 logger.info(f"--overwrite: existing temporary state cannot resume ({exc})")
             else:
-                resume_overwrite = True
+                resume_overwrite = _supports_resume(
+                    input_zarr_array.shape[:-1], processing_blocksize[:-1]
+                )
+                if not resume_overwrite:
+                    logger.info("--overwrite: restarting multi-Z-block temporary state")
         if temporary_directory.exists() and not resume_overwrite:
             logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
             shutil.rmtree(temporary_directory)
@@ -2000,7 +2536,7 @@ def _run_single_input(
         stagger_seconds=stagger_seconds,
         channel_indices=channel_indices,
         run_identity=run_identity,
-        assume_nonempty=assume_nonempty,
+        nonempty_threshold=nonempty_threshold,
         overwrite_output=overwrite,
     )
 
@@ -2028,7 +2564,7 @@ def cli() -> None:
 
 
 @cli.command("run")
-@click.argument("input_zarr", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("input_zarr", type=click.Path(exists=True, path_type=Path))
 @click.option("--channels", default=None, type=str, help="Comma-separated list of channel names to use.")
 @click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing segmentation.")
 @click.option(
@@ -2064,10 +2600,11 @@ def cli() -> None:
 @click.option("--target-ny", default=None, type=int, help="Desired internal Cellpose ny tiles.")
 @click.option("--target-nx", default=None, type=int, help="Desired internal Cellpose nx tiles.")
 @click.option(
-    "--assume-nonempty/--scan-nonempty",
-    default=False,
+    "--nonempty-threshold",
+    default=DEFAULT_NONEMPTY_THRESHOLD,
     show_default=True,
-    help="On a nonempty-cache miss, process every planned block without scanning input.",
+    type=click.IntRange(min=0),
+    help="561 threshold for block scheduling and Cellpose input masking; values must be strictly greater.",
 )
 @click.option(
     "--cellpose-only/--no-cellpose-only",
@@ -2094,11 +2631,11 @@ def run(
     target_nz: int | None,
     target_ny: int | None,
     target_nx: int | None,
-    assume_nonempty: bool,
+    nonempty_threshold: int,
     cellpose_only: bool,
     stagger_seconds: float,
 ) -> None:
-    """Run distributed Cellpose segmentation on one fused .zarr input."""
+    """Run Cellpose on a ZYXC Zarr or registered-source JSON manifest."""
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     logging.getLogger("cellpose").setLevel(logging.WARNING)
     _run_single_input(
@@ -2113,7 +2650,7 @@ def run(
         target_nz=target_nz,
         target_ny=target_ny,
         target_nx=target_nx,
-        assume_nonempty=assume_nonempty,
+        nonempty_threshold=nonempty_threshold,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
     )

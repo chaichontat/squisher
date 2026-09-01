@@ -23,6 +23,9 @@ import scipy.sparse.csgraph
 import zarr
 from numpy.typing import NDArray
 
+logger = logging.getLogger(__name__)
+GLOBAL_LABEL_BITS = 16
+FINALIZE_WORKERS = min(8, os.cpu_count() or 1)
 
 
 def _zarr_codecs(dtype: np.dtype | type[np.generic] | str, *, label: bool = False) -> list[Any]:
@@ -67,11 +70,12 @@ def create_zarr_array(
 
 def write_dask_to_zarr(array: dask.array.Array, output: zarr.Array) -> None:
     """Write whole Zarr chunks so concurrent tasks cannot clobber partial writes."""
-    array.rechunk(output.chunks).store(output, lock=False)
-
-
-logger = logging.getLogger(__name__)
-GLOBAL_LABEL_BITS = 16
+    array.rechunk(output.chunks).store(
+        output,
+        lock=False,
+        scheduler="threads",
+        num_workers=FINALIZE_WORKERS,
+    )
 
 
 def determine_merge_relabeling(
@@ -144,6 +148,48 @@ def determine_merge_relabeling(
     return lut
 
 
+def determine_sparse_merge_relabeling(
+    used_labels: NDArray[Any],
+    label_pairs: list[NDArray[Any]],
+) -> NDArray[np.uint32]:
+    """Return sorted global IDs and their contiguous merged labels.
+
+    Memory scales with labels and boundary contacts rather than the largest
+    bit-packed global ID. Background is implicit and remains zero.
+    """
+    unique_labels = np.unique(np.asarray(used_labels, dtype=np.uint32))
+    unique_labels = unique_labels[unique_labels > 0]
+
+    candidate_pairs = []
+    for pairs in label_pairs:
+        pairs = np.asarray(pairs)
+        if pairs.ndim != 2 or pairs.shape[0] != 2:
+            raise ValueError(f"label pairs must have shape (2, N); got {pairs.shape}.")
+        if pairs.size:
+            candidate_pairs.append(pairs.astype(np.uint32, copy=False))
+
+    if unique_labels.size == 0:
+        return np.empty((2, 0), dtype=np.uint32)
+
+    if not candidate_pairs:
+        final_labels = np.arange(1, unique_labels.size + 1, dtype=np.uint32)
+        return np.vstack((unique_labels, final_labels))
+
+    pairs = np.concatenate(candidate_pairs, axis=1)
+    graph_labels = np.unique(np.concatenate((unique_labels, pairs.ravel())))
+    compact_pairs = _compress_label_pairs_to_compact_space(pairs, graph_labels)
+    i, j = compact_pairs
+    graph = scipy.sparse.coo_matrix(
+        (np.ones(i.size, dtype=np.uint8), (i, j)),
+        shape=(graph_labels.size + 1, graph_labels.size + 1),
+    ).tocsr()
+    components = scipy.sparse.csgraph.connected_components(graph, directed=False)[1]
+    used_components = components[np.searchsorted(graph_labels, unique_labels) + 1]
+    _, final_labels = np.unique(used_components, return_inverse=True)
+    final_labels = (final_labels + 1).astype(np.uint32, copy=False)
+    return np.vstack((unique_labels, final_labels))
+
+
 def relabel_and_write(
     temp_zarr: zarr.Array,
     new_labeling_path: Path | str,
@@ -168,6 +214,86 @@ def relabel_and_write(
         apply_lut_mmap,
         segmentation_da,
         lut_path=str(new_labeling_path),
+        dtype=np.uint32,
+        chunks=segmentation_da.chunks,
+    )
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    out = create_zarr_array(
+        write_path,
+        shape=tuple(int(s) for s in relabeled.shape),
+        chunks=tuple(int(c[0]) for c in relabeled.chunks),
+        dtype=np.uint32,
+        overwrite=True,
+        codecs=label_zarr_codecs(np.uint32),
+    )
+    write_dask_to_zarr(relabeled, out)
+
+
+def sparse_relabel_and_write(
+    temp_zarr: zarr.Array,
+    mapping_path: Path | str,
+    write_path: Path | str,
+    *,
+    block_token_chunks: bool = False,
+) -> None:
+    """Apply a sorted two-row ``global ID -> final label`` mapping by chunk."""
+    write_path = Path(write_path)
+    mapping_path = Path(mapping_path)
+    mapping = np.load(mapping_path, mmap_mode="r")
+    if mapping.ndim != 2 or mapping.shape[0] != 2:
+        raise ValueError(f"Sparse label mapping must have shape (2, N); got {mapping.shape}.")
+    if mapping.shape[1] and (
+        mapping[0, 0] == 0
+        or np.any(mapping[0, 1:] <= mapping[0, :-1])
+    ):
+        raise ValueError("Sparse label mapping requires positive, strictly increasing global IDs.")
+    del mapping
+
+    def apply_sparse_mapping(block: np.ndarray, path: str) -> np.ndarray:
+        mapping = np.load(path, mmap_mode="r")
+        old_labels, final_labels = mapping
+        flattened = block.ravel()
+        foreground = flattened != 0
+        old_foreground = flattened[foreground]
+        output = np.zeros(flattened.shape, dtype=np.uint32)
+        if old_foreground.size == 0:
+            return output.reshape(block.shape)
+
+        if not block_token_chunks:
+            positions = np.searchsorted(old_labels, old_foreground)
+            if np.any(positions == old_labels.size) or not np.array_equal(
+                old_labels[positions], old_foreground
+            ):
+                raise ValueError("Temporary segmentation contains a global ID absent from the sparse mapping.")
+            output[foreground] = final_labels[positions]
+            return output.reshape(block.shape)
+
+        tokens = np.right_shift(old_foreground, GLOBAL_LABEL_BITS)
+        token = int(tokens[0])
+        if np.any(tokens != token):
+            raise ValueError("A temporary segmentation chunk contains multiple block tokens.")
+
+        token_start = token << GLOBAL_LABEL_BITS
+        token_stop = (token + 1) << GLOBAL_LABEL_BITS
+        lo = np.searchsorted(old_labels, token_start, side="left")
+        hi = np.searchsorted(old_labels, token_stop, side="left")
+        token_old = old_labels[lo:hi]
+        token_final = final_labels[lo:hi]
+        local_ids = np.bitwise_and(token_old, (1 << GLOBAL_LABEL_BITS) - 1)
+        local_lut = np.zeros(int(local_ids.max(initial=0)) + 1, dtype=np.uint32)
+        local_lut[local_ids] = token_final
+
+        block_local = np.bitwise_and(old_foreground, (1 << GLOBAL_LABEL_BITS) - 1)
+        if np.any(block_local >= local_lut.size) or np.any(local_lut[block_local] == 0):
+            raise ValueError("Temporary segmentation contains a global ID absent from the sparse mapping.")
+        output[foreground] = local_lut[block_local]
+        return output.reshape(block.shape)
+
+    segmentation_da = dask.array.from_zarr(temp_zarr)
+    relabeled = dask.array.map_blocks(
+        apply_sparse_mapping,
+        segmentation_da,
+        path=str(mapping_path),
         dtype=np.uint32,
         chunks=segmentation_da.chunks,
     )
@@ -279,7 +405,7 @@ def global_segment_ids(
     block_index: tuple[int, ...],
     nblocks: NDArray[np.int_],
     label_bits: int = GLOBAL_LABEL_BITS,
-) -> tuple[NDArray[np.uint32], list[np.uint32]]:
+) -> tuple[NDArray[np.uint32], NDArray[np.uint32]]:
     """
     Generate globally unique segment IDs using bit-packing.
 
@@ -314,6 +440,23 @@ def global_segment_ids(
     ValueError
         If block index or label count exceeds the bit allocation.
     """
+    max_label = int(segmentation.max())
+    remap = global_segment_id_remap(max_label, block_index, nblocks, label_bits=label_bits)
+    segmentation_global = remap[segmentation.ravel()].reshape(segmentation.shape)
+    return segmentation_global, remap
+
+
+def global_segment_id_remap(
+    max_label: int,
+    block_index: tuple[int, ...],
+    nblocks: NDArray[np.int_],
+    *,
+    label_bits: int = GLOBAL_LABEL_BITS,
+) -> NDArray[np.uint32]:
+    """Build the block-local to globally unique label mapping without copying a mask."""
+    if max_label < 0:
+        raise ValueError("Segmentation labels cannot be negative.")
+
     block_token = int(np.ravel_multi_index(block_index, tuple(nblocks.tolist())))
     max_blocks = 1 << (32 - label_bits)
     max_labels = 1 << label_bits
@@ -324,9 +467,6 @@ def global_segment_ids(
             f"Consider reducing label_bits or using fewer/larger blocks."
         )
 
-    # Assume labels are sequential 0..max_label (from prior relabeling in postproc).
-    # This avoids O(N log N) np.unique on 51M elements, making this O(N).
-    max_label = int(segmentation.max())
     if max_label >= max_labels:
         raise ValueError(
             f"Label count {max_label} exceeds max {max_labels} with {label_bits} label bits. "
@@ -338,9 +478,7 @@ def global_segment_ids(
     remap = np.arange(max_label + 1, dtype=np.uint32) | np.uint32(block_token << label_bits)
     remap[0] = 0  # Background stays 0
 
-    # Direct indexing - O(N) instead of O(N log N)
-    segmentation_global = remap[segmentation.ravel()].reshape(segmentation.shape)
-    return segmentation_global, remap
+    return remap
 
 
 def decode_block_global_labels(
@@ -419,7 +557,7 @@ def remove_overlaps(
 def adjacent_faces(
     block_indices: list[tuple[int, ...]], faces: list[list[NDArray[Any]]]
 ) -> list[NDArray[Any]]:
-    """Find faces which touch and pair them together in new data structure."""
+    """Pair touching faces with the boundary axis normalized to axis 0."""
     face_pairs = []
     faces_index_lookup = {a: b for a, b in zip(block_indices, faces)}
     for block_index in block_indices:
@@ -430,7 +568,12 @@ def adjacent_faces(
             try:
                 a = faces_index_lookup[block_index][2 * ax + 1]
                 b = faces_index_lookup[neighbor_index][2 * ax]
-                face_pairs.append(np.concatenate((a, b), axis=ax))
+                face_pairs.append(
+                    np.concatenate(
+                        (np.moveaxis(a, ax, 0), np.moveaxis(b, ax, 0)),
+                        axis=0,
+                    )
+                )
             except KeyError:
                 continue
     return face_pairs
@@ -455,7 +598,7 @@ def shrink_labels(plane: NDArray[Any], threshold: float) -> NDArray[Any]:
     return shrunk_labels.reshape(plane.shape)
 
 
-def _find_label_pairs_across_boundary(face: NDArray[Any], structure: NDArray[Any]) -> NDArray[np.int64]:
+def find_label_pairs_across_boundary(face: NDArray[Any]) -> NDArray[np.int64]:
     """
     Find pairs of labels that touch across a face boundary.
 
@@ -465,32 +608,18 @@ def _find_label_pairs_across_boundary(face: NDArray[Any], structure: NDArray[Any
     Parameters
     ----------
     face : ndarray
-        Face array with shape (..., 2, ...) where axis with size 2 represents
-        the two sides of the boundary.
-    structure : ndarray
-        Binary structure for connectivity (unused, kept for API compatibility).
+        Face array whose first axis has size 2 and represents the two sides of
+        the boundary.
 
     Returns
     -------
     pairs : ndarray of shape (2, n_pairs)
         Array of (label_a, label_b) pairs that touch across the boundary.
     """
-    # Find the axis with size 2 (the boundary axis)
-    boundary_axis = None
-    for i, s in enumerate(face.shape):
-        if s == 2:
-            boundary_axis = i
-            break
+    if face.ndim == 0 or face.shape[0] != 2:
+        raise ValueError(f"Paired face must have boundary axis first with size 2; got {face.shape}.")
 
-    if boundary_axis is None:
-        return np.empty((2, 0), dtype=np.int64)
-
-    # Get slices for each side
-    sl0 = tuple(slice(0, 1) if i == boundary_axis else slice(None) for i in range(face.ndim))
-    sl1 = tuple(slice(1, 2) if i == boundary_axis else slice(None) for i in range(face.ndim))
-
-    side0 = face[sl0].squeeze(axis=boundary_axis)
-    side1 = face[sl1].squeeze(axis=boundary_axis)
+    side0, side1 = face
 
     # Find where both sides have non-zero labels
     mask = (side0 > 0) & (side1 > 0)
@@ -537,7 +666,7 @@ def _compress_label_pairs_to_compact_space(
     idx = np.searchsorted(unique_labels, flat)
 
     # Sanity check: every label appearing in faces must be present in unique_labels.
-    if not np.array_equal(unique_labels[idx], flat):
+    if np.any(idx == unique_labels.size) or not np.array_equal(unique_labels[idx], flat):
         raise ValueError("Encountered face labels that are not present in used_labels.")
 
     compact_flat = (idx + 1).astype(np.int64)  # reserve 0 for background
@@ -546,7 +675,6 @@ def _compress_label_pairs_to_compact_space(
 
 def _process_single_face(
     face: NDArray[Any],
-    structure: NDArray[Any],
     unique_labels: NDArray[np.uint32],
     pre_shrunk: bool = False,
 ) -> NDArray[np.int64] | None:
@@ -562,8 +690,6 @@ def _process_single_face(
     ----------
     face
         2-pixel-thick face slab (concatenation of adjacent block boundaries).
-    structure
-        Binary structure for connectivity analysis.
     unique_labels
         Sorted array of unique global label IDs.
     pre_shrunk
@@ -571,20 +697,16 @@ def _process_single_face(
 
     Returns (2, M) array of compact label pairs, or None if no pairs found.
     """
-    # Split face into the two adjacent block boundaries
-    sl0 = tuple(slice(0, 1) if d == 2 else slice(None) for d in face.shape)
-    sl1 = tuple(slice(1, 2) if d == 2 else slice(None) for d in face.shape)
+    if face.ndim == 0 or face.shape[0] != 2:
+        raise ValueError(f"Paired face must have boundary axis first with size 2; got {face.shape}.")
 
-    if pre_shrunk:
-        # Faces already shrunk on workers - just extract slices
-        a = face[sl0]
-        b = face[sl1]
-    else:
-        a = shrink_labels(face[sl0], 1.0)
-        b = shrink_labels(face[sl1], 1.0)
+    if not pre_shrunk:
+        face = np.concatenate(
+            (shrink_labels(face[:1], 1.0), shrink_labels(face[1:], 1.0)),
+            axis=0,
+        )
 
-    face_combined = np.concatenate((a, b), axis=np.argmin(a.shape))
-    mapped_global = _find_label_pairs_across_boundary(face_combined, structure)
+    mapped_global = find_label_pairs_across_boundary(face)
 
     if mapped_global.size == 0:
         return None
@@ -627,14 +749,13 @@ def block_face_adjacency_graph(
     if nlabels == 0:
         return scipy.sparse.csr_matrix((1, 1), dtype=np.int32)
 
-    structure = scipy.ndimage.generate_binary_structure(3, 1)
     n_faces = len(faces)
 
     # Process faces in parallel
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         results = list(
-            executor.map(lambda f: _process_single_face(f, structure, unique_labels, pre_shrunk), faces)
+            executor.map(lambda f: _process_single_face(f, unique_labels, pre_shrunk), faces)
         )
     t_parallel = time.perf_counter() - t0
 
@@ -751,6 +872,38 @@ def stitch_labels(
     return zarr.open(write_path, mode="r"), new_labeling
 
 
+def stitch_label_pairs(
+    label_pairs: list[NDArray[Any]],
+    box_ids_list: list[NDArray[np.uint32]],
+    temp_zarr: zarr.Array,
+    write_path: Path | str,
+    mapping_path: Path | str,
+) -> tuple[zarr.Array, NDArray[np.uint32]]:
+    """Merge precomputed overlap-IoU pairs and relabel the disjoint cores."""
+    all_box_ids = (
+        np.concatenate(box_ids_list).astype(np.uint32)
+        if box_ids_list
+        else np.empty(0, dtype=np.uint32)
+    )
+    mapping = determine_sparse_merge_relabeling(all_box_ids, label_pairs)
+    mapping_path = Path(mapping_path)
+    np.save(mapping_path, mapping)
+
+    n_final_labels = int(mapping[1].max()) if mapping.shape[1] else 0
+    logger.info(
+        "Relabeling to %d final labels (merged from %d IDs)",
+        n_final_labels,
+        len(all_box_ids),
+    )
+    sparse_relabel_and_write(
+        temp_zarr,
+        mapping_path,
+        write_path,
+        block_token_chunks=True,
+    )
+    return zarr.open(write_path, mode="r"), mapping
+
+
 def merge_boxes_for_labels(
     boxes_list: list[list[tuple[slice, ...]]],
     box_ids_list: list[NDArray[np.uint32]],
@@ -772,3 +925,22 @@ def merge_boxes_for_labels(
         return []
     box_ids = np.concatenate(box_ids_list).astype(np.uint32)
     return merge_all_boxes(boxes, new_labeling[box_ids])
+
+
+def merge_boxes_for_sparse_labels(
+    boxes_list: list[list[tuple[slice, ...]]],
+    box_ids_list: list[NDArray[np.uint32]],
+    mapping: NDArray[np.uint32],
+) -> list[tuple[slice, ...]]:
+    """Merge bounding boxes using a sorted two-row sparse label mapping."""
+    if not box_ids_list:
+        return []
+    if mapping.ndim != 2 or mapping.shape[0] != 2:
+        raise ValueError(f"Sparse label mapping must have shape (2, N); got {mapping.shape}.")
+
+    boxes = [box for sublist in boxes_list for box in sublist]
+    box_ids = np.concatenate(box_ids_list).astype(np.uint32)
+    positions = np.searchsorted(mapping[0], box_ids)
+    if np.any(positions == mapping.shape[1]) or not np.array_equal(mapping[0, positions], box_ids):
+        raise ValueError("Bounding-box labels are absent from the sparse mapping.")
+    return merge_all_boxes(boxes, mapping[1, positions])
