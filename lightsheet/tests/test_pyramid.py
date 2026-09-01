@@ -25,6 +25,10 @@ def test_pyramid_shard_chunks_preserve_storage_chunks_with_shape_cap() -> None:
     assert pyramid.pyramid_shard_chunks((12, 960, 960), (198, 662, 549), (1, 60, 60)) == (12, 660, 540)
 
 
+def test_pyramid_shard_chunks_align_uncapped_storage_to_inner_chunks() -> None:
+    assert pyramid.pyramid_shard_chunks((12, 960, 960), (36, 1044, 760), (1, 7, 7)) == (12, 959, 756)
+
+
 def test_standalone_pyramid_level_uses_shards_with_downsampled_inner_chunks(monkeypatch, tmp_path) -> None:
     zarr = pytest.importorskip("zarr")
     root = tmp_path / "pyramid.ome.zarr"

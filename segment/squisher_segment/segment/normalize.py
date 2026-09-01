@@ -22,7 +22,7 @@ def _sample_z_indices(z_size: int, z_samples: int, *, seed: int) -> np.ndarray:
 
 
 def _gpu_unsharp_planes(sampled: np.ndarray, *, radius: float) -> np.ndarray:
-    """Sharpen independent sampled Z planes without coupling nonadjacent planes."""
+    """Sharpen planes independently while keeping only one plane on the GPU."""
     import cupy as cp
     from cucim.skimage import filters as cucim_filters
 
@@ -31,21 +31,28 @@ def _gpu_unsharp_planes(sampled: np.ndarray, *, radius: float) -> np.ndarray:
 
     pool = cp.get_default_memory_pool()
     pinned_pool = cp.get_default_pinned_memory_pool()
-    sampled_gpu = cp.asarray(sampled, dtype=cp.float32)
+    filtered = np.empty(sampled.shape, dtype=np.float32)
     try:
-        for z_index in range(sampled_gpu.shape[0]):
-            sharpened = cucim_filters.unsharp_mask(
-                sampled_gpu[z_index],
-                radius=radius,
-                preserve_range=True,
-                channel_axis=2,
-            )
-            sampled_gpu[z_index] = sharpened
-            del sharpened
-        cp.cuda.get_current_stream().synchronize()
-        return cp.asnumpy(sampled_gpu)
+        for z_index in range(sampled.shape[0]):
+            plane_gpu = cp.asarray(sampled[z_index], dtype=cp.float32)
+            try:
+                sharpened = cucim_filters.unsharp_mask(
+                    plane_gpu,
+                    radius=radius,
+                    preserve_range=True,
+                    channel_axis=2,
+                )
+                try:
+                    cp.cuda.get_current_stream().synchronize()
+                    filtered[z_index] = cp.asnumpy(sharpened)
+                finally:
+                    del sharpened
+            finally:
+                del plane_gpu
+                pool.free_all_blocks()
+                pinned_pool.free_all_blocks()
+        return filtered
     finally:
-        del sampled_gpu
         pool.free_all_blocks()
         pinned_pool.free_all_blocks()
 
@@ -62,14 +69,18 @@ def sample_percentiles(
     z_samples: int = 32,
     unsharp: bool = True,
     unsharp_radius: float = 3.0,
+    foreground_channel: int | None = None,
+    foreground_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample percentile ranges from a large 4D stack.
 
     Assumes input is shaped (Z, Y, X, C) and returns per-channel
     low/high percentiles computed from up to ``n`` randomly sampled
     spatial crops of size ``block`` across deterministic representative Z
-    planes after plane-wise GPU unsharp filtering. One Z plane is sampled from
-    each equal-depth stratum to avoid alignment with regularly spaced empty bands.
+    planes after plane-wise GPU unsharp filtering. Source reads are limited to
+    the candidate spatial crop, and only one cropped plane is held on the GPU.
+    One Z plane is sampled from each equal-depth stratum to avoid alignment with
+    regularly spaced empty bands.
 
     Behavior matches the historical implementation used by the
     distributed segmentation scripts and preserves the 1-based
@@ -83,6 +94,8 @@ def sample_percentiles(
     - low, high: percentile bounds to compute (0-100)
     - seed: RNG seed for reproducibility
     - z_samples: maximum number of stratified source Z planes to load
+    - foreground_channel: optional 1-based channel defining valid voxels
+    - foreground_threshold: strict lower bound for valid foreground voxels
 
     Returns
     - mean_perc: array (n_channels, 2) with [[low, high], ...]
@@ -102,25 +115,25 @@ def sample_percentiles(
         raise ValueError("Expected image with shape (Z, Y, X, C).")
     if shape[1] < block[0] or shape[2] < block[1]:
         raise ValueError("Block size larger than image spatial dimensions.")
+    if (foreground_channel is None) != (foreground_threshold is None):
+        raise ValueError("foreground_channel and foreground_threshold must be provided together.")
+    if foreground_channel is not None and (
+        isinstance(foreground_channel, bool)
+        or foreground_channel < 1
+        or foreground_channel > shape[3]
+    ):
+        raise ValueError("foreground_channel must be a valid 1-based channel index.")
 
     z_indices = _sample_z_indices(int(shape[0]), z_samples, seed=seed)
-    sampled_raw = np.stack(
-        [np.asarray(arr[int(z_index), :, :, :]) for z_index in z_indices],
-        axis=0,
-    )
     logger.info(
-        f"Loaded {len(z_indices)} representative Z planes from {shape[0]} "
-        "for normalization"
-    )
-    sampled_filtered = (
-        _gpu_unsharp_planes(sampled_raw, radius=unsharp_radius)
-        if unsharp
-        else sampled_raw
+        f"Selected {len(z_indices)} representative Z planes from {shape[0]} "
+        f"for bounded {block[0]}x{block[1]} normalization crops"
     )
 
     rng = np.random.default_rng(seed)
     # Historical convention: incoming channels are 1-based
     ch_idx = [c - 1 for c in channels]
+    foreground_idx = foreground_channel - 1 if foreground_channel is not None else None
 
     # Over-sample starts to allow skipping zero-padded/stitch-edge crops
     y_starts = rng.integers(0, shape[1] - block[0] + 1, n * 2)
@@ -133,22 +146,42 @@ def sample_percentiles(
             break
         y_slice = slice(y_start, y_start + block[0])
         x_slice = slice(x_start, x_start + block[1])
-        raw_crop = sampled_raw[:, y_slice, x_slice, :]
-        logger.info(f"Sampled crop {taken} at ({y_start}, {x_start})")
-        # Skip crops dominated by 0s or 1s (stitched borders / saturated regions)
-        sel = raw_crop[..., ch_idx]
-        total = sel.size
-        zero_ratio = float(np.count_nonzero(sel == 0)) / max(total, 1)
-        one_ratio = float(np.count_nonzero(sel == 1)) / max(total, 1)
-        if zero_ratio > 0.10 or one_ratio > 0.10:
-            logger.info(f"Crop rejected: zero_ratio={zero_ratio:.3f}, one_ratio={one_ratio:.3f} (>0.10 threshold)")
-            continue
-
-        # Compute percentiles per selected channel (keep channel axis last).
-        filtered_crop = sampled_filtered[:, y_slice, x_slice, :]
-        samples.append(
-            np.percentile(filtered_crop[..., ch_idx], [low, high], axis=(0, 1, 2))
+        raw_crop = np.stack(
+            [
+                np.asarray(arr[int(z_index), y_slice, x_slice, :])
+                for z_index in z_indices
+            ],
+            axis=0,
         )
+        logger.info(f"Sampled crop {taken} at ({y_start}, {x_start})")
+        if foreground_idx is not None:
+            foreground = raw_crop[..., foreground_idx] > foreground_threshold
+            if not np.any(foreground):
+                logger.info("Crop rejected: no foreground voxels")
+                continue
+        else:
+            # Preserve the generic sampler's historical stitched-edge rejection.
+            sel = raw_crop[..., ch_idx]
+            total = sel.size
+            zero_ratio = float(np.count_nonzero(sel == 0)) / max(total, 1)
+            one_ratio = float(np.count_nonzero(sel == 1)) / max(total, 1)
+            if zero_ratio > 0.10 or one_ratio > 0.10:
+                logger.info(
+                    f"Crop rejected: zero_ratio={zero_ratio:.3f}, "
+                    f"one_ratio={one_ratio:.3f} (>0.10 threshold)"
+                )
+                continue
+
+        filtered_crop = (
+            _gpu_unsharp_planes(raw_crop, radius=unsharp_radius) if unsharp else raw_crop
+        )
+        if foreground_idx is not None:
+            values = filtered_crop[..., ch_idx][foreground]
+            samples.append(np.percentile(values, [low, high], axis=0))
+        else:
+            samples.append(
+                np.percentile(filtered_crop[..., ch_idx], [low, high], axis=(0, 1, 2))
+            )
         taken += 1
 
     if not samples:
@@ -171,6 +204,8 @@ def sample_percentile(
     z_samples: int = 32,
     unsharp: bool = True,
     unsharp_radius: float = 3.0,
+    foreground_channel: int | None = None,
+    foreground_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Backward-compatible wrapper returning the same result as sample_percentiles."""
 
@@ -185,4 +220,6 @@ def sample_percentile(
         z_samples=z_samples,
         unsharp=unsharp,
         unsharp_radius=unsharp_radius,
+        foreground_channel=foreground_channel,
+        foreground_threshold=foreground_threshold,
     )

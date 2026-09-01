@@ -73,9 +73,8 @@ def _find_raw_for_target_tiles(
     for raw in range(1, raw_upper + 1):
         padded = mapper(raw, bsize=bsize)
         if padded_min <= padded <= padded_max:
-            if best_raw is None or raw > best_raw:
-                best_raw = raw
-                best_padded = padded
+            best_raw = raw
+            best_padded = padded
 
     if best_raw is None or best_padded is None:
         raise ValueError(f"Could not find raw size for n_target={n_target} along axis={axis}")

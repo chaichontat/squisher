@@ -122,15 +122,37 @@ def segment_run(
         typer.Argument(exists=True, help="Input ZYXC Zarr or registered-source JSON manifest."),
     ],
     channels: Annotated[str | None, typer.Option(help="Comma-separated channel names to segment.")] = None,
-    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing segmentation.")] = False,
-    config_path: Annotated[Path | None, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Config JSON path.")] = None,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing segmentation.")
+    ] = False,
+    config_path: Annotated[
+        Path | None, typer.Option("--config", "-c", exists=True, dir_okay=False, help="Config JSON path.")
+    ] = None,
     workers_per_gpu: Annotated[int, typer.Option(help="Workers to spawn per GPU.")] = 4,
+    workers_per_device: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated worker counts in CUDA_VISIBLE_DEVICES order."),
+    ] = None,
     threads_per_worker: Annotated[int, typer.Option(help="Threads per worker.")] = 1,
-    use_localcuda: Annotated[bool, typer.Option("--use-localcuda/--no-use-localcuda", help="Use dask-cuda LocalCUDACluster when workers_per_gpu<=1.")] = False,
+    use_localcuda: Annotated[
+        bool,
+        typer.Option(
+            "--use-localcuda/--no-use-localcuda",
+            help="Use dask-cuda LocalCUDACluster when workers_per_gpu<=1.",
+        ),
+    ] = False,
     n_workers: Annotated[int | None, typer.Option(help="LocalCUDACluster worker count.")] = None,
     target_nz: Annotated[int | None, typer.Option(help="Desired internal Cellpose nz tiles.")] = None,
     target_ny: Annotated[int | None, typer.Option(help="Desired internal Cellpose ny tiles.")] = None,
     target_nx: Annotated[int | None, typer.Option(help="Desired internal Cellpose nx tiles.")] = None,
+    start_zyx: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated Z,Y,X crop start."),
+    ] = None,
+    box_size_zyx: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated Z,Y,X crop size."),
+    ] = None,
     nonempty_threshold: Annotated[
         int,
         typer.Option(
@@ -138,19 +160,39 @@ def segment_run(
             help="561 threshold for block scheduling and Cellpose input masking; values must be strictly greater.",
         ),
     ] = 1000,
-    cellpose_only: Annotated[bool, typer.Option("--cellpose-only/--no-cellpose-only", help="Stop after Cellpose inference.")] = False,
-    stagger_seconds: Annotated[float, typer.Option(help="Seconds to stagger worker starts on one GPU.")] = 5.0,
+    cellpose_only: Annotated[
+        bool, typer.Option("--cellpose-only/--no-cellpose-only", help="Stop after Cellpose inference.")
+    ] = False,
+    stagger_seconds: Annotated[
+        float, typer.Option(help="Seconds to stagger worker starts on one GPU.")
+    ] = 5.0,
+    stitch_mode: Annotated[
+        str, typer.Option(help="Block stitching mode: face or overlap-iou.")
+    ] = "face",
+    stitch_iou_threshold: Annotated[
+        float, typer.Option(min=0.0, max=1.0, help="Minimum reciprocal overlap IoU.")
+    ] = 0.25,
 ) -> None:
     from squisher_segment.segmentation.distributed import distributed_segmentation as segment_mod
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     logging.getLogger("cellpose").setLevel(logging.WARNING)
+    try:
+        parsed_start = segment_mod._parse_zyx_option(start_zyx, "--start-zyx")
+        parsed_box_size = segment_mod._parse_zyx_option(box_size_zyx, "--box-size-zyx")
+        parsed_worker_counts = segment_mod._parse_worker_counts(workers_per_device)
+        parsed_stitch_mode, parsed_iou_threshold = segment_mod.overlap_stitch.validate_stitch_options(
+            stitch_mode, stitch_iou_threshold
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     segment_mod._run_single_input(
         input_path=input_zarr,
         channels=channels,
         overwrite=overwrite,
         config_path=config_path,
         workers_per_gpu=workers_per_gpu,
+        workers_per_device=parsed_worker_counts,
         threads_per_worker=threads_per_worker,
         use_localcuda=use_localcuda,
         n_workers=n_workers,
@@ -160,6 +202,10 @@ def segment_run(
         nonempty_threshold=nonempty_threshold,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
+        start_zyx=parsed_start,
+        box_size_zyx=parsed_box_size,
+        stitch_mode=parsed_stitch_mode,
+        stitch_iou_threshold=parsed_iou_threshold,
     )
 
 
@@ -167,8 +213,12 @@ def segment_run(
 def segment_stitch(
     temp_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Cellpose temp directory.")],
     output_path: Annotated[Path, typer.Argument(help="Output segmentation .zarr path.")],
-    cleanup: Annotated[bool, typer.Option("--cleanup/--no-cleanup", help="Remove temp directory after stitching.")] = True,
-    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")] = False,
+    cleanup: Annotated[
+        bool, typer.Option("--cleanup/--no-cleanup", help="Remove temp directory after stitching.")
+    ] = True,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")
+    ] = False,
 ) -> None:
     from squisher_segment.segmentation.distributed import distributed_segmentation as segment_mod
 
@@ -178,7 +228,9 @@ def segment_stitch(
 
 @postproc_app.command("run")
 def postproc_run(
-    input_zarr_path: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Input segmentation .zarr.")],
+    input_zarr_path: Annotated[
+        Path, typer.Argument(exists=True, file_okay=False, help="Input segmentation .zarr.")
+    ],
     output_path: Annotated[Path | None, typer.Option(help="Output postprocessed .zarr path.")] = None,
     blocksize: Annotated[
         tuple[int, int, int] | None,
@@ -188,7 +240,9 @@ def postproc_run(
     v_min: Annotated[int, typer.Option("--v-min", help="Minimum volume for small cell donation.")] = 500,
     margin: Annotated[int, typer.Option(help="Margin parameter; overlap is 2*margin.")] = 30,
     workers_per_gpu: Annotated[int, typer.Option(help="Workers per GPU.")] = 1,
-    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")] = False,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite/--no-overwrite", help="Overwrite existing output.")
+    ] = False,
 ) -> None:
     import zarr
     from squisher_segment.segmentation.distributed import distributed_postproc as postproc_mod
@@ -197,7 +251,9 @@ def postproc_run(
     resolved_output_path = output_path
     if resolved_output_path is None:
         sigma_str = sigma.replace(",", "-").replace(" ", "")
-        resolved_output_path = input_zarr_path.parent / f"{input_zarr_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+        resolved_output_path = (
+            input_zarr_path.parent / f"{input_zarr_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+        )
     postproc_mod.distributed_postproc(
         input_zarr=input_zarr,
         write_path=resolved_output_path,
@@ -213,7 +269,9 @@ def postproc_run(
 
 @app.command("extract")
 def extract(
-    input_path: Annotated[Path, typer.Argument(exists=True, help="Input registered TIFF or fused .zarr volume.")],
+    input_path: Annotated[
+        Path, typer.Argument(exists=True, help="Input registered TIFF or fused .zarr volume.")
+    ],
     mode: Annotated[str, typer.Option(help="Extraction mode: z, ortho, or maxproj.")] = "z",
     out: Annotated[Path | None, typer.Option(help="Output directory.")] = None,
     dz: Annotated[int, typer.Option(help="Use every Nth Z plane for z/maxproj modes.")] = 1,
@@ -231,7 +289,13 @@ def extract(
     seed: Annotated[int | None, typer.Option(help="Random seed for sampled candidates.")] = None,
     label: Annotated[str | None, typer.Option(help="Filename prefix; defaults to input stem.")] = None,
     masks: Annotated[Path | None, typer.Option(exists=True, help="Optional matching mask TIFF/Zarr.")] = None,
-    enrich_boundaries: Annotated[Path | None, typer.Option(exists=True, help="Optional mask used to bias candidate selection.")] = None,
+    stage: Annotated[
+        Path | None,
+        typer.Option(help="Reusable local .zarr stage for a registered input manifest."),
+    ] = None,
+    enrich_boundaries: Annotated[
+        Path | None, typer.Option(exists=True, help="Optional mask used to bias candidate selection.")
+    ] = None,
     aux_channel_stack: Annotated[
         Path | None,
         typer.Option(
@@ -257,6 +321,7 @@ def extract(
         seed=seed,
         label=label,
         masks=masks,
+        stage=stage,
         enrich_boundaries=enrich_boundaries,
         aux_channel_stack=aux_channel_stack,
     )
@@ -271,6 +336,13 @@ def regionprops_command(
     output: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="Output Parquet; defaults beside labels."),
+    ] = None,
+    intensity: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--intensity",
+            help="Repeatable NAME=PATH coordinate-matched Zarr or OME-Zarr source.",
+        ),
     ] = None,
     workers: Annotated[int, typer.Option(min=1, help="Parallel label-chunk workers.")] = 2,
     offset_zyx: Annotated[
@@ -289,10 +361,32 @@ def regionprops_command(
     """Measure chunk-parallel region properties without loading the full label volume."""
     from squisher_segment.segment.regionprops import measure_zarr
 
+    intensity_paths: dict[str, Path] = {}
+    for specification in intensity or []:
+        name, separator, raw_path = specification.partition("=")
+        if not separator or not name or not raw_path:
+            raise typer.BadParameter(
+                f"Intensity must use NAME=PATH syntax, got {specification!r}.",
+                param_hint="--intensity",
+            )
+        path = Path(raw_path)
+        if not path.is_dir():
+            raise typer.BadParameter(
+                f"Intensity Zarr does not exist or is not a directory: {path}",
+                param_hint="--intensity",
+            )
+        if name in intensity_paths:
+            raise typer.BadParameter(
+                f"Intensity name {name!r} was supplied more than once.",
+                param_hint="--intensity",
+            )
+        intensity_paths[name] = path
+
     resolved_output = output or labels.parent / "props.parquet"
     written = measure_zarr(
         labels,
         resolved_output,
+        intensity_paths=intensity_paths,
         workers=workers,
         offset_zyx=offset_zyx,
         resume=resume,

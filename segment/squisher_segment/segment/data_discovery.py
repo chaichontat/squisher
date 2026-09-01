@@ -5,7 +5,21 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Pattern, Sequence
 
-_IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+_IMAGE_EXTENSIONS = {
+    ".dax",
+    ".flex",
+    ".jpeg",
+    ".jpg",
+    ".nd2",
+    ".nrrd",
+    ".png",
+    ".tif",
+    ".tiff",
+}
+
+
+def _is_mask_tiff(path: Path) -> bool:
+    return path.suffix.lower() in {".tif", ".tiff"} and path.stem.lower().endswith("_masks")
 
 
 def _compile_patterns(patterns: Sequence[str]) -> list[Pattern[str]]:
@@ -24,22 +38,27 @@ def _matches_any(patterns: Sequence[Pattern[str]], value: str) -> bool:
 
 def _iter_image_dirs(start: Path) -> Iterable[Path]:
     if start.is_file():
-        yield start.parent
+        if not _is_mask_tiff(start):
+            yield start.parent
         return
 
     if not start.exists():
         return
 
     discovered_dirs: set[Path] = set()
+    found_mask_tiff = False
     for file_path in start.rglob("*"):
         if not file_path.is_file():
+            continue
+        if _is_mask_tiff(file_path):
+            found_mask_tiff = True
             continue
         suffix = file_path.suffix.lower()
         if suffix in _IMAGE_EXTENSIONS or file_path.name.endswith("_seg.npy"):
             discovered_dirs.add(file_path.parent)
 
     if not discovered_dirs:
-        if start.is_dir():
+        if start.is_dir() and not found_mask_tiff:
             yield start
         return
 
@@ -87,4 +106,3 @@ def _discover_training_dirs(root: Path, training_paths: Sequence[str]) -> list[P
         )
 
     return discovered
-

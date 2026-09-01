@@ -188,6 +188,8 @@ def build_full_affine_geometry(tiles: list[Any], params: list[Any], *, level: in
 def source_shape_zyx(tile: Any, source_shape: tuple[int, ...]) -> tuple[int, int, int]:
     if tile.axes == "CZYX":
         return int(source_shape[1]), int(source_shape[2]), int(source_shape[3])
+    if tile.axes == "ZCYX":
+        return int(source_shape[0]), int(source_shape[2]), int(source_shape[3])
     if tile.axes == "ZYX":
         return int(source_shape[0]), int(source_shape[1]), int(source_shape[2])
     raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
@@ -206,6 +208,8 @@ def remaining_sample_steps(tile: Any, *, source_shape: tuple[int, ...], target_l
 def stitch_shape_zyx(tile: Any) -> tuple[int, int, int]:
     if tile.axes == "CZYX":
         return int(tile.shape[1]), int(tile.shape[2]), int(tile.shape[3])
+    if tile.axes == "ZCYX":
+        return int(tile.shape[0]), int(tile.shape[2]), int(tile.shape[3])
     if tile.axes == "ZYX":
         return int(tile.shape[0]), int(tile.shape[1]), int(tile.shape[2])
     raise ValueError(f"Unsupported axes {tile.axes!r} in {tile.path}")
@@ -237,6 +241,10 @@ def sampled_tile(tile: Any, *, channel: int, level: int, stitch: Any) -> np.ndar
             if channel < 0 or channel >= source_tile.shape[0]:
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {tile.shape[0]}")
             sampled = array[channel, z_slice, y_slice, x_slice]
+        elif source_tile.axes == "ZCYX":
+            if channel < 0 or channel >= source_tile.shape[1]:
+                raise ValueError(f"Channel {channel} is outside {tile.path} channel count {tile.shape[1]}")
+            sampled = array[z_slice, channel, y_slice, x_slice]
         elif source_tile.axes == "ZYX":
             if channel != 0:
                 raise ValueError(f"Channel {channel} is outside single-channel tile {tile.path}")

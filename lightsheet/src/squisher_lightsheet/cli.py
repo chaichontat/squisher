@@ -38,6 +38,10 @@ from squisher_lightsheet.cross_register_method8 import (
     run_tile_quadrant_method8,
 )
 from squisher_lightsheet.fusion import DEFAULT_OUTPUT_CHUNKSIZE_ZYX, fuse_tiles
+from squisher_lightsheet.fused_fixed import (
+    DEFAULT_SWEEP_RUNNER,
+    run_fused_fixed_method6,
+)
 from squisher_lightsheet.global_phase import (
     DEFAULT_FFT_HIGHPASS_SIGMA_ZYX,
     DEFAULT_LEVEL as DEFAULT_GLOBAL_PHASE_LEVEL,
@@ -72,7 +76,7 @@ from squisher_lightsheet.ome_metadata_dumb_stitch import (
     parse_view_dir as parse_ome_metadata_dumb_stitch_view_dir,
     render_ome_metadata_dumb_stitch,
 )
-from squisher_lightsheet.ome_rechunk import rechunk_ome_tiffs
+from squisher_lightsheet.ome_zarr_rechunk import DEFAULT_CHUNK_SHAPE_ZYX, rechunk_ome_zarr
 from squisher_lightsheet.parsing import parse_source_view_path_entry
 from squisher_lightsheet.positions import create_position_file, create_single_position_file
 from squisher_lightsheet.pyramid import add_pyramids
@@ -82,6 +86,7 @@ from squisher_lightsheet.qc import (
     render_fused_tile_index_overlay,
     render_registration_center_z_spotcheck,
     render_registration_qc,
+    write_fused_threshold_review_tiff,
 )
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy_registration
 from squisher_lightsheet.rough_phase import rough_phase_align
@@ -179,6 +184,8 @@ def fused_fixed_contact_sheet(
         typer.Option("--renderer-python", exists=True, dir_okay=False),
     ] = None,
     status: Annotated[str, typer.Option("--status")] = "accepted",
+    rejection_reason: Annotated[str | None, typer.Option("--rejection-reason")] = None,
+    tile_filter: Annotated[str | None, typer.Option("--tile-filter")] = None,
     before_transform: Annotated[
         Literal["phase-correlation", "linear-initializer"],
         typer.Option("--before-transform"),
@@ -208,11 +215,12 @@ def fused_fixed_contact_sheet(
         "--before-transform",
         before_transform,
     ]
+    if rejection_reason is not None:
+        command.extend(["--rejection-reason", rejection_reason])
+    if tile_filter is not None:
+        command.extend(["--tile-filter", tile_filter])
     logger.info("{}", " ".join(command))
-    result = subprocess.run(command, check=True, text=True, capture_output=True)
-    if result.stderr:
-        typer.echo(result.stderr, err=True)
-    typer.echo(result.stdout.strip())
+    subprocess.run(command, check=True)
 
 
 @app.command("fused-fixed-materialize-overlap")
@@ -591,6 +599,115 @@ def cross_register_global_phase(
     )
 
 
+@cross_register_app.command("method6")
+def cross_register_method6(
+    fixed_position: Annotated[
+        Path, typer.Option("--fixed-position", exists=True, dir_okay=False, readable=True)
+    ],
+    moving_position: Annotated[
+        Path, typer.Option("--moving-position", exists=True, dir_okay=False, readable=True)
+    ],
+    moving_source_position: Annotated[
+        Path,
+        typer.Option("--moving-source-position", exists=True, dir_okay=False, readable=True),
+    ],
+    fixed_fused: Annotated[
+        Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    output_registration: Annotated[Path, typer.Option("--output-registration", dir_okay=False)],
+    fixed_mask_threshold: Annotated[
+        float, typer.Option("--fixed-mask-threshold", min=0.0)
+    ],
+    source_label: Annotated[str, typer.Option("--source-label")],
+    target_label: Annotated[str, typer.Option("--target-label")],
+    moving_channel: Annotated[int, typer.Option("--moving-channel", min=0)] = 0,
+    sweep_runner: Annotated[
+        Path,
+        typer.Option("--sweep-runner", exists=True, dir_okay=False, readable=True),
+    ] = DEFAULT_SWEEP_RUNNER,
+    window_filter_json: Annotated[
+        Path | None,
+        typer.Option("--window-filter-json", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    core_shape_zyx: Annotated[str, typer.Option("--core-shape-zyx")] = "480,480,480",
+    window_shape_zyx: Annotated[str, typer.Option("--window-shape-zyx")] = "528,528,528",
+    fit_downsample_zyx: Annotated[str, typer.Option("--fit-downsample-zyx")] = "1,1,1",
+    native_lib_dir: Annotated[
+        Path,
+        typer.Option("--native-lib-dir", exists=True, file_okay=False, readable=True),
+    ] = DEFAULT_CROSS_REGISTER_METHOD8_LIB_DIR,
+    ftol: Annotated[float, typer.Option("--ftol", min=0.0)] = 1e-4,
+    max_iterations: Annotated[int, typer.Option("--max-iterations", min=1)] = 300,
+    phase_upsample_factor: Annotated[int, typer.Option("--phase-upsample-factor", min=1)] = 10,
+    min_corr: Annotated[float, typer.Option("--min-corr")] = 0.15,
+    min_grad_ncc: Annotated[float, typer.Option("--min-grad-ncc")] = 0.24,
+    fixed_mask_level: Annotated[int, typer.Option("--fixed-mask-level", min=0)] = 2,
+    fixed_mask_min_voxels: Annotated[int, typer.Option("--fixed-mask-min-voxels", min=1)] = 256,
+    fixed_mask_max_masked_fraction: Annotated[
+        float,
+        typer.Option("--fixed-mask-max-masked-fraction", min=0.0, max=1.0),
+    ] = 0.95,
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 1,
+    max_tasks_per_worker: Annotated[int, typer.Option("--max-tasks-per-worker", min=1)] = 10,
+    devices: Annotated[str, typer.Option("--devices")] = "0",
+    max_windows: Annotated[int | None, typer.Option("--max-windows", min=1)] = None,
+    resume: Annotated[bool, typer.Option("--resume/--no-resume")] = True,
+    overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
+) -> None:
+    """Fit fused-fixed Method 6 with log1p, then write one canonical channel registration."""
+    if output_registration.exists() and not overwrite:
+        raise typer.BadParameter(
+            f"output registration already exists at {output_registration}; pass --overwrite to replace it"
+        )
+    _require_distinct_paths(
+        inputs={
+            "fixed position": fixed_position,
+            "moving position": moving_position,
+            "moving source position": moving_source_position,
+            "fixed fused": fixed_fused,
+        },
+        outputs={"output registration": output_registration},
+    )
+    summary, registration = run_fused_fixed_method6(
+        fixed_position=fixed_position,
+        moving_position=moving_position,
+        moving_source_position=moving_source_position,
+        fixed_fused=fixed_fused,
+        output_dir=output_dir,
+        output_registration=output_registration,
+        moving_channel=moving_channel,
+        fixed_mask_threshold=fixed_mask_threshold,
+        source_label=source_label,
+        target_label=target_label,
+        sweep_runner=sweep_runner,
+        window_filter_json=window_filter_json,
+        core_shape_zyx=parse_shape_zyx(core_shape_zyx),
+        window_shape_zyx=parse_shape_zyx(window_shape_zyx),
+        fit_downsample_zyx=parse_shape_zyx(fit_downsample_zyx),
+        native_lib_dir=native_lib_dir,
+        ftol=ftol,
+        max_iterations=max_iterations,
+        phase_upsample_factor=phase_upsample_factor,
+        min_corr=min_corr,
+        min_grad_ncc=min_grad_ncc,
+        fixed_mask_level=fixed_mask_level,
+        fixed_mask_min_voxels=fixed_mask_min_voxels,
+        fixed_mask_max_masked_fraction=fixed_mask_max_masked_fraction,
+        workers=workers,
+        max_tasks_per_worker=max_tasks_per_worker,
+        devices=_parse_devices(devices),
+        max_windows=max_windows,
+        resume=resume,
+    )
+    typer.echo(
+        json.dumps(
+            {"summary": str(summary), "registration": str(registration)},
+            indent=2,
+        )
+    )
+
+
 @cross_register_method8_app.command("coarse")
 def cross_register_method8_coarse(
     fixed_position: Annotated[
@@ -789,6 +906,31 @@ def cross_register_method8_method8(
                 "window_json_dir": str(window_json_dir.resolve()),
                 "manifest": str(manifest),
             },
+            indent=2,
+        )
+    )
+
+
+@app.command("threshold-review")
+def threshold_review(
+    fixed_fused: Annotated[
+        Path,
+        typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    level: Annotated[int, typer.Option("--level", min=0)] = 2,
+    z_index: Annotated[int | None, typer.Option("--z-index", min=0)] = None,
+) -> None:
+    """Write an unscaled fixed-channel OME-TIFF for manual mask-threshold review."""
+    review_tiff, manifest = write_fused_threshold_review_tiff(
+        fused_zarr=fixed_fused,
+        output=output,
+        level=level,
+        z_index=z_index,
+    )
+    typer.echo(
+        json.dumps(
+            {"review_tiff": str(review_tiff), "manifest": str(manifest)},
             indent=2,
         )
     )
@@ -1150,25 +1292,30 @@ def mvs_refine_level0(
     typer.echo(refined["metrics"]["level0_refinement"]["output_registration"])
 
 
-@app.command("rechunk-ome-tiff")
-def rechunk_ome_tiff(
-    inputs: Annotated[list[Path], typer.Argument()],
-    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
-    chunk_shape_zyx: Annotated[str, typer.Option("--chunk-shape-zyx")] = "12,240,240",
-    pyramid_downsample_factors: Annotated[str, typer.Option("--pyramid-downsample-factors")] = "2,4",
-    workers: Annotated[int, typer.Option("--workers", min=1)] = 1,
+@app.command("rechunk-ome-zarr")
+def rechunk_ome_zarr_command(
+    source: Annotated[Path, typer.Argument(exists=True, file_okay=False, readable=True)],
+    destination: Annotated[Path, typer.Argument(file_okay=False)],
+    start_level: Annotated[int, typer.Option("--start-level", min=0)] = 2,
+    zstd_level: Annotated[int, typer.Option("--zstd-level", min=1, max=22)] = 3,
+    chunk_shape_zyx: Annotated[str, typer.Option("--chunk-shape-zyx")] = ",".join(
+        str(size) for size in DEFAULT_CHUNK_SHAPE_ZYX
+    ),
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 8,
+    codec_concurrency: Annotated[int, typer.Option("--codec-concurrency", min=1)] = 4,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
     summary_output: Annotated[Path | None, typer.Option("--summary-output", dir_okay=False)] = None,
 ) -> None:
-    summary = rechunk_ome_tiffs(
-        inputs=inputs,
-        output_dir=output_dir,
+    """Rebase an OME-Zarr pyramid suffix into a lossless Zstd store."""
+    summary = rechunk_ome_zarr(
+        source=source,
+        destination=destination,
+        start_level=start_level,
+        zstd_level=zstd_level,
         chunk_shape_zyx=_parse_int_zyx(chunk_shape_zyx),
-        pyramid_downsample_factors=tuple(
-            int(value.strip()) for value in pyramid_downsample_factors.split(",") if value.strip()
-        ),
         overwrite=overwrite,
         workers=workers,
+        codec_concurrency=codec_concurrency,
         progress=_log_progress,
     )
     text = json.dumps(summary, indent=2)

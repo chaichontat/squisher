@@ -18,6 +18,7 @@ from squisher.jpegxr_zarr import (
     DEFAULT_JPEGXR_LEVEL,
     jpegxr_plane_chunk_shape,
     jpegxr_sharding_codec,
+    register_jpegxr_codec,
 )
 from squisher_lightsheet.pyramid import (
     chunk_count,
@@ -84,6 +85,7 @@ def write_pyramid_level(
     factors: dict[str, int],
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
 ) -> tuple[int, ...]:
+    register_jpegxr_codec()
     source = zarr.open_array(str(root / source_path), mode="r", zarr_format=3)
     factor_tuple = tuple(int(factors[dim]) for dim in dims)
     shape = output_shape(tuple(int(size) for size in source.shape), dims, factors)

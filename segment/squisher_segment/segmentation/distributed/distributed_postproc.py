@@ -90,11 +90,12 @@ Programmatic:
     result = distributed_postproc(input_zarr, write_path, sigma=(1, 2, 2), V_min=8000, ...)
 """
 
+import hashlib
+import json
 import os
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -116,13 +117,13 @@ from squisher_segment.segment.postproc3d import (  # noqa: F401
 )
 from squisher_segment.segmentation.distributed.gpu_cluster import cluster, myGPUCluster, myLocalCluster
 from squisher_segment.segmentation.distributed.merge_utils import (
-    GLOBAL_LABEL_BITS,
     block_faces,
     create_zarr_array,
     determine_sparse_merge_relabeling,
     find_label_pairs_across_boundary,
     get_block_crops,
     get_nblocks,
+    global_label_bits,
     global_segment_ids,
     label_zarr_codecs,
     remove_overlaps,
@@ -130,14 +131,6 @@ from squisher_segment.segmentation.distributed.merge_utils import (
     sparse_relabel_and_write,
     write_dask_to_zarr,
 )
-
-
-@contextmanager
-def progress_bar(total: int):
-    def _advance(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    yield _advance
 
 
 def _parse_sigma_option(val: str) -> float | tuple[float, float, float]:
@@ -195,13 +188,7 @@ def _validate_tiling(
         )
 
     nblocks = get_nblocks(shape, np.asarray(blocksize))
-    block_count = int(np.prod(nblocks, dtype=np.int64))
-    max_blocks = 1 << (32 - GLOBAL_LABEL_BITS)
-    if block_count > max_blocks:
-        raise ValueError(
-            f"Postproc grid has {block_count} blocks, exceeding the {max_blocks} "
-            f"blocks representable with {GLOBAL_LABEL_BITS} label bits."
-        )
+    global_label_bits(nblocks)
     return nblocks
 
 
@@ -436,25 +423,13 @@ def process_postproc_block(
     bg_scale = postproc_kwargs.get("bg_scale", bg_scale)
 
     t1 = time.perf_counter()
-    try:
-        masks = gaussian_smooth_labels_cupy(
-            masks,
-            sigma=sigma,
-            in_place=True,
-            bg_scale=bg_scale,
-            max_expansion=max_expansion,
-        )
-    except ImportError:
-        # Fall back to CPU if CuPy/CUDA not available
-        from squisher_segment.segment.postproc3d import gaussian_smooth_labels
-
-        masks = gaussian_smooth_labels(
-            masks,
-            sigma=sigma,
-            in_place=True,
-            bg_scale=bg_scale,
-            max_expansion=max_expansion,
-        )
+    masks = gaussian_smooth_labels_cupy(
+        masks,
+        sigma=sigma,
+        in_place=True,
+        bg_scale=bg_scale,
+        max_expansion=max_expansion,
+    )
     t_phase1 = time.perf_counter()
     logger.debug(f"  Block {block_index}: Phase 1 (gaussian_smooth) in {(t_phase1 - t1) * 1000:.1f} ms")
     logger.debug(f"  Block {block_index}: max_label after Phase 1 = {int(masks.max())}")
@@ -536,7 +511,12 @@ def process_postproc_block(
 
     # 5. Assign globally unique IDs
     t_global_start = time.perf_counter()
-    masks_global, remap = global_segment_ids(masks_cropped, block_index, nblocks)
+    masks_global, remap = global_segment_ids(
+        masks_cropped,
+        block_index,
+        nblocks,
+        label_bits=global_label_bits(nblocks),
+    )
     del masks_cropped  # No longer needed after global_segment_ids
     # Convert local IDs to global IDs using remap
     box_ids = remap[local_ids].astype(np.uint32)
@@ -575,12 +555,12 @@ def _copy_zarr_metadata(
     volumes_filename: str | None = None,
     postproc_params: dict[str, Any] | None = None,
 ) -> None:
-    """Copy metadata from input zarr to output zarr, including source mtime and label mapping info."""
+    """Copy neutral metadata and assign identity owned by postprocessing."""
     output_zarr = zarr.open(output_path, mode="r+")
 
-    # Copy all attributes from input
     for key, value in input_zarr.attrs.items():
-        output_zarr.attrs[key] = value
+        if key not in {"squisher_run_key", "squisher_output_schema"}:
+            output_zarr.attrs[key] = value
 
     # Add source file mtime if we can determine the input path
     if input_path is not None:
@@ -600,14 +580,17 @@ def _copy_zarr_metadata(
 
     # Add label mapping metadata if provided
     if mapping_filename is not None and nblocks is not None:
+        label_bits = global_label_bits(np.asarray(nblocks))
+        local_label_mask = (1 << label_bits) - 1
         output_zarr.attrs["label_mapping"] = {
             "file": mapping_filename,
             "format": "sorted_global_and_final_rows",
-            "label_bits": GLOBAL_LABEL_BITS,
+            "label_bits": label_bits,
+            "local_label_mask": local_label_mask,
             "nblocks": list(nblocks),
             "rows": ["global_id", "final_label"],
             "decode_global_id": (
-                "local = gid & 0xFFFF; block_token = gid >> 16; "
+                f"local = gid & {local_label_mask}; block_token = gid >> {label_bits}; "
                 "block_idx = np.unravel_index(block_token, nblocks)"
             ),
         }
@@ -619,6 +602,26 @@ def _copy_zarr_metadata(
             "units": "voxels",
             "background_index": 0,
         }
+
+    postproc_identity = {
+        "schema_version": 1,
+        "source_run_key": input_zarr.attrs.get("squisher_run_key"),
+        "source_schema": {
+            "shape": list(input_zarr.shape),
+            "chunks": list(input_zarr.chunks),
+            "dtype": str(input_zarr.dtype),
+        },
+        "output_schema": {
+            "shape": list(output_zarr.shape),
+            "chunks": list(output_zarr.chunks),
+            "dtype": str(output_zarr.dtype),
+        },
+        "params": postproc_params or {},
+    }
+    output_zarr.attrs["squisher_postproc"] = postproc_identity
+    output_zarr.attrs["squisher_postproc_key"] = hashlib.sha256(
+        json.dumps(postproc_identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _run_distributed_postproc(
@@ -685,10 +688,12 @@ def _run_distributed_postproc(
     blocksize = _resolve_blocksize(input_zarr, blocksize)
     overlap = 2 * margin
     nblocks = _validate_tiling(input_zarr.shape, blocksize, overlap)
+    label_bits = global_label_bits(nblocks)
 
     logger.info(
         f"Starting distributed postproc: blocksize={blocksize}, "
-        f"overlap={overlap}, margin={margin}, sigma={sigma}, V_min={V_min}"
+        f"overlap={overlap}, margin={margin}, sigma={sigma}, V_min={V_min}, "
+        f"label_bits={label_bits}"
     )
 
     temporary_directory = Path(temporary_directory)
@@ -724,6 +729,7 @@ def _run_distributed_postproc(
         "margin": margin,
         "overlap": overlap,
         "blocksize": list(blocksize),
+        "label_bits": label_bits,
     }
 
     # Shuffle block order for better load balancing across workers
@@ -782,11 +788,8 @@ def _run_distributed_postproc(
             del left_face, right_face
 
     t_gather = time.perf_counter()
-    with progress_bar(len(block_indices)) as submit:
-        for future in block_futures:
-            future.add_done_callback(submit)
-        del future_lookup, block_futures
-        compact_results = cluster.client.gather(box_stats_futures + pair_futures)
+    del future_lookup, block_futures
+    compact_results = cluster.client.gather(box_stats_futures + pair_futures)
     gather_time = time.perf_counter() - t_gather
     logger.debug(f"[timing] gather: {gather_time:.2f}s")
 

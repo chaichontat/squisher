@@ -7,7 +7,8 @@ import click
 from loguru import logger
 
 from squisher_segment.segment.extract_core import (
-    _is_zarr_path,
+    _is_random_access_volume_path,
+    _stage_registered_volume,
     normalize_numeric_options,
     run_single_file_extract,
 )
@@ -29,6 +30,7 @@ def run_extract(
     seed: int | None,
     label: str | None,
     masks: Path | None,
+    stage: Path | None,
     enrich_boundaries: Path | None,
     aux_channel_stack: Path | None = None,
     ortho_depth: int | None = None,
@@ -38,15 +40,21 @@ def run_extract(
     if mode not in {"z", "ortho", "maxproj"}:
         raise click.BadParameter("Mode must be 'z', 'ortho', or 'maxproj'.")
 
-    input_path = input_path.resolve()
-    if input_path.is_dir() and not _is_zarr_path(input_path):
+    source_path = input_path.resolve()
+    if source_path.is_dir() and not _is_random_access_volume_path(source_path):
         raise click.BadParameter("Input directory must be a .zarr store.")
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input not found: {input_path}")
+    if not source_path.exists():
+        raise FileNotFoundError(f"Input not found: {source_path}")
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
-    use_zarr = _is_zarr_path(input_path)
+    out_dir = out if out is not None else source_path.parent / "segment_extract"
+    label_value = label or source_path.stem
+    registered_path = source_path
+    if stage is not None:
+        registered_path = _stage_registered_volume(source_path, stage.resolve())
+
+    use_zarr = _is_random_access_volume_path(registered_path)
     if ortho_depth is not None:
         if mode != "ortho" or not use_zarr:
             raise click.BadParameter("--ortho-depth is only valid for ortho extraction from Zarr input.")
@@ -64,19 +72,19 @@ def run_extract(
         ortho_anisotropy_default=6,
     )
 
-    out_dir = out if out is not None else input_path.parent / "segment_extract"
     if out_dir.is_file():
         raise click.BadParameter("--out must point to a directory, not a file.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    label_value = label or input_path.stem
-    logger.info(f"[{label_value}] Input: {input_path}")
+    logger.info(f"[{label_value}] Input: {source_path}")
+    if registered_path != source_path:
+        logger.info(f"[{label_value}] Staged input: {registered_path}")
     logger.info(f"[{label_value}] Output: {out_dir}")
     logger.info(f"[{label_value}] Upscale factor: {upscale_value}")
 
     run_single_file_extract(
         mode=mode,
-        registered=input_path,
+        registered=registered_path,
         out=out_dir,
         dz=dz,
         n=n,

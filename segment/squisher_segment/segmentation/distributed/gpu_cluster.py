@@ -91,19 +91,27 @@ def _visible_devices() -> list[str]:
     return _auto_device_tokens()
 
 
-def _gpu_count() -> int:
-    return len(_visible_devices())
-
-
 def _build_worker_spec(
-    *, devices: list[str], workers_per_gpu: int, threads_per_worker: int
+    *,
+    devices: list[str],
+    workers_per_gpu: int,
+    workers_per_device: tuple[int, ...] | None = None,
+    threads_per_worker: int,
 ) -> dict[str, Any]:
     """Construct a SpecCluster worker spec with env pinning per GPU."""
     from distributed.nanny import Nanny
 
+    worker_counts = workers_per_device or (workers_per_gpu,) * len(devices)
+    if len(worker_counts) != len(devices):
+        raise ValueError(
+            f"workers_per_device has {len(worker_counts)} entries for {len(devices)} visible GPUs."
+        )
+    if any(count < 1 for count in worker_counts):
+        raise ValueError("Every workers_per_device entry must be positive.")
+
     worker_spec: dict[str, Any] = {}
-    for dev, token in enumerate(devices):
-        for k in range(workers_per_gpu):
+    for dev, (token, worker_count) in enumerate(zip(devices, worker_counts, strict=True)):
+        for k in range(worker_count):
             name = f"gpu-{dev}-w{k}"
             worker_spec[name] = {
                 "cls": Nanny,
@@ -116,7 +124,12 @@ def _build_worker_spec(
     return worker_spec
 
 
-def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tuple[Client, Any, str | None]:
+def _start_speccluster(
+    *,
+    workers_per_gpu: int,
+    workers_per_device: tuple[int, ...] | None = None,
+    threads_per_worker: int,
+) -> tuple[Client, Any, str | None]:
     from distributed import Scheduler
     from distributed.deploy.spec import SpecCluster
 
@@ -131,6 +144,7 @@ def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tupl
     spec = _build_worker_spec(
         devices=devices,
         workers_per_gpu=int(workers_per_gpu),
+        workers_per_device=workers_per_device,
         threads_per_worker=int(threads_per_worker),
     )
     cluster = SpecCluster(workers=spec, scheduler={"cls": Scheduler, "options": {}})
@@ -161,6 +175,8 @@ class myGPUCluster:
     workers_per_gpu : int
         If >1, uses SpecCluster with CUDA_VISIBLE_DEVICES pinning and this many
         workers per GPU. If <=1 and `use_localcuda=True`, starts LocalCUDACluster.
+    workers_per_device : tuple[int, ...] | None
+        Optional worker count for each CUDA_VISIBLE_DEVICES entry, in order.
     threads_per_worker : int
         Dask threads per worker (default 1 for GPU-bound work).
     use_localcuda : bool
@@ -173,6 +189,7 @@ class myGPUCluster:
         self,
         *,
         workers_per_gpu: int = 2,
+        workers_per_device: tuple[int, ...] | None = None,
         threads_per_worker: int = 1,
         use_localcuda: bool = False,
         n_workers: int | None = None,
@@ -182,20 +199,21 @@ class myGPUCluster:
         self._cluster: Any = None
         self._dashboard: str | None = None
 
-        if workers_per_gpu and workers_per_gpu > 1:
+        if workers_per_device is not None or (workers_per_gpu and workers_per_gpu > 1):
             self._client, self._cluster, self._dashboard = _start_speccluster(
-                workers_per_gpu=workers_per_gpu, threads_per_worker=threads_per_worker
+                workers_per_gpu=workers_per_gpu,
+                workers_per_device=workers_per_device,
+                threads_per_worker=threads_per_worker,
+            )
+        elif use_localcuda:
+            self._client, self._cluster, self._dashboard = _start_localcuda(
+                n_workers=n_workers, threads_per_worker=threads_per_worker
             )
         else:
-            if use_localcuda:
-                self._client, self._cluster, self._dashboard = _start_localcuda(
-                    n_workers=n_workers, threads_per_worker=threads_per_worker
-                )
-            else:
-                # Fall back to SpecCluster with a single worker per GPU to avoid hard dependency on dask-cuda
-                self._client, self._cluster, self._dashboard = _start_speccluster(
-                    workers_per_gpu=1, threads_per_worker=threads_per_worker
-                )
+            # Fall back to SpecCluster with a single worker per GPU to avoid hard dependency on dask-cuda
+            self._client, self._cluster, self._dashboard = _start_speccluster(
+                workers_per_gpu=1, threads_per_worker=threads_per_worker
+            )
 
         # Mirror attributes expected by distributed_segmentation
         self.client = self._client  # type: ignore[assignment]

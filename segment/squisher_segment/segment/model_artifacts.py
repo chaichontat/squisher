@@ -1,9 +1,27 @@
 import hashlib
+import os
 import re
 from pathlib import Path
+from typing import Mapping
 
 
 _PLAN_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def configured_model_paths(model_kwargs: Mapping[str, object]) -> dict[str, Path]:
+    """Return configured checkpoint paths keyed by their inference role."""
+    primary = model_kwargs.get("pretrained_model")
+    if not isinstance(primary, (str, os.PathLike)) or not os.fspath(primary):
+        raise ValueError("model_kwargs must include a non-empty 'pretrained_model'.")
+
+    paths = {"xy": Path(primary)}
+    ortho = model_kwargs.get("pretrained_model_ortho")
+    if ortho is None:
+        return paths
+    if not isinstance(ortho, (str, os.PathLike)) or not os.fspath(ortho):
+        raise ValueError("model_kwargs must include a non-empty 'pretrained_model_ortho'.")
+    paths["ortho"] = Path(ortho)
+    return paths
 
 
 def plan_path_for_device(model_path: Path, device_name: str) -> Path:
@@ -37,6 +55,7 @@ def runtime_source_sha256() -> dict[str, str]:
         "distributed_segmentation": distributed_root / "distributed_segmentation.py",
         "model_cache": distributed_root / "model_cache.py",
         "merge_utils": distributed_root / "merge_utils.py",
+        "overlap_stitch": distributed_root / "overlap_stitch.py",
         "model_artifacts": Path(__file__),
         "normalize": package_root / "segment" / "normalize.py",
         "cellpose_core": Path(cellpose.core.__file__),

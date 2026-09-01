@@ -51,8 +51,7 @@ def pyramid_shard_chunks(
     chunks = []
     for source_chunk, size, inner_chunk in zip(source_storage_chunks, shape, inner_chunks, strict=True):
         capped = min(max(int(source_chunk), int(inner_chunk)), int(size))
-        if capped == int(size):
-            capped = (capped // int(inner_chunk)) * int(inner_chunk)
+        capped = (capped // int(inner_chunk)) * int(inner_chunk)
         if capped < int(inner_chunk):
             capped = int(inner_chunk)
         chunks.append(capped)

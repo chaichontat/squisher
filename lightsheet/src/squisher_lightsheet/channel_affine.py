@@ -765,6 +765,9 @@ def estimate_translation_gpu(
     moving_zyx: np.ndarray,
     *,
     upsample_factor: int = CHANNEL_PHASE_UPSAMPLE_FACTOR,
+    reference_mask: np.ndarray | None = None,
+    moving_mask: np.ndarray | None = None,
+    overlap_ratio: float = 0.3,
 ) -> tuple[float, float, float]:
     import cupy as cp
     from cucim.skimage.registration import phase_cross_correlation
@@ -773,11 +776,37 @@ def estimate_translation_gpu(
         raise ValueError(f"Expected matching shapes, got fixed={fixed_zyx.shape}, moving={moving_zyx.shape}")
     if upsample_factor < 1:
         raise ValueError("upsample_factor must be >= 1")
+    if (reference_mask is None) != (moving_mask is None):
+        raise ValueError("reference_mask and moving_mask must be provided together")
+    if not 0.0 < float(overlap_ratio) <= 1.0:
+        raise ValueError("overlap_ratio must be in (0, 1]")
     fixed = cp.asarray(fixed_zyx, dtype=cp.float32)
     moving = cp.asarray(moving_zyx, dtype=cp.float32)
-    fixed -= cp.mean(fixed)
-    moving -= cp.mean(moving)
-    shift, _error, _phase = phase_cross_correlation(fixed, moving, upsample_factor=upsample_factor)
+    if reference_mask is None:
+        fixed -= cp.mean(fixed)
+        moving -= cp.mean(moving)
+        shift, _error, _phase = phase_cross_correlation(
+            fixed,
+            moving,
+            upsample_factor=upsample_factor,
+        )
+    else:
+        fixed_mask = cp.asarray(reference_mask, dtype=cp.bool_)
+        moving_support = cp.asarray(moving_mask, dtype=cp.bool_)
+        if fixed_mask.shape != fixed.shape or moving_support.shape != moving.shape:
+            raise ValueError(
+                "phase masks must match their images, got "
+                f"reference={fixed_mask.shape}/{fixed.shape} moving={moving_support.shape}/{moving.shape}"
+            )
+        fixed -= cp.mean(fixed[fixed_mask])
+        moving -= cp.mean(moving[moving_support])
+        shift, _error, _phase = phase_cross_correlation(
+            fixed,
+            moving,
+            reference_mask=fixed_mask,
+            moving_mask=moving_support,
+            overlap_ratio=float(overlap_ratio),
+        )
     shift_cpu = cp.asnumpy(shift)
     return float(shift_cpu[0]), float(shift_cpu[1]), float(shift_cpu[2])
 

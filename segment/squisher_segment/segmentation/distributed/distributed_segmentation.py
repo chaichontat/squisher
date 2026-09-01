@@ -3,10 +3,8 @@ import datetime
 import hashlib
 import json
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from json import JSONEncoder
 import os
 import pathlib
 import shutil
@@ -37,6 +35,7 @@ from squisher_segment.segment.extract_core import (
 )
 from squisher.jpegxr_zarr import register_jpegxr_codec
 from squisher_segment.segmentation.distributed.cache_utils import (
+    NumpyEncoder,
     atomic_write_text,
     read_nonempty_cache,
     read_normalization_cache,
@@ -44,6 +43,7 @@ from squisher_segment.segmentation.distributed.cache_utils import (
     write_normalization_cache,
 )
 from squisher_segment.segment.model_artifacts import (
+    configured_model_paths,
     file_sha256,
     plan_path_for_device,
     runtime_source_sha256,
@@ -55,6 +55,7 @@ from squisher_segment.segmentation.distributed.merge_utils import (
     find_label_pairs_across_boundary,
     get_block_crops,
     get_nblocks,
+    global_label_bits,
     global_segment_id_remap,
     remove_overlaps,
     create_zarr_array,
@@ -65,15 +66,18 @@ from squisher_segment.segmentation.distributed.merge_utils import (
 )
 from squisher_segment.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from squisher_segment.segmentation.distributed.tiling import solve_internal_zyx_for_tiles
+from squisher_segment.segmentation.distributed import overlap_stitch
 
 # Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
 # during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
-dask.config.set({
-    "distributed.comm.timeouts.connect": "60s",
-    "distributed.comm.timeouts.tcp": "120s",
-    "distributed.scheduler.worker-ttl": "10m",
-    "distributed.admin.tick.limit": "10m",
-})
+dask.config.set(
+    {
+        "distributed.comm.timeouts.connect": "60s",
+        "distributed.comm.timeouts.tcp": "120s",
+        "distributed.scheduler.worker-ttl": "10m",
+        "distributed.admin.tick.limit": "10m",
+    }
+)
 
 # IMPORTANT: No Rich logging at module level - RichHandler uses ContextVar which
 # cannot be pickled. This causes "cannot pickle '_contextvars.ContextVar'" errors
@@ -82,23 +86,35 @@ dask.config.set({
 logger = logging.getLogger(__name__)
 NONEMPTY_CHANNEL_NAME = "561"
 DEFAULT_NONEMPTY_THRESHOLD = 1000
+NONEMPTY_MIN_FRACTION = 0.05
+SEGMENTATION_RETRY_DELAY_SECONDS = 30.0
 
 
-class NumpyEncoder(JSONEncoder):
-    def default(self, obj: Any) -> Any:
-        if isinstance(obj, np.generic):
-            return obj.item()
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
-
-
-@contextmanager
-def progress_bar(total: int):
-    def _advance(*args: Any, **kwargs: Any) -> None:
+def _parse_zyx_option(value: str | None, option_name: str) -> tuple[int, int, int] | None:
+    """Parse one comma-separated Z,Y,X CLI value without applying bounds policy."""
+    if value is None:
         return None
+    parts = tuple(part.strip() for part in value.split(","))
+    if len(parts) != 3 or any(not part for part in parts):
+        raise ValueError(f"{option_name} must contain exactly three comma-separated integers.")
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"{option_name} must contain exactly three comma-separated integers.") from exc
+    return parsed[0], parsed[1], parsed[2]
 
-    yield _advance
+
+def _parse_worker_counts(value: str | None) -> tuple[int, ...] | None:
+    """Parse positive per-device worker counts in CUDA_VISIBLE_DEVICES order."""
+    if value is None:
+        return None
+    try:
+        counts = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise ValueError("--workers-per-device must contain comma-separated integers.") from exc
+    if not counts or any(count < 1 for count in counts):
+        raise ValueError("--workers-per-device entries must be positive integers.")
+    return counts
 
 
 def unsharp_all(img: NDArray[Any], crop: None = None, channel_axis: int = 3) -> NDArray[Any]:
@@ -113,9 +129,7 @@ def unsharp_all(img: NDArray[Any], crop: None = None, channel_axis: int = 3) -> 
         selection[axis] = channel
         selection_tuple = tuple(selection)
         image_gpu = cp.asarray(image[selection_tuple], dtype=cp.float32)
-        result_gpu = cucim_filters.unsharp_mask(
-            image_gpu, radius=3, preserve_range=True
-        )
+        result_gpu = cucim_filters.unsharp_mask(image_gpu, radius=3, preserve_range=True)
         result[selection_tuple] = cp.asnumpy(result_gpu)
         del image_gpu, result_gpu
         pool.free_all_blocks()
@@ -131,10 +145,9 @@ def _get_worker_logger() -> logging.Logger:
     worker_logger = logging.getLogger(f"{__name__}.worker")
     if not worker_logger.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "\n%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-            datefmt="%H:%M:%S"
-        ))
+        handler.setFormatter(
+            logging.Formatter("\n%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%H:%M:%S")
+        )
         worker_logger.addHandler(handler)
         worker_logger.setLevel(logging.INFO)
         worker_logger.propagate = False  # Don't propagate to root (which may have Rich)
@@ -145,8 +158,8 @@ def _retire_worker_after_error(*, reason: str) -> None:
     """Best-effort retire the current Dask worker after a task failure.
 
     This prevents a worker that hit a fatal error (often GPU/CUDA state) from
-    picking up the next tile. The task exception is still re-raised to the
-    scheduler so remaining tiles can be rescheduled to healthy workers.
+    picking up the next tile while leaving its Nanny alive to start a replacement.
+    The task exception is still re-raised to the scheduler.
     """
     try:
         worker = distributed.get_worker()
@@ -158,15 +171,16 @@ def _retire_worker_after_error(*, reason: str) -> None:
     loop = getattr(worker, "loop", None)
     if loop is None:
         try:
-            worker.close(reason=reason)  # type: ignore[call-arg]
+            worker.close(nanny=False, reason=reason)  # type: ignore[call-arg]
         except Exception as close_exc:
             _get_worker_logger().error(f"Failed to close worker after error: {close_exc!r}")
         return
 
     try:
-        loop.add_callback(worker.close, reason=reason)  # type: ignore[misc]
+        loop.add_callback(worker.close, nanny=False, reason=reason)  # type: ignore[misc]
     except Exception as close_exc:
         _get_worker_logger().error(f"Failed to schedule worker close after error: {close_exc!r}")
+
 
 def _log_slurm_tile_summary(total_tiles: int, processed_tiles: int, elapsed_seconds: float) -> None:
     job_id = os.environ.get("SLURM_JOB_ID")
@@ -263,11 +277,7 @@ def _save_intermediate_state(
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, path)
-        directory_fd = os.open(temp_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_directory(temp_dir)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -361,25 +371,30 @@ def _load_intermediate_state(temp_dir: Path) -> tuple[list, list, list, list[tup
 ######################## Checkpoint/Resume Functions ###########################
 
 
-def _trt_plan_identity(model_path: Path, device_names: set[str]) -> list[dict[str, Any]]:
+def _trt_plan_identity(
+    model_paths: dict[str, Path],
+    device_names: set[str],
+) -> list[dict[str, Any]]:
     plans = []
-    for device_name in sorted(device_names):
-        plan_path = plan_path_for_device(model_path, device_name).resolve()
-        if not plan_path.is_file():
-            raise FileNotFoundError(
-                f"TensorRT plan required. Expected plan at {plan_path} for CUDA device "
-                f"'{device_name}'."
+    for model_role, model_path in model_paths.items():
+        for device_name in sorted(device_names):
+            plan_path = plan_path_for_device(model_path, device_name).resolve()
+            if not plan_path.is_file():
+                raise FileNotFoundError(
+                    f"TensorRT plan required for {model_role}. Expected plan at {plan_path} "
+                    f"for CUDA device '{device_name}'."
+                )
+            plan_stat = plan_path.stat()
+            plans.append(
+                {
+                    "model_role": model_role,
+                    "device_name": device_name,
+                    "path": str(plan_path),
+                    "sha256": file_sha256(plan_path),
+                    "size": plan_stat.st_size,
+                    "mtime_ns": plan_stat.st_mtime_ns,
+                }
             )
-        plan_stat = plan_path.stat()
-        plans.append(
-            {
-                "device_name": device_name,
-                "path": str(plan_path),
-                "sha256": file_sha256(plan_path),
-                "size": plan_stat.st_size,
-                "mtime_ns": plan_stat.st_mtime_ns,
-            }
-        )
     return plans
 
 
@@ -423,7 +438,7 @@ def _input_provenance_identity(
 
 
 def _runtime_artifact_identity(
-    model_path: Path,
+    model_kwargs: dict[str, Any],
     input_provenance: list[dict[str, str]],
     *,
     max_devices: int | None = None,
@@ -441,10 +456,10 @@ def _runtime_artifact_identity(
         device_count = min(device_count, max_devices)
 
     return {
-        "pipeline_revision": 3,
+        "pipeline_revision": 4,
         "squisher_segment_version": version("squisher-segment"),
         "trt_plans": _trt_plan_identity(
-            model_path,
+            configured_model_paths(model_kwargs),
             {torch.cuda.get_device_name(index) for index in range(device_count)},
         ),
         "source_sha256": runtime_source_sha256(),
@@ -505,16 +520,27 @@ def _validate_runtime_artifacts(runtime_artifacts: dict[str, Any]) -> None:
     missing = [name for name in required_nonempty if not runtime_artifacts.get(name)]
     if missing:
         raise ValueError(f"runtime_artifacts is missing required non-empty fields: {missing}")
-    required_plan_fields = {"device_name", "path", "sha256", "size", "mtime_ns"}
+    required_plan_fields = {
+        "model_role",
+        "device_name",
+        "path",
+        "sha256",
+        "size",
+        "mtime_ns",
+    }
     if not all(
         isinstance(plan, dict)
         and required_plan_fields <= plan.keys()
+        and plan["model_role"] in {"xy", "ortho"}
         and all(plan[field] for field in ("device_name", "path", "sha256"))
         and isinstance(plan["size"], int)
         and isinstance(plan["mtime_ns"], int)
         for plan in runtime_artifacts["trt_plans"]
     ):
         raise ValueError("runtime_artifacts contains an incomplete TensorRT plan identity.")
+    plan_keys = [(plan["model_role"], plan["device_name"]) for plan in runtime_artifacts["trt_plans"]]
+    if len(plan_keys) != len(set(plan_keys)):
+        raise ValueError("runtime_artifacts contains duplicate model-role/device plans.")
     if not isinstance(runtime_artifacts["source_sha256"], dict) or not all(
         isinstance(name, str) and isinstance(digest, str) and digest
         for name, digest in runtime_artifacts["source_sha256"].items()
@@ -537,16 +563,22 @@ def _validate_run_identity_structure(run_identity: dict[str, Any]) -> dict[str, 
         "nonempty_rule",
         "preprocessing_steps",
         "runtime_artifacts",
+        "stitching",
     }
     missing = sorted(required - run_identity.keys())
-    if run_identity.get("schema_version") != 4 or missing:
+    if run_identity.get("schema_version") != 6 or missing:
         raise ValueError(
-            f"run_identity must be a complete schema-4 artifact-bound identity; missing {missing}."
+            f"run_identity must be a complete schema-6 artifact-bound identity; missing {missing}."
         )
     if not isinstance(run_identity["input"], dict) or not run_identity["input"]:
         raise ValueError("run_identity input must be a non-empty mapping.")
-    if not isinstance(run_identity["model_sha256"], str) or not run_identity["model_sha256"]:
-        raise ValueError("run_identity model_sha256 must be non-empty.")
+    model_sha256 = run_identity["model_sha256"]
+    if (
+        not isinstance(model_sha256, dict)
+        or set(model_sha256) not in ({"xy"}, {"xy", "ortho"})
+        or not all(isinstance(digest, str) and digest for digest in model_sha256.values())
+    ):
+        raise ValueError("run_identity model_sha256 must map configured model roles to digests.")
     if not isinstance(run_identity["model_kwargs"], dict) or not isinstance(
         run_identity["eval_kwargs"], dict
     ):
@@ -557,14 +589,26 @@ def _validate_run_identity_structure(run_identity: dict[str, Any]) -> dict[str, 
         or not isinstance(nonempty_rule.get("channel"), str)
         or not isinstance(nonempty_rule.get("channel_index"), int)
         or not isinstance(nonempty_rule.get("threshold"), int)
+        or nonempty_rule.get("min_fraction") != NONEMPTY_MIN_FRACTION
     ):
         raise ValueError(
-            "run_identity nonempty_rule must define channel, channel_index, and threshold."
+            "run_identity nonempty_rule must define channel, channel_index, threshold, "
+            f"and min_fraction={NONEMPTY_MIN_FRACTION}."
         )
     runtime_artifacts = run_identity["runtime_artifacts"]
     if not isinstance(runtime_artifacts, dict):
         raise ValueError("run_identity runtime_artifacts must be a mapping.")
     _validate_runtime_artifacts(runtime_artifacts)
+    if {plan["model_role"] for plan in runtime_artifacts["trt_plans"]} != set(model_sha256):
+        raise ValueError("run_identity TensorRT plan roles do not match configured model roles.")
+    stitching = run_identity["stitching"]
+    if not isinstance(stitching, dict):
+        raise ValueError("run_identity stitching must be a mapping.")
+    mode, threshold = overlap_stitch.validate_stitch_options(
+        stitching.get("mode", ""), stitching.get("iou_threshold")
+    )
+    if stitching != {"mode": mode, "iou_threshold": threshold}:
+        raise ValueError("run_identity stitching options are not canonical.")
     return runtime_artifacts
 
 
@@ -580,14 +624,13 @@ def _validate_run_identity_matches_call(
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
 ) -> None:
     """Reject resumable identities that do not describe the current evaluation."""
-    model_path = model_kwargs.get("pretrained_model")
-    if not isinstance(model_path, (str, os.PathLike)):
-        raise ValueError("model_kwargs must include pretrained_model for resumable evaluation.")
-
     input_identity = run_identity["input"]
     expected = {
         "channel_indices": list(channel_indices),
-        "model_sha256": file_sha256(Path(model_path)),
+        "model_sha256": {
+            model_role: file_sha256(model_path)
+            for model_role, model_path in configured_model_paths(model_kwargs).items()
+        },
         "model_kwargs": model_kwargs,
         "eval_kwargs": eval_kwargs,
         "blocksize": list(blocksize),
@@ -607,8 +650,7 @@ def _validate_run_identity_matches_call(
         "attrs": dict(input_zarr.attrs),
     }
     if any(
-        input_identity.get(field) != _normalize_for_comparison(value)
-        for field, value in input_schema.items()
+        input_identity.get(field) != _normalize_for_comparison(value) for field, value in input_schema.items()
     ):
         mismatches.append("input")
 
@@ -620,8 +662,7 @@ def _validate_run_identity_matches_call(
 
     if mismatches:
         raise ValueError(
-            "run_identity does not match the current evaluation: "
-            + ", ".join(sorted(set(mismatches)))
+            "run_identity does not match the current evaluation: " + ", ".join(sorted(set(mismatches)))
         )
 
 
@@ -637,15 +678,22 @@ def _build_run_identity(
     nonempty_rule: dict[str, Any],
     mask: NDArray[Any] | None,
     runtime_artifacts: dict[str, Any],
+    stitch_mode: str = overlap_stitch.FACE_MODE,
+    stitch_iou_threshold: float = 0.25,
 ) -> dict[str, Any]:
     _validate_runtime_artifacts(runtime_artifacts)
-    model_path = Path(model_kwargs["pretrained_model"])
+    stitch_mode, stitch_iou_threshold = overlap_stitch.validate_stitch_options(
+        stitch_mode, stitch_iou_threshold
+    )
     return _normalize_for_comparison(
         {
-            "schema_version": 4,
+            "schema_version": 6,
             "input": input_identity,
             "channel_indices": list(channel_indices),
-            "model_sha256": file_sha256(model_path),
+            "model_sha256": {
+                model_role: file_sha256(model_path)
+                for model_role, model_path in configured_model_paths(model_kwargs).items()
+            },
             "model_kwargs": model_kwargs,
             "eval_kwargs": eval_kwargs,
             "blocksize": list(blocksize),
@@ -655,6 +703,10 @@ def _build_run_identity(
             "preprocessing_steps": _preprocessing_identity(preprocessing_steps),
             "cellpose_version": version("cellpose"),
             "runtime_artifacts": runtime_artifacts,
+            "stitching": {
+                "mode": stitch_mode,
+                "iou_threshold": stitch_iou_threshold,
+            },
         }
     )
 
@@ -717,10 +769,7 @@ def _open_blank_temp_zarr(
     if _zarr_schema(array) != expected:
         raise RuntimeError(f"Temporary Zarr {path} has an unexpected schema; use --overwrite.")
     metadata_names = {"zarr.json", ".zarray", ".zattrs", ".zgroup"}
-    if any(
-        child.is_file() and child.name not in metadata_names
-        for child in path.rglob("*")
-    ):
+    if any(child.is_file() and child.name not in metadata_names for child in path.rglob("*")):
         raise RuntimeError(
             f"Temporary Zarr {path} contains data without a run configuration; use --overwrite."
         )
@@ -806,10 +855,9 @@ def promoted_output_matches(output_path: Path, run_identity: dict[str, Any]) -> 
     if not output_path.exists():
         return False
     output = zarr.open_array(output_path, mode="r")
-    return (
-        output.attrs.get("squisher_run_key") == _identity_digest(run_identity)
-        and output.attrs.get("squisher_output_schema") == _zarr_schema(output)
-    )
+    return output.attrs.get("squisher_run_key") == _identity_digest(run_identity) and output.attrs.get(
+        "squisher_output_schema"
+    ) == _zarr_schema(output)
 
 
 def load_checkpoint(path: Path) -> set[tuple[int, ...]]:
@@ -1058,9 +1106,7 @@ class RegisteredOMEZarrInput:
             _offset_roi_selector(selector, start, stop - start)
             for selector, (start, stop) in zip(selectors[:3], self.roi_zyx, strict=True)
         )
-        channel_indices, result_channel_selector = _selector_indices(
-            selectors[3], len(self.sources)
-        )
+        channel_indices, result_channel_selector = _selector_indices(selectors[3], len(self.sources))
         channels = [
             np.asarray(_open_registered_channel(self.sources[index], self.datasets[index])[spatial])
             for index in channel_indices
@@ -1069,6 +1115,95 @@ class RegisteredOMEZarrInput:
 
     def get_orthogonal_selection(self, selection: object) -> NDArray[Any]:
         return self[selection]
+
+
+@dataclass(frozen=True)
+class CroppedZYXCInput:
+    """Expose a bounded ZYXC view without materializing its source."""
+
+    source: Any
+    start_zyx: tuple[int, int, int]
+    box_size_zyx: tuple[int, int, int]
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        return (*self.box_size_zyx, int(self.source.shape[3]))
+
+    @property
+    def chunks(self) -> tuple[int, int, int, int]:
+        return (
+            *(
+                min(int(chunk), size)
+                for chunk, size in zip(self.source.chunks[:3], self.box_size_zyx, strict=True)
+            ),
+            int(self.source.chunks[3]),
+        )
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return np.dtype(self.source.dtype)
+
+    @property
+    def ndim(self) -> int:
+        return 4
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        return dict(self.source.attrs)
+
+    def _map_selection(self, selection: object) -> tuple[object, ...]:
+        selectors = _normalize_array_key(selection, self.ndim)
+        spatial = tuple(
+            _offset_roi_selector(selector, start, size)
+            for selector, start, size in zip(selectors[:3], self.start_zyx, self.box_size_zyx, strict=True)
+        )
+        return (*spatial, selectors[3])
+
+    def __getitem__(self, key: object) -> NDArray[Any]:
+        return np.asarray(self.source[self._map_selection(key)])
+
+    def get_orthogonal_selection(self, selection: object) -> NDArray[Any]:
+        mapped = self._map_selection(selection)
+        getter = getattr(self.source, "get_orthogonal_selection", None)
+        if getter is not None:
+            return np.asarray(getter(mapped))
+        return np.asarray(self.source[mapped])
+
+
+def _crop_zyxc_input(
+    input_array: Any,
+    input_identity: dict[str, Any],
+    *,
+    start_zyx: tuple[int, int, int] | None,
+    box_size_zyx: tuple[int, int, int] | None,
+) -> tuple[Any, dict[str, Any]]:
+    """Return an identity-bound lazy crop, or reject an invalid crop contract."""
+    if (start_zyx is None) != (box_size_zyx is None):
+        raise ValueError("start_zyx and box_size_zyx must be provided together.")
+    if start_zyx is None or box_size_zyx is None:
+        return input_array, input_identity
+    if any(value < 0 for value in start_zyx):
+        raise ValueError(f"start_zyx must be non-negative; got {start_zyx}.")
+    if any(value <= 0 for value in box_size_zyx):
+        raise ValueError(f"box_size_zyx must be positive; got {box_size_zyx}.")
+
+    spatial_shape = tuple(int(value) for value in input_array.shape[:3])
+    stop_zyx = tuple(start + size for start, size in zip(start_zyx, box_size_zyx, strict=True))
+    if any(stop > extent for stop, extent in zip(stop_zyx, spatial_shape, strict=True)):
+        raise ValueError(f"Requested ZYX box {start_zyx}:{stop_zyx} is outside input shape {spatial_shape}.")
+
+    cropped = CroppedZYXCInput(input_array, start_zyx, box_size_zyx)
+    identity = {
+        "kind": "cropped-zyxc",
+        "source": input_identity,
+        "start_zyx": list(start_zyx),
+        "box_size_zyx": list(box_size_zyx),
+        "shape": list(cropped.shape),
+        "chunks": list(cropped.chunks),
+        "dtype": str(cropped.dtype),
+        "attrs": cropped.attrs,
+    }
+    return cropped, identity
 
 
 def _ome_level_zero(root: zarr.Group, source: Path) -> tuple[str, zarr.Array]:
@@ -1080,8 +1215,7 @@ def _ome_level_zero(root: zarr.Group, source: Path) -> tuple[str, zarr.Array]:
     multiscale = multiscales[0]
     axes = multiscale.get("axes") if isinstance(multiscale, dict) else None
     axis_names = tuple(
-        str(axis.get("name") if isinstance(axis, dict) else axis).lower()
-        for axis in axes or []
+        str(axis.get("name") if isinstance(axis, dict) else axis).lower() for axis in axes or []
     )
     if axis_names != ("z", "y", "x"):
         raise ValueError(f"Source {source} must have OME-Zarr ZYX axes; found {axis_names}.")
@@ -1108,8 +1242,7 @@ def _open_registered_ome_input(
         raise ValueError(f"Invalid registered input manifest {manifest_path}.") from exc
     if (
         not isinstance(manifest, dict)
-        or manifest.get("artifact_type")
-        != "squisher_segment.registered_ome_input.v1"
+        or manifest.get("artifact_type") != "squisher_segment.registered_ome_input.v1"
     ):
         raise ValueError(f"Unsupported registered input manifest {manifest_path}.")
 
@@ -1168,7 +1301,9 @@ def _open_registered_ome_input(
     shapes = {tuple(int(value) for value in array.shape) for array in source_arrays}
     dtypes = {np.dtype(array.dtype) for array in source_arrays}
     if len(shapes) != 1 or len(dtypes) != 1:
-        raise ValueError(f"Registered OME-Zarr sources must have identical shape and dtype; got {shapes=} {dtypes=}.")
+        raise ValueError(
+            f"Registered OME-Zarr sources must have identical shape and dtype; got {shapes=} {dtypes=}."
+        )
     source_shape = next(iter(shapes))
     if len(source_shape) != 3:
         raise ValueError(f"Registered OME-Zarr sources must be ZYX; got {source_shape}.")
@@ -1176,12 +1311,17 @@ def _open_registered_ome_input(
         roi_zyx = tuple((int(bounds[0]), int(bounds[1])) for bounds in roi)
     except (IndexError, TypeError, ValueError) as exc:
         raise ValueError(f"Registered input manifest {manifest_path} has an invalid ROI.") from exc
-    if any(start < 0 or stop <= start or stop > size for (start, stop), size in zip(roi_zyx, source_shape, strict=True)):
+    if any(
+        start < 0 or stop <= start or stop > size
+        for (start, stop), size in zip(roi_zyx, source_shape, strict=True)
+    ):
         raise ValueError(f"Registered input ROI {roi_zyx} is outside source shape {source_shape}.")
 
     logical_shape = [*(stop - start for start, stop in roi_zyx), len(channels)]
     if manifest.get("shape") != logical_shape or manifest.get("dtype") != str(next(iter(dtypes))):
-        raise ValueError(f"Registered input manifest {manifest_path} shape or dtype does not match its sources.")
+        raise ValueError(
+            f"Registered input manifest {manifest_path} shape or dtype does not match its sources."
+        )
     registered = RegisteredOMEZarrInput(
         sources=tuple(source_paths),
         datasets=tuple(dataset_paths),
@@ -1239,13 +1379,12 @@ def _resolve_nonempty_rule(input_zarr: zarr.Array, threshold: int) -> dict[str, 
         raise ValueError("nonempty_threshold must be non-negative.")
     _, names = _resolve_channel_selection(input_zarr, None)
     if NONEMPTY_CHANNEL_NAME not in names:
-        raise ValueError(
-            f"Input Zarr must contain channel {NONEMPTY_CHANNEL_NAME!r} for block selection."
-        )
+        raise ValueError(f"Input Zarr must contain channel {NONEMPTY_CHANNEL_NAME!r} for block selection.")
     return {
         "channel": NONEMPTY_CHANNEL_NAME,
         "channel_index": names.index(NONEMPTY_CHANNEL_NAME),
         "threshold": threshold,
+        "min_fraction": NONEMPTY_MIN_FRACTION,
     }
 
 
@@ -1313,11 +1452,18 @@ def _sam_processing_blocksize(
     return (*spatial_blocksize, n_channels)
 
 
+def _normalization_block_yx(input_spatial_shape: tuple[int, int, int]) -> tuple[int, int]:
+    """Bound the normalization sample to the requested input's YX extent."""
+    return min(256, input_spatial_shape[1]), min(1024, input_spatial_shape[2])
+
+
 def _build_cellpose_eval_kwargs(
     *,
     diameter: int | float,
     normalization: dict[str, Any],
     ortho_weights: list[float] | None,
+    flow3d_smooth: float,
+    skip_empty_tiles: bool = True,
 ) -> dict[str, Any]:
     eval_kwargs: dict[str, Any] = {
         "diameter": diameter,
@@ -1327,12 +1473,13 @@ def _build_cellpose_eval_kwargs(
         "cellprob_threshold": 0,
         "anisotropy": 1.0,
         "resample": False,
-        "flow3D_smooth": 1.5,
+        "flow3D_smooth": flow3d_smooth,
         "niter": 1000,
         "do_3D": True,
         "min_size": 500,
         "channel_axis": 3,
         "return_flows": False,
+        "skip_empty_tiles": skip_empty_tiles,
         "use_kde_clustering": True,
         "z_axis": 0,
     }
@@ -1355,11 +1502,12 @@ def _segmentation_block_crops(
     return get_block_crops(input_shape, np.asarray(blocksize), overlap_by_axis, mask)
 
 
-def _supports_resume(
-    input_shape: tuple[int, ...],
-    spatial_blocksize: tuple[int, ...],
-) -> bool:
-    return bool(get_nblocks(input_shape, np.asarray(spatial_blocksize))[0] == 1)
+def _completed_blocks(
+    planned_indices: list[tuple[int, ...]],
+    checkpointed_indices: set[tuple[int, ...]],
+) -> set[tuple[int, ...]]:
+    """Return every planned block with durable checkpoint metadata."""
+    return set(planned_indices) & checkpointed_indices
 
 
 def _check_block_has_data(
@@ -1367,10 +1515,14 @@ def _check_block_has_data(
     zarr_array: zarr.Array,
     channel_index: int,
     threshold: int,
+    min_fraction: float = NONEMPTY_MIN_FRACTION,
 ) -> bool:
-    """Return whether a planned crop contains input above the threshold."""
+    """Return whether enough of a planned crop exceeds the foreground threshold."""
+    if not 0.0 <= min_fraction <= 1.0:
+        raise ValueError("min_fraction must be between 0 and 1.")
     data_slice = _read_input_crop(zarr_array, crop, (channel_index,))
-    return bool((data_slice > threshold).any())
+    foreground_count = int(np.count_nonzero(data_slice > threshold))
+    return foreground_count >= min_fraction * data_slice.size
 
 
 def _select_input_blocks(
@@ -1391,8 +1543,10 @@ def _select_input_blocks(
         return idxs
 
     logger.info(
-        "Non-empty cache miss or invalidated; scanning channel %d for values > %d.",
+        "Non-empty cache miss or invalidated; scanning channel %d for at least %.1f%% "
+        "of voxels > %d.",
         nonempty_channel_index,
+        100 * NONEMPTY_MIN_FRACTION,
         nonempty_threshold,
     )
     check_futures = client.map(
@@ -1401,22 +1555,21 @@ def _select_input_blocks(
         zarr_array=input_zarr,
         channel_index=nonempty_channel_index,
         threshold=nonempty_threshold,
+        min_fraction=NONEMPTY_MIN_FRACTION,
     )
 
     total_tiles = len(check_futures)
     logger.info(f"Checking foreground blocks: 0/{total_tiles}")
     has_foreground: list[bool] = [True] * total_tiles
     future_to_index = {fut: i for i, fut in enumerate(check_futures)}
-    with progress_bar(total_tiles) as submit:
-        [fut.add_done_callback(submit) for fut in check_futures]
-        for fut in distributed.as_completed(check_futures):
-            i = future_to_index.get(fut)
-            if i is None:
-                raise RuntimeError("Foreground scan produced an unknown future.")
-            try:
-                has_foreground[i] = bool(fut.result())
-            except Exception as exc:
-                raise RuntimeError(f"Foreground scan failed for block {i}: {exc!r}") from exc
+    for fut in distributed.as_completed(check_futures):
+        i = future_to_index.get(fut)
+        if i is None:
+            raise RuntimeError("Foreground scan produced an unknown future.")
+        try:
+            has_foreground[i] = bool(fut.result())
+        except Exception as exc:
+            raise RuntimeError(f"Foreground scan failed for block {i}: {exc!r}") from exc
     logger.info(f"Checked foreground blocks: {total_tiles}/{total_tiles}")
 
     idxs = [i for i, foreground in enumerate(has_foreground) if foreground]
@@ -1439,7 +1592,7 @@ def process_block(
     blocksize: tuple[int, ...],
     overlap: int,
     output_zarr: zarr.Array,
-    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] = [],
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] | None = None,
     worker_logs_directory: str | None = None,
     test_mode: bool = False,
     stagger_seconds: float = 0.0,
@@ -1448,10 +1601,10 @@ def process_block(
     foreground_channel_index: int | None = None,
     foreground_threshold: int | None = None,
     overlap_directory: str | None = None,
-) -> (
-    tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
-    | dict[str, Any]
-):
+    stitch_mode: str = overlap_stitch.FACE_MODE,
+    overlap_evidence: list[dict[str, Any]] | None = None,
+    overlap_run_key: str | None = None,
+) -> tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]] | dict[str, Any]:
     """
     Preprocess and segment one block with eventual merger in mind.
 
@@ -1502,7 +1655,8 @@ def process_block(
             eval_kwargs,
             worker_logs_directory,
         )
-        wlog.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
+        n_masks = int(segmentation_3d.max())
+        wlog.info(f"Block {block_index}: {n_masks} masks found.")
 
         spatial_crop_slices = crop[:-1]
         spatial_blocksize = blocksize[:-1]
@@ -1518,9 +1672,10 @@ def process_block(
         nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)
         block_index_3d = block_index[:-1]
         remap = global_segment_id_remap(
-            int(segmentation_3d.max()),
+            n_masks,
             block_index_3d,
             nblocks_3d,
+            label_bits=global_label_bits(nblocks_3d),
         )
         segmentation_global_3d = remap[segmentation_trimmed_3d]
 
@@ -1531,17 +1686,28 @@ def process_block(
             return (segmentation_global_3d, boxes, box_ids_for_this_block)
 
         output_zarr[crop_trimmed_3d] = segmentation_global_3d
-        if overlap_directory is not None:
+        if overlap_directory is not None and stitch_mode == overlap_stitch.FACE_MODE:
             _save_overlap_faces(
                 Path(overlap_directory),
                 block_index,
                 block_faces(segmentation_global_3d, shrink=True),
             )
+        elif overlap_directory is not None and stitch_mode == overlap_stitch.IOU_MODE:
+            if overlap_run_key is None:
+                raise ValueError("overlap_run_key is required for overlap-IoU evidence.")
+            overlap_stitch.write_block_evidence(
+                Path(overlap_directory),
+                block_index,
+                overlap_evidence or (),
+                segmentation_3d,
+                spatial_crop_slices,
+                run_key=overlap_run_key,
+            )
         return {
             "index": block_index,
             "worker": worker_name,
             "duration_s": time.perf_counter() - start_time,
-            "n_masks": int(np.max(segmentation_3d)),
+            "n_masks": n_masks,
         }
     except Exception as exc:
         wlog.exception(
@@ -1550,6 +1716,21 @@ def process_block(
         if worker is not None:
             _retire_worker_after_error(reason=f"squisher_segment process_block failed: {exc!r}")
         raise
+
+
+def _process_block_with_evidence(
+    block_index: tuple[int, ...],
+    crop: tuple[slice, ...],
+    overlap_evidence: list[dict[str, Any]],
+    **kwargs: Any,
+) -> tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]] | dict[str, Any]:
+    """Bind pair-side evidence per mapped block without broadcasting the whole plan."""
+    return process_block(
+        block_index,
+        crop,
+        overlap_evidence=overlap_evidence,
+        **kwargs,
+    )
 
 
 # ----------------------- component functions ---------------------------------#
@@ -1561,7 +1742,7 @@ def read_preprocess_and_segment(
     channel_indices: tuple[int, ...] | None,
     foreground_channel_index: int | None,
     foreground_threshold: int | None,
-    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] | None,
     model_kwargs: dict[str, Any],
     eval_kwargs: dict[str, Any],
     worker_logs_directory: str | None,
@@ -1575,20 +1756,11 @@ def read_preprocess_and_segment(
     if preprocessing_steps is None:
         preprocessing_steps = []
     if (foreground_channel_index is None) != (foreground_threshold is None):
-        raise ValueError(
-            "foreground_channel_index and foreground_threshold must be provided together."
-        )
+        raise ValueError("foreground_channel_index and foreground_threshold must be provided together.")
 
-    model_channels = (
-        tuple(range(input_zarr.shape[-1]))
-        if channel_indices is None
-        else channel_indices
-    )
+    model_channels = tuple(range(input_zarr.shape[-1])) if channel_indices is None else channel_indices
     read_channels = model_channels
-    if (
-        foreground_channel_index is not None
-        and foreground_channel_index not in read_channels
-    ):
+    if foreground_channel_index is not None and foreground_channel_index not in read_channels:
         read_channels += (foreground_channel_index,)
     raw = _read_input_crop(input_zarr, crop, read_channels)
     background = None
@@ -1647,12 +1819,17 @@ def read_preprocess_and_segment(
 
 
 def _block_metadata_from_temp(
-    temp_zarr: zarr.Array,
     crop: tuple[slice, ...],
+    *,
+    temp_zarr: zarr.Array,
 ) -> tuple[list[tuple[slice, ...]], NDArray[np.uint32]]:
     """Decode one owned block and calculate its global boxes on a worker GPU."""
     seg_block = temp_zarr[crop]
-    local_labels, box_ids = decode_block_global_labels(seg_block)
+    nblocks = get_nblocks(temp_zarr.shape, np.asarray(temp_zarr.chunks))
+    local_labels, box_ids = decode_block_global_labels(
+        seg_block,
+        label_bits=global_label_bits(nblocks),
+    )
     boxes = bounding_boxes_in_global_coordinates(local_labels, crop)
     return boxes, box_ids
 
@@ -1664,12 +1841,19 @@ def _wait_for_futures_collect_errors(
     stage: str,
     log: logging.Logger,
     checkpoint_path: Path,
-) -> list[str]:
-    failures: list[str] = []
+) -> list[tuple[distributed.Future, str]]:
+    failures: list[tuple[distributed.Future, str]] = []
     for fut in distributed.as_completed(futures):
         label = future_labels.get(fut, getattr(fut, "key", "<unknown>"))
         try:
             result = fut.result()
+        except Exception as exc:
+            msg = f"{label}: {exc!r}"
+            log.error(f"{stage} task failed: {msg}")
+            failures.append((fut, msg))
+            continue
+
+        try:
             if not isinstance(result, dict):
                 raise TypeError(f"{label} returned invalid completion metadata")
             append_checkpoint(
@@ -1680,10 +1864,45 @@ def _wait_for_futures_collect_errors(
                 int(result["n_masks"]),
             )
         except Exception as exc:
-            msg = f"{label}: {exc!r}"
-            log.error(f"{stage} task failed: {msg}")
-            failures.append(msg)
+            raise RuntimeError(f"{stage} completion handling failed for {label}: {exc!r}") from exc
     return failures
+
+
+def _wait_for_futures_retry_once(
+    *,
+    client: distributed.Client,
+    futures: list[distributed.Future],
+    future_labels: dict[distributed.Future, str],
+    stage: str,
+    log: logging.Logger,
+    checkpoint_path: Path,
+) -> list[str]:
+    """Retry failed tasks once after allowing replacement workers to start."""
+    failures = _wait_for_futures_collect_errors(
+        futures=futures,
+        future_labels=future_labels,
+        stage=stage,
+        log=log,
+        checkpoint_path=checkpoint_path,
+    )
+    if not failures:
+        return []
+
+    retry_futures = [future for future, _ in failures]
+    log.warning(
+        f"{stage} will retry {len(retry_futures)} failed tasks after "
+        f"{SEGMENTATION_RETRY_DELAY_SECONDS:.0f} seconds."
+    )
+    time.sleep(SEGMENTATION_RETRY_DELAY_SECONDS)
+    client.retry(retry_futures)
+    retry_failures = _wait_for_futures_collect_errors(
+        futures=retry_futures,
+        future_labels=future_labels,
+        stage=f"{stage} retry",
+        log=log,
+        checkpoint_path=checkpoint_path,
+    )
+    return [message for _, message in retry_failures]
 
 
 ######################## Distributed Cellpose #################################
@@ -1890,8 +2109,6 @@ def distributed_eval(
     )
     if selection_indices != block_indices:
         raise RuntimeError("Foreground selection crops do not match the inference block grid.")
-    if is_resume and not _supports_resume(input_zarr.shape[:-1], blocksize[:-1]):
-        raise RuntimeError("Resume is currently supported only when Z fits in one block.")
     assert cluster is not None
 
     # GPU preflight probe to confirm worker pinning
@@ -1940,21 +2157,55 @@ def distributed_eval(
     assert temporary_directory.exists()
     temp_zarr_path = temporary_directory / "segmentation_unstitched.zarr"
     checkpoint_path = temporary_directory / "checkpoint.jsonl"
-    overlap_directory = temporary_directory / "overlaps"
+    stitching = run_identity["stitching"]
+    stitch_mode = stitching["mode"]
+    stitch_iou_threshold = float(stitching["iou_threshold"])
+    run_identity_key = _identity_digest(run_identity)
+    overlap_directory = temporary_directory / (
+        "overlap-evidence" if stitch_mode == overlap_stitch.IOU_MODE else "overlaps"
+    )
+    evidence_by_block: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    evidence_rows: list[list[dict[str, Any]]] = [[], [], []]
+    if stitch_mode == overlap_stitch.IOU_MODE:
+        evidence_rows, evidence_by_block = overlap_stitch.plan_overlap_evidence(
+            {
+                tuple(index[:3]): tuple(crop[:-1])
+                for index, crop in zip(final_block_indices, final_block_crops, strict=True)
+            },
+            shape=tuple(int(value) for value in output_shape),
+            blocksize=tuple(int(value) for value in output_blocksize),
+        )
 
     if is_resume:
         if not temp_zarr_path.exists():
             raise RuntimeError(f"Cannot resume: temp_zarr missing at {temp_zarr_path}")
-        completed_indices = load_checkpoint(checkpoint_path)
-        missing_sidecars = [
-            index
-            for index in completed_indices
-            if not _overlap_sidecar_path(overlap_directory, index).is_file()
-        ]
+        completed_indices = _completed_blocks(
+            final_block_indices,
+            load_checkpoint(checkpoint_path),
+        )
+        if stitch_mode == overlap_stitch.IOU_MODE:
+            overlap_stitch.initialize_overlap_evidence(
+                overlap_directory,
+                evidence_rows,
+                run_key=run_identity_key,
+                resume=True,
+            )
+            missing_sidecars = [
+                index
+                for index in completed_indices
+                if not overlap_stitch.block_marker_matches(
+                    overlap_directory, index, run_identity_key
+                )
+            ]
+        else:
+            missing_sidecars = [
+                index
+                for index in completed_indices
+                if not _overlap_sidecar_path(overlap_directory, index).is_file()
+            ]
         if missing_sidecars:
             raise RuntimeError(
-                "Cannot resume: overlap evidence is missing for completed blocks "
-                f"{missing_sidecars[:10]}."
+                f"Cannot resume: overlap evidence is missing for completed blocks {missing_sidecars[:10]}."
             )
         logger.info(
             f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed"
@@ -1987,15 +2238,26 @@ def distributed_eval(
             run_identity=run_identity,
         )
 
-    overlap_directory.mkdir(parents=True, exist_ok=True)
+    if stitch_mode == overlap_stitch.IOU_MODE:
+        if not is_resume:
+            overlap_stitch.initialize_overlap_evidence(
+                overlap_directory,
+                evidence_rows,
+                run_key=run_identity_key,
+                resume=False,
+            )
+    else:
+        overlap_directory.mkdir(parents=True, exist_ok=True)
 
     # Filter to remaining blocks
     remaining_block_indices = []
     remaining_block_crops = []
+    remaining_evidence = []
     for idx, crop in zip(final_block_indices, final_block_crops):
         if tuple(idx) not in completed_indices:
             remaining_block_indices.append(idx)
             remaining_block_crops.append(crop)
+            remaining_evidence.append(evidence_by_block.get(tuple(idx[:3]), []))
 
     logger.info(
         f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)"
@@ -2013,11 +2275,17 @@ def distributed_eval(
         )
         cluster.client.register_plugin(plugin)
 
-        workers_per_gpu = cluster_kwargs.get("workers_per_gpu", 4) if cluster_kwargs else 4
+        worker_counts = cluster_kwargs.get("workers_per_device")
+        workers_per_gpu = (
+            max(worker_counts)
+            if worker_counts
+            else cluster_kwargs.get("workers_per_gpu", 4)
+        )
         futures = cluster.client.map(
-            process_block,
+            _process_block_with_evidence,
             remaining_block_indices,
             remaining_block_crops,
+            remaining_evidence,
             input_zarr=input_zarr,
             preprocessing_steps=preprocessing_steps,
             model_kwargs=model_kwargs,
@@ -2032,21 +2300,21 @@ def distributed_eval(
             foreground_channel_index=nonempty_rule["channel_index"],
             foreground_threshold=nonempty_rule["threshold"],
             overlap_directory=str(overlap_directory),
+            stitch_mode=stitch_mode,
+            overlap_run_key=run_identity_key,
         )
-
-        with progress_bar(len(remaining_block_indices)) as submit:
-            [fut.add_done_callback(submit) for fut in futures]
-            future_labels = {
-                fut: f"block={idx}"
-                for fut, idx in zip(futures, remaining_block_indices, strict=True)
-            }
-            failures = _wait_for_futures_collect_errors(
-                futures=futures,
-                future_labels=future_labels,
-                stage="Segmentation",
-                log=logger,
-                checkpoint_path=checkpoint_path,
-            )
+        future_labels = {
+            future: f"block={index}"
+            for future, index in zip(futures, remaining_block_indices, strict=True)
+        }
+        failures = _wait_for_futures_retry_once(
+            client=cluster.client,
+            futures=futures,
+            future_labels=future_labels,
+            stage="Segmentation",
+            log=logger,
+            checkpoint_path=checkpoint_path,
+        )
 
         if failures:
             preview = "\n".join(failures[:10])
@@ -2086,8 +2354,20 @@ def distributed_eval(
             box_ids_list.append(box_ids)
             non_empty_indices.append(final_block_indices[i])
 
-    label_pairs = _overlap_pairs_from_sidecars(final_block_indices, overlap_directory)
-    logger.info("Matched %d neighboring label-pair groups by face contact", len(label_pairs))
+    if stitch_mode == overlap_stitch.IOU_MODE:
+        nblocks = tuple(
+            int(value) for value in get_nblocks(output_shape, np.asarray(output_blocksize))
+        )
+        label_pairs = overlap_stitch.match_evidence(
+            overlap_directory,
+            threshold=stitch_iou_threshold,
+            nblocks=nblocks,
+            label_bits=global_label_bits(np.asarray(nblocks)),
+        )
+        logger.info("Matched %d neighboring label-pair groups by overlap IoU", len(label_pairs))
+    else:
+        label_pairs = _overlap_pairs_from_sidecars(final_block_indices, overlap_directory)
+        logger.info("Matched %d neighboring label-pair groups by face contact", len(label_pairs))
 
     # Save intermediate state for potential separate stitching
     _save_intermediate_state(
@@ -2130,6 +2410,7 @@ def distributed_eval(
         output_path=Path(write_path),
         run_identity=run_identity,
         overwrite_output=overwrite_output,
+        non_empty_indices=non_empty_indices,
     )
 
     _log_slurm_tile_summary(
@@ -2199,6 +2480,7 @@ def _stitch_precomputed(
     output_path: Path,
     run_identity: dict[str, Any],
     overwrite_output: bool,
+    non_empty_indices: list[tuple[int, ...]],
 ) -> tuple[zarr.Array, list[tuple[slice, ...]]]:
     """Write a complete staged Zarr and atomically expose it at the final path."""
     if output_path.exists() and not overwrite_output:
@@ -2211,21 +2493,21 @@ def _stitch_precomputed(
         temp_zarr=temp_zarr,
         write_path=staged_path,
         mapping_path=temp_dir / "new_labeling.npy",
+        chunk_coords=[tuple(index[: temp_zarr.ndim]) for index in non_empty_indices],
+        label_bits=global_label_bits(
+            get_nblocks(temp_zarr.shape, np.asarray(temp_zarr.chunks))
+        ),
     )
     staged_zarr = zarr.open_array(staged_path, mode="r+")
     merged_boxes = merge_boxes_for_sparse_labels(boxes_list, box_ids_list, mapping)
     if _zarr_schema(staged_zarr) != _zarr_schema(temp_zarr):
-        raise RuntimeError(
-            f"Staged output {staged_path} schema does not match temporary segmentation."
-        )
+        raise RuntimeError(f"Staged output {staged_path} schema does not match temporary segmentation.")
     staged_zarr.attrs["squisher_run_key"] = _identity_digest(run_identity)
     staged_zarr.attrs["squisher_output_schema"] = _zarr_schema(staged_zarr)
 
     backup_path = _backup_output_path(output_path, run_identity)
     if backup_path.exists():
-        raise RuntimeError(
-            f"Cannot promote {staged_path}: unresolved output backup exists at {backup_path}."
-        )
+        raise RuntimeError(f"Cannot promote {staged_path}: unresolved output backup exists at {backup_path}.")
     if output_path.exists():
         os.replace(output_path, backup_path)
         _fsync_directory(output_path.parent)
@@ -2279,6 +2561,7 @@ def stitch_segmentation(
         output_path=output_path,
         run_identity=run_identity,
         overwrite_output=overwrite_output,
+        non_empty_indices=non_empty_indices,
     )
 
     logger.info(f"Total stitch_segmentation: {time.perf_counter() - t_total_start:.2f}s")
@@ -2302,6 +2585,11 @@ def _run_single_input(
     nonempty_threshold: int,
     cellpose_only: bool,
     stagger_seconds: float,
+    start_zyx: tuple[int, int, int] | None = None,
+    box_size_zyx: tuple[int, int, int] | None = None,
+    workers_per_device: tuple[int, ...] | None = None,
+    stitch_mode: str = overlap_stitch.FACE_MODE,
+    stitch_iou_threshold: float = 0.25,
 ) -> None:
     if not input_path.exists() or input_path.suffix not in {".zarr", ".json"}:
         raise FileNotFoundError(
@@ -2329,16 +2617,35 @@ def _run_single_input(
 
     ortho_weights = config.get("ortho_weights", [3, 1.0, 1.0])
     diameter = config.get("diameter", 30)
+    flow3d_smooth = config.get("flow3D_smooth", 1.5)
+    if isinstance(flow3d_smooth, bool) or not isinstance(flow3d_smooth, int | float):
+        raise ValueError("flow3D_smooth must be a non-negative number.")
+    if flow3d_smooth < 0:
+        raise ValueError("flow3D_smooth must be a non-negative number.")
+    skip_empty_tiles = config.get("skip_empty_tiles", True)
+    if not isinstance(skip_empty_tiles, bool):
+        raise ValueError("skip_empty_tiles must be a boolean.")
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],
         "gpu": True,
     }
+    pretrained_model_ortho = config.get("pretrained_model_ortho")
+    if pretrained_model_ortho is not None:
+        if not isinstance(pretrained_model_ortho, (str, os.PathLike)) or not os.fspath(
+            pretrained_model_ortho
+        ):
+            raise ValueError("pretrained_model_ortho must be a non-empty path when provided.")
+        cellpose_model_kwargs["pretrained_model_ortho"] = pretrained_model_ortho
 
     local_cluster_kwargs = {
         "workers_per_gpu": workers_per_gpu,
         "threads_per_worker": threads_per_worker,
     }
-    if use_localcuda and workers_per_gpu <= 1:
+    if workers_per_device is not None:
+        if use_localcuda:
+            raise ValueError("--workers-per-device cannot be combined with --use-localcuda.")
+        local_cluster_kwargs["workers_per_device"] = workers_per_device
+    elif use_localcuda and workers_per_gpu <= 1:
         local_cluster_kwargs.update(
             {
                 "use_localcuda": True,
@@ -2349,9 +2656,7 @@ def _run_single_input(
     preprocessing_pipeline = [(unsharp_all, {})]
 
     if input_path.suffix == ".json":
-        input_zarr_array, input_identity, input_provenance = _open_registered_ome_input(
-            input_path
-        )
+        input_zarr_array, input_identity, input_provenance = _open_registered_ome_input(input_path)
     else:
         input_zarr_array = zarr.open_array(input_path, mode="r")
         input_schema = {
@@ -2369,6 +2674,12 @@ def _run_single_input(
             "attrs": dict(input_zarr_array.attrs),
             "provenance": input_provenance,
         }
+    input_zarr_array, input_identity = _crop_zyxc_input(
+        input_zarr_array,
+        input_identity,
+        start_zyx=start_zyx,
+        box_size_zyx=box_size_zyx,
+    )
     if input_zarr_array.ndim != 4:
         raise ValueError(f"Input Zarr must have ZYXC shape; got {input_zarr_array.shape}.")
     channel_indices, channel_names = _resolve_channel_selection(input_zarr_array, channels)
@@ -2393,9 +2704,12 @@ def _run_single_input(
         processing_blocksize[:-1],
     )
     normalization_path = base_dir / "normalization.json"
+    normalization_block_yx = _normalization_block_yx(
+        tuple(int(value) for value in input_zarr_array.shape[:-1])
+    )
     normalization_settings = {
-        "implementation": "bounded-z-gpu-v2",
-        "block_yx": [256, 1024],
+        "implementation": "foreground-cropped-gpu-v4",
+        "block_yx": list(normalization_block_yx),
         "spatial_samples": 30,
         "z_samples": 32,
         "z_selection": "seeded-stratified",
@@ -2405,10 +2719,10 @@ def _run_single_input(
         "unsharp_backend": "cucim",
         "unsharp_dimensionality": "plane-wise-2d",
         "unsharp_radius": 3.0,
+        "foreground_channel": nonempty_rule["channel"],
+        "foreground_threshold": nonempty_rule["threshold"],
     }
-    normalization_key = _identity_digest(
-        {"input_key": input_key, "settings": normalization_settings}
-    )
+    normalization_key = _identity_digest({"input_key": input_key, "settings": normalization_settings})
     cached_normalization = read_normalization_cache(normalization_path, normalization_key)
     lowhigh_selected: NDArray[np.float64] | None = None
 
@@ -2425,13 +2739,15 @@ def _run_single_input(
         perc, _ = sample_percentile(
             input_zarr_array,
             channels=source_channels,
-            block=(256, 1024),
+            block=normalization_block_yx,
             n=30,
             low=1,
             high=99.9,
             seed=0,
             z_samples=32,
             unsharp_radius=3.0,
+            foreground_channel=nonempty_rule["channel_index"] + 1,
+            foreground_threshold=nonempty_rule["threshold"],
         )
         lowhigh_selected = np.asarray(perc, dtype=float)
         write_normalization_cache(
@@ -2456,6 +2772,8 @@ def _run_single_input(
         diameter=diameter,
         normalization=normalization,
         ortho_weights=ortho_weights,
+        flow3d_smooth=float(flow3d_smooth),
+        skip_empty_tiles=skip_empty_tiles,
     )
 
     run_identity = _build_run_identity(
@@ -2469,12 +2787,12 @@ def _run_single_input(
         nonempty_rule=nonempty_rule,
         mask=None,
         runtime_artifacts=_runtime_artifact_identity(
-            Path(cellpose_model_kwargs["pretrained_model"]),
+            cellpose_model_kwargs,
             input_provenance,
-            max_devices=(
-                n_workers if use_localcuda and workers_per_gpu <= 1 else None
-            ),
+            max_devices=(n_workers if use_localcuda and workers_per_gpu <= 1 else None),
         ),
+        stitch_mode=stitch_mode,
+        stitch_iou_threshold=stitch_iou_threshold,
     )
     backup_path = _restore_output_backup(zarr_output_path, run_identity)
     if (
@@ -2496,11 +2814,7 @@ def _run_single_input(
             except ValueError as exc:
                 logger.info(f"--overwrite: existing temporary state cannot resume ({exc})")
             else:
-                resume_overwrite = _supports_resume(
-                    input_zarr_array.shape[:-1], processing_blocksize[:-1]
-                )
-                if not resume_overwrite:
-                    logger.info("--overwrite: restarting multi-Z-block temporary state")
+                resume_overwrite = True
         if temporary_directory.exists() and not resume_overwrite:
             logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
             shutil.rmtree(temporary_directory)
@@ -2552,9 +2866,7 @@ def _run_single_input(
     shutil.rmtree(temporary_directory)
     logger.info("Run Finished")
     logger.info(f"Final segmentation saved to: {zarr_output_path}")
-    logger.info(
-        f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}"
-    )
+    logger.info(f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}")
     logger.info(f"Number of segmented objects found: {len(final_bounding_boxes)}")
 
 
@@ -2566,7 +2878,9 @@ def cli() -> None:
 @cli.command("run")
 @click.argument("input_zarr", type=click.Path(exists=True, path_type=Path))
 @click.option("--channels", default=None, type=str, help="Comma-separated list of channel names to use.")
-@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing segmentation.")
+@click.option(
+    "--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing segmentation."
+)
 @click.option(
     "--config",
     "-c",
@@ -2581,6 +2895,12 @@ def cli() -> None:
     show_default=True,
     type=int,
     help="Number of workers to spawn per GPU.",
+)
+@click.option(
+    "--workers-per-device",
+    default=None,
+    type=str,
+    help="Comma-separated worker counts in CUDA_VISIBLE_DEVICES order.",
 )
 @click.option(
     "--threads-per-worker",
@@ -2599,6 +2919,8 @@ def cli() -> None:
 @click.option("--target-nz", default=None, type=int, help="Desired internal Cellpose nz tiles.")
 @click.option("--target-ny", default=None, type=int, help="Desired internal Cellpose ny tiles.")
 @click.option("--target-nx", default=None, type=int, help="Desired internal Cellpose nx tiles.")
+@click.option("--start-zyx", default=None, type=str, help="Comma-separated Z,Y,X crop start.")
+@click.option("--box-size-zyx", default=None, type=str, help="Comma-separated Z,Y,X crop size.")
 @click.option(
     "--nonempty-threshold",
     default=DEFAULT_NONEMPTY_THRESHOLD,
@@ -2619,31 +2941,60 @@ def cli() -> None:
     type=float,
     help="Seconds to stagger worker starts on the same GPU (0 to disable).",
 )
+@click.option(
+    "--stitch-mode",
+    default=overlap_stitch.FACE_MODE,
+    show_default=True,
+    type=click.Choice(overlap_stitch.STITCH_MODES, case_sensitive=False),
+    help="Block stitching mode.",
+)
+@click.option(
+    "--stitch-iou-threshold",
+    default=0.25,
+    show_default=True,
+    type=click.FloatRange(min=0.0, max=1.0),
+    help="Minimum reciprocal overlap IoU.",
+)
 def run(
     input_zarr: Path,
     channels: str | None,
     overwrite: bool,
     config_path: Path | None,
     workers_per_gpu: int,
+    workers_per_device: str | None,
     threads_per_worker: int,
     use_localcuda: bool,
     n_workers: int | None,
     target_nz: int | None,
     target_ny: int | None,
     target_nx: int | None,
+    start_zyx: str | None,
+    box_size_zyx: str | None,
     nonempty_threshold: int,
     cellpose_only: bool,
     stagger_seconds: float,
+    stitch_mode: str,
+    stitch_iou_threshold: float,
 ) -> None:
     """Run Cellpose on a ZYXC Zarr or registered-source JSON manifest."""
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     logging.getLogger("cellpose").setLevel(logging.WARNING)
+    try:
+        parsed_start = _parse_zyx_option(start_zyx, "--start-zyx")
+        parsed_box_size = _parse_zyx_option(box_size_zyx, "--box-size-zyx")
+        parsed_worker_counts = _parse_worker_counts(workers_per_device)
+        parsed_stitch_mode, parsed_iou_threshold = overlap_stitch.validate_stitch_options(
+            stitch_mode, stitch_iou_threshold
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
     _run_single_input(
         input_path=input_zarr,
         channels=channels,
         overwrite=overwrite,
         config_path=config_path,
         workers_per_gpu=workers_per_gpu,
+        workers_per_device=parsed_worker_counts,
         threads_per_worker=threads_per_worker,
         use_localcuda=use_localcuda,
         n_workers=n_workers,
@@ -2653,18 +3004,19 @@ def run(
         nonempty_threshold=nonempty_threshold,
         cellpose_only=cellpose_only,
         stagger_seconds=stagger_seconds,
+        start_zyx=parsed_start,
+        box_size_zyx=parsed_box_size,
+        stitch_mode=parsed_stitch_mode,
+        stitch_iou_threshold=parsed_iou_threshold,
     )
 
 
 def _run_stitch(temp_dir: Path, output_path: Path, *, cleanup: bool, overwrite: bool) -> None:
     """Own validation, recovery, promotion, and cleanup for both CLI frontends."""
     run_identity = load_run_identity(temp_dir / "run_config.json")
+    _validate_run_identity_structure(run_identity)
     backup_path = _restore_output_backup(output_path, run_identity)
-    if (
-        backup_path.exists()
-        and output_path.exists()
-        and promoted_output_matches(output_path, run_identity)
-    ):
+    if backup_path.exists() and output_path.exists() and promoted_output_matches(output_path, run_identity):
         logger.info(f"Completing interrupted output promotion: {output_path}")
         write_completion_marker(output_path, run_identity)
         _remove_output_backup(backup_path)
@@ -2692,9 +3044,7 @@ def _run_stitch(temp_dir: Path, output_path: Path, *, cleanup: bool, overwrite: 
     if not (temp_dir / "intermediate_state.npz").exists():
         raise FileNotFoundError(f"No intermediate_state.npz found in {temp_dir}")
     logger.info(f"Stitching segmentation from {temp_dir}")
-    final_zarr, final_boxes = stitch_segmentation(
-        temp_dir, output_path, overwrite_output=overwrite
-    )
+    final_zarr, final_boxes = stitch_segmentation(temp_dir, output_path, overwrite_output=overwrite)
     write_completion_marker(output_path, run_identity)
     _remove_output_backup(_backup_output_path(output_path, run_identity))
 
@@ -2711,8 +3061,15 @@ def _run_stitch(temp_dir: Path, output_path: Path, *, cleanup: bool, overwrite: 
 @cli.command("stitch")
 @click.argument("temp_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("output_path", type=click.Path(path_type=Path))
-@click.option("--cleanup/--no-cleanup", default=True, show_default=True, help="Remove temp directory after successful stitching.")
-@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing output.")
+@click.option(
+    "--cleanup/--no-cleanup",
+    default=True,
+    show_default=True,
+    help="Remove temp directory after successful stitching.",
+)
+@click.option(
+    "--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing output."
+)
 def stitch(temp_dir: Path, output_path: Path, cleanup: bool, overwrite: bool) -> None:
     """Stitch pre-computed Cellpose results into a final segmentation."""
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)

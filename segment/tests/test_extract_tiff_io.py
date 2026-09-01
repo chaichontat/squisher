@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 import numpy as np
 import pytest
 import tifffile
+import zarr
 from typer.testing import CliRunner
 
 import squisher_segment.cli as cli_module
@@ -17,13 +19,16 @@ from squisher_segment.segment.extract_core import (
     RandomContentCrop,
     SingleChannelMaskArray,
     ZarrBackedTiffVolume,
+    _contentful_z_candidates_around,
+    _deduplicate_ortho_content_crops,
     _fill_requested_ortho_block,
     _fill_requested_ortho_strips,
     _fixed_depth_z_slice,
     _open_aux_channel_volumes,
     _open_volume,
-    _contentful_z_candidates_around,
+    _parse_channels,
     _sample_random_content_z_crops,
+    _stage_registered_volume,
     _write_random_content_z_crops,
     _z_candidates_around,
     _z_crop_slice_around,
@@ -51,11 +56,144 @@ def test_extract_cli_forwards_ortho_depth(
 
     result = CliRunner().invoke(
         cli_module.app,
-        ["extract", str(input_path), "--mode", "ortho", "--ortho-depth", "64"],
+        [
+            "extract",
+            str(input_path),
+            "--mode",
+            "ortho",
+            "--ortho-depth",
+            "64",
+            "--stage",
+            str(tmp_path / "stage.zarr"),
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert captured["ortho_depth"] == 64
+    assert captured["stage"] == tmp_path / "stage.zarr"
+
+
+def test_registered_stage_is_materialized_once_and_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "roi.json"
+    manifest.write_text(json.dumps({"artifact_type": "squisher_segment.registered_ome_input.v1"}))
+    source = np.arange(3 * 4 * 5 * 2, dtype=np.uint16).reshape(3, 4, 5, 2)
+    open_count = 0
+
+    def open_volume(_path: Path) -> tuple[np.ndarray, list[str]]:
+        nonlocal open_count
+        open_count += 1
+        return source, ["405", "561"]
+
+    monkeypatch.setattr(extract_core, "_open_volume", open_volume)
+    stage = tmp_path / "stage.zarr"
+
+    assert _stage_registered_volume(manifest, stage) == stage
+    assert _stage_registered_volume(manifest, stage) == stage
+
+    assert open_count == 1
+    staged = zarr.open_array(stage, mode="r")
+    np.testing.assert_array_equal(staged[:], source)
+    assert staged.attrs["key"] == ["405", "561"]
+    assert staged.attrs["_ARRAY_DIMENSIONS"] == ["z", "y", "x", "c"]
+    assert staged.attrs["squisher_complete"] is True
+
+
+def test_registered_stage_rejects_changed_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "roi.json"
+    manifest.write_text(json.dumps({"artifact_type": "squisher_segment.registered_ome_input.v1"}))
+    source = np.ones((2, 3, 4, 1), dtype=np.uint16)
+    monkeypatch.setattr(extract_core, "_open_volume", lambda _path: (source, ["405"]))
+    stage = tmp_path / "stage.zarr"
+    _stage_registered_volume(manifest, stage)
+    manifest.write_text(
+        json.dumps({"artifact_type": "squisher_segment.registered_ome_input.v1", "changed": True})
+    )
+
+    with pytest.raises(click.BadParameter, match="does not match"):
+        _stage_registered_volume(manifest, stage)
+
+
+def test_ortho_content_crops_deduplicate_identical_output_windows() -> None:
+    crops = [
+        RandomContentCrop(z_index=32, y0=0, x0=0),
+        RandomContentCrop(z_index=96, y0=0, x0=0),
+        RandomContentCrop(z_index=96, y0=0, x0=512),
+    ]
+
+    unique_crops = _deduplicate_ortho_content_crops(crops, z_len=128, ortho_depth=128)
+
+    assert unique_crops == [crops[0], crops[2]]
+
+
+def test_ortho_deduplication_preserves_sampled_z_exports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeVolume:
+        shape = (128, 512, 512, 1)
+        ndim = 4
+
+    crops = [
+        RandomContentCrop(z_index=32, y0=0, x0=0),
+        RandomContentCrop(z_index=96, y0=0, x0=0),
+    ]
+    ortho_batches: list[int] = []
+    z_export_crops: list[RandomContentCrop] = []
+    monkeypatch.setattr(extract_core, "_open_volume", lambda _file: (FakeVolume(), ["405"]))
+    monkeypatch.setattr(
+        extract_core,
+        "_content_estimation_volume",
+        lambda _file, vol: ContentEstimationVolume(vol=vol, scale_zyx=(1.0, 1.0, 1.0)),
+    )
+    monkeypatch.setattr(extract_core, "_sample_random_content_z_crops", lambda **_kwargs: crops)
+    monkeypatch.setattr(
+        extract_core,
+        "_write_requested_ortho_slices",
+        lambda **kwargs: ortho_batches.append(len(kwargs["requests"])),
+    )
+    monkeypatch.setattr(
+        extract_core,
+        "_write_random_content_z_crops",
+        lambda **kwargs: z_export_crops.extend(kwargs["content_crops"]),
+    )
+
+    extract_core._execute_zarr_ortho_extraction(
+        label="roi",
+        files=[tmp_path / "stage.zarr"],
+        config=extract_core.ExtractionConfig(
+            mode="ortho",
+            channels="405",
+            crop=0,
+            dz=1,
+            n=2,
+            anisotropy=1,
+            upscale=1.0,
+            seed=1,
+            threads=1,
+            ortho_depth=128,
+        ),
+        out_dir=tmp_path / "out",
+        max_from_path=None,
+        aux_channel_stack=None,
+        explicit_mask_path=None,
+        enrich_boundaries=None,
+    )
+
+    assert ortho_batches == [102]
+    assert z_export_crops == crops
+
+
+def test_parse_channels_prefers_numeric_metadata_names() -> None:
+    names = ["405", "561", "638"]
+
+    assert _parse_channels("405,561,638", names, 3) == [0, 1, 2]
+    assert _parse_channels("0,2", names, 3) == [0, 2]
 
 
 def test_lazy_tiff_normalizes_zcyx_and_czyx(tmp_path: Path) -> None:
@@ -134,6 +272,53 @@ def test_open_volume_accepts_single_channel_ome_zarr_zyx(tmp_path: Path) -> None
     assert vol.shape == (2, 3, 4, 1)
     np.testing.assert_array_equal(vol[1, 1:, :2, 0], data[1, 1:, :2])
     np.testing.assert_array_equal(vol[0, :2, :3, :], data[0, :2, :3, None])
+
+
+def test_open_volume_accepts_registered_input_manifest(tmp_path: Path) -> None:
+    from squisher_segment.segmentation.distributed import distributed_segmentation
+
+    source = tmp_path / "c405.ome.zarr"
+    data = np.arange(3 * 5 * 6, dtype=np.uint16).reshape(3, 5, 6)
+    root = zarr.create_group(source)
+    root.create_array("0", data=data, chunks=(1, 2, 3))
+    root.attrs.update(
+        {
+            "squisher_complete": True,
+            "ome": {
+                "multiscales": [
+                    {
+                        "axes": [{"name": axis} for axis in ("z", "y", "x")],
+                        "datasets": [{"path": "0"}],
+                    }
+                ]
+            },
+        }
+    )
+    manifest = tmp_path / "direct.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifact_type": "squisher_segment.registered_ome_input.v1",
+                "channels": ["405"],
+                "sources": [
+                    {
+                        "channel": "405",
+                        "path": str(source),
+                        "root_metadata_sha256": distributed_segmentation.file_sha256(source / "zarr.json"),
+                    }
+                ],
+                "source_roi_zyx": [[1, 3], [1, 5], [2, 6]],
+                "shape": [2, 4, 4, 1],
+                "dtype": "uint16",
+            }
+        )
+    )
+
+    vol, names = _open_volume(manifest)
+
+    assert names == ["405"]
+    assert vol.shape == (2, 4, 4, 1)
+    np.testing.assert_array_equal(vol[:, :, :, 0], data[1:3, 1:5, 2:6])
 
 
 def test_open_zarr_registers_squisher_codec_before_parsing(monkeypatch, tmp_path: Path) -> None:
@@ -564,6 +749,66 @@ def test_zarr_z_extraction_default_samples_xyz_and_limits_z_candidates(
     assert jobs[0].z_candidates == list(range(75, 126))
 
 
+def test_zarr_z_extraction_merges_overlapping_requests_for_one_tile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeVolume:
+        shape = (300, 512, 512, 1)
+        ndim = 4
+
+    vol = FakeVolume()
+    jobs: list[extract_core.TileJob] = []
+    monkeypatch.setattr(extract_core, "_open_volume", lambda _file: (vol, None))
+    monkeypatch.setattr(
+        extract_core,
+        "_content_estimation_volume",
+        lambda _file, level0_vol: ContentEstimationVolume(vol=level0_vol, scale_zyx=(1.0, 1.0, 1.0)),
+    )
+    monkeypatch.setattr(
+        extract_core,
+        "_sample_random_content_z_crops",
+        lambda **_kwargs: [
+            RandomContentCrop(z_index=100, y0=0, x0=0),
+            RandomContentCrop(z_index=101, y0=0, x0=0),
+        ],
+    )
+    monkeypatch.setattr(
+        extract_core,
+        "_contentful_z_candidates_around",
+        lambda **kwargs: [kwargs["center"], kwargs["center"] + 1],
+    )
+    monkeypatch.setattr(
+        extract_core,
+        "_extract_tiles_from_zarr",
+        lambda *, job, **_kwargs: jobs.append(job),
+    )
+
+    extract_core._execute_zarr_z_extraction(
+        label="tile",
+        files=[tmp_path / "roi.zarr"],
+        config=extract_core.ExtractionConfig(
+            mode="z",
+            channels=None,
+            crop=0,
+            dz=1,
+            n=2,
+            anisotropy=6,
+            upscale=1.0,
+            seed=1,
+            threads=1,
+        ),
+        out_dir=tmp_path / "out",
+        max_from_path=None,
+        explicit_mask_path=None,
+        enrich_boundaries=None,
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].tile_origins == [(0, 0)]
+    assert jobs[0].z_candidates == [100, 101, 102]
+
+
 def test_contentful_z_candidates_replace_empty_planes() -> None:
     vol = np.ones((130, 512, 512, 1), dtype=np.uint16)
     vol[75] = 0
@@ -646,6 +891,89 @@ def test_zarr_z_tile_extraction_appends_aux_channel(tmp_path: Path) -> None:
         out = tif.asarray()
     assert np.all(out[0] == 1)
     assert np.all(out[1] == 17)
+
+
+def test_zarr_z_tile_extraction_batches_mask_planes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingOIndex:
+        def __init__(self, data: np.ndarray) -> None:
+            self.data = data
+            self.reads: list[tuple[object, ...]] = []
+
+        def __getitem__(self, key: tuple[object, ...]) -> np.ndarray:
+            self.reads.append(key)
+            return self.data[key]
+
+    class RecordingMask:
+        def __init__(self, data: np.ndarray) -> None:
+            self.data = data
+            self.shape = data.shape
+            self.ndim = data.ndim
+            self.dtype = data.dtype
+            self.oindex = RecordingOIndex(data)
+            self.scalar_reads = 0
+
+        def __getitem__(self, key: object) -> np.ndarray:
+            self.scalar_reads += 1
+            return self.data[key]
+
+    primary = np.ones((3, 512, 512, 1), dtype=np.uint16)
+    mask_data = np.arange(3, dtype=np.uint32)[:, None, None] * np.ones(
+        (3, 512, 512), dtype=np.uint32
+    )
+    mask = RecordingMask(mask_data)
+    written_masks: list[np.ndarray] = []
+    monkeypatch.setattr(extract_core, "_write_tiff", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        extract_core,
+        "_write_mask_tiff",
+        lambda _path, data, **_kwargs: written_masks.append(data.copy()),
+    )
+
+    extract_core._extract_tiles_from_zarr(
+        job=extract_core.TileJob(
+            file=tmp_path / "input.zarr",
+            vol=primary,
+            channel_names=["405"],
+            mask_vol=mask,
+            mask_path=tmp_path / "masks.zarr",
+            tile_origins=[(0, 0)],
+            z_candidates=[0, 1, 2],
+        ),
+        roi="tile",
+        out_dir=tmp_path,
+        channels="405",
+        dz=1,
+        upscale=1.0,
+        max_from_path=None,
+        progress=None,
+    )
+
+    assert mask.scalar_reads == 0
+    assert len(mask.oindex.reads) == 1
+    assert mask.oindex.reads[0][0] == [0, 1, 2]
+    for z_index, written in enumerate(written_masks):
+        np.testing.assert_array_equal(written, mask_data[z_index])
+
+
+def test_mask_tile_batches_bound_retained_bytes() -> None:
+    mask = np.zeros((5, 512, 512), dtype=np.uint32)
+    max_retained_bytes = 2 * 512 * 512 * mask.dtype.itemsize
+
+    batches = list(
+        extract_core._iter_mask_tile_batches(
+            mask,
+            list(range(5)),
+            slice(0, 512),
+            slice(0, 512),
+            max_retained_bytes=max_retained_bytes,
+        )
+    )
+
+    assert [z_indices for z_indices, _tiles in batches] == [[0, 1], [2, 3], [4]]
+    assert max(tiles.nbytes for _z_indices, tiles in batches) <= max_retained_bytes
 
 
 def test_zarr_maxproj_tile_extraction_rejects_empty_z_candidates(tmp_path: Path) -> None:

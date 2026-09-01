@@ -56,9 +56,60 @@ def test_postproc_tiling_rejects_halo_at_least_as_large_as_core() -> None:
     )
 
 
+def test_postproc_tiling_uses_available_uint32_capacity() -> None:
+    nblocks = postproc._validate_tiling(
+        (2470, 10657, 7871),
+        (280, 712, 712),
+        overlap=60,
+    )
+
+    np.testing.assert_array_equal(nblocks, [9, 15, 12])
+    assert merge_utils.global_label_bits(nblocks) == 21
+
+
 def test_postproc_tiling_rejects_unrepresentable_block_grid() -> None:
-    with pytest.raises(ValueError, match="exceeding"):
-        postproc._validate_tiling((41, 40, 40), (1, 1, 1), overlap=0)
+    with pytest.raises(ValueError, match="cannot fit in uint32"):
+        postproc._validate_tiling((1, 1, 1 << 32), (1, 1, 1), overlap=0)
+
+
+def test_postproc_gpu_smoothing_import_error_is_not_hidden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=np.ones((1, 2, 2), dtype=np.uint32),
+        chunks=(1, 2, 2),
+    )
+    output_zarr = zarr.create_array(
+        tmp_path / "output.zarr",
+        shape=input_zarr.shape,
+        chunks=input_zarr.chunks,
+        dtype=np.uint32,
+    )
+    monkeypatch.setattr(postproc.cp, "asarray", np.asarray)
+    monkeypatch.setattr(postproc.cp, "asnumpy", np.asarray)
+    monkeypatch.setattr(postproc.cp, "unique", np.unique)
+
+    def fail_gpu_smoothing(*_args: object, **_kwargs: object) -> None:
+        raise ImportError("gpu unavailable")
+
+    monkeypatch.setattr(
+        postproc,
+        "gaussian_smooth_labels_cupy",
+        fail_gpu_smoothing,
+    )
+    with pytest.raises(ImportError, match="gpu unavailable"):
+        postproc.process_postproc_block(
+            block_index=(0, 0, 0),
+            crop=(slice(None), slice(None), slice(None)),
+            input_zarr=input_zarr,
+            output_zarr=output_zarr,
+            blocksize=input_zarr.shape,
+            overlap=0,
+            nblocks=np.ones(3, dtype=int),
+            postproc_kwargs={"sigma": 1.0},
+        )
 
 
 def test_zyx_overlap_trimming_covers_each_voxel_once() -> None:
@@ -283,6 +334,46 @@ def test_sparse_relabel_write_can_drop_a_global_label(tmp_path: Path) -> None:
     np.testing.assert_array_equal(output[:], np.asarray([[[0, 1, 0]]], dtype=np.uint32))
 
 
+def test_sparse_relabel_write_reads_only_selected_chunks(tmp_path: Path) -> None:
+    data = np.asarray(
+        [
+            [[10, 0, 99, 99], [0, 10, 99, 99]],
+            [[88, 88, 20, 0], [88, 88, 0, 20]],
+        ],
+        dtype=np.uint32,
+    )
+    temp = zarr.create_array(
+        tmp_path / "temp.zarr",
+        data=data,
+        chunks=(1, 2, 2),
+    )
+    mapping_path = tmp_path / "mapping.npy"
+    np.save(
+        mapping_path,
+        np.asarray([[10, 20], [1, 2]], dtype=np.uint32),
+    )
+
+    merge_utils.sparse_relabel_and_write(
+        temp,
+        mapping_path,
+        tmp_path / "output.zarr",
+        block_token_chunks=True,
+        chunk_coords=[(0, 0, 0), (1, 0, 1)],
+    )
+
+    output = zarr.open_array(tmp_path / "output.zarr", mode="r")
+    np.testing.assert_array_equal(
+        output[:],
+        np.asarray(
+            [
+                [[1, 0, 0, 0], [0, 1, 0, 0]],
+                [[0, 0, 2, 0], [0, 0, 0, 2]],
+            ],
+            dtype=np.uint32,
+        ),
+    )
+
+
 def test_face_pairing_does_not_infer_axis_from_extent_two() -> None:
     nblocks = np.asarray((1, 2, 1))
     first = np.zeros((2, 2, 8), dtype=np.uint32)
@@ -415,6 +506,69 @@ def test_postproc_owner_publishes_unique_workspace_and_returns_array(
     assert workspaces[0] != workspaces[1]
     assert all(not workspace.exists() for workspace in workspaces)
     assert (tmp_path / "first.zarr" / "volumes.npy").is_file()
+
+
+def test_postproc_metadata_owns_transformed_artifact_identity(tmp_path: Path) -> None:
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        shape=(2, 3, 4),
+        chunks=(1, 3, 4),
+        dtype=np.uint32,
+    )
+    input_zarr.attrs.update(
+        {
+            "key": ["labels"],
+            "squisher_run_key": "raw-segmentation-run",
+            "squisher_output_schema": {"shape": [2, 3, 4]},
+        }
+    )
+    output_path = tmp_path / "output.zarr"
+    zarr.create_array(
+        output_path,
+        shape=input_zarr.shape,
+        chunks=input_zarr.chunks,
+        dtype=np.uint32,
+    )
+
+    postproc._copy_zarr_metadata(
+        input_zarr,
+        output_path,
+        postproc_params={"sigma": [1.0, 2.0, 2.0]},
+    )
+
+    output = zarr.open_array(output_path, mode="r")
+    assert output.attrs["key"] == ["labels"]
+    assert "squisher_run_key" not in output.attrs
+    assert "squisher_output_schema" not in output.attrs
+    assert output.attrs["squisher_postproc"]["source_run_key"] == "raw-segmentation-run"
+    assert len(output.attrs["squisher_postproc_key"]) == 64
+
+
+def test_postproc_metadata_records_dynamic_label_bits(tmp_path: Path) -> None:
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        shape=(1, 1, 1),
+        chunks=(1, 1, 1),
+        dtype=np.uint32,
+    )
+    output_path = tmp_path / "output.zarr"
+    zarr.create_array(
+        output_path,
+        shape=input_zarr.shape,
+        chunks=input_zarr.chunks,
+        dtype=np.uint32,
+    )
+
+    postproc._copy_zarr_metadata(
+        input_zarr,
+        output_path,
+        nblocks=(9, 15, 12),
+        mapping_filename="label_mapping.npy",
+    )
+
+    mapping_metadata = zarr.open_array(output_path, mode="r").attrs["label_mapping"]
+    assert mapping_metadata["label_bits"] == 21
+    assert mapping_metadata["local_label_mask"] == (1 << 21) - 1
 
 
 def test_postproc_rejects_source_as_destination(tmp_path: Path) -> None:

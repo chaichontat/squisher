@@ -56,6 +56,7 @@ def _compute_model_md5(model_path: Path) -> str:
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    name: str
     base_model: str | None
     # Backend selector: 'sam' (v4 transformer) or 'unet' (legacy UNet).
     backend: Literal["sam", "unet"] = "sam"
@@ -73,7 +74,10 @@ class TrainConfig(BaseModel):
 
     learning_rate: float = 0.008
     batch_size: int = 16
+    bsize: int = 224
     weight_decay: float = 1e-5
+    SGD: bool = False
+    optimizer: Literal["adamw"] | None = None
 
     normalization_percs: tuple[float, float] = (1, 99.5)
     train_losses: list[float] = Field(default_factory=list)
@@ -432,10 +436,11 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         test_data=test_images,
         test_labels=test_labels,
         weight_decay=train_config.weight_decay,
-        SGD=False,
+        SGD=train_config.SGD if train_config.optimizer is None else False,
         learning_rate=train_config.learning_rate,
         rescale=True,
         n_epochs=train_config.n_epochs,
+        bsize=train_config.bsize,
         model_name=name,
         normalize=cast(bool, {"percentile": train_config.normalization_percs}),
         min_train_masks=4,

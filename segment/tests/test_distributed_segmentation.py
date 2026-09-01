@@ -14,6 +14,7 @@ from typer.testing import CliRunner as TyperCliRunner
 from squisher_segment.cli import app
 from squisher_segment.segmentation.distributed import cache_utils
 from squisher_segment.segmentation.distributed import distributed_segmentation as segmentation
+from squisher_segment.segmentation.distributed import gpu_cluster
 from squisher_segment.segmentation.distributed import merge_utils
 
 
@@ -28,6 +29,7 @@ def _runtime_artifacts(tag: str = "test") -> dict[str, object]:
     return {
         "trt_plans": [
             {
+                "model_role": "xy",
                 "device_name": "Test GPU",
                 "path": f"/{tag}.plan",
                 "sha256": tag,
@@ -50,6 +52,30 @@ def _input_identity(path: Path, array: zarr.Array) -> dict[str, object]:
     }
 
 
+def _valid_run_identity(tag: str = "test") -> dict[str, object]:
+    return {
+        "schema_version": 6,
+        "input": {"path": f"/{tag}.zarr"},
+        "channel_indices": [0],
+        "model_sha256": {"xy": tag},
+        "model_kwargs": {},
+        "eval_kwargs": {},
+        "blocksize": [1, 1, 1, 1],
+        "overlap": 0,
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 0,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
+        "mask": None,
+        "preprocessing_steps": [],
+        "cellpose_version": "test",
+        "runtime_artifacts": _runtime_artifacts(tag),
+        "stitching": {"mode": "face", "iou_threshold": 0.25},
+    }
+
+
 def _write_ome_channel(path: Path, data: np.ndarray) -> None:
     root = zarr.create_group(path)
     array = root.create_array("0", data=data, chunks=(1, 2, 3))
@@ -67,6 +93,48 @@ def _write_ome_channel(path: Path, data: np.ndarray) -> None:
             },
         }
     )
+
+
+def test_retire_worker_keeps_nanny_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    scheduled: dict[str, object] = {}
+
+    class FakeLoop:
+        def add_callback(self, callback: object, **kwargs: object) -> None:
+            scheduled["callback"] = callback
+            scheduled["kwargs"] = kwargs
+
+    class FakeWorker:
+        loop = FakeLoop()
+
+        def close(self, **kwargs: object) -> None:
+            raise AssertionError("close must be scheduled on the worker loop")
+
+    worker = FakeWorker()
+    monkeypatch.setattr(segmentation.distributed, "get_worker", lambda: worker)
+
+    segmentation._retire_worker_after_error(reason="CUDA OOM")
+
+    assert scheduled["callback"] == worker.close
+    assert scheduled["kwargs"] == {"nanny": False, "reason": "CUDA OOM"}
+    assert worker._squisher_segment_fatal_error is True
+
+
+def test_retire_worker_without_loop_keeps_nanny_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    close_kwargs: list[dict[str, object]] = []
+
+    class FakeWorker:
+        loop = None
+
+        def close(self, **kwargs: object) -> None:
+            close_kwargs.append(kwargs)
+
+    worker = FakeWorker()
+    monkeypatch.setattr(segmentation.distributed, "get_worker", lambda: worker)
+
+    segmentation._retire_worker_after_error(reason="CUDA OOM")
+
+    assert close_kwargs == [{"nanny": False, "reason": "CUDA OOM"}]
+    assert worker._squisher_segment_fatal_error is True
 
 
 def test_registered_ome_manifest_reads_roi_and_survives_pickle(tmp_path: Path) -> None:
@@ -87,16 +155,12 @@ def test_registered_ome_manifest_reads_roi_and_survives_pickle(tmp_path: Path) -
                     {
                         "channel": "405",
                         "path": str(source_405),
-                        "root_metadata_sha256": segmentation.file_sha256(
-                            source_405 / "zarr.json"
-                        ),
+                        "root_metadata_sha256": segmentation.file_sha256(source_405 / "zarr.json"),
                     },
                     {
                         "channel": "561",
                         "path": str(source_561),
-                        "root_metadata_sha256": segmentation.file_sha256(
-                            source_561 / "zarr.json"
-                        ),
+                        "root_metadata_sha256": segmentation.file_sha256(source_561 / "zarr.json"),
                     },
                 ],
                 "source_roi_zyx": [[1, 3], [1, 5], [2, 6]],
@@ -115,9 +179,7 @@ def test_registered_ome_manifest_reads_roi_and_survives_pickle(tmp_path: Path) -
     )
     np.testing.assert_array_equal(restored[:, :, :, :], expected)
     np.testing.assert_array_equal(
-        restored.get_orthogonal_selection(
-            (slice(0, 1), slice(1, 3), slice(0, 2), [1, 0])
-        ),
+        restored.get_orthogonal_selection((slice(0, 1), slice(1, 3), slice(0, 2), [1, 0])),
         expected[0:1, 1:3, 0:2][:, :, :, [1, 0]],
     )
     assert array.shape == (2, 4, 4, 2)
@@ -127,6 +189,53 @@ def test_registered_ome_manifest_reads_roi_and_survives_pickle(tmp_path: Path) -
         "input.json",
         "zarr.json",
     }
+
+
+def test_crop_zyxc_input_reads_exact_box_and_binds_identity(tmp_path: Path) -> None:
+    array, data = _write_input(tmp_path / "input.zarr")
+    identity = _input_identity(tmp_path / "input.zarr", array)
+
+    cropped, cropped_identity = segmentation._crop_zyxc_input(
+        array,
+        identity,
+        start_zyx=(0, 1, 1),
+        box_size_zyx=(2, 2, 3),
+    )
+
+    np.testing.assert_array_equal(
+        cropped.get_orthogonal_selection((slice(None), slice(None), slice(None), [2, 0])),
+        data[:, 1:3, 1:4][:, :, :, [2, 0]],
+    )
+    assert cropped.shape == (2, 2, 3, 3)
+    assert cropped_identity["start_zyx"] == [0, 1, 1]
+    assert cropped_identity["box_size_zyx"] == [2, 2, 3]
+    assert cropped_identity["source"] == identity
+
+
+@pytest.mark.parametrize(
+    ("start", "size", "message"),
+    [
+        ((0, 0, 0), None, "provided together"),
+        ((-1, 0, 0), (1, 1, 1), "non-negative"),
+        ((0, 0, 0), (0, 1, 1), "positive"),
+        ((1, 3, 3), (2, 2, 3), "outside input shape"),
+    ],
+)
+def test_crop_zyxc_input_rejects_invalid_boxes(
+    tmp_path: Path,
+    start: tuple[int, int, int] | None,
+    size: tuple[int, int, int] | None,
+    message: str,
+) -> None:
+    array, _ = _write_input(tmp_path / "input.zarr")
+
+    with pytest.raises(ValueError, match=message):
+        segmentation._crop_zyxc_input(
+            array,
+            _input_identity(tmp_path / "input.zarr", array),
+            start_zyx=start,
+            box_size_zyx=size,
+        )
 
 
 def test_selected_channels_are_read_once_in_requested_order(tmp_path: Path) -> None:
@@ -289,15 +398,48 @@ def test_sam_blocksize_keeps_full_volume_interior_geometry() -> None:
     assert blocksize == (120, 712, 504, 3)
 
 
+def test_normalization_block_is_bounded_by_cropped_input() -> None:
+    assert segmentation._normalization_block_yx((256, 512, 512)) == (256, 512)
+    assert segmentation._normalization_block_yx((2_470, 10_657, 7_871)) == (256, 1024)
+
+
+def test_normalization_settings_can_disable_unsharp() -> None:
+    settings = segmentation._normalization_settings(
+        block_yx=(256, 1024),
+        nonempty_rule={"channel": "561", "threshold": 1000},
+        unsharp=False,
+    )
+
+    assert settings["unsharp"] is False
+    assert settings["unsharp_backend"] is None
+    assert settings["unsharp_dimensionality"] is None
+    assert settings["unsharp_radius"] is None
+
+
 def test_cellpose_eval_uses_unit_anisotropy_and_masks_only() -> None:
     eval_kwargs = segmentation._build_cellpose_eval_kwargs(
         diameter=30,
         normalization={"lowhigh": [[0.0, 1.0]] * 3},
         ortho_weights=[3, 1.0, 1.0],
+        flow3d_smooth=1.0,
     )
 
     assert eval_kwargs["anisotropy"] == 1.0
+    assert eval_kwargs["flow3D_smooth"] == 1.0
     assert eval_kwargs["return_flows"] is False
+    assert eval_kwargs["skip_empty_tiles"] is True
+
+
+def test_cellpose_eval_can_disable_empty_tile_checks() -> None:
+    eval_kwargs = segmentation._build_cellpose_eval_kwargs(
+        diameter=30,
+        normalization={"lowhigh": [[0.0, 1.0]] * 3},
+        ortho_weights=[3, 1.0, 1.0],
+        flow3d_smooth=1.0,
+        skip_empty_tiles=False,
+    )
+
+    assert eval_kwargs["skip_empty_tiles"] is False
 
 
 def test_channel_selection_rejects_ambiguous_metadata(tmp_path: Path) -> None:
@@ -335,7 +477,24 @@ def test_nonempty_rule_resolves_561_channel_and_threshold(tmp_path: Path) -> Non
         "channel": "561",
         "channel_index": 1,
         "threshold": 750,
+        "min_fraction": 0.05,
     }
+
+
+def test_block_requires_five_percent_foreground_voxels(tmp_path: Path) -> None:
+    data = np.zeros((1, 1, 100, 3), dtype=np.uint16)
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=data,
+        chunks=(1, 1, 100, 3),
+    )
+    crop = (slice(0, 1), slice(0, 1), slice(0, 100), slice(0, 3))
+
+    input_zarr[0, 0, :4, 1] = 1001
+    assert not segmentation._check_block_has_data(crop, input_zarr, 1, 1000)
+
+    input_zarr[0, 0, 4, 1] = 1001
+    assert segmentation._check_block_has_data(crop, input_zarr, 1, 1000)
 
 
 def test_default_scan_caches_blocks_with_561_above_1000(
@@ -383,10 +542,7 @@ def test_default_scan_caches_blocks_with_561_above_1000(
         ).reshape(1, 1, 3, 3),
         chunks=(1, 1, 1, 3),
     )
-    crops = [
-        (slice(0, 1), slice(0, 1), slice(i, i + 1), slice(0, 3))
-        for i in range(3)
-    ]
+    crops = [(slice(0, 1), slice(0, 1), slice(i, i + 1), slice(0, 3)) for i in range(3)]
     reads: list[tuple[slice, ...]] = []
     original_read = segmentation._read_input_crop
 
@@ -474,7 +630,12 @@ def test_distributed_eval_scans_block_cores_without_inference_halos(
         blocksize=(1, 1, 2, 1),
         overlap=2,
         preprocessing_steps=[],
-        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+        nonempty_rule={
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
         mask=None,
         runtime_artifacts=_runtime_artifacts(),
     )
@@ -554,20 +715,26 @@ def test_nonempty_rule_changes_run_and_cache_identity(tmp_path: Path) -> None:
 
     threshold_1000 = segmentation._build_run_identity(
         **common,
-        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+        nonempty_rule={
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
     )
     threshold_999 = segmentation._build_run_identity(
         **common,
-        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 999},
+        nonempty_rule={
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 999,
+            "min_fraction": 0.05,
+        },
     )
 
-    assert threshold_1000["schema_version"] == threshold_999["schema_version"] == 4
-    assert segmentation._identity_digest(threshold_1000) != segmentation._identity_digest(
-        threshold_999
-    )
-    assert segmentation._nonempty_cache_key(threshold_1000) != segmentation._nonempty_cache_key(
-        threshold_999
-    )
+    assert threshold_1000["schema_version"] == threshold_999["schema_version"] == 6
+    assert segmentation._identity_digest(threshold_1000) != segmentation._identity_digest(threshold_999)
+    assert segmentation._nonempty_cache_key(threshold_1000) != segmentation._nonempty_cache_key(threshold_999)
 
 
 def test_nonempty_cache_ignores_inference_only_changes(tmp_path: Path) -> None:
@@ -580,7 +747,12 @@ def test_nonempty_cache_ignores_inference_only_changes(tmp_path: Path) -> None:
         "channel_indices": (0,),
         "blocksize": (2, 4, 4, 1),
         "overlap": 60,
-        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
         "mask": None,
     }
     identity_a = segmentation._build_run_identity(
@@ -602,6 +774,35 @@ def test_nonempty_cache_ignores_inference_only_changes(tmp_path: Path) -> None:
     assert segmentation._nonempty_cache_key(identity_a) == segmentation._nonempty_cache_key(identity_b)
 
 
+def test_stitch_options_change_run_but_not_nonempty_identity(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.write_bytes(b"model")
+    common = {
+        "input_identity": {"path": "/data/input.zarr"},
+        "channel_indices": (0,),
+        "model_kwargs": {"pretrained_model": str(model)},
+        "eval_kwargs": {"diameter": 30},
+        "blocksize": (2, 4, 4, 1),
+        "overlap": 60,
+        "preprocessing_steps": [],
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
+        "mask": None,
+        "runtime_artifacts": _runtime_artifacts(),
+    }
+    face = segmentation._build_run_identity(**common, stitch_mode="face")
+    overlap = segmentation._build_run_identity(
+        **common, stitch_mode="overlap-iou", stitch_iou_threshold=0.4
+    )
+
+    assert segmentation._identity_digest(face) != segmentation._identity_digest(overlap)
+    assert segmentation._nonempty_cache_key(face) == segmentation._nonempty_cache_key(overlap)
+
+
 def test_mask_content_changes_run_and_nonempty_cache_identity(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     model_path.write_bytes(b"model")
@@ -613,7 +814,12 @@ def test_mask_content_changes_run_and_nonempty_cache_identity(tmp_path: Path) ->
         "blocksize": (2, 4, 4, 1),
         "overlap": 60,
         "preprocessing_steps": [],
-        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
         "runtime_artifacts": _runtime_artifacts(),
     }
     mask_a = np.zeros((2, 2, 2), dtype=np.uint8)
@@ -643,7 +849,12 @@ def test_distributed_eval_rejects_conflicting_nonempty_rule(tmp_path: Path) -> N
         blocksize=(2, 4, 4, 1),
         overlap=2,
         preprocessing_steps=[],
-        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 999},
+        nonempty_rule={
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 999,
+            "min_fraction": 0.05,
+        },
         mask=None,
         runtime_artifacts=_runtime_artifacts(),
     )
@@ -676,7 +887,12 @@ def test_distributed_eval_rejects_identity_that_does_not_match_call(tmp_path: Pa
         blocksize=(2, 4, 4, 1),
         overlap=2,
         preprocessing_steps=[],
-        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000},
+        nonempty_rule={
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
         mask=None,
         runtime_artifacts=_runtime_artifacts(),
     )
@@ -755,6 +971,33 @@ def test_typer_segment_run_propagates_nonempty_threshold(
     assert captured["nonempty_threshold"] == 750
 
 
+def test_typer_segment_run_propagates_overlap_iou(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(
+        app,
+        [
+            "segment",
+            "run",
+            str(input_path),
+            "--stitch-mode",
+            "overlap-iou",
+            "--stitch-iou-threshold",
+            "0.4",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["stitch_mode"] == "overlap-iou"
+    assert captured["stitch_iou_threshold"] == 0.4
+
+
 def test_click_segment_run_propagates_nonempty_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -771,6 +1014,118 @@ def test_click_segment_run_propagates_nonempty_threshold(
 
     assert result.exit_code == 0, result.output
     assert captured["nonempty_threshold"] == 750
+
+
+def test_typer_segment_run_propagates_per_device_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(
+        app,
+        ["segment", "run", str(input_path), "--workers-per-device", "3,2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["workers_per_device"] == (3, 2)
+
+
+def test_worker_spec_supports_per_device_counts() -> None:
+    spec = gpu_cluster._build_worker_spec(
+        devices=["gpu-a", "gpu-b"],
+        workers_per_gpu=4,
+        workers_per_device=(3, 2),
+        threads_per_worker=1,
+    )
+
+    assert set(spec) == {
+        "gpu-0-w0",
+        "gpu-0-w1",
+        "gpu-0-w2",
+        "gpu-1-w0",
+        "gpu-1-w1",
+    }
+    assert spec["gpu-0-w2"]["options"]["env"] == {"CUDA_VISIBLE_DEVICES": "gpu-a"}
+    assert spec["gpu-1-w1"]["options"]["env"] == {"CUDA_VISIBLE_DEVICES": "gpu-b"}
+
+
+def test_gpu_cluster_routes_each_worker_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    routes: list[str] = []
+
+    def start_speccluster(**kwargs: object) -> tuple[object, object, None]:
+        routes.append("spec")
+        return object(), object(), None
+
+    def start_localcuda(**kwargs: object) -> tuple[object, object, None]:
+        routes.append("localcuda")
+        return object(), object(), None
+
+    monkeypatch.setattr(gpu_cluster, "_start_speccluster", start_speccluster)
+    monkeypatch.setattr(gpu_cluster, "_start_localcuda", start_localcuda)
+
+    gpu_cluster.myGPUCluster(workers_per_device=(3, 2))
+    gpu_cluster.myGPUCluster(workers_per_gpu=3)
+    gpu_cluster.myGPUCluster(workers_per_gpu=1, use_localcuda=True)
+    gpu_cluster.myGPUCluster(workers_per_gpu=1)
+
+    assert routes == ["spec", "spec", "localcuda", "spec"]
+
+
+def test_typer_segment_run_propagates_requested_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(
+        app,
+        [
+            "segment",
+            "run",
+            str(input_path),
+            "--start-zyx",
+            "1518,8538,3161",
+            "--box-size-zyx",
+            "256,512,512",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["start_zyx"] == (1518, 8538, 3161)
+    assert captured["box_size_zyx"] == (256, 512, 512)
+
+
+def test_click_segment_run_propagates_requested_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = ClickCliRunner().invoke(
+        segmentation.cli,
+        [
+            "run",
+            str(input_path),
+            "--start-zyx",
+            "1518,8538,3161",
+            "--box-size-zyx",
+            "256,512,512",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["start_zyx"] == (1518, 8538, 3161)
+    assert captured["box_size_zyx"] == (256, 512, 512)
 
 
 def test_typer_segment_stitch_propagates_transaction_options(
@@ -828,9 +1183,7 @@ def test_nonempty_and_normalization_caches_require_matching_input(tmp_path: Path
 
     assert cache_utils.read_nonempty_cache(nonempty_path, blocksize, "run-a") == [0, 2]
     assert cache_utils.read_nonempty_cache(nonempty_path, blocksize, "run-b") is None
-    assert cache_utils.read_normalization_cache(normalization_path, "input-a") == {
-        "1": [1.0, 9.0]
-    }
+    assert cache_utils.read_normalization_cache(normalization_path, "input-a") == {"1": [1.0, 9.0]}
     assert cache_utils.read_normalization_cache(normalization_path, "input-b") is None
     assert json.loads(normalization_path.read_text())["settings"] == settings
 
@@ -865,10 +1218,10 @@ def test_trt_plan_content_is_part_of_run_identity(tmp_path: Path) -> None:
     plan_path = segmentation.plan_path_for_device(model_path, "Test GPU")
     plan_path.write_bytes(b"plan-a")
     artifacts_a = _runtime_artifacts("a")
-    artifacts_a["trt_plans"] = segmentation._trt_plan_identity(model_path, {"Test GPU"})
+    artifacts_a["trt_plans"] = segmentation._trt_plan_identity({"xy": model_path}, {"Test GPU"})
     plan_path.write_bytes(b"plan-b")
     artifacts_b = _runtime_artifacts("a")
-    artifacts_b["trt_plans"] = segmentation._trt_plan_identity(model_path, {"Test GPU"})
+    artifacts_b["trt_plans"] = segmentation._trt_plan_identity({"xy": model_path}, {"Test GPU"})
     common = {
         "input_identity": {"path": "/data/input.zarr"},
         "channel_indices": (0,),
@@ -877,7 +1230,12 @@ def test_trt_plan_content_is_part_of_run_identity(tmp_path: Path) -> None:
         "blocksize": (2, 4, 4, 1),
         "overlap": 60,
         "preprocessing_steps": [],
-        "nonempty_rule": {"channel": "561", "channel_index": 1, "threshold": 1000},
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
         "mask": None,
     }
 
@@ -888,13 +1246,70 @@ def test_trt_plan_content_is_part_of_run_identity(tmp_path: Path) -> None:
     assert segmentation._identity_digest(identity_a) != segmentation._identity_digest(identity_b)
 
 
+def test_ortho_checkpoint_and_plan_are_part_of_run_identity(tmp_path: Path) -> None:
+    xy_model = tmp_path / "xy-model"
+    ortho_model = tmp_path / "ortho-model"
+    xy_model.write_bytes(b"xy")
+    ortho_model.write_bytes(b"ortho-a")
+    for model_path in (xy_model, ortho_model):
+        segmentation.plan_path_for_device(model_path, "Test GPU").write_bytes(b"plan-a")
+    model_kwargs = {
+        "pretrained_model": str(xy_model),
+        "pretrained_model_ortho": str(ortho_model),
+    }
+    common = {
+        "input_identity": {"path": "/data/input.zarr"},
+        "channel_indices": (0,),
+        "model_kwargs": model_kwargs,
+        "eval_kwargs": {"diameter": 30},
+        "blocksize": (2, 4, 4, 1),
+        "overlap": 60,
+        "preprocessing_steps": [],
+        "nonempty_rule": {
+            "channel": "561",
+            "channel_index": 1,
+            "threshold": 1000,
+            "min_fraction": 0.05,
+        },
+        "mask": None,
+    }
+
+    artifacts_a = _runtime_artifacts("a")
+    artifacts_a["trt_plans"] = segmentation._trt_plan_identity(
+        {"xy": xy_model, "ortho": ortho_model}, {"Test GPU"}
+    )
+    identity_a = segmentation._build_run_identity(**common, runtime_artifacts=artifacts_a)
+
+    ortho_model.write_bytes(b"ortho-b")
+    artifacts_b = _runtime_artifacts("a")
+    artifacts_b["trt_plans"] = artifacts_a["trt_plans"]
+    identity_b = segmentation._build_run_identity(**common, runtime_artifacts=artifacts_b)
+
+    ortho_model.write_bytes(b"ortho-a")
+    segmentation.plan_path_for_device(ortho_model, "Test GPU").write_bytes(b"plan-b")
+    artifacts_c = _runtime_artifacts("a")
+    artifacts_c["trt_plans"] = segmentation._trt_plan_identity(
+        {"xy": xy_model, "ortho": ortho_model}, {"Test GPU"}
+    )
+    identity_c = segmentation._build_run_identity(**common, runtime_artifacts=artifacts_c)
+
+    assert identity_a["model_sha256"].keys() == {"xy", "ortho"}
+    assert {plan["model_role"] for plan in artifacts_a["trt_plans"]} == {"xy", "ortho"}
+    assert segmentation._identity_digest(identity_a) != segmentation._identity_digest(identity_b)
+    assert segmentation._identity_digest(identity_a) != segmentation._identity_digest(identity_c)
+
+
+def test_runtime_artifacts_reject_duplicate_role_device_plans() -> None:
+    artifacts = _runtime_artifacts()
+    artifacts["trt_plans"].append(dict(artifacts["trt_plans"][0]))
+
+    with pytest.raises(ValueError, match="duplicate model-role/device plans"):
+        segmentation._validate_runtime_artifacts(artifacts)
+
+
 def test_checkpoint_ignores_truncated_and_malformed_lines(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "checkpoint.jsonl"
-    checkpoint_path.write_text(
-        '{"index": [0, 1, 2]}\n'
-        '{"worker": "missing-index"}\n'
-        '{"index": [3, 4'
-    )
+    checkpoint_path.write_text('{"index": [0, 1, 2]}\n{"worker": "missing-index"}\n{"index": [3, 4')
 
     assert segmentation.load_checkpoint(checkpoint_path) == {(0, 1, 2)}
 
@@ -918,9 +1333,7 @@ def test_driver_checkpoints_only_successful_futures(
                 raise self._error
             return self._result
 
-    success = ImmediateFuture(
-        {"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.25, "n_masks": 4}
-    )
+    success = ImmediateFuture({"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.25, "n_masks": 4})
     interrupted = ImmediateFuture(error=RuntimeError("worker stopped before completion"))
     monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
     checkpoint_path = tmp_path / "checkpoint.jsonl"
@@ -937,6 +1350,85 @@ def test_driver_checkpoints_only_successful_futures(
     assert segmentation.load_checkpoint(checkpoint_path) == {(0, 0, 0, 0)}
 
 
+def test_driver_waits_before_retrying_failed_block_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RetriableFuture:
+        key = "failed-block"
+        attempt = 0
+
+        def result(self) -> dict[str, object]:
+            if self.attempt == 0:
+                raise RuntimeError("worker stopped before completion")
+            return {"index": (0, 0, 0, 0), "worker": "gpu-1", "duration_s": 2.0, "n_masks": 3}
+
+    class Client:
+        retried: list[object] = []
+
+        def retry(self, futures: list[RetriableFuture]) -> None:
+            self.retried.extend(futures)
+            for future in futures:
+                future.attempt += 1
+
+    future = RetriableFuture()
+    client = Client()
+    sleeps: list[float] = []
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation.time, "sleep", sleeps.append)
+    checkpoint_path = tmp_path / "checkpoint.jsonl"
+
+    failures = segmentation._wait_for_futures_retry_once(
+        client=client,
+        futures=[future],
+        future_labels={future: "block=(0, 0, 0, 0)"},
+        stage="Segmentation",
+        log=segmentation.logger,
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert sleeps == [30.0]
+    assert client.retried == [future]
+    assert failures == []
+    assert segmentation.load_checkpoint(checkpoint_path) == {(0, 0, 0, 0)}
+
+
+def test_driver_does_not_retry_checkpoint_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuccessfulFuture:
+        key = "successful-block"
+
+        def result(self) -> dict[str, object]:
+            return {"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.0, "n_masks": 2}
+
+    class Client:
+        def retry(self, futures: list[SuccessfulFuture]) -> None:
+            raise AssertionError("a driver-side checkpoint failure must not retry the task")
+
+    def fail_checkpoint(*args: object, **kwargs: object) -> None:
+        raise OSError("checkpoint disk full")
+
+    def fail_sleep(seconds: float) -> None:
+        raise AssertionError("must not wait before a driver-side failure")
+
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation, "append_checkpoint", fail_checkpoint)
+    monkeypatch.setattr(segmentation.time, "sleep", fail_sleep)
+    future = SuccessfulFuture()
+
+    with pytest.raises(RuntimeError, match="completion handling failed.*checkpoint disk full"):
+        segmentation._wait_for_futures_retry_once(
+            client=Client(),
+            futures=[future],
+            future_labels={future: "block=(0, 0, 0, 0)"},
+            stage="Segmentation",
+            log=segmentation.logger,
+            checkpoint_path=tmp_path / "checkpoint.jsonl",
+        )
+
+
 def test_stitch_failure_never_exposes_partial_final_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -950,6 +1442,7 @@ def test_stitch_failure_never_exposes_partial_final_output(
     run_identity = {"schema_version": 3, "run": "test"}
 
     def interrupted_stitch(**kwargs: object) -> None:
+        assert kwargs["chunk_coords"] == []
         write_path = Path(kwargs["write_path"])
         staged = zarr.create_array(
             write_path,
@@ -972,6 +1465,7 @@ def test_stitch_failure_never_exposes_partial_final_output(
             output_path=output_path,
             run_identity=run_identity,
             overwrite_output=False,
+            non_empty_indices=[],
         )
 
     assert not output_path.exists()
@@ -987,6 +1481,7 @@ def test_stitch_failure_never_exposes_partial_final_output(
         output_path=output_path,
         run_identity=run_identity,
         overwrite_output=False,
+        non_empty_indices=[],
     )
 
     np.testing.assert_array_equal(final[:], temp_zarr[:])
@@ -1084,6 +1579,7 @@ def test_overwrite_promotion_failure_restores_prior_output(
             output_path=output_path,
             run_identity=run_identity,
             overwrite_output=True,
+            non_empty_indices=[],
         )
 
     restored = zarr.open_array(output_path, mode="r")
@@ -1097,7 +1593,7 @@ def test_stitch_recovers_promoted_output_before_stale_marker_check(tmp_path: Pat
     temp_dir.mkdir()
     (temp_dir / "segmentation_unstitched.zarr").mkdir()
     (temp_dir / "intermediate_state.npz").touch()
-    current_identity = {"schema_version": 3, "run": "current"}
+    current_identity = _valid_run_identity("current")
     segmentation.save_run_config(temp_dir / "run_config.json", current_identity)
 
     output_path = tmp_path / "output.zarr"
@@ -1130,7 +1626,7 @@ def test_stitch_recovers_promoted_output_before_stale_marker_check(tmp_path: Pat
 def test_matching_completed_stitch_cleans_interrupted_temp_state(tmp_path: Path) -> None:
     temp_dir = tmp_path / "temp"
     temp_dir.mkdir()
-    identity = {"schema_version": 3, "run": "complete"}
+    identity = _valid_run_identity("complete")
     segmentation.save_run_config(temp_dir / "run_config.json", identity)
     output_path = tmp_path / "output.zarr"
     zarr.create_array(output_path, shape=(2, 3, 4), chunks=(1, 3, 4), dtype=np.uint32)
@@ -1190,7 +1686,7 @@ def test_run_stitch_replaces_output_transactionally_and_cleans_temp(tmp_path: Pa
         chunks=(1, 3, 4),
     )
     segmentation._save_intermediate_state(temp_dir, [], [], [], [])
-    identity = {"schema_version": 3, "run": "replacement"}
+    identity = _valid_run_identity("replacement")
     segmentation.save_run_config(temp_dir / "run_config.json", identity)
     output_path = tmp_path / "output.zarr"
     zarr.create_array(
@@ -1208,6 +1704,23 @@ def test_run_stitch_replaces_output_transactionally_and_cleans_temp(tmp_path: Pa
     assert not temp_dir.exists()
 
 
+def test_run_stitch_rejects_stale_run_identity(tmp_path: Path) -> None:
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir()
+    segmentation.save_run_config(
+        temp_dir / "run_config.json",
+        {"schema_version": 4, "run": "stale"},
+    )
+
+    with pytest.raises(ValueError, match="schema-6 artifact-bound identity"):
+        segmentation._run_stitch(
+            temp_dir,
+            tmp_path / "output.zarr",
+            cleanup=False,
+            overwrite=False,
+        )
+
+
 def test_input_provenance_requires_and_hashes_manifest(tmp_path: Path) -> None:
     input_path = tmp_path / "input.zarr"
     input_path.mkdir()
@@ -1217,13 +1730,11 @@ def test_input_provenance_requires_and_hashes_manifest(tmp_path: Path) -> None:
 
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
-        '{"version": 1, "shape": [2, 3, 4, 1], '
-        '"chunks": [1, 3, 4, 1], "dtype": "uint16"}'
+        '{"version": 1, "shape": [2, 3, 4, 1], "chunks": [1, 3, 4, 1], "dtype": "uint16"}'
     )
     first = segmentation._input_provenance_identity(input_path, expected_schema=schema)
     manifest_path.write_text(
-        '{"version": 2, "shape": [2, 3, 4, 1], '
-        '"chunks": [1, 3, 4, 1], "dtype": "uint16"}'
+        '{"version": 2, "shape": [2, 3, 4, 1], "chunks": [1, 3, 4, 1], "dtype": "uint16"}'
     )
     second = segmentation._input_provenance_identity(input_path, expected_schema=schema)
 
@@ -1244,7 +1755,7 @@ def test_distributed_eval_requires_artifact_bound_identity(tmp_path: Path) -> No
             channel_indices=(0,),
         )
 
-    with pytest.raises(ValueError, match="complete schema-4"):
+    with pytest.raises(ValueError, match="complete schema-6"):
         segmentation.distributed_eval.__wrapped__(
             input_zarr=input_zarr,
             blocksize=(2, 4, 4, 1),
@@ -1364,6 +1875,26 @@ def test_sparse_global_labels_decode_to_bounded_block_labels() -> None:
     np.testing.assert_array_equal(global_ids, global_labels[global_labels != 0])
     assert decoded.max() == 3
     assert global_labels.max() > 65_000_000
+
+
+def test_global_label_bits_use_available_uint32_capacity() -> None:
+    nblocks = np.array((9, 15, 12))
+    label_bits = merge_utils.global_label_bits(nblocks)
+
+    remap = merge_utils.global_segment_id_remap(
+        75_414,
+        block_index=(3, 5, 6),
+        nblocks=nblocks,
+        label_bits=label_bits,
+    )
+    decoded, global_ids = merge_utils.decode_block_global_labels(
+        remap[[0, 1, 75_414]],
+        label_bits=label_bits,
+    )
+
+    assert label_bits == 21
+    np.testing.assert_array_equal(decoded, np.array([0, 1, 75_414], dtype=np.uint32))
+    np.testing.assert_array_equal(global_ids, remap[[1, 75_414]])
 
 
 def test_block_label_decode_rejects_mixed_block_tokens() -> None:

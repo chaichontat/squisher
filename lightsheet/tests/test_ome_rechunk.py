@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 import zarr
+from zarr.codecs import BytesCodec, ZstdCodec
 
 from squisher_lightsheet import mvs_seams
 from squisher_lightsheet.ome_rechunk import rechunk_ome_tiffs
+from squisher_lightsheet.ome_zarr_rechunk import rechunk_ome_zarr
 
 
 def xy_block_mean(data: np.ndarray, factor: int) -> np.ndarray:
@@ -140,3 +144,120 @@ def test_mvs_image_crop_reads_rechunked_ome_zarr(tmp_path) -> None:
     assert axes == "CZYX"
     assert shape == data.shape
     np.testing.assert_array_equal(crop, data[1, 1:4, 2:7, 3:8].astype(np.float32))
+
+
+def _write_zarr_source(path: Path, *, levels: int = 4, complete: bool = True) -> list[np.ndarray]:
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    shapes = [(4, 16, 20), (4, 8, 10), (2, 4, 5), (2, 2, 3)][:levels]
+    transforms = [
+        [{"type": "scale", "scale": [float(index + 1), float(2**index), float(2**index)]}]
+        for index in range(levels)
+    ]
+    root.attrs.update(
+        {
+            "ome": {
+                "version": "0.5",
+                "multiscales": [
+                    {
+                        "name": "fixture",
+                        "axes": [
+                            {"name": "z", "type": "space", "unit": "micrometer"},
+                            {"name": "y", "type": "space", "unit": "micrometer"},
+                            {"name": "x", "type": "space", "unit": "micrometer"},
+                        ],
+                        "datasets": [
+                            {"path": str(index), "coordinateTransformations": transform}
+                            for index, transform in enumerate(transforms)
+                        ],
+                    }
+                ],
+            },
+            "fixture_metadata": {"preserve": True},
+            "squisher_complete": complete,
+        }
+    )
+    values = []
+    for index, shape in enumerate(shapes):
+        data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape) + index * 1000
+        array = root.create_array(
+            str(index),
+            shape=shape,
+            chunks=tuple(min(size, chunk) for size, chunk in zip(shape, (2, 4, 4), strict=True)),
+            dtype=np.uint16,
+            fill_value=7,
+            attributes={"_ARRAY_DIMENSIONS": ["z", "y", "x"], "level_attr": index},
+            dimension_names=("z", "y", "x"),
+            serializer=BytesCodec(),
+            compressors=[ZstdCodec(level=1)],
+        )
+        array[:] = data
+        values.append(data)
+    return values
+
+
+def test_rechunk_ome_zarr_rebases_levels_and_writes_lossless_zstd(tmp_path: Path) -> None:
+    source = tmp_path / "source.ome.zarr"
+    expected = _write_zarr_source(source)
+    destination = tmp_path / "preview.ome.zarr"
+
+    summary = rechunk_ome_zarr(
+        source=source,
+        destination=destination,
+        start_level=2,
+        zstd_level=3,
+        chunk_shape_zyx=(2, 4, 4),
+        workers=2,
+        codec_concurrency=2,
+    )
+
+    root = zarr.open_group(str(destination), mode="r")
+    assert sorted(root.keys()) == ["0", "1"]
+    assert root.attrs["squisher_complete"] is True
+    assert root.attrs["fixture_metadata"] == {"preserve": True}
+    assert root.attrs["squisher_rechunk"]["source_start_level"] == 2
+    multiscale = root.attrs["ome"]["multiscales"][0]
+    assert [dataset["path"] for dataset in multiscale["datasets"]] == ["0", "1"]
+    assert [dataset["coordinateTransformations"] for dataset in multiscale["datasets"]] == [
+        [{"type": "scale", "scale": [3.0, 4.0, 4.0]}],
+        [{"type": "scale", "scale": [4.0, 8.0, 8.0]}],
+    ]
+
+    level0 = root["0"]
+    level1 = root["1"]
+    assert tuple(level0.metadata.dimension_names) == ("z", "y", "x")
+    assert level0.attrs.asdict() == {"_ARRAY_DIMENSIONS": ["z", "y", "x"], "level_attr": 2}
+    assert level0.fill_value == 7
+    assert tuple(level0.chunks) == (2, 4, 4)
+    assert tuple(level1.chunks) == (2, 2, 2)
+    np.testing.assert_array_equal(level0[:], expected[2])
+    np.testing.assert_array_equal(level1[:], expected[3])
+    assert [codec.to_dict()["name"] for codec in level0.metadata.codecs] == ["bytes", "zstd"]
+    assert level0.metadata.codecs[-1].to_dict()["configuration"]["level"] == 3
+    assert summary["source_start_level"] == 2
+    assert [level["source_path"] for level in summary["levels"]] == ["2", "3"]
+
+
+def test_rechunk_ome_zarr_rejects_insufficient_levels(tmp_path: Path) -> None:
+    source = tmp_path / "short.ome.zarr"
+    _write_zarr_source(source, levels=2)
+
+    with pytest.raises(ValueError, match="has 2 pyramid level"):
+        rechunk_ome_zarr(source=source, destination=tmp_path / "out.ome.zarr")
+
+
+def test_rechunk_ome_zarr_rejects_incomplete_source(tmp_path: Path) -> None:
+    source = tmp_path / "incomplete.ome.zarr"
+    _write_zarr_source(source, complete=False)
+
+    with pytest.raises(ValueError, match="explicitly marked incomplete"):
+        rechunk_ome_zarr(source=source, destination=tmp_path / "out.ome.zarr")
+
+
+def test_rechunk_ome_zarr_refuses_existing_output_without_overwrite(tmp_path: Path) -> None:
+    source = tmp_path / "source.ome.zarr"
+    _write_zarr_source(source)
+    destination = tmp_path / "existing.ome.zarr"
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        rechunk_ome_zarr(source=source, destination=destination)

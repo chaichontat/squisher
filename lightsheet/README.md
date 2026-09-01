@@ -32,6 +32,26 @@ opening their headers. Use this path only for controlled acquisitions. Pixel
 reads remain lazy, although a compressed strip may decode more data than the
 requested slice.
 
+## Rechunk an OME-Zarr preview
+
+Use `rechunk-ome-zarr` to copy level 2 onward from an existing OME-Zarr pyramid
+into a standard lossless Zstd Zarr v3 store. Source level 2 becomes output level
+0, and the selected datasets retain their axes and physical coordinate
+transformations for direct use in Napari.
+
+```bash
+lightsheet rechunk-ome-zarr SOURCE.ome.zarr PREVIEW.ome.zarr \
+  --start-level 2 \
+  --zstd-level 3 \
+  --chunk-shape-zyx 12,480,480 \
+  --workers 8 \
+  --codec-concurrency 4
+```
+
+The command writes through `.PREVIEW.ome.zarr.tmp`, sets
+`squisher_complete=true` only after every selected level is copied, and refuses
+existing output unless `--overwrite` is passed.
+
 ## WGACtrl-405-L2 Run Record (2026-07-10)
 
 The commands below record the processing sequence launched for
@@ -417,10 +437,12 @@ applies those affines without resampling the materialized crop bytes first.
 Use this order:
 
 1. Coarsely place the moving tiles in the fixed frame.
-2. Fit phase-primed native Method10 affines on a non-overlapping core grid. A
-   fixed-image threshold is acquisition-specific. For the L-514638
-   moving-channel-0 to fused-channel-1 run, use `--fixed-mask-threshold 50`;
-   the mask is evaluated on fixed fused level 2. Mark threshold-empty or overly
+2. Fit phase-primed native Method6 affines on a non-overlapping core grid. The
+   fixed-image threshold is acquisition-specific and is evaluated on fixed fused
+   level 2. First write an unscaled center-Z OME-TIFF with
+   `threshold-review`, inspect its native intensity values,
+   and pass the selected value to `--fixed-mask-threshold`. Do not transfer a
+   threshold selected from the moving channel. Mark threshold-empty or overly
    masked windows as rejected and exclude them from recovery.
 3. Detect implausible or missing fits from per-tile leave-one-out corner-displacement
    residuals. Rerun eligible windows from a leave-one-out initializer. Average
@@ -443,6 +465,39 @@ Use this order:
    then validate the OME-Zarr completion marker, multiscales, shapes, chunks,
    codecs, and an overlay-free intensity QC image.
 
+Generate the fixed-channel threshold artifact before the fit:
+
+```bash
+lightsheet threshold-review \
+  --fixed-fused FIXED_FUSED_OME_ZARR \
+  --output RUN_DIR/fixed-mask-review.ome.tif \
+  --level 2
+```
+
+Run the canonical fused-fixed Method 6 fit and global affine aggregation as one
+CLI stage:
+
+```bash
+lightsheet cross-register method6 \
+  --fixed-position FIXED.positions.json \
+  --moving-position MOVING.positions.json \
+  --moving-source-position MOVING.registration.json \
+  --fixed-fused FIXED_FUSED_OME_ZARR \
+  --output-dir RUN_DIR/method6 \
+  --output-registration RUN_DIR/registration.json \
+  --moving-channel 0 \
+  --fixed-mask-threshold 50 \
+  --source-label 638 \
+  --target-label 571 \
+  --workers 2 \
+  --devices 0,1
+```
+
+This command fixes the native method to Method 6, applies `log1p` to the fit
+inputs, starts level 0 from level-2 Method 8, and uses the identity linear
+initializer. Before writing the canonical registration, it validates those
+settings and the input paths against the completed or resumed sweep summary.
+
 The overlap in step 6 is required. Materializing only the 480-voxel level-0
 source cores gives the blending weights no shared pixels at core boundaries
 and produces a checker-stripe pattern. The materializer maps each accepted
@@ -459,9 +514,9 @@ Accepted fits seed recovery only when their leave-one-out transform differs
 from the remaining fits by no more than the configured corner-displacement
 tolerance. Outliers become recovery targets and cannot seed their own tile or
 an adjacent tile. A refit of an accepted spatial outlier is retained only when
-its gradient NCC exceeds the original fit and it remains within the
-refit-displacement tolerance of the consensus initializer. Detection defaults
-to 5 px; the separate refit tolerance defaults to 10 px.
+its gradient NCC exceeds the original fit. Distance from the consensus
+initializer is recorded for diagnostics but does not veto an accepted refit.
+Detection defaults to 5 px.
 The historical filename remains `fused_fixed_method8_summary.json`. Each
 command writes a new directory and refuses to overwrite an existing result.
 

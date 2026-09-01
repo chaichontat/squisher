@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -261,6 +263,85 @@ def _read_channel_names_from_zarr(store: Path) -> list[str] | None:
 
 def _is_zarr_path(file: Path) -> bool:
     return file.suffix == ".zarr" or (file.is_dir() and file.name.endswith(".zarr"))
+
+
+def _is_registered_input_path(file: Path) -> bool:
+    if file.suffix != ".json" or not file.is_file():
+        return False
+    try:
+        payload = json.loads(file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("artifact_type") == "squisher_segment.registered_ome_input.v1"
+    )
+
+
+def _is_random_access_volume_path(file: Path) -> bool:
+    return _is_zarr_path(file) or _is_registered_input_path(file)
+
+
+def _stage_registered_volume(input_path: Path, stage_path: Path) -> Path:
+    """Materialize one registered ROI once and reuse it across extract modes."""
+    if not _is_registered_input_path(input_path):
+        raise click.BadParameter("--stage requires a registered OME-Zarr input manifest.")
+    if stage_path.suffix != ".zarr":
+        raise click.BadParameter("--stage must point to a .zarr store.")
+
+    source_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    if stage_path.exists():
+        try:
+            staged = zarr.open_array(stage_path, mode="r")
+        except (OSError, ValueError) as exc:
+            raise click.BadParameter(f"Existing stage is not a readable Zarr array: {stage_path}") from exc
+        metadata = staged.attrs.get("squisher_extract_stage")
+        if staged.attrs.get("squisher_complete") is not True:
+            raise click.BadParameter(f"Existing stage is incomplete: {stage_path}")
+        if not isinstance(metadata, dict) or metadata.get("source_sha256") != source_sha256:
+            raise click.BadParameter(f"Existing stage does not match {input_path}: {stage_path}")
+        if metadata.get("shape") != list(staged.shape) or metadata.get("dtype") != str(staged.dtype):
+            raise click.BadParameter(f"Existing stage metadata is inconsistent: {stage_path}")
+        logger.info(f"Reusing staged registered ROI: {stage_path}")
+        return stage_path
+
+    vol, channel_names = _open_volume(input_path)
+    shape = tuple(int(size) for size in vol.shape)
+    if len(shape) != 4:
+        raise ValueError(f"Registered input must be ZYXC; got shape {shape}.")
+    dtype = np.dtype(vol.dtype)
+    chunks = (
+        min(shape[0], 16),
+        min(shape[1], 256),
+        min(shape[2], 256),
+        shape[3],
+    )
+    stage_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = zarr.create_array(stage_path, shape=shape, chunks=chunks, dtype=dtype)
+    staged.attrs.update(
+        {
+            "_ARRAY_DIMENSIONS": ["z", "y", "x", "c"],
+            "key": channel_names,
+            "squisher_complete": False,
+            "squisher_extract_stage": {
+                "version": 1,
+                "source": str(input_path.resolve()),
+                "source_sha256": source_sha256,
+                "shape": list(shape),
+                "dtype": str(dtype),
+            },
+        }
+    )
+
+    plane_bytes = math.prod(shape[1:]) * dtype.itemsize
+    z_step = max(1, min(shape[0], (512 * 1024**2) // max(1, plane_bytes)))
+    logger.info(f"Staging registered ROI once to {stage_path} in Z batches of {z_step}")
+    for z_start in range(0, shape[0], z_step):
+        z_stop = min(shape[0], z_start + z_step)
+        staged[z_start:z_stop, :, :, :] = np.asarray(vol[z_start:z_stop, :, :, :])
+    staged.attrs["squisher_complete"] = True
+    logger.info(f"Staged registered ROI: {stage_path}")
+    return stage_path
 
 
 def _open_zarr_array(file: Path) -> zarr.Array:
@@ -632,6 +713,13 @@ def _open_volume(file: Path) -> tuple[Volume, list[str] | None]:
     - Zarr: opened directly without materialization.
     Returns: (volume, channel_names)
     """
+    if _is_registered_input_path(file):
+        from squisher_segment.segmentation.distributed.distributed_segmentation import (
+            _open_registered_ome_input,
+        )
+
+        registered, _, _ = _open_registered_ome_input(file)
+        return registered, list(registered.channel_names)
     if _is_zarr_path(file):
         arr = _open_zarr_array(file)
         axes = _zarr_array_axes(arr)
@@ -1007,6 +1095,29 @@ def _fixed_depth_z_slice(center: int, *, z_len: int, depth: int) -> slice:
     return slice(start, start + depth)
 
 
+def _deduplicate_ortho_content_crops(
+    crops: list[RandomContentCrop],
+    *,
+    z_len: int,
+    ortho_depth: int | None,
+) -> list[RandomContentCrop]:
+    """Keep one sample for each output-identical XYZ crop window."""
+    unique: list[RandomContentCrop] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for crop in crops:
+        z_slice = (
+            _z_crop_slice_around(crop.z_index, z_len=z_len)
+            if ortho_depth is None
+            else _fixed_depth_z_slice(crop.z_index, z_len=z_len, depth=ortho_depth)
+        )
+        key = (crop.y0, crop.x0, int(z_slice.start), int(z_slice.stop))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(crop)
+    return unique
+
+
 def _z_candidates_around(
     center: int,
     *,
@@ -1155,11 +1266,13 @@ def _execute_extraction(
     if roi_points is not None:
         logger.info(f"[{label}] Using ROI points from: {roi_points}")
 
-    all_zarr = bool(files and all(_is_zarr_path(f) for f in files))
-    if aux_channel_stack is not None and not (all_zarr and config.mode in {"ortho", "z"}):
+    all_random_access = bool(files and all(_is_random_access_volume_path(file) for file in files))
+    if aux_channel_stack is not None and not (
+        all_random_access and config.mode in {"ortho", "z"}
+    ):
         raise click.BadParameter("--aux-channel-stack is currently supported for z/ortho extraction from a Zarr input.")
 
-    if all_zarr and config.mode == "z":
+    if all_random_access and config.mode == "z":
         _execute_zarr_z_extraction(
             label=label,
             files=files,
@@ -1173,7 +1286,7 @@ def _execute_extraction(
         )
         return
 
-    if all_zarr and config.mode == "maxproj":
+    if all_random_access and config.mode == "maxproj":
         _execute_zarr_maxproj_extraction(
             label=label,
             files=files,
@@ -1186,7 +1299,7 @@ def _execute_extraction(
         )
         return
 
-    if all_zarr and config.mode == "ortho":
+    if all_random_access and config.mode == "ortho":
         _execute_zarr_ortho_extraction(
             label=label,
             files=files,
@@ -1260,6 +1373,7 @@ def _execute_zarr_z_extraction(
                 rng=rng,
                 label=f"{label}:{f.name}",
             )
+            candidates_by_origin: dict[tuple[int, int], set[int]] = {}
             for crop in content_crops:
                 z_candidates = _contentful_z_candidates_around(
                     vol=vol,
@@ -1275,6 +1389,8 @@ def _execute_zarr_z_extraction(
                         f"z={crop.z_index}, y={crop.y0}, x={crop.x0}."
                     )
                     continue
+                candidates_by_origin.setdefault((crop.y0, crop.x0), set()).update(z_candidates)
+            for origin, z_candidates in candidates_by_origin.items():
                 total_outputs += len(z_candidates)
                 tile_jobs.append(
                     TileJob(
@@ -1283,8 +1399,8 @@ def _execute_zarr_z_extraction(
                         channel_names=names_all,
                         mask_vol=mask_vol,
                         mask_path=mask_path,
-                        tile_origins=[(crop.y0, crop.x0)],
-                        z_candidates=z_candidates,
+                        tile_origins=[origin],
+                        z_candidates=sorted(z_candidates),
                         aux_channel_vols=aux_channel_vols,
                         aux_channel_names=aux_channel_names,
                     )
@@ -1611,7 +1727,17 @@ def _execute_zarr_ortho_extraction(
                     label=f"{label}:{f.name}",
                 )
                 content_crops_by_file[f] = content_crops
-                for sample in content_crops:
+                ortho_content_crops = _deduplicate_ortho_content_crops(
+                    content_crops,
+                    z_len=vol.shape[0],
+                    ortho_depth=config.ortho_depth,
+                )
+                if len(ortho_content_crops) != len(content_crops):
+                    logger.info(
+                        f"[{label}:{f.name}] Collapsed {len(content_crops)} sampled crops "
+                        f"to {len(ortho_content_crops)} unique ortho output windows"
+                    )
+                for sample in ortho_content_crops:
                     base_y = sample.y0 + ZARR_TILE_SIZE // 2
                     base_x = sample.x0 + ZARR_TILE_SIZE // 2
                     x_slice = slice(sample.x0, sample.x0 + ZARR_TILE_SIZE)
@@ -2052,6 +2178,10 @@ def _parse_channels(ch_arg: str | None, names: list[str] | None, channel_count: 
     if not parts:
         raise click.BadParameter("Empty --channels specification.")
 
+    if names and all(part in names for part in parts):
+        name_to_idx = {name: index for index, name in enumerate(names)}
+        return [name_to_idx[part] for part in parts]
+
     try:
         return [int(p) for p in parts]
     except ValueError:
@@ -2491,6 +2621,36 @@ def _extract_maxproj_slices(
             reporter.advance()
 
 
+def _iter_mask_tile_batches(
+    mask_vol: MaskLike,
+    z_candidates: list[int],
+    y_slice: slice,
+    x_slice: slice,
+    *,
+    max_retained_bytes: int = 64 * 1024**2,
+) -> Iterator[tuple[list[int], np.ndarray]]:
+    """Read selected mask planes in bounded batches, using Zarr chunk locality when available."""
+    y_size = int(y_slice.stop) - int(y_slice.start)
+    x_size = int(x_slice.stop) - int(x_slice.start)
+    dtype = np.dtype(getattr(mask_vol, "dtype", np.uint32))
+    planes_per_batch = max(1, max_retained_bytes // max(1, y_size * x_size * dtype.itemsize))
+    orthogonal_indexer = getattr(mask_vol, "oindex", None)
+
+    for start in range(0, len(z_candidates), planes_per_batch):
+        batch_z = z_candidates[start : start + planes_per_batch]
+        if orthogonal_indexer is None:
+            mask_tiles = np.stack(
+                [np.asarray(mask_vol[z_index, y_slice, x_slice]) for z_index in batch_z]
+            )
+        else:
+            mask_tiles = np.asarray(orthogonal_indexer[batch_z, y_slice, x_slice])
+        if mask_tiles.shape[0] != len(batch_z):
+            raise ValueError(
+                f"Mask batch returned {mask_tiles.shape[0]} planes for {len(batch_z)} Z indices."
+            )
+        yield batch_z, mask_tiles
+
+
 def _extract_tiles_from_zarr(
     *,
     job: TileJob,
@@ -2528,66 +2688,78 @@ def _extract_tiles_from_zarr(
         y_slice_tile = slice(y0, y0 + ZARR_TILE_SIZE)
         x_slice_tile = slice(x0, x0 + ZARR_TILE_SIZE)
         skipped_for_tile = 0
-        for z_index in z_candidates:
-            if cancel_event.is_set():
-                raise TaskCancelledException("Cancelled by user")
-            plane = job.vol[z_index, y_slice_tile, x_slice_tile, :]
-            aux_planes = [
-                np.asarray(aux_vol[z_index, y_slice_tile, x_slice_tile, :])
-                for aux_vol in job.aux_channel_vols
-            ]
-            skip_tile = _has_too_many_zero_pixels(np.asarray(plane))
-            other_max = None
-            if other_vol is not None:
-                other_tile = other_vol[z_index, y_slice_tile, x_slice_tile, :]
-                if not skip_tile:
-                    skip_tile = _has_too_many_zero_pixels(np.asarray(other_tile))
-                if not skip_tile:
-                    other_max = other_tile.max(axis=2)
+        mask_batches: Iterator[tuple[list[int], np.ndarray | None]]
+        if job.mask_vol is None:
+            mask_batches = iter([(z_candidates, None)])
+        else:
+            mask_batches = _iter_mask_tile_batches(
+                job.mask_vol,
+                z_candidates,
+                y_slice_tile,
+                x_slice_tile,
+            )
 
-            if skip_tile:
-                skipped_for_tile += 1
+        for batch_z, mask_tiles in mask_batches:
+            for batch_index, z_index in enumerate(batch_z):
+                if cancel_event.is_set():
+                    raise TaskCancelledException("Cancelled by user")
+                plane = job.vol[z_index, y_slice_tile, x_slice_tile, :]
+                aux_planes = [
+                    np.asarray(aux_vol[z_index, y_slice_tile, x_slice_tile, :])
+                    for aux_vol in job.aux_channel_vols
+                ]
+                skip_tile = _has_too_many_zero_pixels(np.asarray(plane))
+                other_max = None
+                if other_vol is not None:
+                    other_tile = other_vol[z_index, y_slice_tile, x_slice_tile, :]
+                    if not skip_tile:
+                        skip_tile = _has_too_many_zero_pixels(np.asarray(other_tile))
+                    if not skip_tile:
+                        other_max = other_tile.max(axis=2)
+
+                if skip_tile:
+                    skipped_for_tile += 1
+                    if reporter is not None:
+                        reporter.advance()
+                    continue
+
+                cyx_u16 = _prep_slab(
+                    plane,
+                    ch_idx=selected_indices,
+                    channel_axis=2,
+                    crop_slices=None,
+                    filter_before=True,
+                    append_max=other_max,
+                    apply_filter=False,
+                )
+                cyx_u16 = _append_aux_channel_slabs(cyx_u16, aux_planes, channel_axis=2)
+                cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
+                out_name = _format_tile_filename(
+                    job.file.stem,
+                    roi,
+                    z_index,
+                    y0,
+                    x0,
+                    coord_width=coord_width,
+                )
+                out_file = out_dir / out_name
+                _write_tiff(
+                    out_file,
+                    cyx_u16,
+                    axes="CYX",
+                    names=out_names,
+                    channels_arg=channels,
+                    upscale=upscale,
+                )
+                if mask_tiles is not None:
+                    mask_tile = _squeeze_mask(mask_tiles[batch_index])
+                    if mask_tile.ndim != 2:
+                        raise ValueError("Mask tile extraction expected 2D data.")
+                    resized_mask = _resize_mask(mask_tile, (upscale, upscale))
+                    mask_out = out_dir / _mask_filename(out_name)
+                    _write_mask_tiff(mask_out, resized_mask, axes="YX")
                 if reporter is not None:
                     reporter.advance()
-                continue
-
-            cyx_u16 = _prep_slab(
-                plane,
-                ch_idx=selected_indices,
-                channel_axis=2,
-                crop_slices=None,
-                filter_before=True,
-                append_max=other_max,
-                apply_filter=False,
-            )
-            cyx_u16 = _append_aux_channel_slabs(cyx_u16, aux_planes, channel_axis=2)
-            cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
-            out_name = _format_tile_filename(
-                job.file.stem,
-                roi,
-                z_index,
-                y0,
-                x0,
-                coord_width=coord_width,
-            )
-            out_file = out_dir / out_name
-            _write_tiff(
-                out_file,
-                cyx_u16,
-                axes="CYX",
-                names=out_names,
-                channels_arg=channels,
-                upscale=upscale,
-            )
-            if job.mask_vol is not None:
-                mask_tile = _squeeze_mask(job.mask_vol[z_index, y_slice_tile, x_slice_tile])
-                if mask_tile.ndim != 2:
-                    raise ValueError("Mask tile extraction expected 2D data.")
-                resized_mask = _resize_mask(mask_tile, (upscale, upscale))
-                mask_out = out_dir / _mask_filename(out_name)
-                _write_mask_tiff(mask_out, resized_mask, axes="YX")
-            if reporter is not None:
-                reporter.advance()
         if skipped_for_tile:
             logger.debug(
                 f"Skipped {skipped_for_tile} z-slice(s) in tile ({y0},{x0}) of {job.file.name} due to zeros."

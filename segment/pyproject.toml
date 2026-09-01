@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Extracted distributed Cellpose segmentation and 3D post-processing tools."
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "cellpose @ git+https://github.com/chaichontat/cellpose.git@packed",
+    "cellpose @ git+https://github.com/chaichontat/cellpose.git@cd3eaf13933511d13a490c4452e39bb104485475",
     "click>=8.1",
     "cucim-cu12>=26.6.0",
     "cupy-cuda12x",

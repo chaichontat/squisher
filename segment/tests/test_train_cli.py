@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from squisher_segment.cli import app
@@ -13,33 +12,27 @@ import squisher_segment.segment.train as train_module
 
 
 _BASE_CONFIG = {
+    "name": "embryonicsheet",
     "base_model": None,
     "channels": (1, 2),
     "training_paths": ["sample"],
 }
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("name", "embryonicsheet"),
-        ("bsize", 224),
-        ("SGD", False),
-        ("optimizer", "adamw"),
-        ("use_te", False),
-        ("te_fp8", False),
-    ],
-)
-def test_train_config_rejects_removed_fields(field: str, value: object) -> None:
-    config = {**_BASE_CONFIG, field: value}
-
-    with pytest.raises(ValidationError) as exc_info:
-        TrainConfig.model_validate(config)
-
-    assert any(
-        error["loc"] == (field,) and error["type"] == "extra_forbidden"
-        for error in exc_info.value.errors()
+def test_train_config_accepts_fishtools2_fields() -> None:
+    config = TrainConfig.model_validate(
+        {
+            **_BASE_CONFIG,
+            "bsize": 256,
+            "SGD": False,
+            "optimizer": None,
+        }
     )
+
+    assert config.name == "embryonicsheet"
+    assert config.bsize == 256
+    assert config.SGD is False
+    assert config.optimizer is None
 
 
 def test_run_train_rejects_invalid_test_folder(tmp_path: Path, monkeypatch) -> None:
@@ -82,6 +75,7 @@ def test_train_reads_config_and_writes_trained_config(tmp_path: Path, monkeypatc
     models_path = tmp_path / "models"
     models_path.mkdir()
     config = TrainConfig(
+        name="embryonicsheet",
         base_model=None,
         channels=(1, 2),
         training_paths=["sample"],
@@ -148,6 +142,7 @@ def test_run_train_prepares_images_and_records_model(tmp_path: Path, monkeypatch
         "embryonicsheet",
         tmp_path,
         TrainConfig(
+            name="embryonicsheet",
             base_model=None,
             channels=(1, 2),
             training_paths=["sample"],
@@ -158,7 +153,13 @@ def test_run_train_prepares_images_and_records_model(tmp_path: Path, monkeypatch
     assert updated.model_md5 is not None
 
 
-def test_train_skips_trt_build_when_configured(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(("optimizer", "expected_sgd"), [(None, True), ("adamw", False)])
+def test_train_passes_optimizer_controls(
+    tmp_path: Path,
+    monkeypatch,
+    optimizer: str | None,
+    expected_sgd: bool,
+) -> None:
     model_path = tmp_path / "models" / "embryonicsheet"
     model_path.parent.mkdir()
     model_path.write_bytes(b"trained model")
@@ -170,20 +171,27 @@ def test_train_skips_trt_build_when_configured(tmp_path: Path, monkeypatch) -> N
         "CellposeModel",
         lambda **_: SimpleNamespace(net=SimpleNamespace(diam_mean=np.array(30.0))),
     )
+    seen_train_kwargs: dict[str, object] = {}
+    seen_build_kwargs: dict[str, object] = {}
+
+    def fake_train(*_args, **kwargs):
+        seen_train_kwargs.update(kwargs)
+        return model_path, [0.3], None
+
     monkeypatch.setattr(
         train_module,
         "train_seg_transformer",
-        lambda *_args, **_kwargs: (model_path, [0.3], None),
+        fake_train,
     )
     monkeypatch.setattr(
         train_module,
         "_cleanup_model_artifacts",
-        lambda *_args, **_kwargs: pytest.fail("cleanup should not run"),
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         train_module,
         "build_trt_engine",
-        lambda *_args, **_kwargs: pytest.fail("TRT build should not run"),
+        lambda **kwargs: seen_build_kwargs.update(kwargs),
     )
 
     returned_path, train_losses, test_losses = train_module._train(
@@ -198,13 +206,19 @@ def test_train_skips_trt_build_when_configured(tmp_path: Path, monkeypatch) -> N
         tmp_path,
         "embryonicsheet",
         TrainConfig(
+            name="embryonicsheet",
             base_model="cpsam",
             channels=(1, 2),
             training_paths=["sample"],
-            skip_trt=True,
+            bsize=192,
+            SGD=True,
+            optimizer=optimizer,
         ),
     )
 
     assert returned_path == model_path
     assert train_losses == [0.3]
     assert test_losses is None
+    assert seen_train_kwargs["bsize"] == 192
+    assert seen_train_kwargs["SGD"] is expected_sgd
+    assert seen_build_kwargs["bsize"] == 256

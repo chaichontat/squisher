@@ -20,13 +20,13 @@ References:
 """
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import distributed
 from distributed import WorkerPlugin
 
 from squisher_segment.segment.model_artifacts import (
+    configured_model_paths,
     file_sha256,
     plan_path_for_device,
     runtime_source_sha256,
@@ -62,11 +62,7 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     if backend != "sam":
         raise ValueError("Distributed segmentation supports only the SAM backend.")
 
-    pretrained_model = resolved_kwargs.get("pretrained_model")
-    if pretrained_model is None:
-        raise ValueError("model_kwargs must include 'pretrained_model'.")
-
-    pretrained_path = Path(pretrained_model)
+    model_paths = configured_model_paths(resolved_kwargs)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. TensorRT requires CUDA.")
@@ -74,17 +70,22 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
         raise RuntimeError("No CUDA devices found. TensorRT requires a GPU.")
 
     device_name = torch.cuda.get_device_name(0)
-    plan_candidate = plan_path_for_device(pretrained_path, device_name)
-
-    if not plan_candidate.is_file():
-        raise FileNotFoundError(
-            f"TensorRT plan required. Expected plan at {plan_candidate} for the current GPU."
+    for model_role, model_path in model_paths.items():
+        plan_candidate = plan_path_for_device(model_path, device_name)
+        if not plan_candidate.is_file():
+            raise FileNotFoundError(
+                f"TensorRT plan required for {model_role}. Expected plan at {plan_candidate} "
+                f"for CUDA device '{device_name}'."
+            )
+        _get_worker_logger().info(
+            "Using %s TensorRT plan %s for CUDA device '%s'",
+            model_role,
+            plan_candidate.name,
+            device_name,
         )
-
-    _get_worker_logger().info(
-        f"Using TensorRT plan {plan_candidate.name} for CUDA device '{device_name}'"
-    )
-    resolved_kwargs["pretrained_model"] = str(plan_candidate)
+        resolved_kwargs[
+            "pretrained_model" if model_role == "xy" else "pretrained_model_ortho"
+        ] = str(plan_candidate)
     resolved_kwargs.setdefault("gpu", True)
     return PackedCellposeModelTRT(**resolved_kwargs)
 
@@ -97,22 +98,29 @@ def _validate_worker_plan(
     import torch
 
     device_name = torch.cuda.get_device_name(0)
-    plan_path = plan_path_for_device(Path(model_kwargs["pretrained_model"]), device_name).resolve()
-    expected = next(
-        (plan for plan in trt_plans if plan.get("device_name") == device_name),
-        None,
-    )
-    plan_stat = plan_path.stat()
-    if (
-        expected is None
-        or expected.get("path") != str(plan_path)
-        or expected.get("size") != plan_stat.st_size
-        or expected.get("mtime_ns") != plan_stat.st_mtime_ns
-        or expected.get("sha256") != file_sha256(plan_path)
-    ):
-        raise RuntimeError(
-            f"Worker device '{device_name}' selected unrecorded TensorRT plan {plan_path}."
+    for model_role, model_path in configured_model_paths(model_kwargs).items():
+        plan_path = plan_path_for_device(model_path, device_name).resolve()
+        expected = next(
+            (
+                plan
+                for plan in trt_plans
+                if plan.get("model_role") == model_role
+                and plan.get("device_name") == device_name
+            ),
+            None,
         )
+        plan_stat = plan_path.stat()
+        if (
+            expected is None
+            or expected.get("path") != str(plan_path)
+            or expected.get("size") != plan_stat.st_size
+            or expected.get("mtime_ns") != plan_stat.st_mtime_ns
+            or expected.get("sha256") != file_sha256(plan_path)
+        ):
+            raise RuntimeError(
+                f"Worker device '{device_name}' selected unrecorded {model_role} "
+                f"TensorRT plan {plan_path}."
+            )
 
 
 def _validate_worker_sources(expected: dict[str, str]) -> None:

@@ -45,6 +45,21 @@ def _recovery_row() -> dict[str, object]:
     }
 
 
+def test_recovery_initializer_preserves_recovery_identity() -> None:
+    recovery = _load_recovery()
+    row = _recovery_row() | {"moving_tile": "sample.095.ome.zarr"}
+
+    payload = recovery._initializer_payload(
+        row,
+        np.concatenate([np.eye(3).ravel(), np.zeros(3)]),
+        {"reason": "spatial_transform_outlier"},
+    )
+
+    assert payload["artifact_type"] == (
+        "lightsheet.fused_fixed_native_spatial_recovery_initializer.v1"
+    )
+
+
 def test_detects_and_interpolates_spatial_transform_outlier() -> None:
     recovery = _load_recovery()
     points = np.asarray([[z, y, x] for z in range(5) for y in range(4) for x in range(2)], dtype=np.float64)
@@ -363,18 +378,8 @@ def test_selected_transform_update_keeps_all_representations_consistent() -> Non
     [
         (None, "native_worker_output_missing"),
         ({"status": "rejected", "rejection_reason": "native_rejected"}, "native_rerun_rejected"),
-        (
-            {
-                "status": "accepted",
-                "rejection_reason": None,
-                "selected_attempt": "native_method10_mattes_from_recovery_initializer",
-                "selected_local_matrix_zyx": np.eye(3).tolist(),
-                "selected_local_translation_zyx": [20.0, 0.0, 0.0],
-            },
-            "native_rerun_spatial_outlier",
-        ),
     ],
-    ids=["missing-output", "native-rejection", "spatial-outlier"],
+    ids=["missing-output", "native-rejection"],
 )
 def test_failed_refit_retains_accepted_original(tmp_path, rerun_payload, expected_reason) -> None:
     recovery = _load_recovery()
@@ -434,6 +439,40 @@ def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path) ->
 
     assert result["status"] == "accepted"
     assert result["native_rerun_selected"] is True
+
+
+def test_improving_spatial_refit_ignores_displacement_bound(tmp_path: Path) -> None:
+    recovery = _load_recovery()
+    original_path = tmp_path / "input" / "window.json"
+    output_dir = tmp_path / "output"
+    output_path = output_dir / "window_json" / original_path.name
+    row = {**_recovery_row(), "selected_gradient_component_ncc_mean": 0.40}
+    recovery._write_json(
+        output_path,
+        {
+            **row,
+            "selected_attempt": "native_method6_from_recovery_initializer",
+            "selected_local_translation_zyx": [20.0, 0.0, 0.0],
+            "selected_gradient_component_ncc_mean": 0.50,
+        },
+    )
+
+    result = recovery._finalize_native_rerun(
+        {
+            "row": row,
+            "original_path": original_path,
+            "transform": np.r_[np.eye(3).ravel(), [0.0, 0.0, 0.0]],
+            "provenance": {
+                "reason": "spatial_transform_outlier",
+                "maximum_refit_displacement_px": 1.0,
+            },
+        },
+        output_dir=output_dir,
+        native_method="method6",
+    )
+
+    assert result["native_rerun_selected"] is True
+    assert result["refined_translation_zyx"] == [20.0, 0.0, 0.0]
 
 
 def test_rerun_validation_uses_fixed_window_shape(tmp_path: Path) -> None:
@@ -634,6 +673,62 @@ def test_final_linear_filter_retains_fit_when_support_is_insufficient(
     )
 
 
+def test_final_linear_replacement_skips_insufficient_support(
+    tmp_path: Path, monkeypatch
+) -> None:
+    recovery = _load_recovery()
+    window_path = tmp_path / "window.json"
+    moving_position_path = tmp_path / "positions.json"
+    fixed_path = tmp_path / "fixed.zarr"
+    row = {**_recovery_row(), "moving_tile": "sample.001"}
+    recovery._write_json(window_path, row)
+    recovery._write_json(
+        moving_position_path,
+        {
+            "tiles": [
+                {
+                    "tile": "sample.001",
+                    "scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                    "translation_um": {"z": 0.0, "y": 0.0, "x": 0.0},
+                }
+            ]
+        },
+    )
+    zarr.open_group(fixed_path, mode="w")
+    monkeypatch.setattr(
+        recovery.ngff,
+        "scale_translation",
+        lambda _group: (["z", "y", "x"], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], True, True),
+    )
+    summary_path = tmp_path / "summary.json"
+    recovery._write_json(
+        summary_path,
+        {
+            "moving_position": str(moving_position_path),
+            "fixed_fused": str(fixed_path),
+            "cache_config": {"native_method": "method6"},
+            "windows": [{"level0_json": str(window_path)}],
+        },
+    )
+
+    result_path = recovery.smooth_final_linear_mapping(
+        SimpleNamespace(
+            summary=summary_path,
+            output_dir=tmp_path / "output",
+            minimum_smoothing_samples=4,
+            maximum_outlier_px=5.0,
+        )
+    )
+    result = recovery._read_json(result_path)
+    retained = recovery._read_json(Path(result["windows"][0]["level0_json"]))
+
+    assert retained["selected_attempt"] == row["selected_attempt"]
+    assert result["final_linear_interpolation"]["interpolated_window_count"] == 0
+    assert result["final_linear_interpolation"]["tiles"][0]["status"] == (
+        "skipped_insufficient_support"
+    )
+
+
 def test_adjacent_translation_initializer_collapses_duplicate_window_coordinates() -> None:
     recovery = _load_recovery()
     points = np.asarray([[0, 0, 0], [0, 0, 0], [2, 0, 0], [2, 0, 0]], dtype=np.float64)
@@ -730,20 +825,3 @@ def test_persistent_sweep_worker_is_picklable_for_spawn() -> None:
     sweep = recovery._load_sweep_module()
 
     pickle.dumps(sweep._init_cuda_worker)
-
-
-def test_recovery_initializer_bypasses_phase_priming(monkeypatch) -> None:
-    trial = _load_trial()
-    monkeypatch.setattr(
-        trial,
-        "estimate_translation_gpu",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("phase correlation should not run")),
-    )
-
-    delta = trial._phase_priming_delta(
-        SimpleNamespace(skip_phase_priming=True, phase_upsample_factor=10),
-        object(),
-        object(),
-    )
-
-    assert delta.tolist() == [0.0, 0.0, 0.0]

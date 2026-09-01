@@ -157,6 +157,87 @@ def _plane_from_fused_array(array, *, z: int, channel: int, stride: int) -> np.n
     raise ValueError(f"Unsupported fused array shape {array.shape}; expected ZYX, CZYX, or TCZYX")
 
 
+def write_fused_threshold_review_tiff(
+    *,
+    fused_zarr: Path,
+    output: Path,
+    level: int = 2,
+    z_index: int | None = None,
+) -> tuple[Path, Path]:
+    """Write one native-intensity YX plane from a channel-separated OME-Zarr."""
+    import tifffile
+    import zarr
+
+    manifest = output.with_name(output.name.removesuffix(".ome.tif") + ".json")
+    existing = [path for path in (output, manifest) if path.exists()]
+    if existing:
+        raise FileExistsError(f"Threshold-review output already exists: {', '.join(map(str, existing))}")
+
+    root = zarr.open_group(fused_zarr, mode="r")
+    dataset_path = ngff.level_path(root, level=level, context=fused_zarr)
+    array = root[dataset_path]
+    axes = list(ngff.axes(root, array).lower())
+    if axes != ["z", "y", "x"]:
+        raise ValueError(f"Expected channel-separated ZYX OME-Zarr, found axes {axes} in {fused_zarr}")
+    selected_z = int(array.shape[0] // 2 if z_index is None else z_index)
+    if not 0 <= selected_z < int(array.shape[0]):
+        raise ValueError(
+            f"z_index {selected_z} is outside level {level} z range [0, {array.shape[0]})"
+        )
+
+    dataset_index = ngff.dataset_paths(root).index(dataset_path)
+    transform_axes, scale, translation, _has_scale, _has_translation = ngff.scale_translation(
+        root,
+        dataset_index=dataset_index,
+    )
+    if transform_axes != axes:
+        raise ValueError(f"OME-Zarr transform axes {transform_axes} differ from array axes {axes}")
+    multiscale_axes = root.attrs["ome"]["multiscales"][0]["axes"]
+    units = [axis.get("unit") if isinstance(axis, dict) else None for axis in multiscale_axes]
+    if units != ["micrometer", "micrometer", "micrometer"]:
+        raise ValueError(f"Expected micrometer ZYX axes in {fused_zarr}, found units {units}")
+
+    plane = np.asarray(array[selected_z])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(
+        output,
+        plane,
+        ome=True,
+        photometric="minisblack",
+        tile=(256, 256),
+        compression="zlib",
+        metadata={
+            "axes": "YX",
+            "PhysicalSizeY": float(scale[1]),
+            "PhysicalSizeYUnit": "µm",
+            "PhysicalSizeX": float(scale[2]),
+            "PhysicalSizeXUnit": "µm",
+        },
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifact_type": "lightsheet.fused_threshold_review.v1",
+                "source_zarr": str(fused_zarr.resolve()),
+                "source_array": dataset_path,
+                "source_shape": [int(value) for value in array.shape],
+                "source_dtype": str(array.dtype),
+                "level": int(level),
+                "z_index": selected_z,
+                "z_um": float(translation[0] + selected_z * scale[0]),
+                "scale_um_zyx": [float(value) for value in scale],
+                "translation_um_zyx": [float(value) for value in translation],
+                "output_tiff": str(output.resolve()),
+                "output_shape_yx": [int(value) for value in plane.shape],
+                "processing": "none; native intensity values",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return output.resolve(), manifest.resolve()
+
+
 def render_live_fusion_preview(
     *,
     source_zarr: Path | None = None,

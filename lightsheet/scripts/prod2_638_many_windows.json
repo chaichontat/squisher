@@ -1,0 +1,659 @@
+[
+  {
+    "moving_tile": "235-514561638-3.000.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.000.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.001.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.001.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.002.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.002.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.003.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.003.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.004.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.004.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.005.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.005.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.006.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.006.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.007.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.007.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.008.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.008.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.009.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.009.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.010.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.010.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.011.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.011.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.012.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.012.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.013.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.013.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.014.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.014.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.015.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.015.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.016.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.016.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.017.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.017.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.018.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.018.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.019.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.019.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.020.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.020.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.021.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.021.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.022.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.022.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.023.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.023.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.024.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.024.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.025.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.025.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.026.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.026.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.027.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.027.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.028.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.028.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.029.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.029.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.030.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.030.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.031.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.031.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.032.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.032.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.033.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.033.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.034.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.034.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.035.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.035.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.036.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.036.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.037.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.037.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.038.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.038.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.039.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.039.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.040.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.040.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.041.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.041.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.042.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.042.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.043.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.043.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.044.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.044.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.045.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.045.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.046.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.046.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.047.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.047.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.048.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.048.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.049.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.049.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.050.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.050.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.051.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.051.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.052.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.052.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.053.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.053.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.054.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.054.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.055.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.055.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.056.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.056.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.057.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.057.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.058.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.058.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.059.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.059.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.060.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.060.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.061.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.061.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.062.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.062.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.063.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.063.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.064.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.064.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.065.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.065.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.066.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.066.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.067.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.067.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.068.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.068.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.069.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.069.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.070.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.070.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.071.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.071.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.072.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.072.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.073.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.073.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.074.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.074.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.075.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.075.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.076.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.076.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.077.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.077.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.078.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.078.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.079.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.079.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.080.ome.tif",
+    "tile": "qy1_qx0.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.080.ome.tif",
+    "tile": "qy1_qx1.z00960"
+  },
+  {
+    "moving_tile": "235-514561638-3.081.ome.tif",
+    "tile": "qy1_qx1.z00480"
+  },
+  {
+    "moving_tile": "235-514561638-3.081.ome.tif",
+    "tile": "qy1_qx0.z00960"
+  }
+]
+

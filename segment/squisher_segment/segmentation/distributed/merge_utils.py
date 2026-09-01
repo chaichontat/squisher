@@ -11,6 +11,7 @@ Provides:
 import logging
 import os
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,18 @@ from numpy.typing import NDArray
 logger = logging.getLogger(__name__)
 GLOBAL_LABEL_BITS = 16
 FINALIZE_WORKERS = min(8, os.cpu_count() or 1)
+
+
+def global_label_bits(nblocks: NDArray[np.int_]) -> int:
+    """Use the uint32 bits not required by the block grid for local labels."""
+    block_count = int(np.prod(nblocks, dtype=np.int64))
+    if block_count < 1:
+        raise ValueError("Block grid must contain at least one block.")
+    block_bits = max(1, (block_count - 1).bit_length())
+    label_bits = 32 - block_bits
+    if label_bits < 1:
+        raise ValueError(f"Block grid with {block_count} blocks cannot fit in uint32 IDs.")
+    return label_bits
 
 
 def _zarr_codecs(dtype: np.dtype | type[np.generic] | str, *, label: bool = False) -> list[Any]:
@@ -235,8 +248,10 @@ def sparse_relabel_and_write(
     write_path: Path | str,
     *,
     block_token_chunks: bool = False,
+    chunk_coords: Iterable[tuple[int, ...]] | None = None,
+    label_bits: int = GLOBAL_LABEL_BITS,
 ) -> None:
-    """Apply a sorted two-row ``global ID -> final label`` mapping by chunk."""
+    """Relabel selected temporary chunks into a full, sparse output array."""
     write_path = Path(write_path)
     mapping_path = Path(mapping_path)
     mapping = np.load(mapping_path, mmap_mode="r")
@@ -247,10 +262,8 @@ def sparse_relabel_and_write(
         or np.any(mapping[0, 1:] <= mapping[0, :-1])
     ):
         raise ValueError("Sparse label mapping requires positive, strictly increasing global IDs.")
-    del mapping
 
-    def apply_sparse_mapping(block: np.ndarray, path: str) -> np.ndarray:
-        mapping = np.load(path, mmap_mode="r")
+    def apply_sparse_mapping(block: np.ndarray) -> np.ndarray:
         old_labels, final_labels = mapping
         flattened = block.ravel()
         foreground = flattened != 0
@@ -268,45 +281,66 @@ def sparse_relabel_and_write(
             output[foreground] = final_labels[positions]
             return output.reshape(block.shape)
 
-        tokens = np.right_shift(old_foreground, GLOBAL_LABEL_BITS)
+        tokens = np.right_shift(old_foreground, label_bits)
         token = int(tokens[0])
         if np.any(tokens != token):
             raise ValueError("A temporary segmentation chunk contains multiple block tokens.")
 
-        token_start = token << GLOBAL_LABEL_BITS
-        token_stop = (token + 1) << GLOBAL_LABEL_BITS
+        token_start = token << label_bits
+        token_stop = (token + 1) << label_bits
         lo = np.searchsorted(old_labels, token_start, side="left")
         hi = np.searchsorted(old_labels, token_stop, side="left")
         token_old = old_labels[lo:hi]
         token_final = final_labels[lo:hi]
-        local_ids = np.bitwise_and(token_old, (1 << GLOBAL_LABEL_BITS) - 1)
+        local_ids = np.bitwise_and(token_old, (1 << label_bits) - 1)
         local_lut = np.zeros(int(local_ids.max(initial=0)) + 1, dtype=np.uint32)
         local_lut[local_ids] = token_final
 
-        block_local = np.bitwise_and(old_foreground, (1 << GLOBAL_LABEL_BITS) - 1)
+        block_local = np.bitwise_and(old_foreground, (1 << label_bits) - 1)
         if np.any(block_local >= local_lut.size) or np.any(local_lut[block_local] == 0):
             raise ValueError("Temporary segmentation contains a global ID absent from the sparse mapping.")
         output[foreground] = local_lut[block_local]
         return output.reshape(block.shape)
 
-    segmentation_da = dask.array.from_zarr(temp_zarr)
-    relabeled = dask.array.map_blocks(
-        apply_sparse_mapping,
-        segmentation_da,
-        path=str(mapping_path),
-        dtype=np.uint32,
-        chunks=segmentation_da.chunks,
+    grid_shape = tuple(
+        (int(size) + int(chunk) - 1) // int(chunk)
+        for size, chunk in zip(temp_zarr.shape, temp_zarr.chunks, strict=True)
     )
+    selected_chunks = [
+        tuple(int(index) for index in coord)
+        for coord in (np.ndindex(*grid_shape) if chunk_coords is None else chunk_coords)
+    ]
+    if len(set(selected_chunks)) != len(selected_chunks) or any(
+        len(coord) != temp_zarr.ndim
+        or any(index < 0 or index >= extent for index, extent in zip(coord, grid_shape, strict=True))
+        for coord in selected_chunks
+    ):
+        raise ValueError(f"Chunk coordinates must be unique and within the chunk grid {grid_shape}.")
+
     write_path.parent.mkdir(parents=True, exist_ok=True)
     out = create_zarr_array(
         write_path,
-        shape=tuple(int(s) for s in relabeled.shape),
-        chunks=tuple(int(c[0]) for c in relabeled.chunks),
+        shape=tuple(int(size) for size in temp_zarr.shape),
+        chunks=tuple(int(size) for size in temp_zarr.chunks),
         dtype=np.uint32,
         overwrite=True,
         codecs=label_zarr_codecs(np.uint32),
     )
-    write_dask_to_zarr(relabeled, out)
+
+    def relabel_chunk(coord: tuple[int, ...]) -> None:
+        slices = tuple(
+            slice(index * chunk, min((index + 1) * chunk, size))
+            for index, chunk, size in zip(coord, temp_zarr.chunks, temp_zarr.shape, strict=True)
+        )
+        relabeled = apply_sparse_mapping(np.asarray(temp_zarr[slices]))
+        if np.any(relabeled):
+            out[slices] = relabeled
+
+    if not selected_chunks:
+        return
+
+    with ThreadPoolExecutor(max_workers=min(FINALIZE_WORKERS, len(selected_chunks))) as executor:
+        list(executor.map(relabel_chunk, selected_chunks))
 
 
 def get_block_crops(
@@ -878,10 +912,12 @@ def stitch_label_pairs(
     temp_zarr: zarr.Array,
     write_path: Path | str,
     mapping_path: Path | str,
+    chunk_coords: Iterable[tuple[int, ...]] | None = None,
+    label_bits: int = GLOBAL_LABEL_BITS,
 ) -> tuple[zarr.Array, NDArray[np.uint32]]:
     """Merge precomputed overlap-IoU pairs and relabel the disjoint cores."""
     all_box_ids = (
-        np.concatenate(box_ids_list).astype(np.uint32)
+        np.concatenate(box_ids_list).astype(np.uint32, copy=False)
         if box_ids_list
         else np.empty(0, dtype=np.uint32)
     )
@@ -900,6 +936,8 @@ def stitch_label_pairs(
         mapping_path,
         write_path,
         block_token_chunks=True,
+        chunk_coords=chunk_coords,
+        label_bits=label_bits,
     )
     return zarr.open(write_path, mode="r"), mapping
 

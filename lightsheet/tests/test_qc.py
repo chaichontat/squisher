@@ -7,6 +7,7 @@ import sys
 import numpy as np
 from PIL import Image
 import pytest
+import tifffile
 import zarr
 
 from squisher_lightsheet import qc
@@ -329,6 +330,55 @@ def test_render_live_fusion_preview_uses_latest_log_output_and_nonzero_planes(tm
     assert result.selected_z == (1, 4)
     assert result.selected_nonzero_pixels == (12, 12)
     assert Image.open(output).size == (16, 34)
+
+
+def test_write_fused_threshold_review_preserves_native_plane(tmp_path) -> None:
+    fused = tmp_path / "fused.ome.zarr"
+    root = zarr.open_group(fused, mode="w")
+    values = np.arange(3 * 8 * 10, dtype=np.uint16).reshape(3, 8, 10)
+    root.create_array("2", data=values, chunks=(1, 4, 5))
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [
+                    {"name": "z", "type": "space", "unit": "micrometer"},
+                    {"name": "y", "type": "space", "unit": "micrometer"},
+                    {"name": "x", "type": "space", "unit": "micrometer"},
+                ],
+                "datasets": [
+                    {
+                        "path": "2",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [2.4, 1.2, 1.2]},
+                            {"type": "translation", "translation": [-6.0, 0.0, 0.0]},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    output = tmp_path / "review.ome.tif"
+
+    review_tiff, manifest = qc.write_fused_threshold_review_tiff(
+        fused_zarr=fused,
+        output=output,
+        level=0,
+        z_index=1,
+    )
+
+    np.testing.assert_array_equal(tifffile.imread(review_tiff), values[1])
+    with tifffile.TiffFile(review_tiff) as tif:
+        assert tif.is_ome
+        assert tif.series[0].axes == "YX"
+        assert 'PhysicalSizeX="1.2"' in tif.ome_metadata
+        assert 'PhysicalSizeY="1.2"' in tif.ome_metadata
+    payload = json.loads(manifest.read_text())
+    assert payload["artifact_type"] == "lightsheet.fused_threshold_review.v1"
+    assert payload["source_zarr"] == str(fused.resolve())
+    assert payload["source_array"] == "2"
+    assert payload["z_index"] == 1
+    assert payload["processing"] == "none; native intensity values"
 
 
 def test_render_fused_xyz_overlay_qc_rejects_shape_mismatch(tmp_path) -> None:

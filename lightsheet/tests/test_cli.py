@@ -65,7 +65,7 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "ome-metadata-dumb-stitch",
         "mvs-edge-audit",
         "mvs-refine-level0",
-        "rechunk-ome-tiff",
+        "rechunk-ome-zarr",
         "subtract-channel",
         "track-z-diagnostics",
         "align-lr-dumb-stitch",
@@ -283,6 +283,47 @@ def test_cross_register_method8_group_exposes_stage_subcommands() -> None:
     assert result.exit_code == 0
     for command in ("coarse", "method8", "materialize", "manifest"):
         assert command in result.stdout
+
+
+def test_threshold_review_forwards_source(tmp_path: Path, monkeypatch) -> None:
+    fused = tmp_path / "fused.ome.zarr"
+    fused.mkdir()
+    output = tmp_path / "review.ome.tif"
+    manifest = tmp_path / "review.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output, manifest
+
+    monkeypatch.setattr(cli_module, "write_fused_threshold_review_tiff", fake_write)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "threshold-review",
+            "--fixed-fused",
+            str(fused),
+            "--output",
+            str(output),
+            "--level",
+            "2",
+            "--z-index",
+            "308",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "fused_zarr": fused,
+        "output": output,
+        "level": 2,
+        "z_index": 308,
+    }
+    assert json.loads(result.stdout) == {
+        "review_tiff": str(output),
+        "manifest": str(manifest),
+    }
 
 
 def test_cross_register_method8_coarse_forwards_tile_phase_options(tmp_path: Path, monkeypatch) -> None:
@@ -656,7 +697,6 @@ def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypa
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return SimpleNamespace(stdout="/tmp/accepted_contact_sheet.png\n", stderr="")
 
     monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
     monkeypatch.setattr(cli_module, "FUSED_FIXED_CONTACT_SHEET_SCRIPT", Path(__file__))
@@ -669,17 +709,25 @@ def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypa
             str(run_dir),
             "--limit",
             "8",
+            "--status",
+            "rejected",
+            "--rejection-reason",
+            "native_rerun_rejected",
+            "--tile-filter",
+            "018",
             "--renderer-python",
             str(renderer_python),
         ],
     )
 
     assert result.exit_code == 0
-    assert "accepted_contact_sheet.png" in result.stdout
     assert captured["command"][captured["command"].index("--run-dir") + 1] == str(run_dir.resolve())
     assert captured["command"][captured["command"].index("--limit") + 1] == "8"
+    assert captured["command"][captured["command"].index("--status") + 1] == "rejected"
+    assert captured["command"][captured["command"].index("--rejection-reason") + 1] == "native_rerun_rejected"
+    assert captured["command"][captured["command"].index("--tile-filter") + 1] == "018"
     assert captured["command"][0] == str(renderer_python)
-    assert captured["kwargs"] == {"check": True, "text": True, "capture_output": True}
+    assert captured["kwargs"] == {"check": True}
 
 
 def test_mvs_edge_audit_cli_reports_dropped_edges(tmp_path) -> None:
@@ -762,12 +810,14 @@ def test_mvs_refine_level0_passes_repeated_fallback_refinement_levels(tmp_path, 
     assert captured["fallback_refinement_levels"] == (1, 2)
 
 
-def test_rechunk_ome_tiff_cli_exposes_chunk_default() -> None:
-    result = CliRunner().invoke(app, ["rechunk-ome-tiff", "--help"])
+def test_rechunk_ome_zarr_cli_exposes_transcode_options() -> None:
+    result = CliRunner().invoke(app, ["rechunk-ome-zarr", "--help"])
 
     assert result.exit_code == 0
     assert "--workers" in result.stdout
-    assert "12,240,240" in result.stdout
+    assert "--start-level" in result.stdout
+    assert "--zstd-level" in result.stdout
+    assert "12,480,480" in result.stdout
 
 
 def test_fuse_cli_parses_output_chunksize_zyx(tmp_path, monkeypatch) -> None:
