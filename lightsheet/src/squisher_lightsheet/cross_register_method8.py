@@ -141,6 +141,71 @@ def quadrant_z_windows(
     return windows
 
 
+def spatial_overlap_windows(
+    fixed_tile: TileRecord,
+    moving_tile: TileRecord,
+    *,
+    preseed_matrix_zyx: np.ndarray,
+    core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
+    window_shape_zyx: tuple[int, int, int] = (528, 528, 528),
+) -> list[dict[str, Any]]:
+    """Return exhaustive fixed-tile windows intersecting the moving tile prior."""
+    matrix, translation = preseeded_level0_model(
+        fixed_tile=fixed_tile,
+        moving_tile=moving_tile,
+        preseed_matrix_zyx=preseed_matrix_zyx,
+    )
+    fixed_center = (fixed_tile.shape_zyx.astype(np.float64) - 1.0) / 2.0
+    moving_center = (moving_tile.shape_zyx.astype(np.float64) - 1.0) / 2.0
+    moving_corners = _box_corners_zyx(
+        np.zeros(3, dtype=np.float64), moving_tile.shape_zyx.astype(np.float64) - 1.0
+    )
+    mapped = fixed_center + translation + (matrix @ (moving_corners - moving_center).T).T
+    overlap_start = np.maximum(np.floor(np.min(mapped, axis=0)), 0.0).astype(np.int64)
+    overlap_stop = np.minimum(
+        np.ceil(np.max(mapped, axis=0) + 1.0), fixed_tile.shape_zyx.astype(np.float64)
+    ).astype(np.int64)
+    minimum_crop = np.asarray([16, 64, 64], dtype=np.int64)
+    if np.any(overlap_stop - overlap_start < minimum_crop):
+        return []
+
+    axis_starts = [
+        _axis_starts(size, window=window, step=core)
+        for size, window, core in zip(
+            fixed_tile.shape_zyx, window_shape_zyx, core_shape_zyx, strict=True
+        )
+    ]
+    windows = []
+    window_shape = np.asarray(window_shape_zyx, dtype=np.int64)
+    for z_start in axis_starts[0]:
+        for y_start in axis_starts[1]:
+            for x_start in axis_starts[2]:
+                start = np.asarray([z_start, y_start, x_start], dtype=np.int64)
+                stop = start + window_shape
+                clipped_shape = np.minimum(stop, overlap_stop) - np.maximum(start, overlap_start)
+                if np.any(clipped_shape < minimum_crop):
+                    continue
+                exact_start, exact_stop, _metadata = _clip_fixed_crop_to_prior_overlap(
+                    fixed_start_zyx=start,
+                    fixed_stop_zyx=stop,
+                    fixed_shape_zyx=fixed_tile.shape_zyx,
+                    moving_shape_zyx=moving_tile.shape_zyx,
+                    full_matrix_zyx=matrix,
+                    full_translation_zyx=translation,
+                )
+                if np.any(exact_stop - exact_start < minimum_crop):
+                    continue
+                windows.append(
+                    {
+                        "quadrant": f"y{y_start:05d}_x{x_start:05d}",
+                        "fixed_start_zyx": start.tolist(),
+                        "fixed_stop_zyx": stop.tolist(),
+                        "window_shape_zyx": list(window_shape_zyx),
+                    }
+                )
+    return windows
+
+
 def preseeded_level0_model(
     *,
     fixed_tile: TileRecord,
@@ -348,6 +413,7 @@ def _cache_config_from_args(args: argparse.Namespace, *, preseed_matrix_zyx: np.
     return {
         "fixed_position": str(Path(args.fixed_position).resolve()),
         "moving_position": str(Path(args.moving_position).resolve()),
+        "pair_mode": str(getattr(args, "pair_mode", "tile-number")),
         "fixed_channel": int(args.fixed_channel),
         "moving_channel": int(args.moving_channel),
         "core_shape_zyx": [int(value) for value in args.core_shape_zyx],
@@ -373,6 +439,8 @@ def _cache_config_from_args(args: argparse.Namespace, *, preseed_matrix_zyx: np.
 def _is_resumable_row(row: dict[str, Any], *, cache_config: dict[str, Any]) -> bool:
     precheck = row.get("empty_precheck")
     if row.get("status") == "error" or not isinstance(precheck, dict):
+        return False
+    if row.get("native_return_code") not in (None, 0):
         return False
     if precheck.get("version") not in RESUMABLE_EMPTY_PRECHECK_VERSIONS:
         return False
@@ -589,10 +657,40 @@ def _obviously_empty(stats: dict[str, float], *, min_dynamic_range: float, min_s
     )
 
 
+def _method8_attempt_outcome(
+    *,
+    native_return_code: int,
+    corr: float | None,
+    grad_mean: float,
+    min_corr: float,
+    min_grad_ncc: float,
+) -> tuple[str, str | None]:
+    if native_return_code != 0:
+        return "error", f"native_registration_failed:return_code={native_return_code}"
+    accepted = (
+        corr is not None
+        and np.isfinite(float(corr))
+        and float(corr) >= min_corr
+        and np.isfinite(grad_mean)
+        and grad_mean >= min_grad_ncc
+    )
+    return ("accepted", None) if accepted else ("rejected", "quality_gate")
+
+
+def _select_method8_attempt(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    if candidate["status"] in {"accepted", "error"}:
+        return candidate
+    if float(candidate["gradient_component_ncc_mean"]) > float(current["gradient_component_ncc_mean"]):
+        return candidate
+    return current
+
+
 def _build_tasks(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     fixed_payload = json.loads(Path(args.fixed_position).read_text())
     moving_payload = json.loads(Path(args.moving_position).read_text())
-    moving_by_number = {_tile_number(str(record["tile"])): record for record in moving_payload["tiles"]}
+    pair_mode = str(getattr(args, "pair_mode", "tile-number"))
+    if pair_mode not in {"tile-number", "spatial-overlap"}:
+        raise ValueError(f"Unsupported pair_mode {pair_mode!r}")
     tile_filter = None
     if args.tile_filter:
         tile_filter = {part.strip().zfill(3) for part in args.tile_filter.split(",") if part.strip()}
@@ -603,27 +701,63 @@ def _build_tasks(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[d
     preseed_matrix = _parse_matrix_zyx(args.preseed_matrix_zyx)
     cache_config = _cache_config_from_args(args, preseed_matrix_zyx=preseed_matrix)
     task_index = 0
-    for fixed_record in fixed_payload["tiles"]:
-        tile_no = _tile_number(str(fixed_record["tile"]))
-        if tile_filter is not None and tile_no not in tile_filter:
-            continue
-        moving_record = moving_by_number.get(tile_no)
-        if moving_record is None:
-            raise ValueError(f"moving position file is missing tile number {tile_no}")
-        fixed_tile = tile_record_from_position_record(fixed_record)
-        moving_tile = tile_record_from_position_record(moving_record)
+    fixed_tiles = [tile_record_from_position_record(record) for record in fixed_payload["tiles"]]
+    moving_tiles = [tile_record_from_position_record(record) for record in moving_payload["tiles"]]
+    if pair_mode == "tile-number":
+        moving_by_number = {_tile_number(tile.tile): tile for tile in moving_tiles}
+        pairs = []
+        for fixed_tile in fixed_tiles:
+            tile_no = _tile_number(fixed_tile.tile)
+            if tile_filter is not None and tile_no not in tile_filter:
+                continue
+            moving_tile = moving_by_number.get(tile_no)
+            if moving_tile is None:
+                raise ValueError(f"moving position file is missing tile number {tile_no}")
+            windows = quadrant_z_windows(
+                tuple(int(value) for value in fixed_tile.shape_zyx),
+                core_shape_zyx=args.core_shape_zyx,
+                window_shape_zyx=args.window_shape_zyx,
+            )
+            pairs.append((fixed_tile, moving_tile, windows))
+    else:
+        pairs = []
+        for fixed_tile in fixed_tiles:
+            tile_no = _tile_number(fixed_tile.tile)
+            if tile_filter is not None and tile_no not in tile_filter:
+                continue
+            for moving_tile in moving_tiles:
+                windows = spatial_overlap_windows(
+                    fixed_tile,
+                    moving_tile,
+                    preseed_matrix_zyx=preseed_matrix,
+                    core_shape_zyx=args.core_shape_zyx,
+                    window_shape_zyx=args.window_shape_zyx,
+                )
+                if windows:
+                    pairs.append((fixed_tile, moving_tile, windows))
+
+    for fixed_tile, moving_tile, windows in pairs:
         if tuple(fixed_tile.shape_zyx.tolist()) != tuple(moving_tile.shape_zyx.tolist()):
             raise ValueError(
-                f"fixed/moving logical tile shapes differ for {fixed_record['tile']}: "
+                f"fixed/moving logical tile shapes differ for {fixed_tile.tile}: "
                 f"{fixed_tile.shape_zyx.tolist()} vs {moving_tile.shape_zyx.tolist()}"
             )
-        windows = quadrant_z_windows(
-            tuple(int(value) for value in fixed_tile.shape_zyx),
-            core_shape_zyx=args.core_shape_zyx,
-            window_shape_zyx=args.window_shape_zyx,
-        )
         for window in windows:
-            path = _window_path(args.output_dir, str(fixed_record["tile"]), window["quadrant"], window["fixed_start_zyx"][0])
+            if pair_mode == "tile-number":
+                path = _window_path(
+                    args.output_dir,
+                    fixed_tile.tile,
+                    window["quadrant"],
+                    window["fixed_start_zyx"][0],
+                )
+            else:
+                fixed_no = _tile_number(fixed_tile.tile)
+                moving_no = _tile_number(moving_tile.tile)
+                path = (
+                    args.output_dir
+                    / "window_json"
+                    / f"{fixed_no}-{moving_no}.{window['quadrant']}.z{window['fixed_start_zyx'][0]:05d}.json"
+                )
             if args.resume and path.exists():
                 row = json.loads(path.read_text())
                 if _is_resumable_row(row, cache_config=cache_config):
@@ -916,19 +1050,18 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
             corr = _corr_gpu(fixed_fit_gpu, registered, fixed_mask=fixed_fit_mask_gpu)
             gradient = gradient_component_ncc_3d_gpu(fixed_fit_gpu, registered, fixed_mask=fixed_fit_mask_gpu)
             grad_mean = _gradient_component_ncc_mean(gradient)
-            accepted = (
-                int(native.return_code) == 0
-                and corr is not None
-                and np.isfinite(float(corr))
-                and float(corr) >= float(task["min_corr"])
-                and np.isfinite(grad_mean)
-                and grad_mean >= float(task["min_grad_ncc"])
+            status, reason = _method8_attempt_outcome(
+                native_return_code=int(native.return_code),
+                corr=corr,
+                grad_mean=grad_mean,
+                min_corr=float(task["min_corr"]),
+                min_grad_ncc=float(task["min_grad_ncc"]),
             )
-            return {
+            attempt = {
                 "name": attempt_name,
                 "initial_fit_translation_zyx": np.asarray(attempt_translation, dtype=np.float64).tolist(),
-                "status": "accepted" if accepted else "rejected",
-                "rejection_reason": None if accepted else "quality_gate",
+                "status": status,
+                "rejection_reason": reason if status == "rejected" else None,
                 "native_return_code": int(native.return_code),
                 "corr_refined": None if corr is None else float(corr),
                 "gradient_component_ncc_refined": gradient,
@@ -944,6 +1077,9 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
                 "registered_zyx": registered,
                 "timing_seconds": time.perf_counter() - attempt_started,
             }
+            if status == "error":
+                attempt["error"] = reason
+            return attempt
 
         baseline_attempt = run_method8_attempt("preseed", fit_translation)
         attempts.append({key: value for key, value in baseline_attempt.items() if key != "registered_zyx"})
@@ -970,10 +1106,7 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
             }
             phase_attempt = run_method8_attempt("phase_primed_preseed", phase_fit_translation)
             attempts.append({key: value for key, value in phase_attempt.items() if key != "registered_zyx"})
-            if phase_attempt["status"] == "accepted" or float(phase_attempt["gradient_component_ncc_mean"]) > float(
-                selected_attempt["gradient_component_ncc_mean"]
-            ):
-                selected_attempt = phase_attempt
+            selected_attempt = _select_method8_attempt(selected_attempt, phase_attempt)
         row["timing_seconds"]["fit"] = time.perf_counter() - fit_started
         row["method8_attempts"] = attempts
         row.update(
@@ -994,6 +1127,8 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
                 "full_translation_zyx": selected_attempt["full_translation_zyx"],
             }
         )
+        if selected_attempt.get("error") is not None:
+            row["error"] = selected_attempt["error"]
     except Exception as exc:
         row.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
     finally:
@@ -1075,6 +1210,7 @@ def _write_summary(output_dir: Path, rows: list[dict[str, Any]], args: argparse.
             "output_dir": str(output_dir.resolve()),
             "fixed_channel": int(args.fixed_channel),
             "moving_channel": int(args.moving_channel),
+            "pair_mode": str(getattr(args, "pair_mode", "tile-number")),
             "core_shape_zyx": [int(value) for value in args.core_shape_zyx],
             "window_shape_zyx": [int(value) for value in args.window_shape_zyx],
             "fit_downsample_zyx": [int(value) for value in args.fit_downsample_zyx],
@@ -1102,6 +1238,9 @@ def _write_summary(output_dir: Path, rows: list[dict[str, Any]], args: argparse.
                 "accepted_window_count": len(accepted),
                 "rejected_window_count": sum(1 for row in rows if row.get("status") == "rejected"),
                 "error_window_count": sum(1 for row in rows if row.get("status") == "error"),
+                "native_failure_window_count": sum(
+                    1 for row in rows if row.get("native_return_code") not in (None, 0)
+                ),
                 "corr_refined": None
                 if corr_values.size == 0
                 else {"median": float(np.median(corr_values)), "mean": float(np.mean(corr_values))},
@@ -1121,6 +1260,228 @@ def _write_summary(output_dir: Path, rows: list[dict[str, Any]], args: argparse.
     )
     return summary_path
 
+
+def _validate_completed_rows(rows: list[dict[str, Any]]) -> None:
+    error_count = sum(1 for row in rows if row.get("status") == "error")
+    native_failure_count = sum(1 for row in rows if row.get("native_return_code") not in (None, 0))
+    if error_count or native_failure_count:
+        raise RuntimeError(
+            "Method8 incomplete: "
+            f"{native_failure_count} native registration failure(s), {error_count} error row(s)"
+        )
+
+
+def _position_vector(record: dict[str, Any], key: str) -> np.ndarray:
+    values = record.get(key)
+    if not isinstance(values, dict):
+        raise ValueError(f"position record {record.get('tile')!r} has no {key!r} object")
+    vector = np.asarray([values.get(axis) for axis in "zyx"], dtype=np.float64)
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"position record {record.get('tile')!r} has invalid {key!r}: {values!r}")
+    return vector
+
+
+def _physical_crop_center_correspondences(
+    rows: list[dict[str, Any]],
+    *,
+    fixed_position: dict[str, Any],
+    moving_position: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, list[tuple[str, str]]]:
+    fixed_by_tile = {str(record["tile"]): record for record in fixed_position["tiles"]}
+    moving_by_tile = {str(record["tile"]): record for record in moving_position["tiles"]}
+    source: list[np.ndarray] = []
+    target: list[np.ndarray] = []
+    pairs: list[tuple[str, str]] = []
+    for row in rows:
+        if row.get("status") != "accepted":
+            continue
+        fixed_name = str(row["fixed_tile"])
+        moving_name = str(row["moving_tile"])
+        fixed = fixed_by_tile[fixed_name]
+        moving = moving_by_tile[moving_name]
+        window_shape = np.asarray(row["window_shape_zyx"], dtype=np.float64)
+        fixed_start = np.asarray(row["fixed_start_zyx"], dtype=np.float64)
+        moving_start = np.asarray(row["moving_start_zyx"], dtype=np.float64)
+        local_translation = np.asarray(row["local_translation_zyx"], dtype=np.float64)
+        values = np.concatenate((window_shape, fixed_start, moving_start, local_translation))
+        if window_shape.shape != (3,) or not np.all(np.isfinite(values)):
+            raise ValueError(f"invalid accepted Method8 geometry for {fixed_name!r}, {moving_name!r}")
+        center = (window_shape - 1.0) / 2.0
+        source.append(
+            _position_vector(moving, "translation_um")
+            + _position_vector(moving, "scale_um") * (moving_start + center)
+        )
+        target.append(
+            _position_vector(fixed, "translation_um")
+            + _position_vector(fixed, "scale_um") * (fixed_start + center + local_translation)
+        )
+        pairs.append((fixed_name, moving_name))
+    return np.asarray(source, dtype=np.float64).reshape(-1, 3), np.asarray(target, dtype=np.float64).reshape(-1, 3), pairs
+
+
+def _fit_pair_balanced_huber_affine(
+    source: np.ndarray,
+    target: np.ndarray,
+    pairs: list[tuple[str, str]],
+    *,
+    huber_delta_um: float = 2.0,
+    iterations: int = 30,
+) -> tuple[np.ndarray, np.ndarray]:
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError(f"source and target must have matching Nx3 shapes, got {source.shape} and {target.shape}")
+    if source.shape[0] != len(pairs):
+        raise ValueError("one tile pair is required for every correspondence")
+    design = np.c_[source, np.ones(source.shape[0], dtype=np.float64)]
+    if source.shape[0] < 4 or np.linalg.matrix_rank(design) < 4:
+        raise ValueError("global affine fit requires at least four non-coplanar accepted crop centers")
+    if not np.all(np.isfinite(design)) or not np.all(np.isfinite(target)):
+        raise ValueError("global affine correspondences must be finite")
+    if huber_delta_um <= 0.0 or iterations < 1:
+        raise ValueError("Huber delta and iteration count must be positive")
+    pair_counts: dict[tuple[str, str], int] = {}
+    for pair in pairs:
+        pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    base_weights = np.asarray([1.0 / pair_counts[pair] for pair in pairs], dtype=np.float64)
+    weights = base_weights.copy()
+    coefficients = np.empty((4, 3), dtype=np.float64)
+    for _ in range(iterations):
+        square_root_weights = np.sqrt(weights)[:, None]
+        coefficients = np.linalg.lstsq(
+            design * square_root_weights,
+            target * square_root_weights,
+            rcond=None,
+        )[0]
+        residual = np.linalg.norm(design @ coefficients - target, axis=1)
+        weights = base_weights * np.minimum(1.0, huber_delta_um / np.maximum(residual, 1e-9))
+    matrix = coefficients[:3].T
+    translation = coefficients[3]
+    if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(translation)):
+        raise ValueError("global affine fit produced non-finite coefficients")
+    return matrix, translation
+
+
+def _write_global_affine_qc_plot(
+    *,
+    output_dir: Path,
+    source: np.ndarray,
+    target: np.ndarray,
+    matrix: np.ndarray,
+    translation: np.ndarray,
+) -> dict[str, Path]:
+    import matplotlib.pyplot as plt
+
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    predicted = source @ np.asarray(matrix, dtype=np.float64).T + np.asarray(translation, dtype=np.float64)
+    measured_correction = target - source
+    fitted_correction = predicted - source
+    after_fit_residual = predicted - target
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context({"font.family": "Arial", "font.size": 9.0}):
+        figure, axes = plt.subplots(2, 3, figsize=(8.0, 5.0), sharex="col", constrained_layout=True)
+        colors = ("#2166ac", "#b2182b")
+        world_y = target[:, 1]
+        order = np.argsort(world_y)
+        for component, axis_name in enumerate("ZYX"):
+            axes[0, component].scatter(
+                world_y,
+                measured_correction[:, component],
+                s=9,
+                alpha=0.55,
+                color=colors[0],
+                linewidths=0,
+                label="measured",
+            )
+            axes[0, component].plot(
+                world_y[order],
+                fitted_correction[order, component],
+                ".",
+                markersize=3,
+                color=colors[1],
+                label="affine fit",
+            )
+            axes[0, component].set_title(f"{axis_name} correction")
+            axes[0, component].set_ylabel("Correction (µm)")
+            axes[1, component].scatter(
+                world_y,
+                after_fit_residual[:, component],
+                s=9,
+                alpha=0.65,
+                color="#4d4d4d",
+                linewidths=0,
+            )
+            axes[1, component].axhline(0.0, color="#b2182b", linewidth=0.8)
+            axes[1, component].set_xlabel("Target world Y (µm)")
+            axes[1, component].set_ylabel("After-fit residual (µm)")
+        axes[0, 0].legend(frameon=False, loc="best")
+        figure.suptitle("Measured correction field and residuals after affine fitting", fontsize=11)
+        outputs = {
+            extension: output_dir / f"global_affine_qc.{extension}"
+            for extension in ("png", "pdf", "svg")
+        }
+        figure.savefig(outputs["png"], dpi=300)
+        figure.savefig(outputs["pdf"])
+        figure.savefig(outputs["svg"])
+        plt.close(figure)
+    return outputs
+
+
+def _write_spatial_overlap_global_affine(
+    *,
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+    fixed_position_path: Path,
+    moving_position_path: Path,
+) -> Path:
+    source, target, pairs = _physical_crop_center_correspondences(
+        rows,
+        fixed_position=json.loads(fixed_position_path.read_text()),
+        moving_position=json.loads(moving_position_path.read_text()),
+    )
+    matrix, translation = _fit_pair_balanced_huber_affine(source, target, pairs)
+    predicted = source @ matrix.T + translation
+    residual = np.linalg.norm(predicted - target, axis=1)
+    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    qc_paths = _write_global_affine_qc_plot(
+        output_dir=output_dir,
+        source=source,
+        target=target,
+        matrix=matrix,
+        translation=translation,
+    )
+    artifact_path = output_dir / "global_affine.json"
+    _write_json(
+        artifact_path,
+        {
+            "schema_version": 1,
+            "artifact_type": "lightsheet.spatial_overlap_global_affine.v1",
+            "coordinate_contract": "target_physical_zyx_um = matrix_zyx @ source_physical_zyx_um + translation_zyx_um",
+            "source_position": str(moving_position_path.resolve()),
+            "target_position": str(fixed_position_path.resolve()),
+            "matrix_zyx": matrix,
+            "translation_zyx_um": translation,
+            "determinant": float(np.linalg.det(matrix)),
+            "singular_values": singular_values,
+            "fit": {
+                "estimator": "pair-balanced Huber iteratively reweighted least squares",
+                "huber_delta_um": 2.0,
+                "iterations": 30,
+                "accepted_correspondence_count": int(source.shape[0]),
+                "tile_pair_count": len(set(pairs)),
+                "residual_norm_um": {
+                    "median": float(np.median(residual)),
+                    "p95": float(np.percentile(residual, 95)),
+                    "maximum": float(np.max(residual)),
+                },
+            },
+            "qc": {name: str(path.resolve()) for name, path in qc_paths.items()},
+        },
+    )
+    return artifact_path
+
+
 def _require_gpu_env() -> None:
     missing = [name for name in ("CUDA_PATH", "LD_LIBRARY_PATH") if not os.environ.get(name)]
     if missing:
@@ -1139,41 +1500,45 @@ def run(args: argparse.Namespace) -> Path:
     for row in cached_rows:
         print(_progress(row, cached=True), flush=True)
     _write_summary(args.output_dir, rows, args)
-    if args.workers == 1:
-        for task in tasks:
-            row = _measure_window(task)
-            _write_json(Path(task["output_path"]), row)
+    context = mp.get_context("spawn")
+    pending = list(tasks)
+    running: list[tuple[mp.Process, dict[str, Any]]] = []
+    while pending or running:
+        while pending and len(running) < int(args.workers):
+            task = pending.pop(0)
+            process = context.Process(target=_measure_window_to_path, args=(task,))
+            process.start()
+            running.append((process, task))
+        time.sleep(0.2)
+        still_running: list[tuple[mp.Process, dict[str, Any]]] = []
+        for process, task in running:
+            if process.is_alive():
+                still_running.append((process, task))
+                continue
+            process.join()
+            output_path = Path(task["output_path"])
+            if process.exitcode == 0 and output_path.exists():
+                row = json.loads(output_path.read_text())
+            else:
+                row = _native_process_error_row(task, process.exitcode)
+                _write_json(output_path, row)
             rows.append(row)
             _write_summary(args.output_dir, rows, args)
             print(_progress(row), flush=True)
-    else:
-        context = mp.get_context("spawn")
-        pending = list(tasks)
-        running: list[tuple[mp.Process, dict[str, Any]]] = []
-        while pending or running:
-            while pending and len(running) < int(args.workers):
-                task = pending.pop(0)
-                process = context.Process(target=_measure_window_to_path, args=(task,))
-                process.start()
-                running.append((process, task))
-            time.sleep(0.2)
-            still_running: list[tuple[mp.Process, dict[str, Any]]] = []
-            for process, task in running:
-                if process.is_alive():
-                    still_running.append((process, task))
-                    continue
-                process.join()
-                output_path = Path(task["output_path"])
-                if process.exitcode == 0 and output_path.exists():
-                    row = json.loads(output_path.read_text())
-                else:
-                    row = _native_process_error_row(task, process.exitcode)
-                    _write_json(output_path, row)
-                rows.append(row)
-                _write_summary(args.output_dir, rows, args)
-                print(_progress(row), flush=True)
-            running = still_running
-    return _write_summary(args.output_dir, rows, args).resolve()
+        running = still_running
+    summary_path = _write_summary(args.output_dir, rows, args).resolve()
+    _validate_completed_rows(rows)
+    if str(getattr(args, "pair_mode", "tile-number")) == "spatial-overlap" and args.max_windows is None:
+        global_affine_path = _write_spatial_overlap_global_affine(
+            output_dir=args.output_dir,
+            rows=rows,
+            fixed_position_path=Path(args.fixed_position),
+            moving_position_path=Path(args.moving_position),
+        ).resolve()
+        summary = json.loads(summary_path.read_text())
+        summary["global_affine"] = str(global_affine_path)
+        _write_json(summary_path, summary)
+    return summary_path
 
 
 def run_tile_quadrant_method8(
@@ -1183,6 +1548,7 @@ def run_tile_quadrant_method8(
     output_dir: Path,
     fixed_channel: int = 0,
     moving_channel: int = 0,
+    pair_mode: str = "tile-number",
     core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
     window_shape_zyx: tuple[int, int, int] = (528, 528, 528),
     fit_downsample_zyx: tuple[int, int, int] = (1, 1, 1),
@@ -1214,6 +1580,7 @@ def run_tile_quadrant_method8(
         output_dir=output_dir,
         fixed_channel=fixed_channel,
         moving_channel=moving_channel,
+        pair_mode=pair_mode,
         core_shape_zyx=core_shape_zyx,
         window_shape_zyx=window_shape_zyx,
         fit_downsample_zyx=fit_downsample_zyx,

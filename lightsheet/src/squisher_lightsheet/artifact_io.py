@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from squisher_lightsheet.tile_input import resolve_tile_path
+
 
 def _stat_fingerprint(path: Path) -> dict[str, str | int]:
     stat = path.stat()
@@ -20,21 +22,16 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _zarr_store_name(tile_name: str) -> str:
-    name = Path(tile_name).name
-    for suffix in (".ome.tif", ".ome.tiff"):
-        if name.endswith(suffix):
-            return f"{name[: -len(suffix)]}.ome.zarr"
-    return name
-
-
 def registration_input_fingerprint(position_json: Path, zarr_dir: Path) -> dict[str, Any]:
     """Fingerprint registration placement plus each level-0 store boundary."""
     position_bytes = position_json.read_bytes()
     payload = json.loads(position_bytes)
     tiles = []
     for record in payload.get("tiles", []):
-        tile_path = zarr_dir / _zarr_store_name(str(record["tile"]))
+        tile_path = resolve_tile_path(zarr_dir, str(record["tile"]))
+        if tile_path.is_file():
+            tiles.append({"tile": str(record["tile"]), "source": _stat_fingerprint(tile_path)})
+            continue
         level0_path = tile_path / "0"
         tiles.append(
             {

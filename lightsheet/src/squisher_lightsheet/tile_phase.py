@@ -109,7 +109,7 @@ def _open_tile_level_array(path: Path, *, source_level: int = 0) -> tuple[Any, i
     if stitch_legacy.is_ome_zarr_path(path):
         available_levels = stitch_legacy._ome_zarr_level_count(path)
         resolved_level = min(int(source_level), max(0, available_levels - 1))
-        zarray = stitch_legacy._open_ome_zarr_level_array(path, source_level=resolved_level)
+        zarray = ngff.open_level_array(path, level=resolved_level)
         return da.from_zarr(zarray), resolved_level, available_levels, None
 
     available_levels = tiff_series_level_count(path)
@@ -525,7 +525,7 @@ def read_tile_indexed_z_patch(
         and (tile.axes == "CZYX" or flattened_channel_count(tile.path) == 1)
     )
     if direct_zarr:
-        array = stitch_legacy._open_ome_zarr_level_array(tile.path, source_level=0)
+        array = ngff.open_level_array(tile.path, level=0)
         store = None
     else:
         array, _source_level, _available_levels, store = _open_tile_level_array(

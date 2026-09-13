@@ -14,13 +14,10 @@ from squisher_lightsheet.method8_stitch_register import (
     _all_adjacent_pairs,
     _crop_bounds_for_pair,
     _load_tiles,
-    _tile_id,
     _z_chunks,
-    _zarr_name,
+    _load_array,
+    _load_axes,
 )
-from squisher_lightsheet.ngff import axes as ngff_axes
-from squisher_lightsheet.ngff import open_level_array
-from squisher_lightsheet.ome_metadata_dumb_stitch import read_tile_metadata
 
 ARTIFACT_TYPE = "lightsheet.level2_overlap_screen.v1"
 LOW_CONTENT_REASON = "level2_low_content"
@@ -50,33 +47,7 @@ def _level_tiles(
     level: int,
     channel: int,
 ) -> dict[str, TileInfo]:
-    payload = json.loads(position_json.read_text())
-    tiles: dict[str, TileInfo] = {}
-    for record in payload["tiles"]:
-        tile_name = _zarr_name(str(record["tile"]))
-        tile_id = _tile_id(tile_name)
-        path = zarr_dir / tile_name
-        metadata = read_tile_metadata(path, level=level)
-        if metadata.axes == "CZYX":
-            if not 0 <= channel < metadata.shape[0]:
-                raise ValueError(f"channel {channel} is outside {metadata.shape} in {path}")
-            shape_zyx = metadata.shape[1:]
-        elif metadata.axes == "ZYX":
-            if channel != 0:
-                raise ValueError(f"channel {channel} requested from ZYX tile {path}")
-            shape_zyx = metadata.shape
-        else:
-            raise ValueError(f"expected CZYX or ZYX in {path}, found {metadata.axes}")
-        tiles[tile_id] = TileInfo(
-            tile_id=tile_id,
-            tile_name=tile_name,
-            path=path,
-            start_um_zyx=np.asarray(metadata.translation_um_zyx, dtype=np.float64),
-            spacing_um_zyx=np.asarray(metadata.spacing_um_zyx, dtype=np.float64),
-            shape_zyx=np.asarray(shape_zyx, dtype=np.int64),
-            channel=channel,
-        )
-    return tiles
+    return _load_tiles(position_json, zarr_dir, level=level, channel=channel)
 
 
 def _overlap_slices(
@@ -142,6 +113,7 @@ def screen_level2_overlaps(
     output: Path,
     threshold: float,
     level: int = 2,
+    registration_level: int = 0,
     channel: int = 0,
     z_chunks: int = 6,
     min_foreground_pixels: int = 256,
@@ -157,7 +129,7 @@ def screen_level2_overlaps(
     if not 0.0 <= min_foreground_fraction <= 1.0:
         raise ValueError("min foreground fraction must be between zero and one")
 
-    level0_tiles = _load_tiles(position_json, zarr_dir, channel=channel)
+    level0_tiles = _load_tiles(position_json, zarr_dir, channel=channel, level=registration_level)
     level_tiles = _level_tiles(position_json, zarr_dir, level=level, channel=channel)
     pairs = _all_adjacent_pairs(level0_tiles)
     if not pairs:
@@ -165,12 +137,10 @@ def screen_level2_overlaps(
 
     arrays: dict[str, Any] = {}
     array_axes: dict[str, str] = {}
-    import zarr
 
     for tile_id, tile in level_tiles.items():
-        array = open_level_array(tile.path, level=level)
-        group = zarr.open_group(str(tile.path), mode="r")
-        axes = ngff_axes(group, array)
+        array = _load_array(tile.path, level=level)
+        axes = _load_axes(tile.path, array)
         if axes not in {"CZYX", "ZYX"}:
             raise ValueError(f"expected CZYX or ZYX in {tile.path}, found {axes}")
         arrays[tile_id] = array
@@ -260,6 +230,7 @@ def screen_level2_overlaps(
         "input_fingerprint": registration_input_fingerprint(position_json, zarr_dir),
         "settings": {
             "level": level,
+            "registration_level": registration_level,
             "channel": channel,
             "threshold": float(threshold),
             "threshold_source": "human_reviewed_threshold",
@@ -296,6 +267,7 @@ def load_level2_screen(
     z_chunks: int,
     channel: int,
     threshold: float | None,
+    registration_level: int = 0,
 ) -> dict[tuple[str, int], dict[str, Any]]:
     """Validate a complete screen manifest and return decisions by pair and chunk."""
     payload = json.loads(path.read_text())
@@ -311,6 +283,8 @@ def load_level2_screen(
     if not isinstance(settings, dict):
         raise ValueError(f"{path} is missing settings")
     expected_settings = {"level": 2, "channel": channel, "threshold": threshold, "z_chunks": z_chunks}
+    if settings.get("registration_level", 0) != registration_level:
+        raise ValueError(f"{path} registration level differs from {registration_level}")
     for key, expected in expected_settings.items():
         if settings.get(key) != expected:
             raise ValueError(f"{path} setting {key}={settings.get(key)!r} differs from {expected!r}")

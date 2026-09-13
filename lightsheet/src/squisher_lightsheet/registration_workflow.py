@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import networkx as nx
 from skimage import filters
 
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as stitch_legacy
@@ -91,7 +92,8 @@ def _validate_measurement_summary(
     zarr_dir: Path,
     expected_settings: dict[str, Any],
 ) -> None:
-    if payload.get("artifact_type") != "lightsheet.level0_phase_recovery_measurements.v1":
+    level = expected_settings.get("level", 0)
+    if payload.get("artifact_type") != f"lightsheet.level{level}_phase_recovery_measurements.v1":
         raise ValueError(f"{artifact} is not a level-0 phase recovery measurement summary")
     _require_matching_path(payload, key="position_json", expected=position_json, artifact=artifact)
     _require_matching_path(payload, key="zarr_dir", expected=zarr_dir, artifact=artifact)
@@ -111,7 +113,8 @@ def _validate_optimization_diagnostics(
     expected_outputs: dict[str, Path],
     allow_disconnected: bool = False,
 ) -> None:
-    if payload.get("artifact_type") != "lightsheet.level0_phase_recovery_tile_optimization.v1":
+    level = expected_settings.get("level", 0)
+    if payload.get("artifact_type") != f"lightsheet.level{level}_phase_recovery_tile_optimization.v1":
         raise ValueError(f"{artifact} is not a level-0 phase recovery optimization record")
     _require_matching_path(payload, key="method8_summary", expected=method8_summary, artifact=artifact)
     if payload.get("method8_summary_sha256") != sha256_file(method8_summary):
@@ -318,8 +321,11 @@ def write_canonical_registration(
     diagnostics: Path,
     threshold_record: Path,
     allow_disconnected: bool = False,
+    exclude_disconnected: bool = False,
 ) -> None:
     """Write fusion-ready identity affines around optimized stage translations."""
+    if allow_disconnected and exclude_disconnected:
+        raise ValueError("Choose either retaining or excluding disconnected tiles")
     _require_absent(position_output, registration_output)
     for path in (optimized_position, measurement_summary, diagnostics, threshold_record):
         if not path.is_file():
@@ -341,15 +347,30 @@ def write_canonical_registration(
         raise ValueError(
             f"{diagnostics} tile_count={tile_count} differs from {optimized_position} tiles={len(position_records)}"
         )
-    if not allow_disconnected and connected_count != tile_count:
+    included = set(range(tile_count))
+    if exclude_disconnected and connected_count != tile_count:
+        graph = nx.Graph()
+        graph.add_nodes_from(included)
+        constraints = Path(diagnostics_payload["outputs"]["constraints_jsonl"])
+        for line in constraints.read_text().splitlines():
+            row = json.loads(line)
+            if row["fixed"] not in included or row["moving"] not in included:
+                raise ValueError(f"Constraint tile indexes are outside {optimized_position}")
+            if row["accepted"]:
+                graph.add_edge(row["fixed"], row["moving"])
+        included = set(nx.node_connected_component(graph, diagnostics_payload["anchor_tile_index"]))
+        if len(included) != connected_count:
+            raise ValueError("Accepted constraint graph differs from the optimization connectivity record")
+    if not allow_disconnected and connected_count != len(included):
         raise ValueError(f"registration graph is not fully connected: {connected_count}/{tile_count} tiles")
 
+    level = int(summary_payload.get("settings", {}).get("level", 0))
     method8 = bool(summary_payload.get("settings", {}).get("method8", False))
     provenance = {
         "method": (
-            "level-0 phase correlation with axis-prior shifted-crop recovery and gated Method8"
+            f"level-{level} phase correlation with axis-prior shifted-crop recovery and gated Method8"
             if method8
-            else "level-0 phase correlation with axis-prior shifted-crop recovery"
+            else f"level-{level} phase correlation with axis-prior shifted-crop recovery"
         ),
         "measurement_summary": str(measurement_summary.resolve()),
         "optimized_position": str(optimized_position.resolve()),
@@ -359,10 +380,15 @@ def write_canonical_registration(
         "threshold": threshold_payload,
         "connectivity": {
             "allow_disconnected": bool(allow_disconnected),
-            "tile_count": int(tile_count),
+            "tile_count": len(included),
             "connected_tile_count": int(connected_count),
         },
     }
+    if exclude_disconnected:
+        provenance["connectivity"].update({
+            "source_tile_count": tile_count,
+            "excluded_tiles": [record["tile"] for i, record in enumerate(position_records) if i not in included],
+        })
     canonical_position = deepcopy(position_payload)
     canonical_position["registration_run"] = provenance
 
@@ -370,7 +396,9 @@ def write_canonical_registration(
     canonical_position["input_dir"] = str(zarr_dir.resolve())
     canonical_position["tiles"] = []
     registration_tiles = []
-    for source_record, tile in zip(position_records, tiles, strict=True):
+    for index, (source_record, tile) in enumerate(zip(position_records, tiles, strict=True)):
+        if index not in included:
+            continue
         canonical_record = deepcopy(source_record)
         canonical_record.update(
             {
@@ -407,7 +435,7 @@ def write_canonical_registration(
         "registered_transform_key": "registered_affine",
         "spacing_um": tiles[0].spacing,
         "metrics": {
-            "artifact_type": "lightsheet.level0_phase_recovery_identity_registration.v1",
+            "artifact_type": f"lightsheet.level{level}_phase_recovery_identity_registration.v1",
             "registered_affine_note": (
                 "Identity affine; optimized placement is baked into each tile's stage_translation_um."
             ),
@@ -454,6 +482,7 @@ def run_registration_workflow(
     output_dir: Path,
     threshold: float,
     channel: int = 0,
+    level: int = 0,
     method8_summary: Path | None = None,
     z_chunks: int = 6,
     device: int = 0,
@@ -470,12 +499,19 @@ def run_registration_workflow(
     min_phase_corr: float = 0.15,
     phase_fallback_weight_scale: float = 0.1,
     allow_disconnected: bool = False,
+    exclude_disconnected: bool = False,
     native_lib_dir: Path = DEFAULT_LIB_DIR,
     progress: Callable[[str], None] | None = None,
 ) -> RegistrationWorkflowOutputs:
     """Run the human-gated level-2-screened registration workflow."""
     from squisher_lightsheet.method8_stitch_register import register_level0_phase_recovery
 
+    if allow_disconnected and exclude_disconnected:
+        raise ValueError("Choose either retaining or excluding disconnected tiles")
+    if level not in (0, 1, 2):
+        raise ValueError(f"registration level must be 0, 1, or 2, got {level}")
+    if method8 and level != 0:
+        raise ValueError("Native Method8 requires registration level 0")
     if isinstance(threshold, bool) or not np.isfinite(float(threshold)) or float(threshold) < 0:
         raise ValueError(f"threshold must be a finite non-negative number, got {threshold!r}")
     if not position_json.is_file():
@@ -522,6 +558,7 @@ def run_registration_workflow(
             output=level2_screen,
             threshold=float(threshold),
             level=2,
+            registration_level=level,
             channel=channel,
             z_chunks=z_chunks,
             min_foreground_pixels=256,
@@ -536,6 +573,7 @@ def run_registration_workflow(
         "device": int(device),
         "method8": bool(method8),
         "channel": int(channel),
+        "level": int(level),
         "max_iterations": int(max_iterations),
         "ftol": float(ftol),
         "min_corr": float(min_corr),
@@ -551,6 +589,7 @@ def run_registration_workflow(
         "level2_screen_sha256": sha256_file(level2_screen),
     }
     optimization_settings = {
+        "level": level,
         "max_grad_regression": float(max_grad_regression),
         "max_corr_regression": float(max_corr_regression),
         "phase_fallback": bool(phase_fallback),
@@ -618,7 +657,7 @@ def run_registration_workflow(
                 "constraints_jsonl": constraints_jsonl,
                 "corrections": tile_corrections,
             },
-            allow_disconnected=allow_disconnected,
+            allow_disconnected=allow_disconnected or exclude_disconnected,
         )
 
         outputs = Method8RegistrationOutputs(
@@ -641,6 +680,7 @@ def run_registration_workflow(
             device=device,
             method8=method8,
             channel=channel,
+            level=level,
             max_iterations=max_iterations,
             ftol=ftol,
             min_corr=min_corr,
@@ -678,7 +718,7 @@ def run_registration_workflow(
             "constraints_jsonl": outputs.constraints_jsonl,
             "corrections": outputs.tile_corrections,
         },
-        allow_disconnected=allow_disconnected,
+        allow_disconnected=allow_disconnected or exclude_disconnected,
     )
     write_canonical_registration(
         optimized_position=outputs.optimized_positions,
@@ -689,6 +729,7 @@ def run_registration_workflow(
         diagnostics=outputs.diagnostics,
         threshold_record=threshold_record,
         allow_disconnected=allow_disconnected,
+        exclude_disconnected=exclude_disconnected,
     )
     return RegistrationWorkflowOutputs(
         threshold_record=threshold_record,

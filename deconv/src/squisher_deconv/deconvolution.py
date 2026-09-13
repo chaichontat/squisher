@@ -12,7 +12,9 @@ class Deconvolver(Protocol):
     @property
     def halo(self) -> int: ...
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray: ...
+    def deconvolve(
+        self, volume: np.ndarray, *, channel_gains: Sequence[float] | None = None, raw_z_start: int | None = None, raw_z_size: int | None = None
+    ) -> np.ndarray: ...
 
 
 def infer_psf_halo(path: Path) -> int:
@@ -38,7 +40,12 @@ class IdentityDeconvolver:
 
     halo: int = 0
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray:
+    def deconvolve(self, volume: np.ndarray, *, channel_gains: Sequence[float] | None = None, raw_z_start: int | None = None, raw_z_size: int | None = None) -> np.ndarray:
         if volume.ndim != 4:
             raise ValueError(f"Expected (Z, C, Y, X) volume, got {volume.shape}")
-        return volume.astype(np.float32, copy=True)
+        result = volume.astype(np.float32, copy=True)
+        if channel_gains is not None:
+            from squisher_deconv.tile_gains import validate_channel_gains
+
+            result *= validate_channel_gains(channel_gains, channels=volume.shape[1])[None, :, None, None]
+        return result

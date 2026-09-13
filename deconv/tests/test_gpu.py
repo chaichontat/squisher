@@ -354,3 +354,33 @@ def test_gpu_sample_scale_projectors_are_device_local(tmp_path) -> None:
 
     assert result.exit_code == 0, result.output
     assert len(list((tmp_path / "scale" / "float32-samples").glob("*.tif"))) == 2
+
+
+@pytest.mark.skipif(not _has_cupy_gpu(), reason="CuPy GPU is not available")
+def test_z_field_uses_absolute_raw_coordinates_across_slabs(tmp_path, monkeypatch):
+    import squisher_deconv.gpu as gpu
+    from squisher_deconv.basic_profiles import compose_z_profile
+    from squisher_deconv.residual_field import residual_plane
+
+    base = tmp_path / "base.pkl"
+    _write_basic(base, darkfield=np.zeros((5, 5)), flatfield=np.ones((5, 5)))
+    coefficient = np.zeros((2, 5))
+    coefficient[0, 0] = 0.1
+    coefficient[1, 0] = 0.4
+    profile = tmp_path / "corrected.pkl"
+    compose_z_profile(base, profile, coefficient=coefficient, provenance={})
+    import cupy as cp
+    # This test exercises GPU field application; projector FFTs have separate tests.
+    monkeypatch.setattr(gpu, "_projectors", lambda *args, **kwargs: (cp.ones((1, 1, 1)), cp.ones((1, 1, 1))))
+    monkeypatch.setattr(gpu, "_deconvolve_lucyrichardson_guo", lambda x, projectors, **kwargs: x)
+    engine = gpu.CupyBasicRichardsonLucyDeconvolver(basic_paths=[profile], psf_paths=[tmp_path / "psf.tif"], device=0)
+    raw = np.ones((11, 1, 5, 5), dtype=np.float32) * 100
+    expected = np.stack([100 * residual_plane(coefficient, z=z, shape_zyx=(11, 5, 5)) for z in range(11)])[:, None]
+    full = engine.deconvolve(raw, raw_z_start=0, raw_z_size=11)
+    first = engine.deconvolve(raw[:7], raw_z_start=0, raw_z_size=11)
+    second = engine.deconvolve(raw[4:], raw_z_start=4, raw_z_size=11)
+    np.testing.assert_allclose(full, expected, rtol=2e-6)
+    np.testing.assert_allclose(first[4:], second[:3], rtol=2e-6)
+    np.testing.assert_allclose(second, full[4:], rtol=2e-6)
+    with pytest.raises(ValueError, match="original raw slab coordinates"):
+        engine.deconvolve(raw)

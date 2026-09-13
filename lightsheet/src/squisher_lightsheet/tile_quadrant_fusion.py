@@ -13,10 +13,12 @@ from squisher.jpegxr_zarr import (
     register_jpegxr_codec,
 )
 
+from squisher_lightsheet.artifact_io import sha256_file
 from squisher_lightsheet.cross_register_method8 import _axis_starts
 from squisher_lightsheet.ngff import axes as ngff_axes
 from squisher_lightsheet.ngff import dataset_paths
 from squisher_lightsheet.ngff import level_array
+from squisher_lightsheet.residual_correction import ResidualCorrection, load_residual_corrections
 
 DIMENSIONS = ("z", "y", "x")
 AFFINE_DIMS = ["x_in", "x_out"]
@@ -116,7 +118,23 @@ def _tile_identity(name: str) -> str:
 def _merge_moving_pixel_sources(
     moving_by_tile: dict[str, dict[str, Any]],
     source_input: Path | None,
+    source_dir: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Replace pixel sources by identity while preserving all saved geometry."""
+    if source_dir is not None:
+        records = _merge_moving_pixel_sources(moving_by_tile, source_input)
+        merged = {}
+        for tile, record in records.items():
+            path = source_dir.resolve() / f"{_tile_identity(str(record['tile']))}.ome.zarr"
+            if not path.is_dir():
+                raise FileNotFoundError(f"Missing replacement pixel source for {tile!r}: {path}")
+            array, axes = _ome_level0_array_and_axes(path)
+            expected_shape = _shape_zyx_from_record(record)
+            actual_shape = np.asarray([array.shape[axes.index(dim)] for dim in "ZYX"])
+            if not np.array_equal(actual_shape, expected_shape):
+                raise ValueError(f"{path} shape {actual_shape} differs from saved shape {expected_shape}")
+            merged[tile] = record | {"path": str(path), "shape": list(array.shape), "axes": axes}
+        return merged
     if source_input is None:
         return moving_by_tile
     source_by_identity: dict[str, dict[str, Any]] = {}
@@ -184,6 +202,86 @@ def _ome_level0_array_and_axes(path: Path) -> tuple[Any, str]:
 
 def _ome_level0_array(path: Path) -> Any:
     return _ome_level0_array_and_axes(path)[0]
+
+
+def _load_materialization_residual_corrections(
+    path: Path,
+    *,
+    moving_by_tile: dict[str, dict[str, Any]],
+    moving_position_input: Path,
+    source_channel: int,
+) -> dict[str, ResidualCorrection]:
+    """Validate one correction against the complete original moving-source set."""
+    import zarr
+
+    sources: list[Path] = []
+    shapes: list[tuple[int, int, int]] = []
+    for tile, record in moving_by_tile.items():
+        if any(str(key).startswith("materialized_") for key in record):
+            raise ValueError(
+                f"Residual correction requires original deconvolved sources; {tile!r} is materialized"
+            )
+        source_path = Path(str(record["path"]))
+        if not source_path.is_absolute():
+            source_path = moving_position_input.parent / source_path
+        source_path = source_path.resolve()
+        root = zarr.open_group(str(source_path), mode="r")
+        if root.attrs.get("squisher_materialization") is not None:
+            raise ValueError(
+                f"Residual correction requires original deconvolved sources, not materialized input: "
+                f"{source_path}"
+            )
+        source = level_array(root, level=0)
+        axes = ngff_axes(root, source)
+        if axes != "CZYX":
+            raise ValueError(
+                f"Residual correction requires original CZYX deconvolved sources; "
+                f"{source_path} stores {axes!r}"
+            )
+        if not 0 <= source_channel < int(source.shape[0]):
+            raise ValueError(f"source channel {source_channel} is outside CZYX shape {source.shape}")
+        shape = tuple(int(value) for value in source.shape[1:])
+        recorded_shape = tuple(int(value) for value in _shape_zyx_from_record(record))
+        if recorded_shape != shape:
+            raise ValueError(
+                f"source tile {tile!r} registration shape differs from {source_path}: "
+                f"recorded={recorded_shape}, current={shape}"
+            )
+        sources.append(source_path)
+        shapes.append(shape)
+    return load_residual_corrections(
+        path,
+        sources=sources,
+        shapes_zyx=shapes,
+        channel=source_channel,
+    )
+
+
+def _apply_residual_correction(
+    data: np.ndarray,
+    correction: ResidualCorrection,
+    *,
+    z_slice: slice,
+    y_slice: slice,
+    x_slice: slice,
+    dtype: np.dtype[Any],
+) -> np.ndarray:
+    """Match fusion's float32 multiply and integer conversion before resampling."""
+    corrected = np.asarray(data, dtype=np.float32).copy()
+    multiplier = np.asarray(
+        correction.block(z_slice=z_slice, y_slice=y_slice, x_slice=x_slice),
+        dtype=np.float32,
+    )
+    if multiplier.shape != corrected.shape:
+        raise ValueError(
+            f"Residual correction returned {multiplier.shape}; expected source block {corrected.shape}"
+        )
+    corrected *= multiplier
+    if np.issubdtype(dtype, np.integer):
+        np.rint(corrected, out=corrected)
+        np.clip(corrected, 0, np.iinfo(dtype).max, out=corrected)
+        return corrected.astype(dtype, copy=False)
+    return corrected
 
 
 def _ome_downsample_source(path: Path, desired_factors_zyx: np.ndarray) -> tuple[Any, str, int, np.ndarray]:
@@ -489,6 +587,8 @@ def _materialize_downsampled_channel_crop_ome_zarr(
     level_factor_zyx: np.ndarray,
     spacing_zyx: np.ndarray,
     output_codec: Literal["zstd", "jpegxr"],
+    residual_correction: ResidualCorrection | None = None,
+    residual_correction_identity: dict[str, str] | None = None,
     zstd_level: int = 3,
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
 ) -> list[int]:
@@ -497,9 +597,14 @@ def _materialize_downsampled_channel_crop_ome_zarr(
 
     from squisher_lightsheet.rough_phase import downsample_axis_blocks
 
-    source, inferred_axes, source_level, source_factors = _ome_downsample_source(
-        source_path, level_factor_zyx
-    )
+    if residual_correction is None:
+        source, inferred_axes, source_level, source_factors = _ome_downsample_source(
+            source_path, level_factor_zyx
+        )
+    else:
+        source, inferred_axes = _ome_level0_array_and_axes(source_path)
+        source_level = 0
+        source_factors = np.ones(3, dtype=np.int64)
     axes_value = source_record.get("axes")
     axes = inferred_axes if not isinstance(axes_value, str) or not axes_value else axes_value
     if axes != inferred_axes:
@@ -509,6 +614,8 @@ def _materialize_downsampled_channel_crop_ome_zarr(
         )
     if axes not in {"CZYX", "ZYX"}:
         raise ValueError(f"source tile {source_record.get('tile')!r} has unsupported axes {axes!r}")
+    if residual_correction is not None and axes != "CZYX":
+        raise ValueError("Residual correction requires original CZYX deconvolved sources")
     if axes == "ZYX" and source_channel != 0:
         raise ValueError(f"ZYX source only supports channel 0, got {source_channel}")
     if axes == "CZYX" and not 0 <= source_channel < int(source.shape[0]):
@@ -577,6 +684,10 @@ def _materialize_downsampled_channel_crop_ome_zarr(
         "source_factor_zyx": source_factors.tolist(),
         "remaining_factor_zyx": remaining_factors.tolist(),
         "output_codec": output_codec,
+        "residual_correction": residual_correction_identity,
+        "residual_correction_fingerprint": (
+            None if residual_correction is None else residual_correction.fingerprint
+        ),
     }
 
     dtype = np.dtype(source.dtype)
@@ -591,18 +702,27 @@ def _materialize_downsampled_channel_crop_ome_zarr(
         )
         selection = (source_channel, *spatial_selection) if axes == "CZYX" else spatial_selection
         source_block = np.asarray(source[selection])
+        if residual_correction is not None:
+            source_block = _apply_residual_correction(
+                source_block,
+                residual_correction,
+                z_slice=slice(source_z0, source_z1),
+                y_slice=slice(int(source_start[1]), int(source_stop[1])),
+                x_slice=slice(int(source_start[2]), int(source_stop[2])),
+                dtype=dtype,
+            )
         if np.all(remaining_factors == 1):
-            output[output_z0:output_z1] = source_block
+            materialized = source_block
         else:
-            reduced = downsample_axis_blocks(
+            materialized = downsample_axis_blocks(
                 source_block,
                 tuple(int(value) for value in remaining_factors),
                 reducer="mean",
             )
-            if np.issubdtype(dtype, np.integer):
-                info = np.iinfo(dtype)
-                reduced = np.clip(reduced, info.min, info.max)
-            output[output_z0:output_z1] = reduced.astype(dtype, copy=False)
+        if np.issubdtype(dtype, np.integer):
+            info = np.iinfo(dtype)
+            materialized = np.clip(materialized, info.min, info.max)
+        output[output_z0:output_z1] = materialized.astype(dtype, copy=False)
     root.attrs["squisher_complete"] = True
     _write_materialization_completion(output_path)
     return list(output_shape)
@@ -639,11 +759,15 @@ def _completed_materialization_shape(task: dict[str, Any]) -> list[int] | None:
         "source_start_zyx": np.asarray(task["start_zyx"], dtype=np.int64).tolist(),
         "source_stop_zyx": np.asarray(task["stop_zyx"], dtype=np.int64).tolist(),
         "output_codec": str(task["output_codec"]),
+        "residual_correction": task.get("residual_correction_identity"),
+        "residual_correction_fingerprint": (
+            None
+            if task.get("residual_correction") is None
+            else task["residual_correction"].fingerprint
+        ),
     }
     codec_names = [codec["name"] for codec in output.metadata.to_dict()["codecs"]]
-    expected_codecs = (
-        ["bytes", "zstd"] if task["output_codec"] == "zstd" else ["sharding_indexed"]
-    )
+    expected_codecs = ["bytes", "zstd"] if task["output_codec"] == "zstd" else ["sharding_indexed"]
     if (
         list(output.shape) != expected_shape
         or codec_names != expected_codecs
@@ -674,6 +798,11 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
         raise ValueError("native materialization group contains multiple source channels")
     if axes == "ZYX" and source_channel != 0:
         raise ValueError(f"ZYX source only supports channel 0, got {source_channel}")
+    residual_correction = tasks[0].get("residual_correction")
+    if any(task.get("residual_correction") is not residual_correction for task in tasks):
+        raise ValueError("native materialization group contains multiple residual corrections")
+    if residual_correction is not None and axes != "CZYX":
+        raise ValueError("Residual correction requires original CZYX deconvolved sources")
     if axes == "CZYX" and not 0 <= source_channel < int(source.shape[0]):
         raise ValueError(f"source channel {source_channel} is outside CZYX shape {source.shape}")
     spatial_indices = tuple(axes.index(axis) for axis in "ZYX")
@@ -747,6 +876,10 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
             "source_factor_zyx": [1, 1, 1],
             "remaining_factor_zyx": [1, 1, 1],
             "output_codec": output_codec,
+            "residual_correction": task.get("residual_correction_identity"),
+            "residual_correction_fingerprint": (
+                None if residual_correction is None else residual_correction.fingerprint
+            ),
         }
         active.append((task, root, output))
 
@@ -767,20 +900,34 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
         spatial_selection = (slice(source_z0, source_z1), slice(None), slice(None))
         selection = (source_channel, *spatial_selection) if axes == "CZYX" else spatial_selection
         slab = np.asarray(source[selection])
+        if residual_correction is not None:
+            slab = _apply_residual_correction(
+                slab,
+                residual_correction,
+                z_slice=slice(source_z0, source_z1),
+                y_slice=slice(0, int(source_shape_zyx[1])),
+                x_slice=slice(0, int(source_shape_zyx[2])),
+                dtype=np.dtype(source.dtype),
+            )
         for task, _root, output in intersecting:
             start = np.asarray(task["start_zyx"], dtype=np.int64)
             stop = np.asarray(task["stop_zyx"], dtype=np.int64)
             copy_z0 = max(source_z0, int(start[0]))
             copy_z1 = min(source_z1, int(stop[0]))
-            output[
-                copy_z0 - int(start[0]) : copy_z1 - int(start[0]),
-                :,
-                :,
-            ] = slab[
+            materialized = slab[
                 copy_z0 - source_z0 : copy_z1 - source_z0,
                 int(start[1]) : int(stop[1]),
                 int(start[2]) : int(stop[2]),
             ]
+            dtype = np.dtype(output.dtype)
+            if np.issubdtype(dtype, np.integer):
+                info = np.iinfo(dtype)
+                materialized = np.clip(materialized, info.min, info.max)
+            output[
+                copy_z0 - int(start[0]) : copy_z1 - int(start[0]),
+                :,
+                :,
+            ] = materialized.astype(dtype, copy=False)
 
     shapes: list[list[int]] = []
     for task, root, output in active:
@@ -796,6 +943,8 @@ def export_fused_fixed_overlapping_materialized_chunks(
     source_summary_input: Path | None = None,
     moving_position_input: Path,
     moving_source_input: Path | None = None,
+    moving_source_dir: Path | None = None,
+    residual_correction: Path | None = None,
     output_dir: Path,
     source_channel: int = 0,
     core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
@@ -813,6 +962,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
     moving_by_tile = _merge_moving_pixel_sources(
         _records_by_tile(moving_position_input),
         moving_source_input,
+        moving_source_dir,
     )
     core_shape = np.asarray(core_shape_zyx, dtype=np.int64)
     window_shape = np.asarray(window_shape_zyx, dtype=np.int64)
@@ -828,6 +978,21 @@ def export_fused_fixed_overlapping_materialized_chunks(
         )
     if (source_registration_input is None) == (source_summary_input is None):
         raise ValueError("exactly one of source_registration_input or source_summary_input is required")
+    if residual_correction is None:
+        correction_identity = None
+        corrections: dict[str, ResidualCorrection] = {}
+    else:
+        resolved_correction = residual_correction.resolve()
+        correction_identity = {
+            "path": str(resolved_correction),
+            "sha256": sha256_file(resolved_correction),
+        }
+        corrections = _load_materialization_residual_corrections(
+            residual_correction,
+            moving_by_tile=moving_by_tile,
+            moving_position_input=moving_position_input,
+            source_channel=source_channel,
+        )
     if source_summary_input is not None:
         source_payload = _fused_fixed_registration_from_summary(
             source_summary_input=source_summary_input,
@@ -882,6 +1047,10 @@ def export_fused_fixed_overlapping_materialized_chunks(
         source_path = Path(str(moving_record["path"]))
         if not source_path.is_absolute():
             source_path = moving_position_input.parent / source_path
+        source_path = source_path.resolve()
+        correction = corrections.get(str(source_path))
+        if residual_correction is not None and correction is None:
+            raise ValueError(f"Residual correction is missing source {source_path}")
         tile_name = str(record["tile"])
         output_path = output_dir / "materialized_tiles" / tile_name
         output_record = record | {
@@ -895,8 +1064,15 @@ def export_fused_fixed_overlapping_materialized_chunks(
             "materialized_source_path": str(source_path),
             "materialized_source_start_zyx": overlap_start.tolist(),
             "materialized_source_stop_zyx": overlap_stop.tolist(),
+            "materialized_fixed_origin_um": _dict_zyx(stage_translation),
+            "materialized_fixed_spacing_um": _dict_zyx(stage_scale),
+            "materialized_fixed_shape_zyx": (window_shape // level_factor).tolist(),
             "registered_core_start_l0_zyx": core_start.tolist(),
             "registered_core_stop_l0_zyx": core_stop.tolist(),
+            "residual_correction": correction_identity,
+            "residual_correction_fingerprint": (
+                None if correction is None else correction.fingerprint
+            ),
         }
         output_records.append(output_record)
         position_record = {
@@ -918,6 +1094,8 @@ def export_fused_fixed_overlapping_materialized_chunks(
                 "level_factor_zyx": level_factor,
                 "spacing_zyx": np.abs(expected_stage_scale),
                 "output_codec": output_codec,
+                "residual_correction": correction,
+                "residual_correction_identity": correction_identity,
                 "zstd_level": zstd_level,
                 "jpegxr_level": jpegxr_level,
             }
@@ -939,13 +1117,19 @@ def export_fused_fixed_overlapping_materialized_chunks(
         **source_metadata,
         "moving_position_input": str(moving_position_input.resolve()),
         "moving_source_input": None if moving_source_input is None else str(moving_source_input.resolve()),
+        "moving_source_dir": None if moving_source_dir is None else str(moving_source_dir.resolve()),
         "source_position_artifact_type": moving_payload.get("artifact_type"),
         "source_channel": source_channel,
+        "residual_correction": correction_identity,
         "output_codec": output_codec,
         "zstd_level": zstd_level,
         "jpegxr_level": jpegxr_level,
         "workers": workers,
-        "source_level_policy": "deepest OME-Zarr pyramid level exactly dividing level_factor_zyx",
+        "source_level_policy": (
+            "level 0 required for residual correction before downsampling"
+            if residual_correction is not None
+            else "deepest OME-Zarr pyramid level exactly dividing level_factor_zyx"
+        ),
         "materialization_grid": grid,
         "tile_count": len(output_records),
     }
@@ -956,7 +1140,9 @@ def export_fused_fixed_overlapping_materialized_chunks(
             "source_summary_input",
             "moving_position_input",
             "moving_source_input",
+            "moving_source_dir",
             "source_channel",
+            "residual_correction",
             "output_codec",
             "zstd_level",
             "jpegxr_level",
@@ -977,6 +1163,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
             "units": "micrometer",
             **source_metadata,
             "moving_position_input": str(moving_position_input.resolve()),
+            "residual_correction": correction_identity,
             "materialization_grid": grid,
             "tiles": position_records,
         },
@@ -989,6 +1176,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
             "input_dir": str((output_dir / "materialized_tiles").resolve()),
             **source_metadata,
             "moving_position_input": str(moving_position_input.resolve()),
+            "residual_correction": correction_identity,
             "materialization_grid": grid,
             "tiles": output_records,
         },

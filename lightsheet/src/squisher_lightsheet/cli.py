@@ -24,12 +24,13 @@ from squisher_lightsheet.channel_mattes_anchors import (
     measure_405_to_488_mattes_anchors,
 )
 from squisher_lightsheet.channel_subtraction import (
-    DEFAULT_COMPRESSION as DEFAULT_SUBTRACTION_COMPRESSION,
-    DEFAULT_COMPRESSION_LEVEL as DEFAULT_SUBTRACTION_COMPRESSION_LEVEL,
+    DEFAULT_CHUNK_SHAPE_ZYX as DEFAULT_SUBTRACTION_CHUNK_SHAPE_ZYX,
+    DEFAULT_ZSTD_LEVEL as DEFAULT_SUBTRACTION_ZSTD_LEVEL,
     subtract_channel_tiles,
 )
 from squisher_lightsheet.candidate_grid import render_candidate_grid
 from squisher_lightsheet.channel_affine import (
+    apply_channel_affine_registration,
     align_tiles_to_reference_affine,
     write_global_channel_affine_registration,
 )
@@ -37,7 +38,7 @@ from squisher_lightsheet.cross_register_method8 import (
     DEFAULT_LIB_DIR as DEFAULT_CROSS_REGISTER_METHOD8_LIB_DIR,
     run_tile_quadrant_method8,
 )
-from squisher_lightsheet.fusion import DEFAULT_OUTPUT_CHUNKSIZE_ZYX, fuse_tiles
+from squisher_lightsheet.fusion import DEFAULT_OUTPUT_CHUNKSIZE_ZYX, fuse_tiles, parse_fusion_batch_size
 from squisher_lightsheet.fused_fixed import (
     DEFAULT_SWEEP_RUNNER,
     run_fused_fixed_method6,
@@ -78,8 +79,10 @@ from squisher_lightsheet.ome_metadata_dumb_stitch import (
 )
 from squisher_lightsheet.ome_zarr_rechunk import DEFAULT_CHUNK_SHAPE_ZYX, rechunk_ome_zarr
 from squisher_lightsheet.parsing import parse_source_view_path_entry
+from squisher_lightsheet.planar_tilt import write_planar_tilt_fit
 from squisher_lightsheet.positions import create_position_file, create_single_position_file
 from squisher_lightsheet.pyramid import add_pyramids
+from squisher_lightsheet.registration_join import write_joined_channel_affine_registration
 from squisher_lightsheet.qc import (
     render_live_fusion_preview,
     render_fused_xyz_overlay_qc,
@@ -136,21 +139,197 @@ def _log_progress(message: str) -> None:
     logger.info(message)
 
 
-@app.command("channel-affine-registration")
-def channel_affine_registration(
-    window_dir: Annotated[
-        Path, typer.Option("--window-dir", exists=True, file_okay=False, readable=True)
-    ],
-    reference_registration: Annotated[
-        Path,
+@app.command("fit-planar-tilt")
+def fit_planar_tilt(
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    source: Annotated[
+        list[Path],
         typer.Option(
-            "--reference-registration", exists=True, dir_okay=False, readable=True
+            "--source",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Repeat for each OME-Zarr source.",
         ),
     ],
-    output_registration: Annotated[Path, typer.Option("--output-registration")],
-    expected_moving_channel: Annotated[
-        int, typer.Option("--expected-moving-channel", min=0)
+    window: Annotated[
+        list[str],
+        typer.Option("--window", help="Repeat once per source as MIN,MAX."),
     ],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+    level: Annotated[int, typer.Option("--level", min=0)] = 2,
+    z_depth_um: Annotated[float, typer.Option("--z-depth-um", min=0.001)] = 360.0,
+    xy_step_um: Annotated[float, typer.Option("--xy-step-um", min=0.001)] = 5.0,
+) -> None:
+    """Fit a two-axis tissue-plane normal from masked OME-Zarr sources."""
+    if not np.isfinite(z_depth_um):
+        raise typer.BadParameter("Must be finite.", param_hint="--z-depth-um")
+    if not np.isfinite(xy_step_um):
+        raise typer.BadParameter("Must be finite.", param_hint="--xy-step-um")
+    if len(source) != len(window):
+        raise typer.BadParameter("Provide exactly one --window for each --source.", param_hint="--window")
+    windows = []
+    for value in window:
+        try:
+            lower, upper = (float(piece) for piece in value.split(","))
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"Expected MIN,MAX, received {value!r}.", param_hint="--window"
+            ) from error
+        if not np.isfinite((lower, upper)).all() or lower >= upper:
+            raise typer.BadParameter(
+                f"Expected finite MIN,MAX with MIN < MAX, received {value!r}.",
+                param_hint="--window",
+            )
+        windows.append((lower, upper))
+
+    typer.echo(
+        write_planar_tilt_fit(
+            mask_path=mask,
+            source_paths=source,
+            windows=windows,
+            output_path=output,
+            level=level,
+            z_depth_um=z_depth_um,
+            xy_step_um=xy_step_um,
+        )
+    )
+
+
+@app.command("fit-residual")
+@app.command("post-basic")
+def fit_residual(
+    fixed_fused: Annotated[Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)],
+    registration: Annotated[Path, typer.Option("--registration", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
+    source_level: Annotated[int, typer.Option("--source-level", min=0)] = 2,
+    stride: Annotated[int, typer.Option("--stride", min=1)] = 4,
+    xy_degree: Annotated[int, typer.Option("--xy-degree", min=1, max=2)] = 1,
+    z_degree: Annotated[int, typer.Option("--z-degree", min=0, max=3)] = 1,
+    field_penalty: Annotated[
+        float | None,
+        typer.Option("--field-penalty", min=0, help="Omit to select by held-out pairs."),
+    ] = None,
+    source_field_penalty: Annotated[
+        float | None,
+        typer.Option(
+            "--source-field-penalty",
+            min=0,
+            help="Regularization for per-source spatial fields; omit to select by held-out pairs.",
+        ),
+    ] = None,
+    z_percentile: Annotated[
+        list[float] | None,
+        typer.Option(
+            "--z-percentile",
+            min=0,
+            max=100,
+            help="Repeat to fit one model across selected fixed-grid depths.",
+        ),
+    ] = None,
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 8,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
+) -> None:
+    """Fit shared and source-specific residual fields from deconvolved tiles."""
+    from squisher_lightsheet.residual_correction import (
+        DEFAULT_Z_PERCENTILES,
+        fit_residual_correction,
+    )
+
+    manifest_path = fit_residual_correction(
+        registration=registration,
+        fixed_fused=fixed_fused,
+        output_dir=output_dir,
+        channel=channel,
+        source_level=source_level,
+        stride=stride,
+        xy_degree=xy_degree,
+        z_degree=z_degree,
+        field_penalty=field_penalty,
+        source_field_penalty=source_field_penalty,
+        z_percentiles=DEFAULT_Z_PERCENTILES if z_percentile is None else z_percentile,
+        workers=workers,
+        seed=seed,
+    )
+    typer.echo(manifest_path)
+    typer.echo(f"QC figures: {manifest_path.parent / 'qc'}")
+
+
+@app.command("cross-dataset-match")
+def cross_dataset_match_command(
+    fixed_fused: Annotated[Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)],
+    registration: Annotated[Path, typer.Option("--registration", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    reference_view: Annotated[str, typer.Option("--reference-view")],
+    moving_view: Annotated[str, typer.Option("--moving-view")],
+    correction_by_source_view: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--correction-by-source-view",
+            help="Optional; repeat as VIEW=/path/to/existing/correction.json.",
+        ),
+    ] = None,
+    channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
+    source_level: Annotated[int, typer.Option("--source-level", min=0)] = 2,
+    stride: Annotated[int, typer.Option("--stride", min=1)] = 4,
+    z_percentile: Annotated[
+        list[float] | None,
+        typer.Option(
+            "--z-percentile",
+            min=0,
+            max=100,
+            help="Repeat to sample cross-view overlaps at selected fused-grid depths.",
+        ),
+    ] = None,
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 8,
+) -> None:
+    """Match two post-BaSiC datasets with one global moving-view factor."""
+    from squisher_lightsheet.cross_dataset_match import (
+        DEFAULT_Z_PERCENTILES,
+        cross_dataset_match,
+    )
+
+    corrections = {}
+    for value in correction_by_source_view or []:
+        view, path = parse_source_view_path_entry(value, error_factory=typer.BadParameter)
+        if view in corrections:
+            raise typer.BadParameter(
+                f"Duplicate --correction-by-source-view entry for {view!r}",
+                param_hint="--correction-by-source-view",
+            )
+        if not path.is_file():
+            raise typer.BadParameter(
+                f"Correction file does not exist: {path}",
+                param_hint="--correction-by-source-view",
+            )
+        corrections[view] = path
+    manifest_path = cross_dataset_match(
+        registration=registration,
+        fixed_fused=fixed_fused,
+        output_dir=output_dir,
+        corrections_by_view=corrections,
+        reference_view=reference_view,
+        moving_view=moving_view,
+        channel=channel,
+        source_level=source_level,
+        stride=stride,
+        z_percentiles=DEFAULT_Z_PERCENTILES if z_percentile is None else z_percentile,
+        workers=workers,
+    )
+    typer.echo(manifest_path)
+    typer.echo(f"QC figure: {manifest_path.parent / 'cross-dataset-match-qc.png'}")
+
+
+@app.command("channel-affine-registration")
+def channel_affine_registration(
+    window_dir: Annotated[Path, typer.Option("--window-dir", exists=True, file_okay=False, readable=True)],
+    reference_registration: Annotated[
+        Path,
+        typer.Option("--reference-registration", exists=True, dir_okay=False, readable=True),
+    ],
+    output_registration: Annotated[Path, typer.Option("--output-registration")],
+    expected_moving_channel: Annotated[int, typer.Option("--expected-moving-channel", min=0)],
     expected_fixed_fused: Annotated[
         Path,
         typer.Option("--expected-fixed-fused", exists=True, file_okay=False, readable=True),
@@ -166,6 +345,68 @@ def channel_affine_registration(
             output_registration=output_registration,
             expected_moving_channel=expected_moving_channel,
             expected_fixed_fused=expected_fixed_fused,
+            source_label=source_label,
+            target_label=target_label,
+        )
+    )
+
+
+@app.command("apply-channel-affine")
+def apply_channel_affine(
+    reference_registration: Annotated[
+        Path,
+        typer.Option("--reference-registration", exists=True, dir_okay=False, readable=True),
+    ],
+    calibration_registration: Annotated[
+        Path,
+        typer.Option("--calibration-registration", exists=True, dir_okay=False, readable=True),
+    ],
+    expected_calibration_sha256: Annotated[str, typer.Option("--expected-calibration-sha256")],
+    output_registration: Annotated[Path, typer.Option("--output-registration")],
+    expected_moving_channel: Annotated[int, typer.Option("--expected-moving-channel", min=0)],
+    source_label: Annotated[str, typer.Option("--source-label")],
+    target_label: Annotated[str, typer.Option("--target-label")],
+) -> None:
+    """Apply a pinned physical channel affine to a registration."""
+    typer.echo(
+        apply_channel_affine_registration(
+            reference_registration_input=reference_registration,
+            calibration_registration_input=calibration_registration,
+            expected_calibration_sha256=expected_calibration_sha256,
+            output_registration=output_registration,
+            expected_moving_channel=expected_moving_channel,
+            source_label=source_label,
+            target_label=target_label,
+        )
+    )
+
+
+@app.command("join-channel-affine-registrations")
+def join_channel_affine_registrations(
+    reference_registration: Annotated[
+        Path,
+        typer.Option("--reference-registration", exists=True, dir_okay=False, readable=True),
+    ],
+    side_registration: Annotated[
+        list[Path],
+        typer.Option(
+            "--side-registration",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Repeat for each disjoint side-specific channel-affine registration.",
+        ),
+    ],
+    output_registration: Annotated[Path, typer.Option("--output-registration")],
+    source_label: Annotated[str, typer.Option("--source-label")],
+    target_label: Annotated[str, typer.Option("--target-label")],
+) -> None:
+    """Join side-specific channel affines over one reference registration."""
+    typer.echo(
+        write_joined_channel_affine_registration(
+            reference_registration_input=reference_registration,
+            side_registration_inputs=side_registration,
+            output_registration=output_registration,
             source_label=source_label,
             target_label=target_label,
         )
@@ -244,6 +485,26 @@ def fused_fixed_materialize_overlap(
             help="Registration artifact that maps moving tile identities to pixel-source paths.",
         ),
     ] = None,
+    moving_source_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--moving-source-dir",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Read replacement OME-Zarr tiles with matching identities and spatial shapes; preserve saved geometry.",
+        ),
+    ] = None,
+    residual_correction: Annotated[
+        Path | None,
+        typer.Option(
+            "--residual-correction",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Apply a fitted post-deconvolution correction to native source blocks before materialization.",
+        ),
+    ] = None,
     source_registration: Annotated[
         Path | None,
         typer.Option("--source-registration", exists=True, dir_okay=False, readable=True),
@@ -277,6 +538,8 @@ def fused_fixed_materialize_overlap(
         source_summary_input=source_summary,
         moving_position_input=moving_position,
         moving_source_input=moving_source_registration,
+        moving_source_dir=moving_source_dir,
+        residual_correction=residual_correction,
         output_dir=output_dir,
         source_channel=source_channel,
         core_shape_zyx=parse_shape_zyx(core_shape_zyx),
@@ -508,6 +771,9 @@ def cross_register_global_phase(
     orthogonal_lateral_factor: Annotated[
         int, typer.Option("--orthogonal-lateral-factor", min=1)
     ] = DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
+    orthogonal_z: Annotated[
+        bool, typer.Option("--orthogonal-z/--no-orthogonal-z")
+    ] = True,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
 ) -> None:
     resolved_output_position = output_position or output_dir / "global-phase.positions.json"
@@ -518,16 +784,18 @@ def cross_register_global_phase(
         "moving phase MIP": output_dir / "moving.phase.tif",
         "before overlay": output_dir / "before.png",
         "after overlay": output_dir / "after.png",
-        "orthogonal summary": output_dir / "orthogonal" / "orthogonal.summary.json",
-        "orthogonal contact sheet": output_dir / "orthogonal" / "orthogonal.png",
         "manifest": _global_cross_register_manifest_path(output_dir),
     }
-    for plane in ("zx", "zy"):
-        for artifact in ("fixed.tif", "moving.tif", "before.png", "after.png"):
-            outputs[f"orthogonal {plane} {artifact}"] = output_dir / "orthogonal" / f"{plane}.{artifact}"
-    for plane in ("zx", "zy"):
-        for artifact in ("fixed.tif", "moving.tif", "before.png", "after.png"):
-            outputs[f"orthogonal {plane} {artifact}"] = output_dir / "orthogonal" / f"{plane}.{artifact}"
+    if orthogonal_z:
+        outputs.update(
+            {
+                "orthogonal summary": output_dir / "orthogonal" / "orthogonal.summary.json",
+                "orthogonal contact sheet": output_dir / "orthogonal" / "orthogonal.png",
+            }
+        )
+        for plane in ("zx", "zy"):
+            for artifact in ("fixed.tif", "moving.tif", "before.png", "after.png"):
+                outputs[f"orthogonal {plane} {artifact}"] = output_dir / "orthogonal" / f"{plane}.{artifact}"
     _require_distinct_paths(
         inputs={"fixed position": fixed_position, "moving position": moving_position},
         outputs=outputs,
@@ -554,6 +822,7 @@ def cross_register_global_phase(
         spatial_highpass_sigma=spatial_highpass_sigma,
         max_residual_shift_um=max_residual_shift_um,
         orthogonal_lateral_factor=orthogonal_lateral_factor,
+        orthogonal_z=orthogonal_z,
     )
     manifest = _update_global_cross_register_manifest(
         output_dir,
@@ -581,6 +850,7 @@ def cross_register_global_phase(
             "spatial_highpass_sigma": spatial_highpass_sigma,
             "max_residual_shift_um": max_residual_shift_um,
             "orthogonal_lateral_factor": orthogonal_lateral_factor,
+            "orthogonal_z": orthogonal_z,
         },
     )
     typer.echo(
@@ -590,8 +860,14 @@ def cross_register_global_phase(
                 "summary": str(result.summary),
                 "before_overlay": str(result.before_overlay),
                 "after_overlay": str(result.after_overlay),
-                "orthogonal_summary": str(result.orthogonal_summary),
-                "orthogonal_contact_sheet": str(result.orthogonal_contact_sheet),
+                "orthogonal_summary": (
+                    None if result.orthogonal_summary is None else str(result.orthogonal_summary)
+                ),
+                "orthogonal_contact_sheet": (
+                    None
+                    if result.orthogonal_contact_sheet is None
+                    else str(result.orthogonal_contact_sheet)
+                ),
                 "manifest": str(manifest),
             },
             indent=2,
@@ -611,14 +887,10 @@ def cross_register_method6(
         Path,
         typer.Option("--moving-source-position", exists=True, dir_okay=False, readable=True),
     ],
-    fixed_fused: Annotated[
-        Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)
-    ],
+    fixed_fused: Annotated[Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     output_registration: Annotated[Path, typer.Option("--output-registration", dir_okay=False)],
-    fixed_mask_threshold: Annotated[
-        float, typer.Option("--fixed-mask-threshold", min=0.0)
-    ],
+    fixed_mask_threshold: Annotated[float, typer.Option("--fixed-mask-threshold", min=0.0)],
     source_label: Annotated[str, typer.Option("--source-label")],
     target_label: Annotated[str, typer.Option("--target-label")],
     moving_channel: Annotated[int, typer.Option("--moving-channel", min=0)] = 0,
@@ -796,6 +1068,10 @@ def cross_register_method8_method8(
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     fixed_channel: Annotated[int, typer.Option("--fixed-channel", min=0)] = 0,
     moving_channel: Annotated[int, typer.Option("--moving-channel", min=0)] = 0,
+    pair_mode: Annotated[
+        Literal["tile-number", "spatial-overlap"],
+        typer.Option("--pair-mode", help="Pair corresponding tile numbers or every spatial overlap."),
+    ] = "tile-number",
     core_shape_zyx: Annotated[str, typer.Option("--core-shape-zyx")] = "480,480,480",
     window_shape_zyx: Annotated[str, typer.Option("--window-shape-zyx")] = "528,528,528",
     fit_downsample_zyx: Annotated[str, typer.Option("--fit-downsample-zyx")] = "1,1,1",
@@ -859,6 +1135,7 @@ def cross_register_method8_method8(
         output_dir=output_dir,
         fixed_channel=fixed_channel,
         moving_channel=moving_channel,
+        pair_mode=pair_mode,
         core_shape_zyx=parse_shape_zyx(core_shape_zyx),
         window_shape_zyx=parse_shape_zyx(window_shape_zyx),
         fit_downsample_zyx=parse_shape_zyx(fit_downsample_zyx),
@@ -881,6 +1158,8 @@ def cross_register_method8_method8(
         max_windows=max_windows,
         resume=resume,
     )
+    summary_payload = json.loads(path.read_text())
+    global_affine = summary_payload.get("global_affine")
     manifest = _update_cross_register_manifest(
         output_dir,
         stage="method8",
@@ -889,8 +1168,10 @@ def cross_register_method8_method8(
             "coarse_moving_position": coarse_moving_position.resolve(),
             "summary": path,
             "window_json_dir": window_json_dir.resolve(),
+            "global_affine": global_affine,
             "fixed_channel": fixed_channel,
             "moving_channel": moving_channel,
+            "pair_mode": pair_mode,
             "core_shape_zyx": list(parse_shape_zyx(core_shape_zyx)),
             "window_shape_zyx": list(parse_shape_zyx(window_shape_zyx)),
             "fixed_mask_threshold": _parse_optional_float(fixed_mask_threshold),
@@ -904,6 +1185,7 @@ def cross_register_method8_method8(
             {
                 "method8_summary": str(path),
                 "window_json_dir": str(window_json_dir.resolve()),
+                "global_affine": global_affine,
                 "manifest": str(manifest),
             },
             indent=2,
@@ -1402,16 +1684,31 @@ def fuse(
         list[str] | None,
         typer.Option("--flatfield-dir-by-source-view"),
     ] = None,
+    residual_correction: Annotated[
+        Path | None, typer.Option("--residual-correction", exists=True, dir_okay=False)
+    ] = None,
     fusion_level: Annotated[int, typer.Option("--fusion-level", min=0)] = 0,
     fusion_weight_mode: Annotated[
         str,
         typer.Option("--fusion-weight-mode"),
-    ] = "content-preibisch-coarse",
-    batch_size: Annotated[int, typer.Option("--batch-size", min=1)] = 1,
-    basic_cache_disk_dir: Annotated[
-        Path | None,
-        typer.Option("--basic-cache-disk-dir", file_okay=False),
-    ] = None,
+    ] = "crop-sharpness-seam",
+    seam_width_um: Annotated[
+        float,
+        typer.Option(
+            "--seam-width-um",
+            min=0.0,
+            help="Full interface blend width for sharpness-seam fusion, in micrometers.",
+        ),
+    ] = 10.0,
+    batch_size: Annotated[str, typer.Option("--batch-size")] = "auto",
+    source_cache_max_gib: Annotated[
+        float,
+        typer.Option(
+            "--source-cache-max-gib",
+            min=0.0,
+            help="Total host-memory budget for session-owned raw source chunks; 0 disables caching.",
+        ),
+    ] = 64.0,
     output_chunksize_zyx: Annotated[
         str,
         typer.Option("--output-chunksize-zyx", help="Fusion output chunk size as z,y,x."),
@@ -1456,10 +1753,12 @@ def fuse(
         output=output,
         channels=channel,
         flatfield_dirs_by_source_view=_parse_source_view_flatfield_dirs(flatfield_dir_by_source_view),
+        residual_correction=residual_correction,
         fusion_level=fusion_level,
         fusion_weight_mode=fusion_weight_mode,
-        batch_size=batch_size,
-        basic_cache_disk_dir=basic_cache_disk_dir,
+        seam_width_um=seam_width_um,
+        batch_size=parse_fusion_batch_size(batch_size),
+        source_cache_max_gib=source_cache_max_gib,
         output_chunksize_zyx=_parse_int_zyx(output_chunksize_zyx, "--output-chunksize-zyx"),
         output_grid_template=output_grid_template,
         output_grid_template_level=output_grid_template_level,
@@ -1491,12 +1790,20 @@ def subtract_channel(
     beta: Annotated[float, typer.Option("--beta")] = 0.0,
     target_background: Annotated[float, typer.Option("--target-background")] = 0.0,
     reference_background: Annotated[float, typer.Option("--reference-background")] = 0.0,
+    target_residual_correction: Annotated[
+        Path | None,
+        typer.Option("--target-residual-correction", exists=True, dir_okay=False, readable=True),
+    ] = None,
+    reference_residual_correction: Annotated[
+        Path | None,
+        typer.Option("--reference-residual-correction", exists=True, dir_okay=False, readable=True),
+    ] = None,
     crop_yx_px: Annotated[int, typer.Option("--crop-yx-px", min=0)] = 20,
     z_chunk: Annotated[int, typer.Option("--z-chunk", min=1)] = 64,
-    compression: Annotated[int | None, typer.Option("--compression")] = DEFAULT_SUBTRACTION_COMPRESSION,
-    compression_level: Annotated[float | None, typer.Option("--compression-level")] = (
-        DEFAULT_SUBTRACTION_COMPRESSION_LEVEL
+    chunk_shape_zyx: Annotated[str, typer.Option("--chunk-shape-zyx")] = _format_int_zyx(
+        DEFAULT_SUBTRACTION_CHUNK_SHAPE_ZYX
     ),
+    zstd_level: Annotated[int, typer.Option("--zstd-level", min=1, max=22)] = DEFAULT_SUBTRACTION_ZSTD_LEVEL,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
     limit_tiles: Annotated[int | None, typer.Option("--limit-tiles", min=1)] = None,
 ) -> None:
@@ -1505,7 +1812,7 @@ def subtract_channel(
     The command is a producer stage: it reads raw target/reference channels from
     each source tile, shifts the reference into target local coordinates, applies
     the subtraction model, crops y/x borders, and writes corrected single-channel
-    OME-TIFFs plus position/registration metadata. Downstream fusion treats the
+    OME-Zarrs plus position/registration metadata. Downstream fusion treats the
     output as an ordinary single-channel acquisition.
     """
     result = subtract_channel_tiles(
@@ -1522,10 +1829,12 @@ def subtract_channel(
         beta=beta,
         target_background=target_background,
         reference_background=reference_background,
+        target_residual_correction=target_residual_correction,
+        reference_residual_correction=reference_residual_correction,
         crop_yx_px=crop_yx_px,
         z_chunk=z_chunk,
-        compression=compression,
-        compression_level=compression_level,
+        chunk_shape_zyx=parse_shape_zyx(chunk_shape_zyx),
+        zstd_level=zstd_level,
         overwrite=overwrite,
         limit_tiles=limit_tiles,
         progress=_log_progress,
@@ -1713,6 +2022,10 @@ def ome_metadata_dumb_stitch(
     output_prefix: Annotated[str, typer.Option("--output-prefix")] = "ome_metadata_dumb_stitch",
     draw_tile_labels: Annotated[bool, typer.Option("--draw-tile-labels/--no-draw-tile-labels")] = False,
     draw_tile_outlines: Annotated[bool, typer.Option("--draw-tile-outlines/--no-draw-tile-outlines")] = False,
+    tiff_layout: Annotated[
+        Literal["separate", "channels"],
+        typer.Option("--tiff-layout", help="Write separate TIFFs or one CYX TIFF per view and correction."),
+    ] = "separate",
     write_tiff: Annotated[
         bool,
         typer.Option(
@@ -1753,6 +2066,7 @@ def ome_metadata_dumb_stitch(
         draw_tile_labels=draw_tile_labels,
         draw_tile_outlines=draw_tile_outlines,
         write_tiff=write_tiff,
+        tiff_layout=tiff_layout,
         progress=_log_progress,
     )
     typer.echo(

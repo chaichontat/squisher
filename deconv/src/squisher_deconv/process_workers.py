@@ -56,6 +56,8 @@ class ProcessRunConfig:
     output_relative_root: Path | None
     iterations: int | None = None
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL
+    tile_gains: dict[str, tuple[float, ...]] | None = None
+    tile_gains_path: Path | None = None
 
 
 def run_process_gpu_streaming_deconv(
@@ -102,6 +104,7 @@ def run_process_gpu_sample_scale(
     devices: Sequence[int],
     queue_depth: int,
     stop_on_error: bool,
+    tile_gains: dict[str, tuple[float, ...]] | None = None,
 ) -> tuple[list[Path], list[dict[str, Any]], list[str]]:
     messages, failures = _run_worker_pool(
         task_count=len(windows),
@@ -120,6 +123,7 @@ def run_process_gpu_sample_scale(
                 "paths": tuple(Path(path) for path in paths),
                 "windows": tuple(windows),
                 "sample_dir": sample_dir,
+                "tile_gains": tile_gains,
                 "deconvolver_factory": deconvolver_factory,
                 "stop_on_error": stop_on_error,
             },
@@ -330,6 +334,7 @@ def _sample_scale_worker_loop(
     sample_dir: Path,
     deconvolver_factory: Callable[[int], Deconvolver],
     stop_on_error: bool,
+    tile_gains: dict[str, tuple[float, ...]] | None = None,
 ) -> None:
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -354,6 +359,7 @@ def _sample_scale_worker_loop(
                     window=window,
                     template_source=template_source,
                     sample_dir=sample_dir,
+                    channel_gains=None if tile_gains is None else tile_gains[str(source_path.resolve())],
                     deconvolver=deconvolver,
                 )
             except Exception:
@@ -395,7 +401,9 @@ def _sample_scale_worker_loop(
 
 def _source_for_path(template_source: TiffLogicalSource, path: Path) -> TiffLogicalSource:
     metadata_mode = "summary" if template_source.metadata.tags.get("metadata_mode") == "summary" else "full"
-    source = TiffLogicalSource.open(Path(path), channels=template_source.channels, metadata_mode=metadata_mode)
+    source = TiffLogicalSource.open(
+        Path(path), channels=template_source.channels, metadata_mode=metadata_mode
+    )
     if (source.height, source.width) != (template_source.height, template_source.width):
         raise ValueError(
             f"{source.path} has yx=({source.height},{source.width}), expected "
@@ -416,6 +424,7 @@ def _process_sample_window(
     template_source: TiffLogicalSource,
     sample_dir: Path,
     deconvolver: Deconvolver,
+    channel_gains: tuple[float, ...] | None = None,
 ) -> float:
     source = _source_for_path(template_source, path)
     t_window = time.perf_counter()
@@ -431,7 +440,8 @@ def _process_sample_window(
         f"shape={read.shape} dtype={read.dtype} seconds={time.perf_counter() - t_read:.2f}"
     )
     t_deconv = time.perf_counter()
-    deconvolved = deconvolver.deconvolve(read)
+    gain_kwargs = {} if channel_gains is None else {"channel_gains": channel_gains}
+    deconvolved = deconvolver.deconvolve(read, raw_z_start=window.read_start, raw_z_size=source.z_count, **gain_kwargs)
     _log(
         f"sample deconv done device={device} window[{window_index:05d}] file={source.path.name} "
         f"output_shape={deconvolved.shape} seconds={time.perf_counter() - t_deconv:.2f}"
@@ -474,6 +484,9 @@ def _process_file(
             f"Refusing to overwrite existing sidecar {sidecar}; pass --overwrite to replace it."
         )
 
+    gain_kwargs = (
+        {} if config.tile_gains is None else {"channel_gains": config.tile_gains[str(source.path.resolve())]}
+    )
     provenance = provenance_payload(
         source.path,
         channels=config.channels,
@@ -482,6 +495,7 @@ def _process_file(
         iterations=config.iterations,
         psf_paths=config.psf_paths,
         basic_paths=config.basic_paths,
+        tile_gains_path=config.tile_gains_path,
         output_mode=config.output_mode,
         scaling_path=config.scaling_path,
         devices=config.devices,
@@ -543,9 +557,12 @@ def _process_file(
                 core_stop = slab.core_stop - slab.read_start
                 chunk = deconvolver.deconvolve_core_u16(
                     read,
+                    raw_z_start=slab.read_start,
+                    raw_z_size=source.z_count,
                     core_start=core_start,
                     core_stop=core_stop,
                     scaling=scaling,
+                    **gain_kwargs,
                 )
                 _validate_u16_core_chunk(chunk, source=source, core_planes=slab.core_stop - slab.core_start)
                 _log(
@@ -624,9 +641,12 @@ def _process_file(
                 core_stop = slab.core_stop - slab.read_start
                 chunk = deconvolver.deconvolve_core_u16(
                     read,
+                    raw_z_start=slab.read_start,
+                    raw_z_size=source.z_count,
                     core_start=core_start,
                     core_stop=core_stop,
                     scaling=scaling,
+                    **gain_kwargs,
                 )
                 _validate_u16_core_chunk(chunk, source=source, core_planes=slab.core_stop - slab.core_start)
                 _log(

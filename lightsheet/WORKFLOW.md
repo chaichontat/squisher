@@ -35,6 +35,7 @@ decide whether a run is usable.
   `uint16` YX OME-TIFF and its explicit threshold. It generates and consumes a
   complete level-2 pair-by-Z-chunk screen before any level-0 crop read; it has
   no automatic-threshold, unmasked, caller-supplied-screen, or partial-pair mode.
+  `--level 2` uses the reviewed phase workflow entirely at level 2.
 - Final deliverables use this folder contract:
 
 ```text
@@ -136,7 +137,7 @@ here for manual threshold selection.
 1. Render the native-intensity center-Z metadata dumb-stitch TIFF and select the threshold.
 2. Generate metadata-driven positions.
 3. Run `register`; it screens all adjacent pair-by-Z-chunk units at level 2
-   with the selected threshold before reading accepted units at level 0.
+   with the selected threshold before reading accepted units at the requested registration level.
 4. Report both the original phase-correlation score and the recovery score.
 5. Optimize positions from the accepted constraints.
 6. Render no-blend dumb-stitch QC from the optimized positions.
@@ -153,7 +154,14 @@ lightsheet-stitch register \
   --z-chunks 6
 ```
 
-This call is phase-only by default: it performs the initial level-0 phase
+For a reviewed coarse registration, add `--level 2`. The same threshold mask,
+complete level-2 overlap screen, shifted-crop recovery, quality gates, and
+connectivity checks apply. Registration reads the actual TIFF SubIFD or OME-Zarr
+level and converts fitted shifts using that level's physical spacing; canonical
+outputs retain the original source geometry. `--zarr-dir` accepts TIFF tile
+directories as well as OME-Zarr directories. Native Method8 requires level 0.
+
+This call is phase-only by default: it performs the initial selected-level phase
 correlation, reruns failed or ambiguous edges with axis-prior shifted crops,
 and optimizes positions from the accepted phase constraints. Use `--method8`
 only for an explicitly requested native refinement experiment.
@@ -163,6 +171,10 @@ the accepted constraint graph is disconnected. Use `--allow-disconnected` only
 after explicitly accepting that condition. The canonical provenance retains
 both the total and connected tile counts; the option does not infer missing
 constraints or claim that disconnected tiles were registered.
+Alternatively, use `--exclude-disconnected` to publish only the anchor-connected
+component. Both canonical outputs omit those tiles and record their identities
+under `registration_run.connectivity.excluded_tiles` in provenance. The two
+options are mutually exclusive.
 
 It emits both `registration.positions.json` and the identity-affine
 `registration.json` expected by fusion; optimized placement is stored in each
@@ -194,7 +206,10 @@ side-internal geometry.
    the coarse CR-to-CL shift.
 3. At level 0, sample overlapping CL/CR regions implied by that shift. Use the
    same exhaustive chunking pattern as the 405 mapping work, and apply a mask
-   filter derived from image content.
+   filter derived from image content. The packaged Method8 runner supports this
+   cross-side graph with `--pair-mode spatial-overlap`; its default
+   `tile-number` mode is for corresponding acquisitions and is not the CL/CR
+   contract.
 4. Run native Method8 on the accepted overlap chunks.
 5. Use the median accepted Method8 local translation as the fine global CR
    correction. Add it to the z-median phase-correlation shift.
@@ -219,6 +234,23 @@ python /home/chaichontat/squisher/lightsheet/scripts/canonicalize_cl_cr_r_to_l.p
 The canonicalization script writes `registration.json`, keeps a position JSON as
 an internal fuser input, and prints fusion/movie commands that produce
 `fused.ch0.ome.zarr` and `fused.ch1.ome.zarr`.
+
+If a later channel-affine fit is run separately for CL and CR subsets of that
+combined geometry, publish the combined registration through the pipeline:
+
+```bash
+lightsheet join-channel-affine-registrations \
+  --reference-registration COMBINED_REFERENCE.registration.json \
+  --side-registration CL.registration.json \
+  --side-registration CR.registration.json \
+  --output-registration COMBINED_CHANNEL.registration.json \
+  --source-label MOVING_CHANNEL \
+  --target-label FIXED_CHANNEL
+```
+
+The side tile sets must be disjoint and must cover the reference exactly. Source
+geometry and order come from the reference; only the registered affine comes from
+the matching side artifact. The output records input hashes and side diagnostics.
 
 ## 405-To-488 Mapping
 
@@ -285,6 +317,7 @@ lightsheet fused-fixed-materialize-overlap \
   --source-summary FINAL_SUMMARY.json \
   --moving-position MOVING.positions.json \
   --output-dir MATERIALIZED_LEVEL2 \
+  --residual-correction RESIDUAL_CALIBRATION/correction.json \
   --level-factor-zyx 4,4,4
 
 # Production input: level 0, JPEG-XR
@@ -292,8 +325,15 @@ lightsheet fused-fixed-materialize-overlap \
   --source-summary FINAL_SUMMARY.json \
   --moving-position MOVING.positions.json \
   --output-dir MATERIALIZED_LEVEL0 \
+  --residual-correction RESIDUAL_CALIBRATION/correction.json \
   --level-factor-zyx 1,1,1
 ```
+
+When a residual correction is supplied, materialization always reads the
+original level-0 CZYX sources, applies the correction in native source
+coordinates, and only then performs any requested block downsampling. It does
+not reuse a deeper source pyramid because that would apply the model after the
+native pixels had already been reduced.
 
 Both materializations derive geometry from the same final registration summary.
 The level-0 fusion guard rejects downsampled materialization when the requested

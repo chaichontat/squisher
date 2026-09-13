@@ -5,7 +5,11 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from xml.etree import ElementTree as ET
+
+from squisher_deconv.basic_profiles import load_basic_profile_arrays
+from squisher_deconv.residual_field import residual_plane
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -52,6 +56,7 @@ class BasicProfile:
     darkfield: np.ndarray | None
     flatfield_path: Path
     darkfield_path: Path | None
+    residual_coefficient: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -218,12 +223,17 @@ def load_basic_profile(basic_dir: Path, channel: int) -> BasicProfile:
         raise ValueError(
             f"{darkfield_path} shape {darkfield.shape} does not match flatfield {flatfield.shape}"
         )
+    profiles = sorted(basic_dir.glob(f"*-ch{channel}.pkl"))
+    if len(profiles) > 1:
+        raise ValueError(f"Expected one serialized ch{channel} profile in {basic_dir}, found {profiles}")
+    residual = None if not profiles else load_basic_profile_arrays(profiles[0]).residual_coefficient
     return BasicProfile(
+        residual_coefficient=residual,
         flatfield=flatfield, darkfield=darkfield, flatfield_path=flatfield_path, darkfield_path=darkfield_path
     )
 
 
-def apply_basic(plane: np.ndarray, profile: BasicProfile) -> np.ndarray:
+def apply_basic(plane: np.ndarray, profile: BasicProfile, *, raw_z: int | None = None, raw_shape_zyx: tuple[int, int, int] | None = None, y_slice: slice = slice(None), x_slice: slice = slice(None)) -> np.ndarray:
     if profile.flatfield.shape != plane.shape:
         raise ValueError(
             f"BaSiC profile shape {profile.flatfield.shape} does not match tile plane {plane.shape}"
@@ -231,7 +241,12 @@ def apply_basic(plane: np.ndarray, profile: BasicProfile) -> np.ndarray:
     corrected = plane.astype(np.float32, copy=False)
     if profile.darkfield is not None:
         corrected = corrected - profile.darkfield
-    return corrected / profile.flatfield
+    corrected = corrected / profile.flatfield
+    if profile.residual_coefficient is not None:
+        if raw_z is None or raw_shape_zyx is None:
+            raise ValueError("Z-dependent correction requires original raw Z and source shape")
+        corrected *= residual_plane(profile.residual_coefficient, z=raw_z, shape_zyx=raw_shape_zyx, y_slice=y_slice, x_slice=x_slice)
+    return corrected
 
 
 def canvas_for_tiles(
@@ -375,6 +390,7 @@ def _render_view(
     draw_tile_labels: bool,
     draw_tile_outlines: bool,
     write_tiff: bool,
+    tiff_layout: Literal["separate", "channels"] = "separate",
     output_prefix: str,
     progress,
 ) -> tuple[dict[str, object], list[tuple[str, Path]]]:
@@ -415,7 +431,7 @@ def _render_view(
             _paste(mosaics[("raw", channel)], plane, y0=y0, x0=x0)
             if basic_dir is not None:
                 corrected = orient_plane_yx(
-                    apply_basic(raw_plane, profiles[channel]), tile.spacing_um_zyx[1:]
+                    apply_basic(raw_plane, profiles[channel], raw_z=z_index, raw_shape_zyx=tile.shape_zyx), tile.spacing_um_zyx[1:]
                 )
                 _paste(mosaics[("basic", channel)], corrected, y0=y0, x0=x0)
         placements.append(
@@ -438,32 +454,37 @@ def _render_view(
     for case in cases:
         stretched, display_range = stretch_uint8([mosaics[(case, channel)] for channel in channels])
         display_ranges[case] = list(display_range)
-        for channel, image in zip(channels, stretched, strict=True):
-            if write_tiff:
-                tiff_path = (
-                    output_dir
-                    / f"{output_prefix}-{view}_{case}_ch{channel}_omeMetadata_noBlend{suffix}.ome.tif"
+        if write_tiff:
+            channel_groups = [channels] if tiff_layout == "channels" else [(c,) for c in channels]
+            for group in channel_groups:
+                combined = tiff_layout == "channels"
+                channel_label = "channels" if combined else f"ch{group[0]}"
+                tiff_path = output_dir / (
+                    f"{output_prefix}-{view}_{case}_{channel_label}.ome.tif"
+                    if combined
+                    else f"{output_prefix}-{view}_{case}_{channel_label}_omeMetadata_noBlend{suffix}.ome.tif"
                 )
+                planes = [
+                    _exact_uint16(mosaics[(case, c)]) if case == "raw" else mosaics[(case, c)] for c in group
+                ]
                 imwrite(
                     tiff_path,
-                    (
-                        _exact_uint16(mosaics[(case, channel)])
-                        if case == "raw"
-                        else mosaics[(case, channel)]
-                    ),
+                    np.stack(planes) if combined else planes[0],
                     ome=True,
                     photometric="minisblack",
                     tile=(256, 256),
                     compression="zlib",
                     metadata={
-                        "axes": "YX",
+                        "axes": "CYX" if combined else "YX",
+                        "Channel": {"Name": [f"ch{c}" for c in group]},
                         "PhysicalSizeY": pixel_um_yx[0],
                         "PhysicalSizeYUnit": "µm",
                         "PhysicalSizeX": pixel_um_yx[1],
                         "PhysicalSizeXUnit": "µm",
                     },
                 )
-                outputs[f"{case}_ch{channel}_tiff"] = str(tiff_path)
+                outputs[f"{case}_{channel_label}_tiff"] = str(tiff_path)
+        for channel, image in zip(channels, stretched, strict=True):
             image = annotate_tiles(
                 image, placements, draw_tile_labels=draw_tile_labels, draw_tile_outlines=draw_tile_outlines
             )
@@ -518,9 +539,12 @@ def render_ome_metadata_dumb_stitch(
     draw_tile_labels: bool = False,
     draw_tile_outlines: bool = False,
     write_tiff: bool = False,
+    tiff_layout: Literal["separate", "channels"] = "separate",
     progress=None,
 ) -> DumbStitchResult:
     register_jpegxr_codec()
+    if tiff_layout not in ("separate", "channels"):
+        raise ValueError(f"Unknown TIFF layout: {tiff_layout}")
     if not input_dirs_by_view:
         raise ValueError("At least one input view is required")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -539,6 +563,7 @@ def render_ome_metadata_dumb_stitch(
             draw_tile_labels=draw_tile_labels,
             draw_tile_outlines=draw_tile_outlines,
             write_tiff=write_tiff,
+            tiff_layout=tiff_layout,
             output_prefix=output_prefix,
             progress=progress,
         )
@@ -565,6 +590,7 @@ def render_ome_metadata_dumb_stitch(
                 "draw_tile_labels": bool(draw_tile_labels),
                 "draw_tile_outlines": bool(draw_tile_outlines),
                 "write_tiff": bool(write_tiff),
+                "tiff_layout": tiff_layout,
                 "views": views,
                 "contact_sheet": str(contact_sheet_path),
             },

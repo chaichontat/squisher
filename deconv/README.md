@@ -26,3 +26,40 @@ PYTHONPATH=/home/chaichontat/squisher/deconv/src python -m squisher_deconv basic
 PYTHONPATH=/home/chaichontat/squisher/deconv/src python -m squisher_deconv sample-scale ...
 PYTHONPATH=/home/chaichontat/squisher/deconv/src python -m squisher_deconv run ...
 ```
+
+### Per-tile channel gains
+
+Both `sample-scale` and `run` accept `--tile-gains gains.json`. The manifest must
+cover exactly the supplied source files, using absolute paths and one positive,
+finite multiplier per channel in the same order as `--basic` and `--psf`:
+
+```json
+{
+  "schema_version": 1,
+  "channels": 3,
+  "tiles": [
+    {"source": "/data/tile.ome.tif", "gains": [1.0, 1.12, 1.0]}
+  ]
+}
+```
+
+The engine applies gains after BaSiC subtraction/division and nonnegative
+clipping, before Richardson–Lucy deconvolution. A gain of 1 preserves the
+channel. Missing, duplicate, extra, nonpositive, or nonfinite entries are errors;
+relative paths are rejected. Paths are resolved before matching.
+
+Pass the same manifest to scaling estimation and the production run, and create
+fresh scaling samples when changing gains or BaSiC profiles. Sample manifests
+and output provenance record the gain-file identity. Resume rejects outputs made
+with a different manifest. Registration and fusion do not apply these gains
+again: they consume the already corrected deconvolved tiles.
+
+### Z-dependent post-BaSiC fields
+
+Profiles produced by `lightsheet post-basic --z-degree 1` contain a smooth
+residual field in normalized original raw Z/Y/X coordinates alongside the
+original 2D BaSiC arrays. Pass these pickles through the existing `--basic`
+arguments to both `sample-scale` and `run`. The GPU engine evaluates the field
+using the slab's original raw Z start and the full source Z count, then applies
+it after BaSiC correction and before tile gains and deconvolution. Changing the
+profile requires fresh scaling samples, as with any BaSiC change.

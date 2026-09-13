@@ -13,6 +13,7 @@ from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 
 from squisher_lightsheet import phase_metrics
+from squisher_lightsheet.artifact_io import sha256_file
 from squisher_lightsheet.artifacts import stamp_artifact
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
 from squisher_lightsheet.tile_phase import (
@@ -500,6 +501,135 @@ def compose_registration_affine(
         @ np.linalg.inv(_translation_matrix_zyx_um(moving_stage))
     ).tolist()
     return output
+
+
+def apply_channel_affine_registration(
+    *,
+    reference_registration_input: Path,
+    calibration_registration_input: Path,
+    expected_calibration_sha256: str,
+    output_registration: Path,
+    expected_moving_channel: int,
+    source_label: str,
+    target_label: str,
+) -> Path:
+    """Apply a pinned physical channel affine to every tile in a registration."""
+    if expected_moving_channel < 0:
+        raise ValueError("expected_moving_channel must be nonnegative")
+    if not source_label.strip() or not target_label.strip() or source_label == target_label:
+        raise ValueError("source_label and target_label must be nonempty and distinct")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_calibration_sha256):
+        raise ValueError("expected_calibration_sha256 must be 64 lowercase hexadecimal characters")
+    calibration_sha256 = sha256_file(calibration_registration_input)
+    if calibration_sha256 != expected_calibration_sha256:
+        raise ValueError(
+            f"Calibration SHA256 mismatch: expected {expected_calibration_sha256}, got {calibration_sha256}"
+        )
+    if output_registration.resolve() in {
+        reference_registration_input.resolve(),
+        calibration_registration_input.resolve(),
+    }:
+        raise ValueError("output_registration must differ from both input registrations")
+
+    calibration = json.loads(calibration_registration_input.read_text())
+    artifact_type = calibration.get("artifact_type")
+    diagnostic_key = {
+        "squisher_lightsheet.global_channel_affine_registration.v1": "global_channel_affine",
+        "squisher_lightsheet.transferred_global_channel_affine_registration.v1": "transferred_channel_affine",
+    }.get(artifact_type)
+    if diagnostic_key is None:
+        raise ValueError(f"Unsupported calibration artifact_type {artifact_type!r}")
+    contract = RegistrationTransformContract.model_validate(calibration.get("transform_contract"))
+    if contract.source_space != f"{source_label}_stage_um":
+        raise ValueError(f"Calibration source space is {contract.source_space!r}, expected {source_label!r}")
+    if contract.target_space != f"{target_label}_registered_um":
+        raise ValueError(f"Calibration target space is {contract.target_space!r}, expected {target_label!r}")
+    expected_composition_order = (
+        "reference_registered_affine",
+        "reference_stage_translation_um",
+        "moving_to_reference_channel_affine_um",
+        "inverse_moving_stage_translation_um",
+    )
+    if (
+        contract.composition_order != expected_composition_order
+        or not contract.registered_affine_contains_full_channel_affine
+        or contract.stage_translation_source != "reference_registration_input"
+    ):
+        raise ValueError("Calibration transform contract is not a transferable physical channel affine")
+    diagnostics = calibration.get("diagnostics", {}).get(diagnostic_key, {})
+    channel_affine = np.asarray(diagnostics.get("channel_affine_um_zyx_homogeneous"), dtype=np.float64)
+    if channel_affine.shape != (4, 4) or not np.all(np.isfinite(channel_affine)):
+        raise ValueError("Calibration channel affine must be a finite 4x4 matrix")
+    if not np.allclose(channel_affine[3], [0.0, 0.0, 0.0, 1.0]):
+        raise ValueError("Calibration channel affine must have a homogeneous last row")
+    if abs(float(np.linalg.det(channel_affine[:3, :3]))) < 1e-12:
+        raise ValueError("Calibration channel affine is singular")
+
+    reference = json.loads(reference_registration_input.read_text())
+    if reference.get("artifact_type") == "squisher_lightsheet.transferred_global_channel_affine_registration.v1":
+        raise ValueError("reference registration already contains a transferred channel affine")
+    records = reference.get("tiles")
+    if not isinstance(records, list) or not records:
+        raise ValueError("reference registration must contain a nonempty tiles list")
+    tile_names: set[str] = set()
+    source_paths: set[Path] = set()
+    for record in records:
+        tile = record.get("tile")
+        if not isinstance(tile, str) or not tile or tile in tile_names:
+            raise ValueError(f"Registration tile identity is missing or duplicated: {tile!r}")
+        tile_names.add(tile)
+        path_value = record.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            raise ValueError(f"Registration tile {tile!r} has no source path")
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = reference_registration_input.parent / path
+        resolved_path = path.resolve()
+        if resolved_path in source_paths:
+            raise ValueError(f"Duplicate registration source path {resolved_path}")
+        source_paths.add(resolved_path)
+        shape = record.get("shape")
+        if not isinstance(shape, list) or len(shape) != 4 or expected_moving_channel >= shape[0]:
+            raise ValueError(
+                f"Registration tile {tile!r} does not contain requested acquisition channel "
+                f"{expected_moving_channel}"
+            )
+        if "stage_translation_um" not in record:
+            raise ValueError(f"Registration tile {tile!r} has no explicit stage_translation_um")
+        registered_affine = record.get("registered_affine")
+        if not isinstance(registered_affine, dict) or registered_affine.get("matrix") is None:
+            raise ValueError(f"Registration tile {tile!r} has no registered_affine matrix")
+        if not np.all(np.isfinite(_record_stage_translation_um(record))) or not np.all(
+            np.isfinite(_record_registered_affine_um(record))
+        ):
+            raise ValueError(f"Registration tile {tile!r} has nonfinite placement geometry")
+
+    adapted = json.loads(json.dumps(reference))
+    for record in adapted["tiles"]:
+        stage = _record_stage_translation_um(record)
+        record["registered_affine"] = compose_registration_affine(
+            reference_affine=record["registered_affine"],
+            channel_affine_um=channel_affine,
+            stage_translation_um_zyx=stage,
+            moving_stage_translation_um_zyx=stage,
+        )
+    adapted["artifact_type"] = "squisher_lightsheet.transferred_global_channel_affine_registration.v1"
+    adapted["adapted_from"] = str(reference_registration_input.resolve())
+    adapted["adaptation_method"] = "apply_pinned_global_physical_channel_affine"
+    adapted["transform_contract"] = contract.model_dump(mode="json", by_alias=True)
+    adapted.setdefault("diagnostics", {})["transferred_channel_affine"] = {
+        "calibration_registration": str(calibration_registration_input.resolve()),
+        "calibration_registration_sha256": calibration_sha256,
+        "expected_moving_channel": expected_moving_channel,
+        "source_label": source_label,
+        "target_label": target_label,
+        "channel_affine_um_zyx_homogeneous": channel_affine.tolist(),
+    }
+    output_registration.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_registration.with_name(f".{output_registration.name}.tmp")
+    temporary.write_text(json.dumps(adapted, indent=2) + "\n")
+    temporary.replace(output_registration)
+    return output_registration.resolve()
 
 
 def _tile_record_placement_um(record: dict[str, Any]) -> np.ndarray:

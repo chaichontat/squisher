@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +13,11 @@ from squisher_lightsheet._legacy.rough_align_tltr_center_z_phase import TileReco
 from squisher_lightsheet import channel_affine
 from squisher_lightsheet import native_reg3dgpu
 from squisher_lightsheet.channel_affine import (
+    RegistrationTransformContract,
     _native_window_content_stats,
     _native_window_low_content_reason,
     align_tiles_to_reference_affine,
+    apply_channel_affine_registration,
     center_model_to_homogeneous_um,
     compose_registration_affine,
     crop_center_zyx,
@@ -997,6 +1000,145 @@ def test_global_channel_affine_rejects_invalid_window_lineage_or_geometry(
             output_registration=tmp_path / "output.json",
             expected_moving_channel=1,
             expected_fixed_fused=tmp_path / "fixed.ome.zarr",
+            source_label="638",
+            target_label="561",
+        )
+
+
+def test_apply_channel_affine_uses_pinned_calibration_and_preserves_reference_records(
+    tmp_path: Path,
+) -> None:
+    first = _czyx_registration_record(
+        tmp_path / "first.ome.zarr",
+        tile="first.ome.zarr",
+        stage=(2.0, 20.0, 40.0),
+        registered=np.eye(4),
+    )
+    second_affine = np.eye(4, dtype=np.float64)
+    second_affine[1, 3] = 5.0
+    second = _czyx_registration_record(
+        tmp_path / "second.ome.zarr",
+        tile="second.ome.zarr",
+        stage=(4.0, 80.0, 100.0),
+        registered=second_affine,
+    )
+    reference_path = tmp_path / "reference.json"
+    reference = {"tiles": [first, second], "diagnostics": {"reference": "preserved"}}
+    reference_path.write_text(json.dumps(reference))
+    channel_affine = np.eye(4, dtype=np.float64)
+    channel_affine[:3, :3] = np.diag([1.0, 1.001, 0.999])
+    channel_affine[:3, 3] = [0.5, 0.6, 0.7]
+    calibration = {
+        "artifact_type": "squisher_lightsheet.global_channel_affine_registration.v1",
+        "transform_contract": RegistrationTransformContract(
+            registered_affine_semantics="moving_tile_stage_um_to_reference_registered_um",
+            source_space="638_stage_um",
+            target_space="561_registered_um",
+            composition_order=(
+                "reference_registered_affine",
+                "reference_stage_translation_um",
+                "moving_to_reference_channel_affine_um",
+                "inverse_moving_stage_translation_um",
+            ),
+            registered_affine_contains_full_channel_affine=True,
+            stage_translation_source="reference_registration_input",
+        ).model_dump(mode="json", by_alias=True),
+        "diagnostics": {
+            "global_channel_affine": {"channel_affine_um_zyx_homogeneous": channel_affine.tolist()}
+        },
+    }
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(json.dumps(calibration))
+    calibration_hash = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
+    output_path = tmp_path / "output.json"
+
+    assert (
+        apply_channel_affine_registration(
+            reference_registration_input=reference_path,
+            calibration_registration_input=calibration_path,
+            expected_calibration_sha256=calibration_hash,
+            output_registration=output_path,
+            expected_moving_channel=1,
+            source_label="638",
+            target_label="561",
+        )
+        == output_path.resolve()
+    )
+
+    output = json.loads(output_path.read_text())
+    assert output["diagnostics"]["reference"] == "preserved"
+    assert [record["path"] for record in output["tiles"]] == [first["path"], second["path"]]
+    for source, applied in zip((first, second), output["tiles"], strict=True):
+        stage = np.asarray([source["stage_translation_um"][axis] for axis in "zyx"])
+        expected = compose_registration_affine(
+            reference_affine=source["registered_affine"],
+            channel_affine_um=channel_affine,
+            stage_translation_um_zyx=stage,
+            moving_stage_translation_um_zyx=stage,
+        )
+        np.testing.assert_allclose(applied["registered_affine"]["matrix"], expected["matrix"])
+    transfer = output["diagnostics"]["transferred_channel_affine"]
+    assert transfer["calibration_registration_sha256"] == calibration_hash
+    np.testing.assert_allclose(transfer["channel_affine_um_zyx_homogeneous"], channel_affine)
+    assert json.loads(reference_path.read_text()) == reference
+    assert not output_path.with_name(f".{output_path.name}.tmp").exists()
+
+
+def test_apply_channel_affine_rejects_changed_calibration_before_writing(tmp_path: Path) -> None:
+    reference_path = tmp_path / "reference.json"
+    reference_path.write_text("{}")
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text("{}")
+    output_path = tmp_path / "output.json"
+
+    with pytest.raises(ValueError, match="Calibration SHA256 mismatch"):
+        apply_channel_affine_registration(
+            reference_registration_input=reference_path,
+            calibration_registration_input=calibration_path,
+            expected_calibration_sha256="0" * 64,
+            output_registration=output_path,
+            expected_moving_channel=1,
+            source_label="638",
+            target_label="561",
+        )
+
+    assert not output_path.exists()
+
+
+def test_apply_channel_affine_rejects_wrong_calibration_direction(tmp_path: Path) -> None:
+    calibration = {
+        "artifact_type": "squisher_lightsheet.global_channel_affine_registration.v1",
+        "transform_contract": RegistrationTransformContract(
+            registered_affine_semantics="moving_tile_stage_um_to_reference_registered_um",
+            source_space="561_stage_um",
+            target_space="638_registered_um",
+            composition_order=(
+                "reference_registered_affine",
+                "reference_stage_translation_um",
+                "moving_to_reference_channel_affine_um",
+                "inverse_moving_stage_translation_um",
+            ),
+            registered_affine_contains_full_channel_affine=True,
+            stage_translation_source="reference_registration_input",
+        ).model_dump(mode="json", by_alias=True),
+        "diagnostics": {
+            "global_channel_affine": {
+                "channel_affine_um_zyx_homogeneous": np.eye(4).tolist()
+            }
+        },
+    }
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(json.dumps(calibration))
+    reference_path = tmp_path / "reference.json"
+    reference_path.write_text("{}")
+
+    with pytest.raises(ValueError, match="Calibration source space"):
+        apply_channel_affine_registration(
+            reference_registration_input=reference_path,
+            calibration_registration_input=calibration_path,
+            expected_calibration_sha256=hashlib.sha256(calibration_path.read_bytes()).hexdigest(),
+            output_registration=tmp_path / "output.json",
+            expected_moving_channel=1,
             source_label="638",
             target_label="561",
         )

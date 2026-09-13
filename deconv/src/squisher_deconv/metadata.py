@@ -173,6 +173,7 @@ def provenance_payload(
     iterations: int | None,
     psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
+    tile_gains_path: Path | None = None,
     output_mode: str,
     scaling_path: Path | None,
     devices: list[int],
@@ -196,6 +197,7 @@ def provenance_payload(
         },
         "psfs": file_provenance_records(psf_paths or []),
         "basic_profiles": file_provenance_records(basic_paths or []),
+        "tile_gains": None if tile_gains_path is None else file_provenance_records([tile_gains_path])[0],
         "scaling": None if scaling_path is None else file_provenance_records([scaling_path])[0],
         "versions": dependency_versions(),
     }

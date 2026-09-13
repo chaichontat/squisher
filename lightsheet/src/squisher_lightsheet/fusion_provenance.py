@@ -402,8 +402,11 @@ def _deconvolution_source_paths(
             value = tile.get("materialized_source_path") or tile.get("path")
             if isinstance(value, str) and value.endswith((".zarr", ".ome.zarr")):
                 path = Path(value).expanduser()
-                if not path.is_absolute():
-                    path = input_dir / path.name
+                replacement = input_dir / path.name
+                if not path.is_absolute() or (
+                    not tile.get("materialized_source_path") and replacement.exists()
+                ):
+                    path = replacement
                 candidates.add(path.resolve())
     return sorted(candidates, key=str)
 

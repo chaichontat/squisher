@@ -10,6 +10,28 @@ coordinate contracts, QC gates, and canonical final output layout.
 uv run --package squisher-lightsheet lightsheet --help
 ```
 
+## Planar tissue tilt
+
+Fit one two-axis tissue-plane normal from one or more co-registered OME-Zarr
+volumes without splitting the sample into hemispheres:
+
+```bash
+lightsheet fit-planar-tilt \
+  --mask /path/to/cortex-mask.nrrd \
+  --source /path/to/561.ome.zarr --window 400,16000 \
+  --source /path/to/638.ome.zarr --window 1550,18000 \
+  --output /path/to/planar-tilt.json
+```
+
+The default fit uses OME-Zarr level 2, a centered 360 µm Z slab, and about
+5 µm XY sampling derived from each level's physical scale. All sources must
+share their ZYX shape and physical transform. The identity-direction NRRD mask
+is resampled cubically in physical space, each source covariance is centered
+independently, and the source covariances are pooled with equal weight. The JSON
+records the coronal pitch, lateral tilt, normalized XYZ normal, and realized
+sampling. Use `--level`, `--z-depth-um`, or `--xy-step-um` to override the
+physical sampling contract.
+
 ## Fusion input contract
 
 Fusion accepts local OME-Zarr directories and TIFF files that `tifffile` can
@@ -25,12 +47,185 @@ The position and registration inputs own physical spacing, tile translation,
 channel labels, and orientation. The reader does not infer geometry or align
 channels.
 
-The shared-schema TIFF path assumes that every tile has the same axes, shape,
-dtype, chunk or strip layout, codecs, and pyramid structure. It reads one TIFF
-schema per requested level and applies it to the remaining tiles without
-opening their headers. Use this path only for controlled acquisitions. Pixel
-reads remain lazy, although a compressed strip may decode more data than the
-requested slice.
+## Fit residual calibration after deconvolution
+
+[System design and single-/multi-side workflows](RESIDUAL_CORRECTION.md).
+[Fit acceptance workflow](POST_BASIC.md).
+
+`fit-residual` is the canonical post-deconvolution workflow; `post-basic` is an
+exact CLI alias. It samples registered deconvolved CZYX OME-Zarr sources across
+the fixed fused grid, fits shared and source-specific depth-aware
+camera-coordinate fields plus one gain per source, evaluates held-out source
+pairs and held-out Z planes, then refits
+the deployment model on every eligible overlap. Every fitted source must have
+overlap support in one connected graph.
+
+```bash
+lightsheet fit-residual \
+  --fixed-fused /path/to/fixed-grid.ome.zarr \
+  --registration /path/to/registration.json \
+  --output-dir /path/to/residual-calibration \
+  --channel 0 \
+  --source-level 2 \
+  --stride 4 \
+  --xy-degree 1 \
+  --z-degree 1 \
+  --field-penalty 0.03 \
+  --source-field-penalty 0.03 \
+  --workers 8 \
+  --seed 20260907
+```
+
+By default, the fit samples 39 planes at 2.5-percentile increments. To select a
+smaller explicit set, add repeated `--z-percentile` options:
+
+```bash
+  --z-percentile 20 --z-percentile 30 --z-percentile 40 \
+  --z-percentile 50 --z-percentile 60 --z-percentile 70
+```
+
+Percentiles refer to the fused grid and resolve to
+`floor((Z_count - 1) * percentile / 100)`. They must select at least
+`z-degree + 2` distinct planes. The report's main image uses the selected plane
+nearest the grid center. The manifest records every sampled Z index, physical
+Z, per-plane cutoff, and source membership.
+
+Multi-plane fitting pools seam measurements and assigns every occurrence of a
+source pair to the same train/validation/test split across Z. It also runs
+leave-one-plane-out evaluation: the pooled model uses all remaining planes,
+while the single-plane comparison uses the training plane closest to the main
+report plane. Penalty selection uses training planes only. Each channel figure
+includes the held-out-plane comparison curve; `qc/z_validation.csv` records the
+scores. Before/after images for every sampled plane remain under `planes/`.
+
+The default `--z-degree 1` fits a regularized 3D field across the selected
+depths. The field uses five camera-XY cosine modes whose coefficients vary smoothly
+with normalized original raw Z (`z / (source_Z_count - 1)`). Higher Z modes
+are scaled by `1 / (1 + degree²)` before the existing robust penalized fit;
+`--z-degree` accepts 0–3 and requires at least degree + 2 sampled planes.
+Spread the selected percentiles across the specimen's full depth. The 3D report
+also compares a 2D field trained on exactly the same planes.
+
+The default is `--xy-degree 1`. Shared- and source-specific field
+regularization are independently selected on held-out pairs unless
+`--field-penalty` or `--source-field-penalty` is supplied. The fitting degrees
+and selected penalties are recorded in the output manifest.
+
+Review `qc/field_N.pdf` or `.svg` alongside the channel figure: it shows the
+actual after/before multiplier map and camera-X/Y field profiles at low,
+middle, and high raw Z. Compare corrected tile interiors and boundaries across
+depth before accepting a fit. If a setting introduces or amplifies tile-periodic
+waves, reduce spatial order and/or increase regularization, refit, and repeat
+the visual and seam checks.
+
+A fitted correction is stored in `OUTPUT_DIR/correction.json` as a compact
+coefficient matrix, global scale, exact source identities and shapes, and
+source-specific fields and source gains. Fusion evaluates them lazily at each requested source block's
+original Z/Y/X coordinates; it never expands the model into a full source
+volume. The displayed mask and field-magnitude summary use raw Z 50%.
+
+Registration records must point to the original deconvolved sources and describe
+their full CZYX shape, stage translation, scale, and registered affine.
+Materialized source crops are rejected because they do not preserve the source
+coordinate contract required by the residual model.
+
+The command refuses an existing output directory. It writes
+`correction.json`, `tile-gains.json`, before/after sampled-plane artifacts,
+held-out metrics, a hashed manifest, and QC figures before atomically
+publishing the directory.
+
+### Match separately corrected datasets
+
+Use `cross-dataset-match` after separate per-dataset `post-basic` fits and
+after the datasets have been registered into one coordinate frame. This stage
+keeps every existing per-tile gain and spatial field fixed. It samples only
+cross-view overlaps and fits one robust multiplicative factor for the moving
+dataset; it does not fit tile gains or fields and does not run cross-validation.
+
+```bash
+lightsheet cross-dataset-match \
+  --fixed-fused /path/to/preliminary-joined-reference.ome.zarr \
+  --registration /path/to/joined.registration.json \
+  --output-dir /path/to/cross-dataset-match \
+  --correction-by-source-view TL=/path/to/tl/post-basic/correction.json \
+  --correction-by-source-view TR=/path/to/tr/post-basic/correction.json \
+  --reference-view TL \
+  --moving-view TR \
+  --channel 0 \
+  --source-level 2 \
+  --stride 4 \
+  --z-percentile 20 \
+  --z-percentile 35 \
+  --z-percentile 50 \
+  --z-percentile 65 \
+  --z-percentile 80 \
+  --workers 8
+```
+
+Each `--correction-by-source-view` is optional. Omit it when that view has no
+post-BaSiC residual correction; the command records and uses an explicit
+identity correction for those registered sources.
+
+The output `correction.json` composes supplied and identity corrections into the ordinary
+residual-correction schema consumed by `lightsheet fuse --residual-correction`.
+Reference-view sources retain their prior relative corrections. Moving-view
+sources retain their prior relative tile gains and fields, with the single
+fitted dataset factor applied uniformly. If necessary, one common scale is
+applied to every source so the conservative maximum correction multiplier is
+at most one; this changes neither within-view relative corrections nor the
+fitted between-view ratio. The manifest distinguishes supplied correction
+files from generated identity inputs.
+Inspect `cross-dataset-match-qc.png` before final fusion; it shows the measured
+moving/reference log-ratios before and after the fitted factor.
+
+### Review residual-calibration QC
+
+Both command aliases automatically write PNG, PDF, and SVG figures under
+`OUTPUT_DIR/qc/` and print that directory after completion; no extra command or
+flag is needed. The figures use deconvolved before/after images, the fitted
+residual field, and saved source gains. They are generated before the output
+directory is published, so a QC
+failure prevents publication of the run.
+
+Each channel has **one compact figure**:
+
+- Deconvolved and residual-corrected images, with the same linear intensity range,
+  field of view, and physical scale within each pair.
+- Residual multiplier at raw Z 50% in original camera coordinates, centered on
+  identity.
+- Visible tile ownership regions labeled with source indices and colored by
+  the per-tile gain change. The map uses the sampler's actual affine/cropped
+  support at the selected plane; the CSV maps indices to deconvolved source paths.
+- A correction-magnitude chart for that channel: median and 5th–95th percentile
+  over camera pixels for the residual field factor.
+
+For common scale `S`, shared residual multiplier `M`, source-specific multiplier
+`T`, and source gain `g`, fusion
+applies `deconvolved * S * M * T * g`. The field chart shows the shared
+`100 * (M - 1)` term, `source_fields.csv` summarizes `T`, and the tile chart
+shows `100 * (g - 1)`.
+
+The QC uses a fixed compact panel grid, shared camera-axis labels, and
+colorbars that preserve image panel sizes. It exports one PNG/PDF/SVG set per
+channel, numerical CSVs, and a manifest recording input identities and export
+settings. Inspect the rendered figures
+for label clearance and clipping before using them downstream.
+
+Automatic outputs under `OUTPUT_DIR/qc/`:
+
+- `channel_N.png`, `channel_N.pdf`, and `channel_N.svg` for each fitted channel;
+  PNGs are 300 DPI, and PDF/SVG preserve editable labels.
+- `README.md` with figure definitions.
+- `correction_magnitude.csv` and `tile_gains.csv`, including source mappings and
+  fitted, identity, and excluded status for every requested channel.
+- `qc_manifest.json` with input identities, physical coordinates, display ranges,
+  camera dimensions, and per-channel scale-bar lengths.
+
+The main `manifest.json` records QC artifact hashes under `qc`. Each channel also
+saves `owner-chN.tif`, whose integer values index `sampling.sampled_sources`;
+`-1` identifies pixels with no source. This preserves the tile-to-pixel mapping
+used by the gain map. The renderer uses the packaged Matplotlib dependency and
+runs headlessly without a project-local script or plotting-package setup.
 
 ## Rechunk an OME-Zarr preview
 
@@ -167,7 +362,7 @@ CUDA_VISIBLE_DEVICES=0 lightsheet fuse \
   --channel 0 \
   --fusion-weight-mode content-preibisch-coarse \
   --fusion-level 0 \
-  --batch-size 1 \
+  --batch-size auto \
   --output-chunksize-zyx 12,960,960 \
   --dry-run
 
@@ -179,7 +374,7 @@ CUDA_VISIBLE_DEVICES=0 lightsheet fuse \
   --channel 0 \
   --fusion-weight-mode content-preibisch-coarse \
   --fusion-level 0 \
-  --batch-size 1 \
+  --batch-size auto \
   --output-chunksize-zyx 12,960,960 \
   2>&1 | tee -a "$RUN_ROOT/run-logs/codex-lightsheet-wgactrl-405-l2-fusion.log"
 ```
@@ -243,6 +438,14 @@ to the human reviewer and stop. The PNG is only supplementary. After the
 reviewer supplies a threshold, pass that exact threshold to `lightsheet-stitch
 register`; do not chain registration before manual selection. The registration
 command does not consume or record the review TIFF.
+
+To export all requested channels together, add `--write-tiff --tiff-layout channels`
+and select them with `--channels 0,1,2,3`. Each view gets one `CYX` OME-TIFF
+per correction: raw `uint16` and, with `--basic-dir`, a separate signed `float32`
+BaSiC TIFF. Channel names record the source indexes in the requested order;
+physical XY spacing and native intensities are preserved. For example,
+`--output-prefix q --input-dir L=RAW_TILES` writes `q-L_raw_channels.ome.tif`.
+The default `--tiff-layout separate` retains individual channel TIFFs.
 
 ## Cross-Channel Native Registration
 
@@ -321,6 +524,13 @@ lightsheet cross-register-method8 method8 \
   --native-lib-dir /home/chaichontat/microImageLib/bin/linux \
   ...
 ```
+
+A complete `--pair-mode spatial-overlap` run also fits the default global
+moving-to-fixed affine from the accepted physical crop centers. The fit uses
+pair-balanced Huber weights and writes `global_affine.json` plus
+`global_affine_qc.{png,pdf,svg}`. The QC top row compares the measured and fitted
+correction fields; the bottom row shows the signed residuals after applying the
+fit. Partial `--max-windows` diagnostic runs do not emit a global affine.
 
 For long native runs, prefer an activated shell or the environment executable
 directly. Avoid captured `conda run` wrappers because they can hide progress
@@ -498,6 +708,44 @@ inputs, starts level 0 from level-2 Method 8, and uses the identity linear
 initializer. Before writing the canonical registration, it validates those
 settings and the input paths against the completed or resumed sweep summary.
 
+Apply an accepted physical channel calibration to another acquisition without
+rerunning the estimator:
+
+```bash
+lightsheet apply-channel-affine \
+  --reference-registration REFERENCE.registration.json \
+  --calibration-registration ACCEPTED_CALIBRATION.registration.json \
+  --expected-calibration-sha256 SHA256 \
+  --output-registration MOVING.registration.json \
+  --expected-moving-channel 1 \
+  --source-label 638 \
+  --target-label 561
+```
+
+The command verifies the calibration hash and transform direction, then
+stage-conjugates its isolated physical affine into every reference tile. It
+preserves tile order and source geometry; it never copies the calibration
+artifact's already-applied per-tile matrices.
+
+When separate source views were fitted against subsets of one combined reference
+registration, join their full-tile registrations with the packaged owner:
+
+```bash
+lightsheet join-channel-affine-registrations \
+  --reference-registration COMBINED_REFERENCE.registration.json \
+  --side-registration CL.registration.json \
+  --side-registration CR.registration.json \
+  --output-registration COMBINED_CHANNEL.registration.json \
+  --source-label 514 \
+  --target-label 561
+```
+
+The side registrations must be global channel-affine artifacts whose tile sets
+form an exact, disjoint partition of the reference. The command rejects changed
+source paths or geometry, writes tiles in reference order, and substitutes only
+each side's `registered_affine`. Output provenance records hashes, tile coverage,
+transform contracts, and the global-affine diagnostics from every side input.
+
 The overlap in step 6 is required. Materializing only the 480-voxel level-0
 source cores gives the blending weights no shared pixels at core boundaries
 and produces a checker-stripe pattern. The materializer maps each accepted
@@ -569,6 +817,7 @@ lightsheet fused-fixed-materialize-overlap \
   --source-summary "$CORRECTED_DIR/fused_fixed_method8_summary.json" \
   --output-dir "$MAT_DIR" \
   --source-channel 0 \
+  --residual-correction /path/to/residual-calibration/correction.json \
   --core-shape-zyx 480,480,480 \
   --window-shape-zyx 528,528,528 \
   --level-factor-zyx 4,4,4 \
@@ -582,7 +831,7 @@ lightsheet fuse \
   --output "$FUSION_DIR/fused.ome.zarr" \
   --fusion-weight-mode content-preibisch-coarse \
   --fusion-level 0 \
-  --batch-size 1 \
+  --batch-size auto \
   --output-codec zstd \
   --zstd-level 3 \
   --output-chunksize-zyx 12,960,960 \
@@ -598,6 +847,13 @@ lightsheet fused-tile-index-qc \
   --no-labels \
   --no-markers
 ```
+
+`--residual-correction` applies the fitted post-deconvolution model to each
+original level-0 CZYX source block before downsampling and materialization. The
+correction must match the complete moving source set, channel, native shapes,
+and source metadata. Materialized or single-channel sources are rejected. The
+correction path, content hash, and per-source model fingerprint are recorded in
+the materialization artifacts and participate in `--resume` validation.
 
 Fusion writes structured lineage into the completed OME-Zarr. The compact
 root `squisher_fusion` attribute points to `provenance/manifest.json`; the
@@ -792,3 +1048,32 @@ while `12,960,960` produced `29260` blocks and a representative batch finished
 in about 10 seconds.
 
 These commands require explicit input paths and do not hardcode local dataset locations.
+
+### Apply residual calibration during fusion
+
+Pass `--residual-correction /path/to/residual-calibration/correction.json` to
+`lightsheet fuse`. Fusion requires the exact fitted source set, source metadata,
+spatial shapes, and channel, and cannot combine this model with another BaSiC
+correction. The common `global_scale` preserves relative calibration while
+keeping uint16 multipliers at or below one. Correction identity participates in
+crop-score provenance and the fusion resume plan. During fusion,
+`--source-cache-max-gib` bounds a channel-session cache of canonical raw Zarr
+chunks. Corrections are applied to exact requested ROIs on the active GPU;
+fusion does not materialize corrected source slabs or a corrected disk cache.
+Cache eviction changes performance only and is not resume state. Resume
+identity uses content hashes for JSON and Zarr metadata, so rewriting identical
+metadata does not discard valid progress; raw files without a content hash still
+use size and modification time. When several compatible temporary workspaces
+exist, fusion resumes the one with the most completed output-block markers.
+
+
+`lightsheet fuse` defaults to `crop-sharpness-seam`. It scores contiguous
+native-resolution crops in each registered overlap, assigns overlap interiors to
+the sharper source, and feathers ownership interfaces over 10 micrometers. Pass
+`--fusion-weight-mode` explicitly to select another available mode.
+
+The related `sharpness-seam` mode computes normalized high-pass-energy winners
+within every output block. Its score smoothing uses the existing 7/17 XY-pixel
+Gaussian scales, converted to the same physical scales in Z; finite filter halos
+preserve selection across output chunks. For either seam mode, a zero interface
+width gives hard source selection.

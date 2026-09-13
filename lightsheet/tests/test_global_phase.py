@@ -157,6 +157,52 @@ def test_global_phase_rejects_mismatched_physical_spacing(
         )
 
 
+def test_global_phase_can_skip_orthogonal_z_for_single_fused_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed_position = tmp_path / "fixed.json"
+    moving_position = tmp_path / "moving.json"
+    write_position(fixed_position)
+    write_position(moving_position)
+    fixed = canvas(np.arange(120).reshape(4, 5, 6), origin=(1.2, 8.0, 12.0))
+    moving = canvas(np.arange(120).reshape(4, 5, 6), origin=(0.6, 4.0, 8.0))
+    monkeypatch.setattr(
+        global_phase,
+        "render_position_canvas",
+        lambda position, **_kwargs: fixed if position == fixed_position else moving,
+    )
+    monkeypatch.setattr(
+        global_phase,
+        "phasecorr_shift_gpu",
+        lambda *_args, **_kwargs: (np.asarray([0.0, 1.0, -1.0]), {"peak_value": 0.9}),
+    )
+    correlations = iter([0.1, 0.9])
+    monkeypatch.setattr(
+        global_phase.phase_metrics,
+        "corrcoef_on_mask",
+        lambda *_args, **_kwargs: next(correlations),
+    )
+    monkeypatch.setattr(
+        global_phase,
+        "run_orthogonal_dumb_phase",
+        lambda **_kwargs: pytest.fail("orthogonal Z must be skipped"),
+    )
+    result = global_phase.run_global_phase(
+        fixed_position=fixed_position,
+        moving_position=moving_position,
+        output_dir=tmp_path / "run",
+        output_position=tmp_path / "run" / "global-phase.positions.json",
+        fixed_intensity_transform="identity",
+        orthogonal_z=False,
+    )
+    summary = json.loads(result.summary.read_text())
+    assert summary["orthogonal_z_enabled"] is False
+    assert summary["orthogonal_z_residual_um"] == 0.0
+    assert summary["total_shift_to_apply_moving_zyx_um"] == [0.0, 8.0, 0.0]
+    assert result.orthogonal_summary is None
+    assert result.orthogonal_contact_sheet is None
+
+
 def test_global_phase_rejects_translation_without_coverage_overlap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -386,6 +432,7 @@ def test_cross_register_global_phase_cli_forwards_contract_and_writes_manifest(
     assert captured["fft_highpass_sigma_zyx"] == (1.0, 2.0, 3.0)
     assert captured["max_residual_shift_um"] == 100.0
     assert captured["orthogonal_lateral_factor"] == 4
+    assert captured["orthogonal_z"] is True
     manifest = json.loads((output_dir / "cross-register.manifest.json").read_text())
     assert manifest["stages"]["global-phase"]["fixed_channel"] == 2
     assert manifest["stages"]["global-phase"]["orthogonal_contact_sheet"] == str(

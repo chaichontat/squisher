@@ -17,6 +17,7 @@ dependencies = [
     "scikit-image>=0.26.0",
     "scipy>=1.16.0",
     "squisher",
+    "squisher-deconv",
     "tifffile>=2026.6.1",
     "typer>=0.26.5",
     "zarr>=3.2.1",
@@ -24,6 +25,7 @@ dependencies = [
 
 [tool.uv.sources]
 squisher = { workspace = true }
+squisher-deconv = { workspace = true }
 
 [project.scripts]
 lightsheet = "squisher_lightsheet.cli:main"

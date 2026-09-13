@@ -10,9 +10,21 @@ from squisher_lightsheet.legacy_runner import run_legacy_script
 
 
 coarse_preibisch_content_weights = legacy.coarse_preibisch_content_weights
-temporary_basic_disk_cache_dir = legacy.temporary_basic_disk_cache_dir
 DEFAULT_OUTPUT_CHUNKSIZE_ZYX = (12, 960, 960)
 OutputCodec = Literal["auto", "zstd", "jpegxr"]
+BatchSize = int | Literal["auto"]
+
+
+def parse_fusion_batch_size(value: int | str) -> BatchSize:
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("batch size must be a positive integer or 'auto'") from exc
+    if parsed <= 0:
+        raise ValueError("batch size must be a positive integer or 'auto'")
+    return parsed
 
 
 def _materialization_level_factor_zyx(position_input: Path) -> tuple[int, int, int]:
@@ -105,10 +117,10 @@ def fuse_tiles(
     output: Path,
     channels: list[int] | None = None,
     fusion_level: int = 0,
-    fusion_weight_mode: str = "content-preibisch-coarse",
-    batch_size: int = 1,
-    basic_cache_tiles: int = 64,
-    basic_cache_disk_dir: Path | None = None,
+    fusion_weight_mode: str = "crop-sharpness-seam",
+    seam_width_um: float = 10.0,
+    batch_size: BatchSize = "auto",
+    source_cache_max_gib: float = 64.0,
     output_chunksize_zyx: tuple[int, int, int] = DEFAULT_OUTPUT_CHUNKSIZE_ZYX,
     output_grid_template: Path | None = None,
     output_grid_template_level: int = 0,
@@ -116,10 +128,14 @@ def fuse_tiles(
     zstd_level: int = 3,
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
     flatfield_dirs_by_source_view: dict[str, Path] | None = None,
+    residual_correction: Path | None = None,
     resume_fusion: bool = False,
     dry_run: bool = False,
 ) -> str:
+    if residual_correction is not None and flatfield_dirs_by_source_view:
+        raise ValueError("Residual correction requires already-corrected inputs; do not also apply BaSiC")
     output = canonical_fusion_base_output(output)
+    batch_size = parse_fusion_batch_size(batch_size)
     resolved_output_codec = resolve_fusion_output_codec(
         position_input=position_input,
         fusion_level=fusion_level,
@@ -135,12 +151,14 @@ def fuse_tiles(
         str(output),
         "--fusion-weight-mode",
         fusion_weight_mode,
+        "--seam-width-um",
+        str(seam_width_um),
         "--fusion-level",
         str(fusion_level),
         "--batch-size",
         str(batch_size),
-        "--basic-cache-tiles",
-        str(basic_cache_tiles),
+        "--source-cache-max-gib",
+        str(source_cache_max_gib),
         "--jpegxr-level",
         str(jpegxr_level),
         "--output-codec",
@@ -156,8 +174,8 @@ def fuse_tiles(
         validate_source_view_flatfields(flatfield_dirs_by_source_view)
         for view, flatfield_dir in flatfield_dirs_by_source_view.items():
             args.extend(["--flatfield-dir-by-source-view", f"{view}={flatfield_dir}"])
-    if basic_cache_disk_dir is not None:
-        args.extend(["--basic-cache-disk-dir", str(basic_cache_disk_dir)])
+    if residual_correction is not None:
+        args.extend(["--residual-correction", str(residual_correction)])
     if channels is not None:
         args.extend(["--channels", *(str(channel) for channel in channels)])
     if resume_fusion:

@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from functools import lru_cache
 from typing import Any, Literal
 
 import numpy as np
@@ -27,7 +28,7 @@ from squisher_lightsheet.channel_affine import (
 )
 from squisher_lightsheet.native_reg3dgpu import DEFAULT_LIB_DIR, register_method8_device, zyx_to_xyz_3x4
 from squisher_lightsheet.ngff import axes as ngff_axes
-from squisher_lightsheet.ngff import open_level_array
+from squisher_lightsheet.tile_input import open_array, resolve_tile_path, level_scale_ratio, source_axes
 from squisher_lightsheet.seams import (
     BoundaryConstraint,
     RobustBoundarySettings,
@@ -66,6 +67,7 @@ class TileInfo:
     spacing_um_zyx: np.ndarray
     shape_zyx: np.ndarray
     channel: int
+    level: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,11 +109,17 @@ def _write_text_atomic(path: Path, text: str) -> None:
     tmp_path.replace(path)
 
 
-def _load_array(path: Path) -> Any:
-    return open_level_array(path)
+@lru_cache(maxsize=64)
+def _load_array(path: Path, *, level: int = 0) -> Any:
+    array, _store = open_array(path, source_level=level)
+    return array
 
 
 def _load_axes(path: Path, array: Any) -> str:
+    if path.is_file():
+        from tifffile import TiffFile
+        with TiffFile(path) as tif:
+            return source_axes(str(tif.series[0].axes), tuple(array.shape))
     import zarr
 
     group = zarr.open_group(str(path), mode="r")
@@ -144,22 +152,21 @@ def _zarr_name(tile_name: str) -> str:
     return name
 
 
-def _load_tiles(position_json: Path, zarr_dir: Path, *, channel: int = 0) -> dict[str, TileInfo]:
+def _load_tiles(position_json: Path, zarr_dir: Path, *, channel: int = 0, level: int = 0) -> dict[str, TileInfo]:
     payload = json.loads(position_json.read_text())
     if payload.get("units") != "micrometer":
         raise ValueError(f"{position_json} must declare units='micrometer'")
     tiles: dict[str, TileInfo] = {}
     for record in payload["tiles"]:
-        tile_name = _zarr_name(str(record["tile"]))
+        path = resolve_tile_path(zarr_dir, str(record["tile"]))
+        tile_name = path.name
         tile_id = _tile_id(tile_name)
         if not tile_id.isdigit():
             raise ValueError(f"tile {tile_name!r} must end in a numeric tile ID before .ome.zarr")
         if tile_id in tiles:
             raise ValueError(f"duplicate tile ID {tile_id!r} in {position_json}")
-        path = zarr_dir / tile_name
-        if not path.exists():
-            raise FileNotFoundError(f"Missing tile OME-Zarr for {record['tile']}: {path}")
-        array = _load_array(path)
+        ratio = np.asarray(level_scale_ratio(path, level), dtype=np.float64)
+        array = _load_array(path, level=level)
         axes = _load_axes(path, array)
         if axes == "CZYX":
             if not 0 <= int(channel) < int(array.shape[0]):
@@ -176,15 +183,16 @@ def _load_tiles(position_json: Path, zarr_dir: Path, *, channel: int = 0) -> dic
             tile_name=tile_name,
             path=path,
             start_um_zyx=_record_vector_zyx(record, "translation_um"),
-            spacing_um_zyx=_record_vector_zyx(record, "scale_um"),
+            spacing_um_zyx=_record_vector_zyx(record, "scale_um") * ratio,
             shape_zyx=np.asarray(shape_zyx, dtype=np.int64),
             channel=int(channel),
+            level=level,
         )
     return tiles
 
 
 def _read_tile_crop(tile: TileInfo, slices_zyx: tuple[slice, slice, slice]) -> np.ndarray:
-    array = _load_array(tile.path)
+    array = _load_array(tile.path, level=tile.level)
     selection = (tile.channel, *slices_zyx) if array.ndim == 4 else slices_zyx
     return np.asarray(array[selection], dtype=np.float32)
 
@@ -209,24 +217,26 @@ def _load_position_tiles(
     zarr_dir: Path,
     *,
     channel: int = 0,
+    level: int = 0,
 ) -> tuple[dict[str, Any], list[str], dict[str, int], np.ndarray, list[stitch_legacy.TileMetadata]]:
     payload = json.loads(position_json.read_text())
     if payload.get("units") != "micrometer":
         raise ValueError(f"{position_json} must declare units='micrometer'")
     records = payload["tiles"]
-    tile_names = [_zarr_name(str(record["tile"])) for record in records]
+    loaded = _load_tiles(position_json, zarr_dir, channel=channel, level=level)
+    tile_names = [resolve_tile_path(zarr_dir, str(record["tile"])).name for record in records]
     tile_ids = [_tile_id(name) for name in tile_names]
     if any(not tile_id.isdigit() for tile_id in tile_ids):
         raise ValueError("position tile names must end in numeric IDs before .ome.zarr")
     if len(set(tile_ids)) != len(tile_ids):
         raise ValueError(f"duplicate tile IDs in {position_json}")
     tile_index = {tile_id: index for index, tile_id in enumerate(tile_ids)}
-    spacing = _record_vector_zyx(records[0], "scale_um")
+    spacing = loaded[_tile_id(tile_names[0])].spacing_um_zyx
     track = stitch_legacy.TrackMetadata(slug="track0", track_id="track0", channels=(0,), channel_names=("0",))
     tiles = [
         stitch_legacy.TileMetadata(
             path=zarr_dir / tile_name,
-            shape=_zarr_shape(zarr_dir / tile_name, channel=channel),
+            shape=tuple(int(v) for v in loaded[_tile_id(tile_name)].shape_zyx),
             axes="ZYX",
             spacing={dim: float(value) for dim, value in zip(DIMENSIONS, spacing, strict=True)},
             translation={
@@ -286,8 +296,8 @@ def _crop_bounds_for_pair(
     crop_shape[seam_axis_local] = int(overlap_px[seam_axis_local])
     crop_shape[across_axis] = int(overlap_px[across_axis])
 
-    if crop_shape[0] < 64 or crop_shape[1] < 64 or crop_shape[2] < 64:
-        raise ValueError(f"crop too small for method8: {crop_shape.tolist()} overlap={overlap_px.tolist()}")
+    if np.any(crop_shape <= 0):
+        raise ValueError(f"empty registration crop: {crop_shape.tolist()}")
 
     crop_size_um = crop_shape * spacing_abs
     start_um = overlap_start_um.copy()
@@ -704,6 +714,8 @@ def _measure_z_chunk(
         z_start=int(z_start),
         z_depth=int(z_stop - z_start),
     )
+    if method8 and min(crop_shape) < 64:
+        raise ValueError(f"crop too small for method8: {crop_shape}")
     fit_downsample = _fit_downsample_for_shape(crop_shape, seam_axis)
     fixed_raw = _read_tile_crop(fixed, fixed_slices)
     moving_raw = _read_tile_crop(moving, moving_slices)
@@ -754,7 +766,7 @@ def _measure_z_chunk(
             "fixed_center_z_content": fixed_center_z_content,
             "moving_center_z_content": moving_center_z_content,
             "fixed_threshold_mask": fixed_threshold_mask,
-            "measurement_mode": "level0_phase_correlation",
+            "measurement_mode": f"level{fixed.level}_phase_correlation",
             "phase_shift_fit_zyx": None,
             "phase_shift_zyx": None,
             "phase_shift_wrap_risk_axes": [],
@@ -830,7 +842,7 @@ def _measure_z_chunk(
         "fixed_center_z_content": fixed_center_z_content,
         "moving_center_z_content": moving_center_z_content,
         "fixed_threshold_mask": fixed_threshold_mask,
-        "measurement_mode": "level0_phase_correlation",
+        "measurement_mode": f"level{fixed.level}_phase_correlation",
         "phase_shift_fit_zyx": phase_shift_fit_np.astype(np.float64).tolist(),
         "phase_shift_zyx": phase_shift_zyx.tolist(),
         "phase_shift_wrap_risk_axes": wrap_risk_axes,
@@ -1035,6 +1047,7 @@ def measure_method8_zcoverage(
     device: int = 0,
     method8: bool = False,
     channel: int = 0,
+    level: int = 0,
     max_iterations: int = 300,
     ftol: float = 1e-4,
     min_corr: float = 0.15,
@@ -1050,7 +1063,7 @@ def measure_method8_zcoverage(
     progress: Callable[[str], None] | None = None,
 ) -> Path:
     progress = progress or (lambda _message: None)
-    tiles = _load_tiles(position_json, zarr_dir, channel=channel)
+    tiles = _load_tiles(position_json, zarr_dir, channel=channel, level=level)
     resolved_pairs = _all_adjacent_pairs(tiles) if all_adjacent else list(pairs or ())
     if not resolved_pairs:
         raise ValueError("No adjacent tile pairs were found for registration")
@@ -1067,6 +1080,7 @@ def measure_method8_zcoverage(
             z_chunks=z_chunks,
             channel=channel,
             threshold=fixed_mask_threshold,
+            registration_level=level,
         )
 
     rows: list[dict[str, Any]] = []
@@ -1310,7 +1324,7 @@ def measure_method8_zcoverage(
 
     payload = {
         "schema_version": 1,
-        "artifact_type": "lightsheet.level0_phase_recovery_measurements.v1",
+        "artifact_type": f"lightsheet.level{level}_phase_recovery_measurements.v1",
         "position_json": str(position_json.resolve()),
         "zarr_dir": str(zarr_dir.resolve()),
         "input_fingerprint": registration_input_fingerprint(position_json, zarr_dir),
@@ -1322,6 +1336,7 @@ def measure_method8_zcoverage(
             "device": int(device),
             "method8": bool(method8),
             "channel": int(channel),
+            "level": int(level),
             "max_iterations": int(max_iterations),
             "ftol": float(ftol),
             "min_corr": float(min_corr),
@@ -1592,10 +1607,10 @@ def constraints_from_method8_summary(
         pair = (fixed_index, moving_index)
         representative = edge_rows[len(edge_rows) // 2]
         measurement_mode = representative.get("measurement_mode")
-        source_label = f"level0_{source}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
+        source_label = f"level{summary.get('settings', {}).get('level', 0)}_{source}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
         if measurement_mode is not None:
             source_label = (
-                f"level0_{source}_{measurement_mode}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
+                f"level{summary.get('settings', {}).get('level', 0)}_{source}_{measurement_mode}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
             )
         constraints.append(
             BoundaryConstraint(
@@ -1732,7 +1747,8 @@ def optimize_positions_from_method8_summary(
 ) -> Method8RegistrationOutputs:
     _require_optimized_outputs_absent(output_dir)
     summary = json.loads(method8_summary.read_text())
-    if summary.get("artifact_type") != "lightsheet.level0_phase_recovery_measurements.v1":
+    level = int(summary.get("settings", {}).get("level", 0))
+    if summary.get("artifact_type") != f"lightsheet.level{level}_phase_recovery_measurements.v1":
         raise ValueError(f"{method8_summary} is not a level-0 phase recovery measurement summary")
     recorded_position = summary.get("position_json")
     recorded_zarr_dir = summary.get("zarr_dir")
@@ -1743,7 +1759,7 @@ def optimize_positions_from_method8_summary(
     if summary.get("settings", {}).get("channel") != int(channel):
         raise ValueError(f"{method8_summary} belongs to a different channel")
     position_payload, tile_names, tile_index, spacing, tiles = _load_position_tiles(
-        position_json, zarr_dir, channel=channel
+        position_json, zarr_dir, channel=channel, level=level
     )
     constraints, gate_rejections, constraint_sources, constraint_weighting = constraints_from_method8_summary(
         summary,
@@ -1779,11 +1795,12 @@ def optimize_positions_from_method8_summary(
     correction_norms = np.linalg.norm(corrections_array, axis=1)
     diagnostics = {
         "schema_version": 1,
-        "artifact_type": "lightsheet.level0_phase_recovery_tile_optimization.v1",
+        "artifact_type": f"lightsheet.level{level}_phase_recovery_tile_optimization.v1",
         "method8_summary": str(method8_summary.resolve()),
         "method8_summary_sha256": sha256_file(method8_summary),
         "position_json": str(position_json.resolve()),
         "settings": {
+            "level": level,
             "max_grad_regression": float(max_grad_regression),
             "max_corr_regression": float(max_corr_regression),
             "constraint_aggregation": "median_shift_per_fixed_moving_axis_edge",
@@ -1837,7 +1854,7 @@ def optimize_positions_from_method8_summary(
         translation = _record_vector_zyx(record, "translation_um") + corrections_array[index] * spacing
         _set_record_vector_zyx(record, "translation_um", translation)
     optimized_positions["source"] = (
-        f"{optimized_positions.get('source', 'position file')} + level-0 seam optimization"
+        f"{optimized_positions.get('source', 'position file')} + level-{level} seam optimization"
     )
     optimized_positions["derived_by"] = "lightsheet-stitch register"
     optimized_positions["optimization_diagnostics"] = str(diagnostics_path.resolve())
@@ -1872,6 +1889,7 @@ def register_level0_phase_recovery(
     device: int = 0,
     method8: bool = False,
     channel: int = 0,
+    level: int = 0,
     max_iterations: int = 300,
     ftol: float = 1e-4,
     min_corr: float = 0.15,
@@ -1907,6 +1925,7 @@ def register_level0_phase_recovery(
             device=device,
             method8=method8,
             channel=channel,
+            level=level,
             max_iterations=max_iterations,
             ftol=ftol,
             min_corr=min_corr,

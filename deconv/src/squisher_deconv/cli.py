@@ -132,6 +132,16 @@ def sample_scale(
             help="BaSiC pickle path; repeat per channel.",
         ),
     ] = None,
+    tile_gains: Annotated[
+        Path | None,
+        typer.Option(
+            "--tile-gains",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSON manifest of per-source channel gains applied after BaSiC.",
+        ),
+    ] = None,
     iterations: Annotated[int, typer.Option("--iter", min=1, help="Richardson-Lucy iterations.")] = 1,
     halo: Annotated[int | None, typer.Option("--halo", min=0)] = None,
     seed: Annotated[int, typer.Option("--seed")] = 20260622,
@@ -160,6 +170,7 @@ def sample_scale(
         iterations=iterations,
         psf_paths=psf,
         basic_paths=basic,
+        tile_gains_path=tile_gains,
         seed=seed,
         p_low=p_low,
         p_high=p_high,
@@ -196,14 +207,22 @@ def run(
             help="BaSiC pickle path; repeat per channel.",
         ),
     ] = None,
+    tile_gains: Annotated[
+        Path | None,
+        typer.Option(
+            "--tile-gains",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSON manifest of per-source channel gains applied after BaSiC.",
+        ),
+    ] = None,
     iterations: Annotated[int, typer.Option("--iter", min=1, help="Richardson-Lucy iterations.")] = 1,
     halo: Annotated[int | None, typer.Option("--halo", min=0)] = None,
     slab_depth: Annotated[int, typer.Option("--slab-depth", min=1)] = 16,
     devices: Annotated[str, typer.Option("--devices")] = "auto",
     queue_depth: Annotated[int, typer.Option("--queue-depth", min=1)] = 2,
-    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (
-        DEFAULT_JPEGXR_LEVEL
-    ),
+    jpegxr_level: Annotated[float, typer.Option("--jpegxr-level", min=0.0, max=1.0)] = (DEFAULT_JPEGXR_LEVEL),
     stop_on_error: Annotated[bool, typer.Option("--stop-on-error/--keep-going")] = True,
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
     resume: Annotated[bool, typer.Option("--resume/--no-resume")] = False,
@@ -225,6 +244,7 @@ def run(
         ),
         psf_paths=psf,
         basic_paths=basic,
+        tile_gains_path=tile_gains,
         devices=parse_devices(devices, gpu_auto=True),
         queue_depth=queue_depth,
         jpegxr_level=jpegxr_level,
@@ -273,9 +293,7 @@ def _build_deconvolver_factory(
     if len(psfs) != channels:
         raise typer.BadParameter(f"Expected exactly {channels} --psf path(s), got {len(psfs)}.")
     if basic is not None and len(basic) != channels:
-        raise typer.BadParameter(
-            f"Expected exactly {channels} --basic profile path(s), got {len(basic)}."
-        )
+        raise typer.BadParameter(f"Expected exactly {channels} --basic profile path(s), got {len(basic)}.")
     return CupyDeconvolverFactory(
         basic_paths=tuple(Path(path) for path in basic or ()),
         psf_paths=tuple(Path(path) for path in psfs),

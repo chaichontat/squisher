@@ -139,3 +139,16 @@ def test_collate_scaling_rejects_non_finite_sample_values(tmp_path) -> None:
         )
 
     assert not (tmp_path / "scale" / "scaling.json").exists()
+
+
+def test_float_samples_use_lossless_zstd_and_preserve_values(tmp_path) -> None:
+    from squisher_deconv.scaling import save_float32_sample
+
+    data = np.linspace(-3.5, 1000.25, 2 * 3 * 16 * 16, dtype=np.float32).reshape(2, 3, 16, 16)
+    path = tmp_path / "compressed.tif"
+    save_float32_sample(path, data, metadata={"sample": "codec check"})
+
+    with tifffile.TiffFile(path) as tif:
+        assert all(page.compression.name == "ZSTD" for page in tif.pages)
+        assert tif.series[0].dtype == np.float32
+        np.testing.assert_array_equal(tif.asarray(), data.reshape(6, 16, 16))

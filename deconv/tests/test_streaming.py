@@ -34,7 +34,7 @@ def _read_deconv_ome_zarr(path):
 class FailingDeconvolver:
     halo = 0
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray:
+    def deconvolve(self, volume: np.ndarray, *, raw_z_start=None, raw_z_size=None) -> np.ndarray:
         raise RuntimeError(f"forced failure for {volume.shape}")
 
 
@@ -45,7 +45,7 @@ class RecordingDeconvolver:
         self._device = device
         self._calls = calls
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray:
+    def deconvolve(self, volume: np.ndarray, *, raw_z_start=None, raw_z_size=None) -> np.ndarray:
         self._calls.append(self._device)
         return volume.astype(np.float32, copy=True)
 
@@ -56,6 +56,8 @@ class RecordingDeconvolver:
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        raw_z_start=None,
+        raw_z_size=None,
     ) -> np.ndarray:
         self._calls.append(self._device)
         core = volume[core_start:core_stop]
@@ -68,7 +70,7 @@ class RecordingU16CoreDeconvolver:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[int, ...], int, int, tuple[float, ...], tuple[float, ...]]] = []
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray:
+    def deconvolve(self, volume: np.ndarray, *, raw_z_start=None, raw_z_size=None) -> np.ndarray:
         raise AssertionError("u16 run should use deconvolve_core_u16 when the backend exposes it")
 
     def deconvolve_core_u16(
@@ -78,6 +80,8 @@ class RecordingU16CoreDeconvolver:
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        raw_z_start=None,
+        raw_z_size=None,
     ) -> np.ndarray:
         self.calls.append(
             (
@@ -112,6 +116,8 @@ class SlabLimitedU16Deconvolver:
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        raw_z_start=None,
+        raw_z_size=None,
     ) -> np.ndarray:
         self.read_depths.append(int(volume.shape[0]))
         if volume.shape[0] > self.max_read_z:
@@ -131,6 +137,8 @@ class BadU16CoreDtypeDeconvolver(RecordingU16CoreDeconvolver):
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        raw_z_start=None,
+        raw_z_size=None,
     ) -> np.ndarray:
         core = volume[core_start:core_stop]
         return core.reshape(-1, core.shape[-2], core.shape[-1]).astype(np.float32, copy=False)
@@ -144,6 +152,8 @@ class BadU16CoreShapeDeconvolver(RecordingU16CoreDeconvolver):
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        raw_z_start=None,
+        raw_z_size=None,
     ) -> np.ndarray:
         return np.zeros((1, volume.shape[-2], volume.shape[-1] + 1), dtype=np.uint16)
 
@@ -693,7 +703,15 @@ def test_run_resume_rejects_output_schema_mismatch(tmp_path, monkeypatch) -> Non
         )
 
 
-def test_process_worker_file_pipeline_writes_streamed_u16_output(tmp_path) -> None:
+@pytest.mark.parametrize("queue_depth", [1, 2])
+def test_process_worker_file_pipeline_writes_streamed_u16_output(tmp_path, queue_depth) -> None:
+    class CoordinateDeconvolver:
+        def deconvolve_core_u16(self, volume, *, core_start, core_stop, scaling, raw_z_start, raw_z_size):
+            assert raw_z_size == 3
+            assert raw_z_start == int(volume[0, 0, 0, 0]) // (2 * 4 * 5)
+            core = volume[core_start:core_stop]
+            return core.reshape(-1, 4, 5).astype(np.uint16)
+
     src = tmp_path / "tile.tif"
     payload = np.arange(3 * 2 * 4 * 5, dtype=np.uint16).reshape(6, 4, 5)
     tifffile.imwrite(src, payload, ome=True, metadata={"axes": "ZYX"}, photometric="minisblack")
@@ -713,18 +731,18 @@ def test_process_worker_file_pipeline_writes_streamed_u16_output(tmp_path) -> No
             gamma=1,
             i_max=65535,
         ),
-        deconvolver=RecordingU16CoreDeconvolver(),
+        deconvolver=CoordinateDeconvolver(),
         config=ProcessRunConfig(
             out_dir=tmp_path / "out",
             channels=2,
-            halo=0,
+            halo=1,
             slab_depth=1,
             output_mode="u16",
             psf_paths=None,
             basic_paths=(),
             scaling_path=scaling_dir / "scaling.json",
             devices=(0,),
-            queue_depth=2,
+            queue_depth=queue_depth,
             jpegxr_level=1.0,
             overwrite=False,
             output_relative_root=None,

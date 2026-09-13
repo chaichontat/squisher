@@ -10,7 +10,7 @@ Intended workflow for 514-minus-488 cleanup:
    tiles: load target 514 and reference 488 from the same source tile, shift the
    reference on GPU into the target local coordinates, subtract the fitted
    spillover model, clip to non-negative values, crop the y/x border, and write
-   single-channel corrected OME-TIFF tiles.
+   single-channel corrected OME-Zarr tiles.
 4. Emit a corrected position JSON, and when a registration JSON is supplied,
    emit an adapted registration JSON with the same registered transforms but the
    corrected tile paths and crop-adjusted stage transforms.
@@ -21,9 +21,9 @@ Intended workflow for 514-minus-488 cleanup:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -32,11 +32,15 @@ import numpy as np
 
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
 from squisher_lightsheet import tile_input
+from squisher_lightsheet.residual_correction import (
+    ResidualCorrection,
+    load_residual_corrections,
+)
 
 
 DIMENSIONS = ("z", "y", "x")
-DEFAULT_COMPRESSION = 22610
-DEFAULT_COMPRESSION_LEVEL = 0.7
+DEFAULT_CHUNK_SHAPE_ZYX = (12, 480, 480)
+DEFAULT_ZSTD_LEVEL = 3
 
 
 @dataclass(frozen=True)
@@ -74,128 +78,81 @@ def _crop_translation_um(
     }
 
 
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
-
-
-def _child_with_local_name(parent: ET.Element, name: str) -> ET.Element:
-    for child in parent:
-        if _local_name(child.tag) == name:
-            return child
-    raise ValueError(f"OME element {parent.tag!r} does not contain child {name!r}")
-
-
-def _direct_children_with_local_name(parent: ET.Element, name: str) -> list[ET.Element]:
-    return [child for child in parent if _local_name(child.tag) == name]
-
-
-def _selected_channel_element(pixels: ET.Element, target_channel: int) -> ET.Element:
-    channels = _direct_children_with_local_name(pixels, "Channel")
-    if not (0 <= target_channel < len(channels)):
-        raise ValueError(f"Source OME metadata has {len(channels)} channels; requested {target_channel}")
-    return channels[target_channel]
-
-
-def _ome_xml_for_corrected_tile(
-    *,
-    source_path: Path,
-    output_path: Path,
-    output_shape_zyx: tuple[int, int, int],
-    translation_um: dict[str, float],
-    scale_um: dict[str, float],
-    target_channel: int,
-) -> str:
-    import tifffile
-
-    with tifffile.TiffFile(source_path) as tif:
-        source_xml = tif.ome_metadata
-    if source_xml is None:
-        raise ValueError(f"{source_path} does not contain OME metadata")
-
-    root = ET.fromstring(source_xml)
-    image = _child_with_local_name(root, "Image")
-    image.attrib["Name"] = output_path.name
-    pixels = _child_with_local_name(image, "Pixels")
-    selected_channel = _selected_channel_element(pixels, target_channel)
-
-    for child in list(pixels):
-        if _local_name(child.tag) in {"Channel", "TiffData", "Plane"}:
-            pixels.remove(child)
-
-    pixels.attrib.update(
-        {
-            "DimensionOrder": "XYCZT",
-            "Type": "uint16",
-            "SizeX": str(int(output_shape_zyx[2])),
-            "SizeY": str(int(output_shape_zyx[1])),
-            "SizeZ": str(int(output_shape_zyx[0])),
-            "SizeC": "1",
-            "SizeT": "1",
-            "PhysicalSizeX": f"{abs(float(scale_um['x'])):.17g}",
-            "PhysicalSizeY": f"{abs(float(scale_um['y'])):.17g}",
-            "PhysicalSizeZ": f"{abs(float(scale_um['z'])):.17g}",
-        }
-    )
-
-    selected_channel.attrib = dict(selected_channel.attrib)
-    pixels.append(selected_channel)
-
-    tiff_data = ET.Element(f"{pixels.tag.rsplit('}', 1)[0]}}}TiffData" if "}" in pixels.tag else "TiffData")
-    tiff_data.attrib.update({"IFD": "0", "PlaneCount": str(int(output_shape_zyx[0]))})
-    pixels.append(tiff_data)
-
-    plane_tag = f"{pixels.tag.rsplit('}', 1)[0]}}}Plane" if "}" in pixels.tag else "Plane"
-    for z_index in range(int(output_shape_zyx[0])):
-        plane = ET.Element(plane_tag)
-        plane.attrib.update(
-            {
-                "TheC": "0",
-                "TheZ": str(z_index),
-                "TheT": "0",
-                "PositionX": f"{float(translation_um['x']):.17g}",
-                "PositionY": f"{float(translation_um['y']):.17g}",
-                "PositionZ": f"{float(translation_um['z'] + z_index * scale_um['z']):.17g}",
-            }
-        )
-        pixels.append(plane)
-
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
-
-
-def _write_ome_zyx(
+def _write_ome_zarr_czyx(
     output_path: Path,
     data: np.ndarray,
     *,
-    source_path: Path,
     translation_um: dict[str, float],
     scale_um: dict[str, float],
-    target_channel: int,
-    compression: int | None,
-    compression_level: float | None,
+    channel_name: str,
+    zstd_level: int,
+    chunk_shape_zyx: tuple[int, int, int],
 ) -> None:
-    import tifffile
+    """Write one CZYX scale with physical placement and a final completion marker."""
+    import zarr
+    from zarr.codecs import BytesCodec, ZstdCodec
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    ome_xml = _ome_xml_for_corrected_tile(
-        source_path=source_path,
-        output_path=output_path,
-        output_shape_zyx=tuple(int(value) for value in data.shape),
-        translation_um=translation_um,
-        scale_um=scale_um,
-        target_channel=target_channel,
+    shape = (1, *(int(value) for value in data.shape))
+    chunks = (1, *(min(size, chunk) for size, chunk in zip(data.shape, chunk_shape_zyx, strict=True)))
+    root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+    root.attrs.update(
+        {
+            "ome": {
+                "version": "0.5",
+                "multiscales": [
+                    {
+                        "name": output_path.name.removesuffix(".ome.zarr"),
+                        "axes": [
+                            {"name": "c", "type": "channel"},
+                            {"name": "z", "type": "space", "unit": "micrometer"},
+                            {"name": "y", "type": "space", "unit": "micrometer"},
+                            {"name": "x", "type": "space", "unit": "micrometer"},
+                        ],
+                        "datasets": [
+                            {
+                                "path": "0",
+                                "coordinateTransformations": [
+                                    {
+                                        "type": "scale",
+                                        "scale": [
+                                            1.0,
+                                            abs(float(scale_um["z"])),
+                                            abs(float(scale_um["y"])),
+                                            abs(float(scale_um["x"])),
+                                        ],
+                                    },
+                                    {
+                                        "type": "translation",
+                                        "translation": [
+                                            0.0,
+                                            float(translation_um["z"]),
+                                            float(translation_um["y"]),
+                                            float(translation_um["x"]),
+                                        ],
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            "omero": {"channels": [{"label": channel_name}]},
+            "squisher_complete": False,
+        }
     )
-    compressionargs = None if compression_level is None else {"level": float(compression_level)}
-    tifffile.imwrite(
-        output_path,
-        data,
-        bigtiff=True,
-        ome=False,
-        photometric="minisblack",
-        compression=compression,
-        compressionargs=compressionargs,
-        description=ome_xml.encode("utf-8"),
-        metadata=None,
+    output = root.create_array(
+        "0",
+        shape=shape,
+        chunks=chunks,
+        dtype=data.dtype,
+        fill_value=0,
+        dimension_names=("c", "z", "y", "x"),
+        serializer=BytesCodec(),
+        compressors=[ZstdCodec(level=zstd_level)],
     )
+    output[0] = data
+    root.attrs["squisher_complete"] = True
 
 
 def _subtract_slab_gpu(
@@ -227,7 +184,7 @@ def _subtract_slab_gpu(
             prefilter=False,
         )
     z_stop = reference_gpu.shape[0] - int(halo_after)
-    reference_gpu = reference_gpu[int(halo_before):z_stop]
+    reference_gpu = reference_gpu[int(halo_before) : z_stop]
     corrected = (target_gpu - float(target_background)) - float(alpha) * cp.maximum(
         reference_gpu - float(reference_background),
         0.0,
@@ -256,6 +213,8 @@ def subtract_spillover_array_gpu(
     crop_yx_px: int,
     z_chunk: int,
     output_dtype: np.dtype,
+    target_correction: ResidualCorrection | None = None,
+    reference_correction: ResidualCorrection | None = None,
 ) -> np.ndarray:
     source_shape = tuple(int(value) for value in target.shape)
     if len(source_shape) != 3:
@@ -285,6 +244,18 @@ def subtract_spillover_array_gpu(
         halo_z1 = min(source_shape[0], z1 + z_halo)
         target_slab = np.asarray(target[z0:z1], dtype=output_dtype)
         reference_halo = np.asarray(reference[halo_z0:halo_z1], dtype=output_dtype)
+        if target_correction is not None:
+            target_slab = target_slab * target_correction.block(
+                z_slice=slice(z0, z1),
+                y_slice=slice(0, source_shape[1]),
+                x_slice=slice(0, source_shape[2]),
+            )
+        if reference_correction is not None:
+            reference_halo = reference_halo * reference_correction.block(
+                z_slice=slice(halo_z0, halo_z1),
+                y_slice=slice(0, source_shape[1]),
+                x_slice=slice(0, source_shape[2]),
+            )
         corrected = _subtract_slab_gpu(
             target_slab,
             reference_halo,
@@ -302,9 +273,9 @@ def subtract_spillover_array_gpu(
     return output
 
 
-def _output_tile_path(tile: legacy.TileMetadata, output_tile_dir: Path, *, target_channel: int, reference_channel: int) -> Path:
-    stem = tile.path.name.removesuffix(".ome.tif").removesuffix(".tif")
-    return output_tile_dir / f"{stem}.ch{target_channel}-minus-ch{reference_channel}.ome.tif"
+def _output_tile_path(source_path: Path, output_tile_dir: Path) -> Path:
+    identity = hashlib.sha256(str(source_path).encode()).hexdigest()[:8]
+    return output_tile_dir / f"tile-{identity}.ome.zarr"
 
 
 def _adapt_registration_payload(
@@ -337,12 +308,15 @@ def _adapt_registration_payload(
             continue
         adapted = dict(record)
         adapted["tile"] = output_record["tile"]
-        adapted.pop("path", None)
+        adapted["path"] = output_record["path"]
         adapted["source_tile"] = output_record["source_tile"]
         adapted["source_path"] = output_record["source_path"]
         adapted["source_view"] = output_record.get("side")
         adapted["stage_translation_um"] = output_record["translation_um"]
         adapted["stage_scale_um"] = output_record["scale_um"]
+        adapted["axes"] = output_record["axes"]
+        adapted["shape"] = output_record["shape"]
+        adapted["channels"] = output_record["channels"]
         adapted_tiles.append(adapted)
 
     if len(adapted_tiles) != len(output_records):
@@ -378,10 +352,12 @@ def subtract_channel_tiles(
     beta: float,
     target_background: float,
     reference_background: float,
+    target_residual_correction: Path | None = None,
+    reference_residual_correction: Path | None = None,
     crop_yx_px: int = 20,
     z_chunk: int = 64,
-    compression: int | None = DEFAULT_COMPRESSION,
-    compression_level: float | None = DEFAULT_COMPRESSION_LEVEL,
+    zstd_level: int = DEFAULT_ZSTD_LEVEL,
+    chunk_shape_zyx: tuple[int, int, int] = DEFAULT_CHUNK_SHAPE_ZYX,
     overwrite: bool = False,
     limit_tiles: int | None = None,
     progress: Callable[[str], None] | None = None,
@@ -392,6 +368,10 @@ def subtract_channel_tiles(
         raise ValueError("source_level must be non-negative")
     if limit_tiles is not None and limit_tiles <= 0:
         raise ValueError("limit_tiles must be positive when provided")
+    if not 1 <= zstd_level <= 22:
+        raise ValueError("zstd_level must be between 1 and 22")
+    if len(chunk_shape_zyx) != 3 or any(value <= 0 for value in chunk_shape_zyx):
+        raise ValueError("chunk_shape_zyx must contain three positive values")
 
     output_dir = output_dir.resolve()
     output_tile_dir = output_dir / "tiles"
@@ -411,6 +391,26 @@ def subtract_channel_tiles(
     if limit_tiles is not None:
         selected = selected[:limit_tiles]
 
+    if (target_residual_correction is None) != (reference_residual_correction is None):
+        raise ValueError("Target and reference residual corrections must be supplied together")
+    target_corrections: dict[str, ResidualCorrection] = {}
+    reference_corrections: dict[str, ResidualCorrection] = {}
+    if target_residual_correction is not None and reference_residual_correction is not None:
+        correction_sources = [tile.path for tile, _ in selected]
+        correction_shapes = [tile_input.spatial_shape_zyx(tile.shape, tile.axes) for tile, _ in selected]
+        target_corrections = load_residual_corrections(
+            target_residual_correction,
+            sources=correction_sources,
+            shapes_zyx=correction_shapes,
+            channel=target_channel,
+        )
+        reference_corrections = load_residual_corrections(
+            reference_residual_correction,
+            sources=correction_sources,
+            shapes_zyx=correction_shapes,
+            channel=reference_channel,
+        )
+
     output_records: list[dict[str, Any]] = []
     summary_records: list[SubtractedTileRecord] = []
     for tile_index, (tile, source_record) in enumerate(selected):
@@ -421,12 +421,8 @@ def subtract_channel_tiles(
             source_shape_zyx = tile_input.spatial_shape_zyx(source_shape, source_tile.axes)
             target = tile_input.channel_view(array, source_tile.axes, target_channel, path=tile.path)
             reference = tile_input.channel_view(array, source_tile.axes, reference_channel, path=tile.path)
-            output_path = _output_tile_path(
-                tile,
-                output_tile_dir,
-                target_channel=target_channel,
-                reference_channel=reference_channel,
-            )
+            resolved_tile_path = tile.path.resolve()
+            output_path = _output_tile_path(resolved_tile_path, output_tile_dir)
             if output_path.exists() and not overwrite:
                 raise FileExistsError(f"{output_path} exists; pass overwrite=True to replace it")
             translation_um = _crop_translation_um(source_tile, crop_yx_px=crop_yx_px)
@@ -448,16 +444,17 @@ def subtract_channel_tiles(
                 crop_yx_px=crop_yx_px,
                 z_chunk=z_chunk,
                 output_dtype=np.dtype(target.dtype),
+                target_correction=target_corrections.get(str(resolved_tile_path)),
+                reference_correction=reference_corrections.get(str(resolved_tile_path)),
             )
-            _write_ome_zyx(
+            _write_ome_zarr_czyx(
                 output_path,
                 corrected,
-                source_path=tile.path,
                 translation_um=translation_um,
                 scale_um=scale_um,
-                target_channel=target_channel,
-                compression=compression,
-                compression_level=compression_level,
+                channel_name=source_tile.channels[target_channel],
+                zstd_level=zstd_level,
+                chunk_shape_zyx=chunk_shape_zyx,
             )
             source_tile_name = str(source_record.get("tile") or tile.path.name)
             side = source_record.get("side") if isinstance(source_record, dict) else None
@@ -468,6 +465,9 @@ def subtract_channel_tiles(
                 "source_path": str(tile.path),
                 "side": side,
                 "path": str(output_path),
+                "axes": "CZYX",
+                "shape": [1, *output_shape_zyx],
+                "channels": [source_tile.channels[target_channel]],
                 "translation_um": translation_um,
                 "scale_um": scale_um,
             }
@@ -503,10 +503,18 @@ def subtract_channel_tiles(
             "beta": float(beta),
             "target_background": float(target_background),
             "reference_background": float(reference_background),
+            "target_residual_correction": (
+                None if target_residual_correction is None else str(target_residual_correction.resolve())
+            ),
+            "reference_residual_correction": (
+                None
+                if reference_residual_correction is None
+                else str(reference_residual_correction.resolve())
+            ),
             "crop_yx_px": int(crop_yx_px),
             "z_chunk": int(z_chunk),
-            "compression": compression,
-            "compression_level": compression_level,
+            "zstd_level": int(zstd_level),
+            "chunk_shape_zyx": [int(value) for value in chunk_shape_zyx],
         },
         "tiles": output_records,
     }

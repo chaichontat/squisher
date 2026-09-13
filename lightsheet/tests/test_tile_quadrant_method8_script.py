@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 
 import squisher_lightsheet.cross_register_method8 as tile_quadrant_method8
 
@@ -46,6 +47,88 @@ def test_quadrant_z_windows_cover_960_tile_with_480_step_and_528_window() -> Non
         np.testing.assert_array_equal(stop - start, [528, 528, 528])
         assert np.all(start >= 0)
         assert np.all(stop <= [3161, 960, 960])
+
+
+def test_spatial_overlap_windows_cover_only_intersection(tmp_path: Path) -> None:
+    fixed = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="230Tnc-CL.002.ome.zarr",
+            translation_zyx_um=(0.0, 0.0, 0.0),
+            shape=(1361, 1920, 1920),
+            scale_zyx_um=(1.0, 1.0, 1.0),
+        )
+    )
+    moving = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="230Tnc-CR.000.ome.zarr",
+            translation_zyx_um=(0.0, 249.0, 1660.0),
+            shape=(1361, 1920, 1920),
+            scale_zyx_um=(1.0, 1.0, 1.0),
+        )
+    )
+
+    windows = tile_quadrant_method8.spatial_overlap_windows(
+        fixed,
+        moving,
+        preseed_matrix_zyx=np.eye(3),
+    )
+
+    assert len(windows) == 12
+    assert {window["fixed_start_zyx"][2] for window in windows} == {1392}
+    assert {window["fixed_start_zyx"][1] for window in windows} == {0, 480, 960, 1392}
+    assert {window["fixed_start_zyx"][0] for window in windows} == {0, 480, 833}
+
+
+def test_spatial_overlap_windows_reject_crop_below_minimum_after_exact_clipping(
+    tmp_path: Path,
+) -> None:
+    fixed = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="230-Ptprz1-TL-561638.027.ome.zarr",
+            translation_zyx_um=(4.251466854198135, 2656.4792485996995, 1590.1422616559064),
+            shape=(2, 1194, 1920, 1920),
+            axes="CZYX",
+            scale_zyx_um=(1.8069999999999997, 0.3069942026538213, 0.3069942026538213),
+        )
+    )
+    moving = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="230-Ptprz1-TR-561638.020.ome.zarr",
+            translation_zyx_um=(3.463344376238374, 2233.854030726938, 2135.055157665636),
+            shape=(2, 1194, 1920, 1920),
+            axes="CZYX",
+            scale_zyx_um=(1.8065434632729294, 0.3069942026538213, 0.3069942026538213),
+        )
+    )
+
+    windows = tile_quadrant_method8.spatial_overlap_windows(
+        fixed,
+        moving,
+        preseed_matrix_zyx=np.eye(3),
+    )
+
+    assert not any(
+        window["quadrant"] == "y00480_x01392" for window in windows
+    )
+    for window in windows:
+        matrix, translation = tile_quadrant_method8.preseeded_level0_model(
+            fixed_tile=fixed,
+            moving_tile=moving,
+            preseed_matrix_zyx=np.eye(3),
+        )
+        start, stop, _metadata = tile_quadrant_method8._clip_fixed_crop_to_prior_overlap(
+            fixed_start_zyx=np.asarray(window["fixed_start_zyx"]),
+            fixed_stop_zyx=np.asarray(window["fixed_stop_zyx"]),
+            fixed_shape_zyx=fixed.shape_zyx,
+            moving_shape_zyx=moving.shape_zyx,
+            full_matrix_zyx=matrix,
+            full_translation_zyx=translation,
+        )
+        assert np.all(stop - start >= [16, 64, 64])
 
 
 def test_preseeded_level0_model_uses_resolved_tiles(tmp_path: Path) -> None:
@@ -150,6 +233,17 @@ def test_resume_cache_reuses_completed_rows_and_reruns_errors() -> None:
     )
     assert not tile_quadrant_method8._is_resumable_row(
         {
+            "status": "rejected",
+            "rejection_reason": "quality_gate",
+            "empty_precheck": precheck,
+            "cache_config": cache_config,
+            "quality_mask": "fixed_threshold_mask",
+            "native_return_code": 1,
+        },
+        cache_config=cache_config,
+    )
+    assert not tile_quadrant_method8._is_resumable_row(
+        {
             "status": "error",
             "error": "native_process_terminated: exitcode=-9",
             "empty_precheck": precheck,
@@ -158,6 +252,157 @@ def test_resume_cache_reuses_completed_rows_and_reruns_errors() -> None:
         },
         cache_config=cache_config,
     )
+
+
+def test_method8_attempt_outcome_distinguishes_native_failure_from_quality_rejection() -> None:
+    assert tile_quadrant_method8._method8_attempt_outcome(
+        native_return_code=1,
+        corr=1.0,
+        grad_mean=1.0,
+        min_corr=0.15,
+        min_grad_ncc=0.24,
+    ) == ("error", "native_registration_failed:return_code=1")
+    assert tile_quadrant_method8._method8_attempt_outcome(
+        native_return_code=0,
+        corr=0.8,
+        grad_mean=0.1,
+        min_corr=0.15,
+        min_grad_ncc=0.24,
+    ) == ("rejected", "quality_gate")
+    assert tile_quadrant_method8._method8_attempt_outcome(
+        native_return_code=0,
+        corr=0.8,
+        grad_mean=0.4,
+        min_corr=0.15,
+        min_grad_ncc=0.24,
+    ) == ("accepted", None)
+
+
+def test_phase_attempt_native_failure_supersedes_quality_rejected_baseline() -> None:
+    baseline = {"status": "rejected", "gradient_component_ncc_mean": 0.2}
+    failed_phase = {"status": "error", "gradient_component_ncc_mean": 0.1}
+
+    assert tile_quadrant_method8._select_method8_attempt(baseline, failed_phase) is failed_phase
+
+
+def test_validate_completed_rows_rejects_native_failure_even_when_labeled_rejected() -> None:
+    valid_rows = [
+        {"status": "accepted", "native_return_code": 0},
+        {
+            "status": "rejected",
+            "rejection_reason": "fixed_threshold_mask_too_masked",
+            "native_return_code": None,
+        },
+    ]
+    tile_quadrant_method8._validate_completed_rows(valid_rows)
+
+    with pytest.raises(RuntimeError, match="1 native registration failure"):
+        tile_quadrant_method8._validate_completed_rows(
+            valid_rows
+            + [
+                {
+                    "status": "rejected",
+                    "rejection_reason": "quality_gate",
+                    "native_return_code": 1,
+                }
+            ]
+        )
+
+
+def test_physical_crop_center_correspondences_handle_different_scales(tmp_path: Path) -> None:
+    fixed = _position_record(
+        tmp_path,
+        tile="fixed.ome.zarr",
+        translation_zyx_um=(10.0, 20.0, 30.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(2.0, 1.0, 0.5),
+    )
+    moving = _position_record(
+        tmp_path,
+        tile="moving.ome.zarr",
+        translation_zyx_um=(1.0, 2.0, 3.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(1.5, 0.75, 0.25),
+    )
+    rows = [
+        {
+            "status": "accepted",
+            "fixed_tile": fixed["tile"],
+            "moving_tile": moving["tile"],
+            "window_shape_zyx": [5, 7, 9],
+            "fixed_start_zyx": [4, 6, 8],
+            "moving_start_zyx": [1, 2, 3],
+            "local_translation_zyx": [0.5, -1.0, 2.0],
+        }
+    ]
+
+    source, target, pairs = tile_quadrant_method8._physical_crop_center_correspondences(
+        rows,
+        fixed_position={"tiles": [fixed]},
+        moving_position={"tiles": [moving]},
+    )
+
+    np.testing.assert_allclose(source[0], [5.5, 5.75, 4.75])
+    np.testing.assert_allclose(target[0], [23.0, 28.0, 37.0])
+    assert pairs == [(fixed["tile"], moving["tile"])]
+
+
+def test_pair_balanced_huber_affine_recovers_known_mapping() -> None:
+    source = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [2.0, 1.0, 1.0],
+        ]
+    )
+    matrix = np.asarray(
+        [[1.01, -0.02, 0.03], [0.01, 0.99, -0.04], [-0.02, 0.05, 1.02]]
+    )
+    translation = np.asarray([4.0, -3.0, 2.0])
+    target = source @ matrix.T + translation
+    pairs = [("fixed-a", "moving-a")] * 5 + [("fixed-b", "moving-b")] * 3
+
+    fitted_matrix, fitted_translation = tile_quadrant_method8._fit_pair_balanced_huber_affine(
+        source,
+        target,
+        pairs,
+    )
+
+    np.testing.assert_allclose(fitted_matrix, matrix, atol=1e-12)
+    np.testing.assert_allclose(fitted_translation, translation, atol=1e-12)
+
+
+def test_global_affine_qc_plot_contains_after_fit_residuals(tmp_path: Path) -> None:
+    source = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    matrix = np.eye(3)
+    translation = np.asarray([1.0, 2.0, 3.0])
+    target = source + translation
+
+    outputs = tile_quadrant_method8._write_global_affine_qc_plot(
+        output_dir=tmp_path,
+        source=source,
+        target=target,
+        matrix=matrix,
+        translation=translation,
+    )
+
+    assert all(path.is_file() for path in outputs.values())
+    assert set(outputs) == {"png", "pdf", "svg"}
+    svg = outputs["svg"].read_text()
+    assert "After-fit residual" in svg
+    assert "residuals after affine fitting" in svg
 
 
 def test_resume_cache_reruns_rows_from_different_fixed_mask_config() -> None:

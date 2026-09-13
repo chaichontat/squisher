@@ -15,10 +15,9 @@ from squisher_lightsheet.fusion import (
     channel_output_paths,
     coarse_preibisch_content_weights,
     fuse_tiles,
-    temporary_basic_disk_cache_dir,
 )
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy
-from squisher_lightsheet import tiff_input
+from squisher_lightsheet import crop_sharpness, tiff_input
 
 
 def write_basic_sampling_manifest(
@@ -77,6 +76,107 @@ def test_fusion_resume_uses_only_matching_workspace(tmp_path: Path) -> None:
     )
 
     assert actual == matching
+
+
+def test_fusion_resume_accepts_changed_mtime_when_hashed_content_matches(tmp_path: Path) -> None:
+    channel_output = tmp_path / "fused.ch0.ome.zarr"
+    workspace = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(workspace, channel_output) / "0").mkdir(parents=True)
+    recorded = {
+        "position_input": {"path": "/positions.json", "sha256": "same", "mtime_ns": 1},
+        "source": {"path": "/source.tif", "size": 10, "mtime_ns": 1},
+    }
+    legacy.write_fusion_resume_plan(workspace, recorded)
+
+    assert legacy.find_latest_fusion_temp_workspace(
+        channel_output,
+        expected_plan={
+            "position_input": {"path": "/positions.json", "sha256": "same"},
+            "source": {"path": "/source.tif", "size": 10, "mtime_ns": 1},
+        },
+    ) == workspace
+    assert not legacy.fusion_resume_plans_match(
+        recorded,
+        {
+            "position_input": {"path": "/positions.json", "sha256": "changed"},
+            "source": {"path": "/source.tif", "size": 10, "mtime_ns": 1},
+        },
+    )
+    assert not legacy.fusion_resume_plans_match(
+        recorded,
+        {
+            "position_input": {"path": "/positions.json", "sha256": "same"},
+            "source": {"path": "/source.tif", "size": 10, "mtime_ns": 2},
+        },
+    )
+
+
+def test_fusion_resume_prefers_matching_workspace_with_more_completed_blocks(tmp_path: Path) -> None:
+    channel_output = tmp_path / "fused.ch0.ome.zarr"
+    progressed = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(progressed, channel_output) / "0").mkdir(parents=True)
+    legacy.write_fusion_resume_plan(progressed, {"plan": "matching"})
+    legacy.mark_fusion_block_complete(progressed / "completed-fusion-blocks", (0, 0, 0))
+    newer_empty = legacy.create_fusion_temp_workspace(channel_output)
+    (legacy.fusion_output_from_temp_root(newer_empty, channel_output) / "0").mkdir(parents=True)
+    legacy.write_fusion_resume_plan(newer_empty, {"plan": "matching"})
+
+    assert legacy.find_latest_fusion_temp_workspace(
+        channel_output,
+        expected_plan={"plan": "matching"},
+    ) == progressed
+
+
+def test_crop_preferences_accept_legacy_mtime_when_hashed_content_matches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "crop-scores.json"
+    source_identity = {
+        "path": "/source.ome.zarr",
+        "root_metadata": {"path": "/source.ome.zarr/zarr.json", "sha256": "same"},
+    }
+    identity = {
+        "metric": "native-normalized-highpass-v1",
+        "sigma": [1.0, 2.0, 2.0],
+        "sources": [
+            {
+                "path": "/source.ome.zarr",
+                "root_metadata": {
+                    "path": "/source.ome.zarr/zarr.json",
+                    "sha256": "same",
+                    "mtime_ns": 1,
+                },
+            }
+        ],
+        "transformed_properties": [{"shape": {"z": 1, "y": 1, "x": 1}}],
+        "output_spacing": {"z": 1.0, "y": 1.0, "x": 1.0},
+        "corrections": None,
+    }
+    output.write_text(
+        json.dumps(
+            {
+                "identity": identity,
+                "identity_sha256": "legacy-fingerprint",
+                "pair_preferences": [[0]],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        crop_sharpness.si_utils,
+        "get_stack_properties_from_sim",
+        lambda _sim, *, transform_key: identity["transformed_properties"][0],
+    )
+    monkeypatch.setattr(legacy, "source_tile_resume_identity", lambda *_args, **_kwargs: source_identity)
+
+    assert crop_sharpness.fit_crop_preferences(
+        sims=[object()],
+        source_paths=[Path("/source.ome.zarr")],
+        transform_key="registered_affine",
+        output_spacing=identity["output_spacing"],
+        output=output,
+        read_config=None,
+        sigma=(1.0, 2.0, 2.0),
+    ) == [[0]]
 
 
 def test_fusion_resume_rejects_workspace_without_plan(tmp_path: Path) -> None:
@@ -165,14 +265,26 @@ def test_fuse_uses_backend_supported_defaults(monkeypatch) -> None:
 
     assert captured["script_name"] == "stitch_20x_tl_multiview.py"
     args = captured["args"]
-    assert args[args.index("--fusion-weight-mode") + 1] == "content-preibisch-coarse"
+    assert args[args.index("--fusion-weight-mode") + 1] == "crop-sharpness-seam"
     assert args[args.index("--fusion-level") + 1] == "0"
-    assert args[args.index("--batch-size") + 1] == "1"
-    assert args[args.index("--basic-cache-tiles") + 1] == "64"
+    assert args[args.index("--batch-size") + 1] == "auto"
+    assert args[args.index("--source-cache-max-gib") + 1] == "64.0"
     assert args[args.index("--jpegxr-level") + 1] == "0.7"
     assert args[args.index("--output-codec") + 1] == "jpegxr"
     assert "--per-chunk-cupy-cleanup" not in args
     assert "--resume-fusion" not in args
+
+    fuse_tiles(
+        input_dir=Path("/run"),
+        position_input=Path("/run/positions.json"),
+        registration_input=Path("/run/registration.json"),
+        output=Path("/run/fused.ome.zarr"),
+        fusion_weight_mode="geometric",
+        dry_run=True,
+    )
+
+    args = captured["args"]
+    assert args[args.index("--fusion-weight-mode") + 1] == "geometric"
 
 
 def test_fuse_passes_resume_fusion(monkeypatch) -> None:
@@ -336,7 +448,7 @@ def test_fuse_normalizes_canonical_output_dir(monkeypatch) -> None:
     assert args[args.index("--output") + 1] == "/run/final/fused.ome.zarr"
 
 
-def test_fuse_passes_optional_basic_disk_cache(monkeypatch) -> None:
+def test_fuse_passes_source_cache_budget(monkeypatch) -> None:
     captured = {}
 
     def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
@@ -352,12 +464,12 @@ def test_fuse_passes_optional_basic_disk_cache(monkeypatch) -> None:
         position_input=Path("/run/positions.json"),
         registration_input=Path("/run/registration.json"),
         output=Path("/run/fused.ome.zarr"),
-        basic_cache_disk_dir=Path("/run/basic-slab-cache"),
+        source_cache_max_gib=12.5,
     )
 
     assert captured["script_name"] == "stitch_20x_tl_multiview.py"
     args = captured["args"]
-    assert args[args.index("--basic-cache-disk-dir") + 1] == "/run/basic-slab-cache"
+    assert args[args.index("--source-cache-max-gib") + 1] == "12.5"
 
 
 def test_fuse_passes_fusion_level(monkeypatch) -> None:
@@ -535,17 +647,6 @@ def test_fuse_rejects_multi_input_source_view_flatfield(monkeypatch, tmp_path) -
         )
 
 
-def test_temporary_basic_disk_cache_dir_uses_output_parent_and_cleans_up(tmp_path) -> None:
-    output = tmp_path / "fused.ch0.ome.zarr"
-
-    with temporary_basic_disk_cache_dir(None, output) as cache_dir:
-        assert cache_dir.parent == tmp_path
-        assert cache_dir.exists()
-        (cache_dir / "sentinel").write_text("cache")
-
-    assert not cache_dir.exists()
-
-
 def test_bounded_memory_cache_enforces_entry_and_byte_limits() -> None:
     cache = legacy.BoundedMemoryCache(max_bytes=10, max_entries=2)
 
@@ -565,6 +666,11 @@ def test_bounded_memory_cache_enforces_entry_and_byte_limits() -> None:
     assert list(cache.data) == ["d"]
     assert cache.total_bytes == 8
     assert cache.evictions == 3
+
+    assert cache.put("oversized", b"x" * 11, nbytes=11) is False
+    assert "oversized" not in cache.data
+    assert cache.total_bytes == 8
+    assert cache.rejected == 1
 
 
 def test_bounded_memory_cache_supports_dask_cache_protocol() -> None:
@@ -626,9 +732,10 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
     args = legacy.parse_args()
 
     assert args.flatfield_dir is None
-    assert args.basic_cache_max_gib == legacy.DEFAULT_BASIC_CACHE_MAX_GIB
-    assert args.batch_size == 1
+    assert args.source_cache_max_gib == legacy.DEFAULT_SOURCE_CACHE_MAX_GIB
+    assert args.batch_size == "auto"
     assert args.output_chunksize == (12, 960, 960)
+    assert args.fusion_weight_mode == "crop-sharpness-seam"
 
     monkeypatch.setattr(
         sys,
@@ -1879,26 +1986,40 @@ def test_zarr_safe_fusion_selection_avoids_deepcopying_tiff_store(tmp_path) -> N
         legacy.close_stores([store])
 
 
-def test_content_preibisch_coarse_softmax_sharpens_any_overlap(monkeypatch) -> None:
-    calls = 0
-
-    def fake_gaussian_filter(values, *, sigma, mode):
-        nonlocal calls
-        calls += 1
-        return np.zeros_like(values) if calls == 1 else values
-
-    monkeypatch.setattr("scipy.ndimage.gaussian_filter", fake_gaussian_filter)
-
-    raw_weights = np.array([[0.25, 0.5, 1.0], [0.75, 0.5, np.nan]], dtype=np.float32)
+def test_content_preibisch_coarse_softmax_sharpens_any_overlap() -> None:
+    texture = np.sin(np.arange(128, dtype=np.float32) * np.pi / 4)
+    views = np.stack([np.tile(texture, (32, 1)), np.tile(2 * texture, (32, 1))])
+    views[1, :, 96:] = np.nan
     weights = coarse_preibisch_content_weights(
-        np.sqrt(raw_weights),
-        ~np.isnan(raw_weights),
-        sigma_1=7,
-        sigma_2=17,
-        stride_zyx=(1,),
+        views,
+        np.isfinite(views).astype(np.float32),
+        sigma_1=2,
+        sigma_2=3,
+        stride_zyx=(1, 1, 1),
         softmax_exponent=2.0,
     )
 
-    np.testing.assert_allclose(weights[:, 0], [0.1, 0.9], atol=1e-6)
-    np.testing.assert_allclose(weights[:, 1], [0.5, 0.5], atol=1e-6)
-    np.testing.assert_allclose(weights[:, 2], [1.0, 0.0], atol=1e-6)
+    # Twice the contrast gives four times the energy, then sixteen times the
+    # weight after squaring. Missing support never receives a contribution.
+    np.testing.assert_allclose(weights[:, 16, 32], [1 / 17, 16 / 17], atol=1e-6)
+    np.testing.assert_allclose(weights[0, :, 96:], 1)
+    np.testing.assert_allclose(weights[1, :, 96:], 0)
+
+
+@pytest.mark.parametrize("complete", [True, False, "true", None])
+def test_fusion_resume_honors_deconvolution_completion(tmp_path: Path, complete) -> None:
+    source = tmp_path / "deconv.ome.zarr"
+    (source / "0").mkdir(parents=True)
+    root = source / "zarr.json"
+    root.write_text(json.dumps({"attributes": {"squisher_complete": complete}}))
+    (source / "0/zarr.json").write_text("{}")
+    if complete is not True:
+        with pytest.raises(ValueError, match="Cannot safely resume"):
+            legacy.source_tile_resume_identity(source, require_completion=True)
+        return
+    identity = legacy.source_tile_resume_identity(source, require_completion=True)
+    assert identity["root_metadata"] == legacy.file_resume_identity(root)
+    assert identity["completion"] is None
+    root.write_text(json.dumps({"attributes": {"squisher_complete": True, "revision": 2}}))
+    changed = legacy.source_tile_resume_identity(source, require_completion=True)
+    assert changed["root_metadata"]["sha256"] != identity["root_metadata"]["sha256"]

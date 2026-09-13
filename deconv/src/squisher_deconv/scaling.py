@@ -37,6 +37,7 @@ def save_float32_sample(path: Path, data: np.ndarray, *, metadata: dict[str, Any
         dtype=np.float32,
         metadata=metadata,
         photometric="minisblack",
+        compression="zstd",
     )
 
 

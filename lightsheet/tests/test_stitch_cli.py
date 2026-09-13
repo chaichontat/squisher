@@ -104,7 +104,7 @@ def test_load_tiles_uses_dataset_names_from_position_contract(tmp_path, monkeypa
         )
     )
     array = np.arange(2 * 10 * 20 * 30).reshape(2, 10, 20, 30)
-    monkeypatch.setattr(stitch_register, "_load_array", lambda path: array)
+    monkeypatch.setattr(stitch_register, "_load_array", lambda path, **kwargs: array)
     monkeypatch.setattr(stitch_register, "_load_axes", lambda path, array: "CZYX")
 
     tiles = stitch_register._load_tiles(position_json, zarr_dir, channel=1)

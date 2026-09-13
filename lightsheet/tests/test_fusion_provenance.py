@@ -271,3 +271,15 @@ def test_historical_nan_json_is_preserved_verbatim(tmp_path: Path) -> None:
     manifest = json.loads((output / "provenance" / "manifest.json").read_text())
     artifact = next(item for item in manifest["artifacts"] if item["source_path"] == str(window_path.resolve()))
     assert (output / artifact["bundled_path"]).read_text() == window_path.read_text()
+
+
+def test_deconvolution_provenance_tracks_replacement_input_directory(tmp_path):
+    from squisher_lightsheet.fusion_provenance import _deconvolution_source_paths
+
+    old = tmp_path / "old" / "tile.ome.zarr"
+    new = tmp_path / "new" / "tile.ome.zarr"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    positions = {"tiles": [{"path": str(tmp_path / "tile.ome.tif")}]}
+    registration = {"tiles": [{"path": str(old)}]}
+    assert _deconvolution_source_paths(positions, registration, new.parent) == [new]

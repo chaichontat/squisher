@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, OrderedDict
+from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager, nullcontext
 import copy
 from datetime import datetime
@@ -65,7 +66,7 @@ FUSION_BACKEND = "cupy"
 DEFAULT_REGISTRATION_READ_CHUNK_Z = 128
 DEFAULT_IN_MEMORY_CACHE_MAX_GIB = 64.0
 DEFAULT_REGISTRATION_CACHE_MAX_GIB = DEFAULT_IN_MEMORY_CACHE_MAX_GIB
-DEFAULT_BASIC_CACHE_MAX_GIB = DEFAULT_IN_MEMORY_CACHE_MAX_GIB
+DEFAULT_SOURCE_CACHE_MAX_GIB = DEFAULT_IN_MEMORY_CACHE_MAX_GIB
 DEFAULT_N_PARALLEL_PAIRWISE_REGS = 1
 PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
 DEFAULT_REGISTRATION_PAIR_MODE = "axis-aligned"
@@ -188,64 +189,53 @@ def basic_array_fingerprint(array: np.ndarray) -> str:
     return digest.hexdigest()[:16]
 
 
-def basic_disk_cache_paths(cache_dir: Path, cache_key: str) -> tuple[Path, Path]:
-    digest = hashlib.sha256(cache_key.encode()).hexdigest()
-    return cache_dir / f"{digest}.npy", cache_dir / f"{digest}.json"
+def basic_correction_fingerprint(correction: Any) -> str:
+    """Fingerprint either a static flatfield or a compact lazy correction."""
+    fingerprint = getattr(correction, "fingerprint", None)
+    if isinstance(fingerprint, str) and fingerprint:
+        return fingerprint
+    return basic_array_fingerprint(np.asarray(correction))
 
 
-def read_basic_disk_cache_entry(
-    cache_dir: Path,
-    cache_key: str,
-) -> dict[str, Any] | None:
-    data_path, metadata_path = basic_disk_cache_paths(cache_dir, cache_key)
-    if not data_path.exists() or not metadata_path.exists():
-        return None
-    metadata = json.loads(metadata_path.read_text())
-    if metadata.get("cache_key") != cache_key:
-        raise ValueError(f"BaSiC disk cache metadata mismatch for {metadata_path}")
-    data = np.load(data_path, allow_pickle=False)
-    return {
-        "data": data,
-        "dims": tuple(metadata["dims"]),
-        "offsets": {dim: int(offset) for dim, offset in metadata["offsets"].items()},
-        "bytes": int(data.nbytes),
-    }
-
-
-def write_basic_disk_cache_entry(
-    cache_dir: Path,
-    cache_key: str,
-    cached: dict[str, Any],
-) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    data_path, metadata_path = basic_disk_cache_paths(cache_dir, cache_key)
-    suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
-    tmp_data_path = data_path.with_name(f"{data_path.name}{suffix}")
-    tmp_metadata_path = metadata_path.with_name(f"{metadata_path.name}{suffix}")
-    with tmp_data_path.open("wb") as handle:
-        np.save(handle, cached["data"], allow_pickle=False)
-    metadata = {
-        "cache_key": cache_key,
-        "dims": list(cached["dims"]),
-        "offsets": {dim: int(offset) for dim, offset in cached["offsets"].items()},
-        "shape": [int(value) for value in cached["data"].shape],
-        "dtype": str(cached["data"].dtype),
-        "bytes": int(cached["data"].nbytes),
-    }
-    tmp_metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
-    os.replace(tmp_data_path, data_path)
-    os.replace(tmp_metadata_path, metadata_path)
-
-
-@contextmanager
-def temporary_basic_disk_cache_dir(base_dir: Path | None, output: Path):
-    root = output.parent if base_dir is None else base_dir
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=f".{output.name}.basic-cache-",
-        dir=root,
-    ) as cache_dir:
-        yield Path(cache_dir)
+def _residual_correction_for_region(
+    correction: Any,
+    *,
+    z0: int,
+    z_size: int,
+    y0: int,
+    x0: int,
+    y_size: int,
+    x_size: int,
+    message_prefix: str,
+) -> np.ndarray:
+    """Evaluate a compact residual model in original source coordinates."""
+    shape = tuple(int(value) for value in correction.shape_zyx)
+    expected_shape = (z_size, y_size, x_size)
+    if (
+        len(shape) != 3
+        or z0 < 0
+        or y0 < 0
+        or x0 < 0
+        or z0 + z_size > shape[0]
+        or y0 + y_size > shape[1]
+        or x0 + x_size > shape[2]
+    ):
+        raise ValueError(
+            f"{message_prefix} crop does not match zarr slice: "
+            f"correction_shape={shape}, slice={expected_shape}, "
+            f"origin={(z0, y0, x0)}"
+        )
+    result = np.asarray(
+        correction.block(
+            z_slice=slice(z0, z0 + z_size),
+            y_slice=slice(y0, y0 + y_size),
+            x_slice=slice(x0, x0 + x_size),
+        ),
+        dtype=np.float32,
+    )
+    if result.shape != expected_shape:
+        raise ValueError(f"{message_prefix} returned {result.shape}; expected {expected_shape}")
+    return result
 
 
 def normalize_or_uniform_valid(weights, valid, xp):
@@ -269,21 +259,14 @@ def coarse_preibisch_content_weights(
     stride_zyx: tuple[int, int, int],
     softmax_exponent: float = 2.0,
 ):
+    from multiview_stitcher.weights import nan_gaussian_filter
+
     try:
         import cupy as cp
     except ImportError:  # pragma: no cover - depends on runtime environment
         cp = None
 
-    if cp is not None and isinstance(transformed_views, cp.ndarray):
-        import cupyx.scipy.ndimage as cpx_ndimage
-
-        xp = cp
-        gaussian_filter = cpx_ndimage.gaussian_filter
-    else:
-        import scipy.ndimage as scipy_ndimage
-
-        xp = np
-        gaussian_filter = scipy_ndimage.gaussian_filter
+    xp = cp if cp is not None and isinstance(transformed_views, cp.ndarray) else np
 
     spatial_ndim = transformed_views.ndim - 1
     strides = tuple(int(value) for value in stride_zyx[-spatial_ndim:])
@@ -294,12 +277,19 @@ def coarse_preibisch_content_weights(
     views_ds = transformed_views[ds_slices].astype(xp.float32, copy=False)
     blending_ds = blending_weights[ds_slices]
     valid_ds = (blending_ds > 1e-7) & ~xp.isnan(views_ds)
-    filled = xp.where(valid_ds, views_ds, 0.0)
+    # Missing tile support must not create artificial contrast at its border.
+    masked = xp.where(valid_ds, views_ds, xp.nan)
+    # Center before normalized convolution so constant tiles have exactly zero
+    # contrast, rather than amplified floating-point noise at missing borders.
+    flat = masked.reshape(masked.shape[0], -1)
+    first_valid = valid_ds.reshape(valid_ds.shape[0], -1).argmax(axis=1)
+    reference = flat[xp.arange(flat.shape[0]), first_valid]
+    masked = masked - reference.reshape((-1,) + (1,) * spatial_ndim)
 
     sigma1_ds = (0.0,) + tuple(max(0.5, float(sigma_1) / stride) for stride in strides)
     sigma2_ds = (0.0,) + tuple(max(0.5, float(sigma_2) / stride) for stride in strides)
-    low_pass = gaussian_filter(filled, sigma=sigma1_ds, mode="reflect")
-    quality = gaussian_filter(xp.where(valid_ds, (filled - low_pass) ** 2, 0.0), sigma=sigma2_ds, mode="reflect")
+    low_pass = nan_gaussian_filter(masked, sigma=sigma1_ds, mode="reflect")
+    quality = nan_gaussian_filter((masked - low_pass) ** 2, sigma=sigma2_ds, mode="reflect")
     quality = xp.where(valid_ds, quality, 0.0)
     quality = normalize_or_uniform_valid(quality, valid_ds, xp)
 
@@ -327,7 +317,7 @@ def coarse_preibisch_content_weights(
 def fusion_weight_config(
     args: argparse.Namespace, resolved_chunksize: dict[str, int]
 ) -> tuple[Any | None, dict[str, Any] | None]:
-    if args.fusion_weight_mode == "geometric":
+    if args.fusion_weight_mode in ("geometric", "sharpness-seam", "crop-sharpness-seam"):
         return None, None
 
     from multiview_stitcher.fusion import _core as fusion_core
@@ -4388,7 +4378,7 @@ def build_fusion_sims(
             raise RuntimeError(
                 f"Fusion tile {tile.path} requires {flip_axes} reflection but lost direct Zarr backing"
             )
-        selected.attrs["basic_tile_cache_key"] = f"{tile.path.resolve()}::ch{channel}"
+        selected.attrs["fusion_source_cache_key"] = f"{tile.path.resolve()}::ch{channel}"
         if tile.source_view is not None:
             selected.attrs["source_view"] = tile.source_view
         sims.append(selected)
@@ -4544,6 +4534,13 @@ def load_inverse_flatfield(flatfield_dir: Path, channel: int, tile_shape: tuple[
     import numpy as np
     import tifffile
 
+    from squisher_deconv.basic_profiles import load_basic_profile_arrays
+
+    profiles = sorted(flatfield_dir.glob(f"*-ch{channel}.pkl"))
+    if len(profiles) > 1:
+        raise ValueError(f"Expected one serialized ch{channel} profile in {flatfield_dir}, found {profiles}")
+    if profiles and load_basic_profile_arrays(profiles[0]).residual_coefficient is not None:
+        raise ValueError("Apply Z-dependent post-BaSiC profiles with squisher-deconv before fusion")
     path = flatfield_path(flatfield_dir, channel)
     flatfield = np.asarray(tifffile.imread(path), dtype=np.float32)
     expected_shape = tile_shape[-2:]
@@ -4837,21 +4834,6 @@ def _cached_slice_request_sim(
     return sim
 
 
-def _basic_cache_request_sim(
-    cached: dict[str, Any],
-    info: dict[str, Any],
-    overlap_bb: dict[str, Any],
-    si_utils: Any,
-):
-    return _cached_slice_request_sim(
-        cached,
-        info,
-        overlap_bb,
-        si_utils,
-        message_prefix="BaSiC tile cache",
-    )
-
-
 class BoundedMemoryCache:
     def __init__(self, *, max_bytes: int | None = None, max_entries: int | None = None) -> None:
         self.data: OrderedDict[Any, Any] = OrderedDict()
@@ -4863,6 +4845,7 @@ class BoundedMemoryCache:
         self.misses = 0
         self.evictions = 0
         self.loaded_bytes = 0
+        self.rejected = 0
 
     def get(self, key: Any) -> Any:
         if key not in self.data:
@@ -4872,30 +4855,193 @@ class BoundedMemoryCache:
         self.data.move_to_end(key)
         return self.data[key]
 
-    def put(self, key: Any, value: Any, *, cost: float | None = None, nbytes: int) -> None:
+    def put(self, key: Any, value: Any, *, cost: float | None = None, nbytes: int) -> bool:
         del cost
         value_nbytes = int(nbytes)
         if key in self.data:
+            self.data.pop(key)
             self.total_bytes -= self.nbytes.pop(key, 0)
+        self.loaded_bytes += value_nbytes
+        if (
+            (self.max_entries is not None and self.max_entries <= 0)
+            or (self.max_bytes is not None and value_nbytes > self.max_bytes)
+        ):
+            self.rejected += 1
+            return False
         self.data[key] = value
         self.data.move_to_end(key)
         self.nbytes[key] = value_nbytes
         self.total_bytes += value_nbytes
-        self.loaded_bytes += value_nbytes
         self._evict_until_within_limits()
+        return True
 
     def _evict_until_within_limits(self) -> None:
         while self.data and (
             (self.max_entries is not None and len(self.data) > self.max_entries)
-            or (
-                self.max_bytes is not None
-                and len(self.data) > 1
-                and self.total_bytes > self.max_bytes
-            )
+            or (self.max_bytes is not None and self.total_bytes > self.max_bytes)
         ):
             key, _value = self.data.popitem(last=False)
             self.total_bytes -= self.nbytes.pop(key, 0)
             self.evictions += 1
+
+    def evict_until_fits(self, additional_bytes: int) -> None:
+        while (
+            self.data
+            and self.max_bytes is not None
+            and self.total_bytes + int(additional_bytes) > self.max_bytes
+        ):
+            key, _value = self.data.popitem(last=False)
+            self.total_bytes -= self.nbytes.pop(key, 0)
+            self.evictions += 1
+
+
+class SourceChunkCache:
+    """Session-owned, deduplicated cache of canonical raw source chunks."""
+
+    def __init__(self, *, max_bytes: int) -> None:
+        if max_bytes < 0:
+            raise ValueError("source cache byte limit must be nonnegative")
+        self.cache = BoundedMemoryCache(max_bytes=max_bytes)
+        self._inflight: dict[Any, Future] = {}
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._reserved_bytes = 0
+
+    def get_or_load(self, key: Any, *, expected_bytes: int, loader) -> dict[str, Any]:
+        expected_bytes = int(expected_bytes)
+        if expected_bytes < 0:
+            raise ValueError("expected source chunk bytes must be nonnegative")
+        if self.cache.max_bytes == 0 or expected_bytes > self.cache.max_bytes:
+            return loader()
+
+        with self._lock:
+            cached = self.cache.get(key)
+            if cached is not None:
+                return cached
+            future = self._inflight.get(key)
+            if future is None:
+                future = Future()
+                self._inflight[key] = future
+                owns_load = True
+                self.cache.evict_until_fits(self._reserved_bytes + expected_bytes)
+                while self._reserved_bytes + expected_bytes > self.cache.max_bytes:
+                    self._condition.wait()
+                    self.cache.evict_until_fits(self._reserved_bytes + expected_bytes)
+                self._reserved_bytes += expected_bytes
+            else:
+                owns_load = False
+
+        if not owns_load:
+            return future.result()
+
+        reservation_active = True
+        try:
+            loaded = loader()
+            loaded_bytes = int(loaded["data"].nbytes)
+            if loaded_bytes > expected_bytes:
+                raise ValueError(
+                    f"Source chunk materialized {loaded_bytes} bytes; expected at most {expected_bytes}"
+                )
+            with self._lock:
+                self._reserved_bytes -= expected_bytes
+                reservation_active = False
+                self.cache.put(key, loaded, nbytes=loaded_bytes)
+                future.set_result(loaded)
+                self._inflight.pop(key, None)
+                self._condition.notify_all()
+            return loaded
+        except BaseException as exc:
+            with self._lock:
+                if reservation_active:
+                    self._reserved_bytes -= expected_bytes
+                future.set_exception(exc)
+                self._inflight.pop(key, None)
+                self._condition.notify_all()
+            raise
+
+
+def _source_spatial_layout(info: dict[str, Any]) -> tuple[dict[str, int], dict[str, int]]:
+    array = info["zarr_array"]
+    dims = tuple(info["zarr_dims"])
+    shapes = {dim: int(array.shape[index]) for index, dim in enumerate(dims) if dim in {"z", "y", "x"}}
+    storage_chunks = getattr(array, "shards", None) or array.chunks
+    chunks = {dim: int(storage_chunks[index]) for index, dim in enumerate(dims) if dim in {"z", "y", "x"}}
+    missing = [dim for dim in ("z", "y", "x") if dim not in shapes or dim not in chunks]
+    if missing:
+        raise ValueError(f"Source Zarr cache requires spatial dimensions z, y, x; missing {missing}")
+    if any(chunks[dim] <= 0 for dim in chunks):
+        raise ValueError(f"Source Zarr cache received invalid chunks {chunks}")
+    return shapes, chunks
+
+
+def _source_request_offsets(info: dict[str, Any], overlap_bb: dict[str, Any]) -> dict[str, int]:
+    return {
+        dim: int(round((overlap_bb["origin"][dim] - info["origin"][dim]) / info["spacing"][dim]))
+        for dim in ("z", "y", "x")
+    }
+
+
+def _assemble_source_chunks(
+    chunks,
+    *,
+    info: dict[str, Any],
+    overlap_bb: dict[str, Any],
+    si_utils: Any,
+):
+    iterator = iter(chunks)
+    first = next(iterator, None)
+    if first is None:
+        raise ValueError("Source Zarr cache cannot assemble an empty chunk list")
+    request_offsets = _source_request_offsets(info, overlap_bb)
+    request_shapes = {dim: int(overlap_bb["shape"][dim]) for dim in ("z", "y", "x")}
+    dims = tuple(first["dims"])
+    output_shape = tuple(
+        request_shapes[dim] if dim in request_shapes else int(first["data"].shape[index])
+        for index, dim in enumerate(dims)
+    )
+    output = np.empty(output_shape, dtype=first["data"].dtype)
+
+    def copy_chunk(chunk: dict[str, Any]) -> None:
+        if tuple(chunk["dims"]) != dims:
+            raise ValueError("Source Zarr cache encountered inconsistent chunk dimensions")
+        source_slices = []
+        output_slices = []
+        for axis, dim in enumerate(dims):
+            if dim not in request_shapes:
+                source_slices.append(slice(None))
+                output_slices.append(slice(None))
+                continue
+            chunk_start = int(chunk["offsets"][dim])
+            chunk_stop = chunk_start + int(chunk["data"].shape[axis])
+            request_start = request_offsets[dim]
+            request_stop = request_start + request_shapes[dim]
+            overlap_start = max(chunk_start, request_start)
+            overlap_stop = min(chunk_stop, request_stop)
+            if overlap_start >= overlap_stop:
+                break
+            source_slices.append(slice(overlap_start - chunk_start, overlap_stop - chunk_start))
+            output_slices.append(slice(overlap_start - request_start, overlap_stop - request_start))
+        else:
+            output[tuple(output_slices)] = chunk["data"][tuple(source_slices)]
+
+    copy_chunk(first)
+    del first
+    for chunk in iterator:
+        copy_chunk(chunk)
+        del chunk
+
+    cached = {
+        "data": output,
+        "dims": dims,
+        "offsets": request_offsets,
+    }
+    return _cached_slice_request_sim(
+        cached,
+        info,
+        overlap_bb,
+        si_utils,
+        message_prefix="source chunk cache",
+    )
 
 
 @contextmanager
@@ -4928,10 +5074,7 @@ def basic_corrected_zarr_reads(
     dataset_info_key: str | None = None,
     dataset_attr_keys: tuple[str, ...] = (),
     cache_key_attr: str | None = None,
-    tile_cache_size: int = 0,
-    tile_cache_max_bytes: int | None = None,
-    tile_cache_disk_dir: Path | None = None,
-    tile_cache_z_chunk: int = 16,
+    source_cache_max_bytes: int = 0,
     log_prefix: str = "BaSiC-correcting zarr slice",
     error_prefix: str = "BaSiC correction",
 ):
@@ -4940,35 +5083,44 @@ def basic_corrected_zarr_reads(
     from multiview_stitcher import spatial_image_utils as si_utils
 
     default_dataset = "__default__"
-    if isinstance(inverse_flatfields, dict):
-        inverse_by_dataset = inverse_flatfields
+    correction_enabled = inverse_flatfields is not None
+    if inverse_flatfields is None:
+        correction_by_dataset = {}
+    elif isinstance(inverse_flatfields, dict):
+        correction_by_dataset = inverse_flatfields
     else:
-        inverse_by_dataset = {default_dataset: inverse_flatfields}
+        correction_by_dataset = {default_dataset: inverse_flatfields}
 
     original_deserialize = si_utils.deserialize_zarr_backed_sim
     original_serialize = si_utils.serialize_zarr_backed_sim
     original_sim_sel_coords = si_utils.sim_sel_coords
-    inverse_gpu = {dataset: cp.asarray(inverse, dtype=cp.float32) for dataset, inverse in inverse_by_dataset.items()}
-    flatfield_fingerprints = {
-        dataset: basic_array_fingerprint(np.asarray(inverse)) for dataset, inverse in inverse_by_dataset.items()
+    static_correction_cpu = {
+        dataset: None if callable(getattr(correction, "block", None)) else np.asarray(correction, dtype=np.float32)
+        for dataset, correction in correction_by_dataset.items()
     }
-    state = {"corrected_slices": 0}
-    tile_cache = BoundedMemoryCache(max_bytes=tile_cache_max_bytes, max_entries=tile_cache_size)
-    cache_stats = {"disk_hits": 0}
-    cache_lock = threading.RLock()
+    static_correction_gpu: dict[tuple[int, Any], Any] = {}
+    correction_lock = threading.RLock()
+    source_cache = SourceChunkCache(max_bytes=int(source_cache_max_bytes))
+    state = {
+        "corrected_slices": 0,
+        "source_chunks": 0,
+        "upper_clipped_requests": 0,
+        "uncached_edge_requests": 0,
+        "uncached_edge_requested_bytes": 0,
+        "uncached_edge_materialized_bytes": 0,
+        "uncached_edge_seconds": 0.0,
+    }
 
-    def log_basic_cache_summary(*, event: str, key: str) -> None:
-        total_requests = tile_cache.hits + tile_cache.misses
+    def log_source_cache_summary(*, key: Any) -> None:
+        cache = source_cache.cache
+        total_requests = cache.hits + cache.misses
         if total_requests <= 3 or total_requests % 100 == 0:
             log(
-                "BaSiC tile-slab cache "
-                f"{event}: requests={total_requests}, hits={tile_cache.hits}, "
-                f"misses={tile_cache.misses}, disk_hits={cache_stats['disk_hits']}, "
-                f"evictions={tile_cache.evictions}, "
-                f"entries={len(tile_cache.data)}/{tile_cache_size}, "
-                f"max={format_bytes(tile_cache_max_bytes) if tile_cache_max_bytes is not None else 'none'}, "
-                f"current={format_bytes(tile_cache.total_bytes)}, "
-                f"loaded_total={format_bytes(tile_cache.loaded_bytes)}, "
+                "Fusion raw source-chunk cache "
+                f"retained: requests={total_requests}, hits={cache.hits}, "
+                f"misses={cache.misses}, evictions={cache.evictions}, rejected={cache.rejected}, "
+                f"entries={len(cache.data)}, max={format_bytes(source_cache_max_bytes)}, "
+                f"current={format_bytes(cache.total_bytes)}, loaded_total={format_bytes(cache.loaded_bytes)}, "
                 f"key={key}"
             )
 
@@ -4977,8 +5129,7 @@ def basic_corrected_zarr_reads(
         if dataset_info_key is not None:
             info[dataset_info_key] = sim.attrs.get(dataset_info_key)
         if cache_key_attr is not None:
-            info["_basic_cache_key"] = sim.attrs.get(cache_key_attr)
-        info["_basic_cache_spatial_shape"] = {dim: int(sim.sizes[dim]) for dim in sim.dims if dim in {"z", "y", "x"}}
+            info["_source_cache_key"] = sim.attrs.get(cache_key_attr)
         return info
 
     def zarr_safe_sim_sel_coords(sim, sel_dict):
@@ -4991,96 +5142,149 @@ def basic_corrected_zarr_reads(
             extra_attr_keys=extra_attr_keys,
         )
 
-    def corrected_tile_cache_entry(
+    def source_region(
         info: dict[str, Any],
-        dataset: str,
         overlap_bb: dict[str, Any],
-    ) -> dict[str, Any]:
-        base_cache_key = info.get("_basic_cache_key")
+        sim_coord_dict: dict[str, Any] | None,
+    ):
+        base_cache_key = info.get("_source_cache_key")
         if not base_cache_key:
             raise ValueError(
-                "Tile-level BaSiC cache requires a stable cache key attr; "
+                "Source Zarr cache requires a stable cache key attr; "
                 "set cache_key_attr and attach it to each fusion sim"
             )
+        source_shapes, source_chunks = _source_spatial_layout(info)
+        request_offsets = _source_request_offsets(info, overlap_bb)
+        effective_overlap_bb = {
+            "origin": dict(overlap_bb["origin"]),
+            "shape": dict(overlap_bb["shape"]),
+        }
 
-        spatial_shape = info.get("_basic_cache_spatial_shape") or {}
-        missing_dims = [dim for dim in ("z", "y", "x") if dim not in spatial_shape]
-        if missing_dims:
-            raise ValueError(f"Tile-level BaSiC cache missing spatial shape for {missing_dims}")
+        def uncached_edge_region():
+            started = time.perf_counter()
+            sim = original_deserialize(
+                info,
+                reconstruct_slice=True,
+                overlap_bb=overlap_bb,
+                sim_coord_dict=sim_coord_dict,
+            )
+            data = si_utils._get_backend_data(sim)
+            spatial_elements = math.prod(int(sim.sizes[dim]) for dim in ("z", "y", "x"))
+            nonspatial_elements = int(data.size) // spatial_elements if spatial_elements else 0
+            state["uncached_edge_requests"] += 1
+            state["uncached_edge_requested_bytes"] += int(
+                math.prod(int(overlap_bb["shape"][dim]) for dim in ("z", "y", "x"))
+                * nonspatial_elements
+                * np.dtype(data.dtype).itemsize
+            )
+            state["uncached_edge_materialized_bytes"] += int(data.nbytes)
+            state["uncached_edge_seconds"] += time.perf_counter() - started
+            return sim
 
-        y_size = int(spatial_shape["y"])
-        x_size = int(spatial_shape["x"])
-        _validate_basic_correction_bounds(
-            tuple(inverse_by_dataset[dataset].shape),
-            0,
-            0,
-            y_size,
-            x_size,
-            message_prefix=error_prefix,
+        for dim in ("z", "y", "x"):
+            request_stop = request_offsets[dim] + int(overlap_bb["shape"][dim])
+            if request_offsets[dim] < 0 or request_offsets[dim] >= source_shapes[dim]:
+                return uncached_edge_region()
+            clipped_shape = min(request_stop, source_shapes[dim]) - request_offsets[dim]
+            if clipped_shape != int(overlap_bb["shape"][dim]):
+                effective_overlap_bb["shape"][dim] = clipped_shape
+        if effective_overlap_bb["shape"] != overlap_bb["shape"]:
+            state["upper_clipped_requests"] += 1
+
+        block_ranges = [
+            range(
+                request_offsets[dim] // source_chunks[dim],
+                (request_offsets[dim] + int(effective_overlap_bb["shape"][dim]) - 1)
+                // source_chunks[dim]
+                + 1,
+            )
+            for dim in ("z", "y", "x")
+        ]
+        array_path = str(getattr(info["zarr_array"], "path", ""))
+        selections = tuple(sorted((str(key), repr(value)) for key, value in (sim_coord_dict or {}).items()))
+        dropped = tuple(sorted((str(key), int(value)) for key, value in info.get("isel_dropped", {}).items()))
+        nonspatial_elements = math.prod(
+            int(info["zarr_array"].shape[index])
+            for index, dim in enumerate(info["zarr_dims"])
+            if dim not in {"z", "y", "x"}
+            and dim not in info.get("isel_dropped", {})
+            and dim not in (sim_coord_dict or {})
+        )
+        itemsize = np.dtype(info["zarr_array"].dtype).itemsize
+        block_descriptors = []
+        for block_index in product(*block_ranges):
+            starts = {
+                dim: int(block_index[index]) * source_chunks[dim]
+                for index, dim in enumerate(("z", "y", "x"))
+            }
+            shapes = {
+                dim: min(source_chunks[dim], source_shapes[dim] - starts[dim])
+                for dim in ("z", "y", "x")
+            }
+            key = (str(base_cache_key), array_path, dropped, selections, tuple(int(value) for value in block_index))
+            expected_bytes = int(math.prod(shapes.values()) * nonspatial_elements * itemsize)
+            block_descriptors.append((key, starts, shapes, expected_bytes))
+
+        if any(expected_bytes > source_cache_max_bytes for _key, _starts, _shapes, expected_bytes in block_descriptors):
+            return original_deserialize(
+                info,
+                reconstruct_slice=True,
+                overlap_bb=overlap_bb,
+                sim_coord_dict=sim_coord_dict,
+            )
+
+        def cached_chunks():
+            for key, starts, shapes, expected_bytes in block_descriptors:
+                def load_chunk(starts=starts, shapes=shapes):
+                    block_bb = {
+                        "origin": {
+                            dim: info["origin"][dim] + starts[dim] * info["spacing"][dim]
+                            for dim in ("z", "y", "x")
+                        },
+                        "shape": shapes,
+                    }
+                    sim = original_deserialize(
+                        info,
+                        reconstruct_slice=True,
+                        overlap_bb=block_bb,
+                        sim_coord_dict=sim_coord_dict,
+                    )
+                    data = np.asarray(si_utils._get_backend_data(sim))
+                    state["source_chunks"] += 1
+                    return {
+                        "data": data,
+                        "dims": tuple(sim.dims),
+                        "offsets": starts,
+                    }
+
+                cached = source_cache.get_or_load(key, expected_bytes=expected_bytes, loader=load_chunk)
+                log_source_cache_summary(key=key)
+                yield cached
+                del cached
+
+        if not block_descriptors:
+            raise ValueError(
+                f"Source Zarr cache planned no chunks for request {overlap_bb}"
+            )
+        return _assemble_source_chunks(
+            cached_chunks(),
+            info=info,
+            overlap_bb=effective_overlap_bb,
+            si_utils=si_utils,
         )
 
-        z_total = int(spatial_shape["z"])
-        request_z0 = int(round((overlap_bb["origin"]["z"] - info["origin"]["z"]) / info["spacing"]["z"]))
-        request_z1 = request_z0 + int(overlap_bb["shape"]["z"])
-        slab_depth = max(1, int(tile_cache_z_chunk))
-        slab_z0 = max(0, (request_z0 // slab_depth) * slab_depth)
-        slab_z1 = min(z_total, ((request_z1 + slab_depth - 1) // slab_depth) * slab_depth)
-        if slab_z0 >= slab_z1:
-            raise ValueError(
-                f"Invalid BaSiC tile cache z slab for {base_cache_key}: "
-                f"request_z={request_z0}:{request_z1}, tile_z={z_total}"
-            )
-        cache_key = f"{base_cache_key}::basic{flatfield_fingerprints[dataset]}::z{slab_z0}:{slab_z1}"
-
-        with cache_lock:
-            cached = tile_cache.get(cache_key)
-            if cached is not None:
-                log_basic_cache_summary(event="hit", key=cache_key)
-                return cached
-
-            cached = (
-                None if tile_cache_disk_dir is None else read_basic_disk_cache_entry(tile_cache_disk_dir, cache_key)
-            )
-            if cached is not None:
-                cache_stats["disk_hits"] += 1
-            else:
-                tile_bb = {
-                    "origin": {
-                        "z": info["origin"]["z"] + slab_z0 * info["spacing"]["z"],
-                        "y": info["origin"]["y"],
-                        "x": info["origin"]["x"],
-                    },
-                    "shape": {"z": slab_z1 - slab_z0, "y": y_size, "x": x_size},
-                }
-                slab = original_deserialize(
-                    info,
-                    reconstruct_slice=True,
-                    overlap_bb=tile_bb,
-                    sim_coord_dict=None,
-                )
-                slab_data = si_utils._get_backend_data(slab)
-                data_dtype = np.dtype(slab.dtype)
-                reshape = [1] * slab_data.ndim
-                reshape[slab.get_axis_num("y")] = y_size
-                reshape[slab.get_axis_num("x")] = x_size
-                corrected = _apply_basic_correction_gpu(
-                    slab_data,
-                    inverse_gpu[dataset],
-                    reshape,
-                    data_dtype,
-                )
-                cached = {
-                    "data": cp.asnumpy(corrected),
-                    "dims": tuple(slab.dims),
-                    "offsets": {"z": slab_z0, "y": 0, "x": 0},
-                }
-                if tile_cache_disk_dir is not None:
-                    write_basic_disk_cache_entry(tile_cache_disk_dir, cache_key, cached)
-            cached_bytes = int(cached["data"].nbytes)
-            cached["bytes"] = cached_bytes
-            tile_cache.put(cache_key, cached, nbytes=cached_bytes)
-            log_basic_cache_summary(event="miss-loaded", key=cache_key)
-            return cached
+    def correction_gpu_for(dataset: Any):
+        correction_cpu = static_correction_cpu[dataset]
+        if correction_cpu is None:
+            return None
+        device = int(cp.cuda.runtime.getDevice())
+        key = (device, dataset)
+        with correction_lock:
+            correction_gpu = static_correction_gpu.get(key)
+            if correction_gpu is None:
+                correction_gpu = cp.asarray(correction_cpu, dtype=cp.float32)
+                static_correction_gpu[key] = correction_gpu
+            return correction_gpu
 
     @profile
     def corrected_deserialize_zarr_backed_sim(
@@ -5090,41 +5294,37 @@ def basic_corrected_zarr_reads(
         sim_coord_dict=None,
     ):
         dataset = default_dataset if dataset_info_key is None else info.get(dataset_info_key)
-        if reconstruct_slice and tile_cache_size > 0 and dataset is not None:
-            if overlap_bb is None:
-                raise ValueError("overlap_bb is required for BaSiC-corrected zarr reads")
-            if dataset not in inverse_by_dataset:
-                raise ValueError(f"No BaSiC flatfield configured for dataset {dataset!r}")
-            cached = corrected_tile_cache_entry(info, dataset, overlap_bb)
-            return _basic_cache_request_sim(cached, info, overlap_bb, si_utils)
-
-        sim = original_deserialize(
-            info,
-            reconstruct_slice=reconstruct_slice,
-            overlap_bb=overlap_bb,
-            sim_coord_dict=sim_coord_dict,
-        )
         if not reconstruct_slice:
-            return sim
+            return original_deserialize(
+                info,
+                reconstruct_slice=False,
+                overlap_bb=overlap_bb,
+                sim_coord_dict=sim_coord_dict,
+            )
         if overlap_bb is None:
             raise ValueError("overlap_bb is required for BaSiC-corrected zarr reads")
-        if dataset is None:
-            return sim
-        if dataset not in inverse_by_dataset:
+        if correction_enabled and dataset not in correction_by_dataset:
             raise ValueError(f"No BaSiC flatfield configured for dataset {dataset!r}")
 
-        y0 = int(round((overlap_bb["origin"]["y"] - info["origin"]["y"]) / info["spacing"]["y"]))
-        x0 = int(round((overlap_bb["origin"]["x"] - info["origin"]["x"]) / info["spacing"]["x"]))
+        if source_cache_max_bytes > 0:
+            sim = source_region(info, overlap_bb, sim_coord_dict)
+        else:
+            sim = original_deserialize(
+                info,
+                reconstruct_slice=True,
+                overlap_bb=overlap_bb,
+                sim_coord_dict=sim_coord_dict,
+            )
+        if not correction_enabled:
+            return sim
+
+        source_offsets = _source_request_offsets(info, overlap_bb)
+        z0 = source_offsets["z"]
+        y0 = source_offsets["y"]
+        x0 = source_offsets["x"]
+        z_size = int(sim.sizes["z"])
         y_size = int(sim.sizes["y"])
         x_size = int(sim.sizes["x"])
-        _validate_basic_correction_bounds(
-            tuple(inverse_by_dataset[dataset].shape),
-            y0,
-            x0,
-            y_size,
-            x_size,
-            message_prefix=error_prefix,
-        )
 
         state["corrected_slices"] += 1
         if state["corrected_slices"] <= 3 or state["corrected_slices"] % 10000 == 0:
@@ -5141,10 +5341,34 @@ def basic_corrected_zarr_reads(
         data = si_utils._get_backend_data(sim)
         data_dtype = np.dtype(sim.dtype)
         reshape = [1] * data.ndim
+        correction_gpu = correction_gpu_for(dataset)
+        if correction_gpu is None:
+            correction_gpu = cp.asarray(
+                _residual_correction_for_region(
+                    correction_by_dataset[dataset],
+                    z0=z0,
+                    z_size=z_size,
+                    y0=y0,
+                    x0=x0,
+                    y_size=y_size,
+                    x_size=x_size,
+                    message_prefix=error_prefix,
+                )
+            )
+            reshape[sim.get_axis_num("z")] = z_size
+        else:
+            _validate_basic_correction_bounds(
+                tuple(correction_by_dataset[dataset].shape),
+                y0,
+                x0,
+                y_size,
+                x_size,
+                message_prefix=error_prefix,
+            )
+            correction_gpu = correction_gpu[y0 : y0 + y_size, x0 : x0 + x_size]
         reshape[sim.get_axis_num("y")] = y_size
         reshape[sim.get_axis_num("x")] = x_size
 
-        correction_gpu = inverse_gpu[dataset][y0 : y0 + y_size, x0 : x0 + x_size]
         corrected = _apply_basic_correction_gpu(data, correction_gpu, reshape, data_dtype)
         return sim.copy(data=corrected)
 
@@ -5155,6 +5379,19 @@ def basic_corrected_zarr_reads(
     try:
         yield
     finally:
+        cache = source_cache.cache
+        log(
+            "Fusion raw source-chunk cache summary: "
+            f"requests={cache.hits + cache.misses}, hits={cache.hits}, misses={cache.misses}, "
+            f"source_loads={state['source_chunks']}, evictions={cache.evictions}, rejected={cache.rejected}, "
+            f"entries={len(cache.data)}, current={format_bytes(cache.total_bytes)}, "
+            f"loaded_total={format_bytes(cache.loaded_bytes)}, max={format_bytes(source_cache_max_bytes)}, "
+            f"upper_clipped_requests={state['upper_clipped_requests']}, "
+            f"uncached_edge_requests={state['uncached_edge_requests']}, "
+            f"uncached_edge_requested={format_bytes(state['uncached_edge_requested_bytes'])}, "
+            f"uncached_edge_materialized={format_bytes(state['uncached_edge_materialized_bytes'])}, "
+            f"uncached_edge_seconds={state['uncached_edge_seconds']:.3f}"
+        )
         si_utils.serialize_zarr_backed_sim = original_serialize
         si_utils.deserialize_zarr_backed_sim = original_deserialize
         si_utils.sim_sel_coords = original_sim_sel_coords
@@ -6340,6 +6577,8 @@ def direct_zarr_block_entry(
         if overlap[0] is None:
             continue
         tile_info = si_utils.serialize_zarr_backed_sim(sim)
+        if "fusion_source_index" in sim.attrs:
+            tile_info["fusion_source_index"] = int(sim.attrs["fusion_source_index"])
         source_channel_index = sim.attrs.get("source_channel_index")
         if source_channel_index is not None:
             source_channel_dims = [
@@ -6348,7 +6587,7 @@ def direct_zarr_block_entry(
             if len(source_channel_dims) != 1:
                 raise ValueError(
                     "Expected exactly one backing channel dimension for fusion source "
-                    f"{sim.attrs.get('basic_tile_cache_key', '<unknown>')}, got {source_channel_dims}"
+                    f"{sim.attrs.get('fusion_source_cache_key', '<unknown>')}, got {source_channel_dims}"
                 )
             tile_info["isel_dropped"][source_channel_dims[0]] = int(source_channel_index)
         views.append(
@@ -6489,9 +6728,8 @@ def find_latest_fusion_temp_workspace(
     *,
     expected_plan: dict[str, Any],
 ) -> Path | None:
-    prefix = fusion_temp_workspace_prefix(channel_output)
     candidates = []
-    for path in channel_output.parent.glob(f"{prefix}*"):
+    for path in channel_output.parent.glob(f"{fusion_temp_workspace_prefix(channel_output)}*"):
         fusion_output = fusion_output_from_temp_root(path, channel_output)
         plan_path = fusion_resume_plan_path(path)
         if not path.is_dir() or not (fusion_output / "0").exists() or not plan_path.is_file():
@@ -6501,25 +6739,45 @@ def find_latest_fusion_temp_workspace(
         except (OSError, json.JSONDecodeError) as exc:
             log(f"Ignoring unreadable fusion resume plan {plan_path}: {exc}")
             continue
-        if recorded_plan == expected_plan:
+        if fusion_resume_plans_match(recorded_plan, expected_plan):
             candidates.append(path)
         else:
             log(f"Ignoring fusion temporary workspace with a different run plan: {path}")
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    return max(
+        candidates,
+        key=lambda path: (
+            sum(1 for _ in (path / "completed-fusion-blocks").glob("*.complete")),
+            path.stat().st_mtime,
+        ),
+    )
+
+
+def fusion_resume_plans_match(recorded: Any, expected: Any) -> bool:
+    """Compare plans while accepting legacy mtimes for content-hashed files."""
+
+    def semantic_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: semantic_value(item)
+                for key, item in value.items()
+                if not (key == "mtime_ns" and value.get("sha256") is not None)
+            }
+        if isinstance(value, list):
+            return [semantic_value(item) for item in value]
+        return value
+
+    return semantic_value(recorded) == semantic_value(expected)
 
 
 def file_resume_identity(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
     resolved = path.resolve()
-    stat = resolved.stat() if resolved.exists() else None
-    digest = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
     return {
         "path": str(resolved),
-        "sha256": digest,
-        "mtime_ns": None if stat is None else stat.st_mtime_ns,
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None,
     }
 
 
@@ -6536,9 +6794,15 @@ def source_tile_resume_identity(path: Path, *, require_completion: bool) -> dict
     level0_metadata = ome_zarr_array_metadata_path(resolved / "0")
     completion = resolved / "squisher.complete.json"
     if require_completion and not completion.is_file():
-        raise ValueError(
-            f"Cannot safely resume fusion from {resolved}: missing squisher.complete.json"
-        )
+        # Deconvolution finalizes with an attribute; materialization uses a manifest.
+        # The root metadata hash below includes this completion state in the resume identity.
+        metadata = json.loads(root_metadata.read_text()) if root_metadata.is_file() else {}
+        attributes = metadata.get("attributes", {}) if root_metadata.name == "zarr.json" else metadata
+        if attributes.get("squisher_complete") is not True:
+            raise ValueError(
+                f"Cannot safely resume fusion from {resolved}: missing squisher.complete.json "
+                "or squisher_complete=true"
+            )
     return {
         "path": str(resolved),
         "root_metadata": file_resume_identity(root_metadata),
@@ -6563,17 +6827,18 @@ def fusion_resume_plan(
     blending_widths: dict[str, float],
     inverse_flatfield: Any,
     args: argparse.Namespace,
+    fusion_func_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe the inputs and resolved settings that determine fused pixels."""
     if isinstance(inverse_flatfield, dict):
         flatfield_identity = {
-            str(key): basic_array_fingerprint(np.asarray(value))
+            str(key): basic_correction_fingerprint(value)
             for key, value in sorted(inverse_flatfield.items())
         }
     elif inverse_flatfield is None:
         flatfield_identity = None
     else:
-        flatfield_identity = basic_array_fingerprint(np.asarray(inverse_flatfield))
+        flatfield_identity = basic_correction_fingerprint(inverse_flatfield)
     template_metadata = None
     if output_grid_template is not None:
         root_metadata = output_grid_template / (
@@ -6613,7 +6878,9 @@ def fusion_resume_plan(
         "output_stack_properties": json_safe(output_stack_properties),
         "output_chunksize": output_chunksize,
         "fusion_weight_mode": args.fusion_weight_mode,
+        "seam_width_um": args.seam_width_um,
         "fusion_weight_arguments": json_safe(weights_func_kwargs),
+        "fusion_arguments": json_safe(fusion_func_kwargs),
         "fusion_intensity_threshold": args.fusion_intensity_threshold,
         "blending_widths": json_safe(blending_widths),
         "flatfield": flatfield_identity,
@@ -6777,14 +7044,21 @@ def run_mvs_fuse_chunk_loky_worker(
     payload_cache_path: str,
     cuda_devices: tuple[int, ...],
 ) -> None:
+    payload = load_mvs_fuse_chunk_payload(payload_cache_path)
+    run_mvs_fuse_chunk_worker(block_id, payload, int(cuda_devices[index % len(cuda_devices)]))
+
+
+def run_mvs_fuse_chunk_worker(
+    block_id,
+    payload: dict[str, Any],
+    device: int,
+) -> None:
     import cupy as cp
 
-    device = int(cuda_devices[index % len(cuda_devices)])
     max_attempts = 3
     retry_delay_seconds = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            payload = load_mvs_fuse_chunk_payload(payload_cache_path)
             return run_mvs_fuse_chunk_loky_worker_once(block_id, payload, device)
         except cp.cuda.memory.OutOfMemoryError:
             from multiview_stitcher import misc_utils
@@ -6809,8 +7083,22 @@ def run_mvs_fuse_chunk_loky_worker_batch(
     payload_cache_path: str,
     cuda_device: int,
 ) -> None:
-    for block_id in block_ids:
-        run_mvs_fuse_chunk_loky_worker(0, block_id, payload_cache_path, (int(cuda_device),))
+    """Own correction state and serial block execution on one CUDA device."""
+    import cupy as cp
+    from multiview_stitcher import misc_utils
+
+    payload = load_mvs_fuse_chunk_payload(payload_cache_path)
+    with cp.cuda.Device(int(cuda_device)):
+        with ExitStack() as stack:
+            stack.enter_context(zarr_safe_fusion_selection(
+                extra_attr_keys=("source_view", "fusion_source_cache_key", "fusion_correction_source"),
+            ))
+            read_config = payload.get("worker_read_config")
+            if read_config is not None:
+                stack.enter_context(basic_corrected_zarr_reads(**read_config))
+            for block_id in block_ids:
+                run_mvs_fuse_chunk_loky_worker(0, block_id, payload_cache_path, (int(cuda_device),))
+        misc_utils.clear_cupy_memory()
 
 
 def run_mvs_fuse_chunk_loky_worker_once(
@@ -6925,13 +7213,18 @@ def run_mvs_fuse_chunk_loky_worker_once(
                         f"spatial_block_key={tuple(int(value) for value in spatial_chunk_ind)}, "
                         f"candidate_count={len(candidate_indices or ())}, plan_path={candidate_plan_path}"
                     )
+                block_fusion_kwargs = dict(fuse_kwargs.get("fusion_func_kwargs") or {})
+                if "pair_preferences" in block_fusion_kwargs:
+                    block_fusion_kwargs["source_indices"] = [
+                        int(view["tile_info"]["fusion_source_index"]) for view in block_entry["views"]
+                    ]
                 materialized = fusion_core._fuse_block_zarr_backed(
                     np.asarray(block_entry, dtype=object),
                     output_dtype=np.dtype(output_zarr_array.dtype),
                     sim_coord_dict=sim_coord_dict,
                     sdims=sdims,
                     fusion_func=fuse_kwargs.get("fusion_func", fusion_core.weighted_average_fusion),
-                    fusion_func_kwargs=fuse_kwargs.get("fusion_func_kwargs"),
+                    fusion_func_kwargs=block_fusion_kwargs,
                     weights_func=fuse_kwargs.get("weights_func"),
                     weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
                     overlap_in_pixels=overlap_in_pixels,
@@ -6941,7 +7234,7 @@ def run_mvs_fuse_chunk_loky_worker_once(
                         weights_func=fuse_kwargs.get("weights_func"),
                         weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
                         fusion_func=fuse_kwargs.get("fusion_func"),
-                        fusion_func_kwargs=fuse_kwargs.get("fusion_func_kwargs"),
+                        fusion_func_kwargs=block_fusion_kwargs,
                     ),
                     backend=fuse_kwargs.get("backend"),
                 )
@@ -7508,7 +7801,9 @@ def process_batch_using_joblib_cuda_devices(
     n_jobs: int = 4,
     backend: str = "threading",
     cuda_devices: tuple[int, ...],
+    worker_read_config: dict[str, Any] | None = None,
 ) -> None:
+    """Weight block assignment while allowing at most one active queue per GPU."""
     if not cuda_devices:
         raise ValueError("cuda_devices must contain at least one local CUDA device index")
 
@@ -7520,49 +7815,54 @@ def process_batch_using_joblib_cuda_devices(
     _CUDA_BATCH_DEVICE_OFFSET = (_CUDA_BATCH_DEVICE_OFFSET + len(block_ids)) % len(devices)
     debug_blocks = int(os.environ.get("SQUISHER_FUSION_DEBUG_BLOCKS", "0"))
 
+    block_groups: dict[int, list[tuple[int, Any]]] = {}
+    for index, block_id in enumerate(block_ids):
+        device = devices[(device_offset + index) % len(devices)]
+        block_groups.setdefault(device, []).append((index, block_id))
+    worker_count = min(int(n_jobs), len(block_groups))
+
+    payload = mvs_fuse_chunk_payload(func)
+    if payload is None:
+        raise TypeError(f"{backend} CUDA fusion requires a multiview-stitcher fuse_chunk payload")
+
     if backend == "loky":
-        payload = mvs_fuse_chunk_payload(func)
-        if payload is None:
-            raise TypeError("loky CUDA fusion requires a picklable multiview-stitcher fuse_chunk payload")
+        payload["worker_read_config"] = worker_read_config
         payload_cache_path = write_mvs_fuse_chunk_payload_cache(payload)
-        worker_count = min(int(n_jobs), len(devices), len(block_ids))
-        block_groups = [[] for _ in range(worker_count)]
-        for index, block_id in enumerate(block_ids):
-            block_groups[index % worker_count].append(block_id)
         Parallel(n_jobs=worker_count, backend=backend)(
             delayed(run_mvs_fuse_chunk_loky_worker_batch)(
-                block_group,
-                payload_cache_path,
-                devices[(device_offset + group_index) % len(devices)],
+                [block_id for _, block_id in block_group], payload_cache_path, device
             )
-            for group_index, block_group in enumerate(block_groups)
+            for device, block_group in block_groups.items()
         )
         return
 
-    def run_one(index: int, block_id) -> None:
+    if worker_read_config is not None:
+        raise ValueError("threaded CUDA fusion requires a session-owned source-read context")
+
+    def run_queue(device: int, block_group: list[tuple[int, Any]]) -> None:
         import cupy as cp
 
-        device = devices[(device_offset + index) % len(devices)]
-        should_debug = debug_blocks < 0 or index < debug_blocks
-        if should_debug:
-            started = time.perf_counter()
-            log(
-                "Fusion block start: "
-                f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
-                f"thread={threading.get_ident()}"
-            )
         with cp.cuda.Device(device):
-            func(block_id)
-        if should_debug:
-            elapsed = time.perf_counter() - started
-            log(
-                "Fusion block done: "
-                f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
-                f"thread={threading.get_ident()}, elapsed={elapsed:.3f}s"
-            )
+            for index, block_id in block_group:
+                should_debug = debug_blocks < 0 or index < debug_blocks
+                if should_debug:
+                    started = time.perf_counter()
+                    log(
+                        "Fusion block start: "
+                        f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
+                        f"thread={threading.get_ident()}"
+                    )
+                run_mvs_fuse_chunk_worker(block_id, payload, device)
+                if should_debug:
+                    elapsed = time.perf_counter() - started
+                    log(
+                        "Fusion block done: "
+                        f"batch_index={index}, block_id={block_id}, local_cuda_device={device}, "
+                        f"thread={threading.get_ident()}, elapsed={elapsed:.3f}s"
+                    )
 
-    Parallel(n_jobs=min(int(n_jobs), len(block_ids)), backend=backend)(
-        delayed(run_one)(index, block_id) for index, block_id in enumerate(block_ids)
+    Parallel(n_jobs=worker_count, backend=backend)(
+        delayed(run_queue)(device, block_group) for device, block_group in block_groups.items()
     )
 
 
@@ -7973,6 +8273,7 @@ def parse_args() -> argparse.Namespace:
             "to use instead of INPUT_DIR/*.ome.tif stage positions."
         ),
     )
+    parser.add_argument("--residual-correction", type=Path, help="Source-keyed post-deconvolution correction JSON.")
     parser.add_argument(
         "--flatfield-dir",
         type=Path,
@@ -8098,7 +8399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=parse_batch_size,
-        default=1,
+        default="auto",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -8129,8 +8430,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fusion-weight-mode",
-        choices=("geometric", "content-dct", "content-preibisch", "content-preibisch-coarse"),
-        default="content-preibisch-coarse",
+        choices=("geometric", "content-dct", "content-preibisch", "content-preibisch-coarse", "sharpness-seam", "crop-sharpness-seam"),
+        default="crop-sharpness-seam",
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -8183,6 +8484,10 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--seam-width-um", type=float, default=10.0,
+        help="Full feather width at sharpness-seam interfaces, in micrometers.",
+    )
+    parser.add_argument(
         "--fusion-blend-width-voxels",
         type=float,
         nargs=3,
@@ -8203,27 +8508,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--basic-cache-tiles",
-        type=parse_nonnegative_int,
-        default=128,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--basic-cache-max-gib",
+        "--source-cache-max-gib",
         type=parse_nonnegative_float,
-        default=DEFAULT_BASIC_CACHE_MAX_GIB,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--basic-cache-disk-dir",
-        type=Path,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--basic-cache-z-chunk",
-        type=parse_positive_int,
-        default=32,
-        help=argparse.SUPPRESS,
+        default=DEFAULT_SOURCE_CACHE_MAX_GIB,
+        help="Total host-memory budget for the session raw source-chunk cache; 0 disables it.",
     )
     parser.add_argument(
         "--fusion-progress-log-seconds",
@@ -8922,7 +9210,12 @@ def run_stitch_once(
             raise_if_output_exists(channel_output)
 
             inverse_flatfield = None
-            apply_flatfield = flatfield_dir is not None or bool(flatfield_dirs_by_source_view)
+            correction_key = None
+            residual_correction = getattr(args, "residual_correction", None)
+            if residual_correction is not None and (flatfield_dir is not None or flatfield_dirs_by_source_view):
+                raise ValueError("Residual correction requires already-corrected inputs; do not also apply BaSiC")
+            basic_flatfield_applied = flatfield_dir is not None or bool(flatfield_dirs_by_source_view)
+            apply_flatfield = basic_flatfield_applied
             if apply_flatfield:
                 inverse_flatfield = load_fusion_inverse_flatfields(
                     source_tiles,
@@ -8936,6 +9229,22 @@ def run_stitch_once(
                     log(f"Resolved pooled BaSiC correction for channel {channel}")
             else:
                 log(f"Fusion flatfield correction disabled for channel {channel}")
+            if isinstance(inverse_flatfield, dict):
+                correction_key = "source_view"
+            if residual_correction is not None:
+                from squisher_lightsheet.residual_correction import load_residual_corrections
+
+                if args.fusion_level != 0:
+                    raise ValueError("Residual correction requires --fusion-level 0")
+                inverse_flatfield = load_residual_corrections(
+                    residual_correction, sources=[tile.path for tile in source_tiles],
+                    shapes_zyx=[tuple(tile.shape[-3:]) for tile in source_tiles], channel=channel,
+                )
+                correction_key = "fusion_correction_source"
+                for sim, tile in zip(sims, source_tiles, strict=True):
+                    sim.attrs[correction_key] = str(tile.path.resolve())
+                apply_flatfield = True
+                log(f"Applying residual correction for channel {channel}: {residual_correction}")
             resolved_chunksize = process_output_chunksize(sims, output_chunksize)
             log(f"Resolved fusion output chunksize: {resolved_chunksize}")
             resolved_batch_size = resolve_fusion_batch_size(
@@ -8949,6 +9258,56 @@ def run_stitch_once(
                 if args.fusion_intensity_threshold is None
                 else {"intensity_threshold": float(args.fusion_intensity_threshold)}
             )
+            fusion_func = inplace_weighted_average_fusion
+            if args.fusion_weight_mode == "sharpness-seam":
+                from squisher_lightsheet.seam_fusion import sharpness_seam_fusion
+
+                if not np.isfinite(args.seam_width_um) or args.seam_width_um < 0:
+                    raise ValueError("--seam-width-um must be finite and nonnegative")
+                if args.content_preibisch_sigma1 <= 0 or args.content_preibisch_sigma2 <= 0:
+                    raise ValueError("Sharpness smoothing sigmas must be positive")
+                fusion_func = sharpness_seam_fusion
+                xy_spacing = min(output_spacing["y"], output_spacing["x"])
+                fusion_func_kwargs = dict(fusion_func_kwargs or {})
+                fusion_func_kwargs.update(
+                    sigma_1=tuple(args.content_preibisch_sigma1 * xy_spacing / output_spacing[d] for d in ("z", "y", "x")),
+                    sigma_2=tuple(args.content_preibisch_sigma2 * xy_spacing / output_spacing[d] for d in ("z", "y", "x")),
+                    feather_radius=tuple(int(np.ceil(args.seam_width_um / (2 * output_spacing[d]))) for d in ("z", "y", "x")),
+                )
+                log(f"Fusion method: sharpness selection with interface feathering {fusion_func_kwargs}")
+            if args.fusion_weight_mode == "crop-sharpness-seam":
+                from squisher_lightsheet.crop_sharpness import crop_sharpness_fusion, fit_crop_preferences
+
+                if args.fusion_level != 0 or args.disable_view_candidate_culling or not all(
+                    si_utils.is_xarray_zarr_backed(sim) for sim in sims
+                ):
+                    raise ValueError("Crop sharpness requires native Zarr sources and direct candidate-culling fusion")
+                if not np.isfinite(args.seam_width_um) or args.seam_width_um < 0:
+                    raise ValueError("--seam-width-um must be finite and nonnegative")
+                if args.content_preibisch_sigma1 <= 0:
+                    raise ValueError("Sharpness smoothing sigma must be positive")
+                for index, sim in enumerate(sims):
+                    sim.attrs["fusion_source_index"] = index
+                read_config = None if not apply_flatfield else dict(
+                    inverse_flatfields=inverse_flatfield, dataset_info_key=correction_key,
+                    dataset_attr_keys=() if correction_key is None else (correction_key,),
+                    cache_key_attr="fusion_source_cache_key", source_cache_max_bytes=0,
+                )
+                xy_spacing = min(output_spacing["y"], output_spacing["x"])
+                preferences = fit_crop_preferences(
+                    sims=sims, source_paths=[tile.path for tile in source_tiles],
+                    transform_key=transform_key, output_spacing=output_spacing,
+                    output=channel_output.parent / f"crop-scores.ch{channel}.json",
+                    read_config=read_config,
+                    sigma=tuple(args.content_preibisch_sigma1 * xy_spacing / output_spacing[d] for d in ("z", "y", "x")),
+                )
+                fusion_func = crop_sharpness_fusion
+                fusion_func_kwargs = dict(fusion_func_kwargs or {})
+                fusion_func_kwargs.update(
+                    pair_preferences=preferences,
+                    feather_radius=tuple(int(np.ceil(args.seam_width_um / (2 * output_spacing[d]))) for d in ("z", "y", "x")),
+                )
+                log("Fusion method: native overlap-crop preferences with interface-only feathering")
             blending_widths = narrow_fusion_blending_widths(
                 source_tiles,
                 params,
@@ -8970,6 +9329,7 @@ def run_stitch_once(
                 blending_widths=blending_widths,
                 inverse_flatfield=inverse_flatfield,
                 args=args,
+                fusion_func_kwargs=fusion_func_kwargs,
             )
             if args.resume_fusion:
                 temp_root = find_latest_fusion_temp_workspace(
@@ -8996,31 +9356,26 @@ def run_stitch_once(
                     "Fusion source intensity threshold: "
                     f"values <= {args.fusion_intensity_threshold:g} contribute zero weight"
                 )
-            if apply_flatfield:
-                basic_cache_max_bytes = (
-                    None if args.basic_cache_max_gib is None else int(args.basic_cache_max_gib * 1024**3)
-                )
-                log(
-                    "BaSiC cache settings: "
-                    f"tile_cache_size={args.basic_cache_tiles}, "
-                    f"tile_cache_max_gib={args.basic_cache_max_gib}, "
-                    f"tile_cache_disk_root={args.basic_cache_disk_dir or fusion_output.parent}, "
-                    f"tile_cache_z_chunk={args.basic_cache_z_chunk}"
-                )
+            source_cache_max_bytes = int(args.source_cache_max_gib * 1024**3)
+            log(
+                "Fusion source cache settings: "
+                f"scope=channel-session, representation=raw-zarr-chunks, "
+                f"max={format_bytes(source_cache_max_bytes)}, disk_cache=disabled"
+            )
             local_cuda_devices = visible_local_cuda_devices() if FUSION_BACKEND == "cupy" else ()
             if local_cuda_devices:
                 weighted_cuda_devices = cuda_devices_weighted_by_total_vram(local_cuda_devices)
                 batch_func = process_batch_using_joblib_cuda_devices
                 batch_func_kwargs = {
                     "n_jobs": args.batch_jobs,
-                    "backend": "loky",
+                    "backend": "threading",
                     "cuda_devices": weighted_cuda_devices,
                 }
                 log(
                     "Fusion CUDA batch executor: "
                     f"local_cuda_devices={local_cuda_devices}, "
                     f"weighted_devices={weighted_cuda_devices} ({format_cuda_device_weights(weighted_cuda_devices)}), "
-                    f"process_jobs={args.batch_jobs}, backend=loky"
+                    f"device_queues={len(set(weighted_cuda_devices))}, backend=threading"
                 )
             else:
                 batch_func = misc_utils.process_batch_using_joblib
@@ -9064,7 +9419,7 @@ def run_stitch_once(
                     output_chunksize=resolved_chunksize,
                     weights_func=weights_func,
                     weights_func_kwargs=weights_func_kwargs,
-                    fusion_func=inplace_weighted_average_fusion,
+                    fusion_func=fusion_func,
                     fusion_func_kwargs=fusion_func_kwargs,
                     interpolation_order=1,
                 )
@@ -9125,26 +9480,20 @@ def run_stitch_once(
                     zarr_safe_fusion_selection(
                         extra_attr_keys=(
                             "source_view",
-                            "basic_tile_cache_key",
+                            "fusion_source_cache_key",
+                            "fusion_correction_source",
                         )
                     )
                 )
-                if apply_flatfield:
-                    basic_cache_disk_dir = stack.enter_context(
-                        temporary_basic_disk_cache_dir(args.basic_cache_disk_dir, fusion_output)
+                stack.enter_context(
+                    basic_corrected_zarr_reads(
+                        inverse_flatfields=inverse_flatfield,
+                        dataset_info_key=correction_key,
+                        dataset_attr_keys=() if correction_key is None else (correction_key,),
+                        cache_key_attr="fusion_source_cache_key",
+                        source_cache_max_bytes=source_cache_max_bytes,
                     )
-                    stack.enter_context(
-                        basic_corrected_zarr_reads(
-                            inverse_flatfield,
-                            dataset_info_key="source_view" if isinstance(inverse_flatfield, dict) else None,
-                            dataset_attr_keys=("source_view",) if isinstance(inverse_flatfield, dict) else (),
-                            cache_key_attr="basic_tile_cache_key",
-                            tile_cache_size=args.basic_cache_tiles,
-                            tile_cache_max_bytes=basic_cache_max_bytes,
-                            tile_cache_disk_dir=basic_cache_disk_dir,
-                            tile_cache_z_chunk=args.basic_cache_z_chunk,
-                        )
-                    )
+                )
                 stack.enter_context(
                     profile_zarr_slice_materialization(
                         enabled=args.profile_max_fusion_batches is not None or args.profile_skip_fusion_batches > 0
@@ -9163,7 +9512,7 @@ def run_stitch_once(
                         fusion.fuse(
                             images=sims,
                             transform_key=transform_key,
-                            fusion_func=inplace_weighted_average_fusion,
+                            fusion_func=fusion_func,
                             fusion_func_kwargs=fusion_func_kwargs,
                             output_stack_properties=output_stack_properties,
                             output_chunksize=resolved_chunksize,
@@ -9250,22 +9599,24 @@ def run_stitch_once(
                 "output_chunksize": resolved_chunksize,
                 "batch_size": resolved_batch_size,
                 "weight_mode": args.fusion_weight_mode,
+                "method_arguments": json_safe(fusion_func_kwargs),
                 "weight_arguments": weights_func_kwargs,
                 "intensity_threshold": args.fusion_intensity_threshold,
                 "blending_widths": blending_widths,
                 "candidate_plan": candidate_summary,
                 "candidate_blocks": len(allowed_fusion_blocks),
                 "total_output_blocks": total_fusion_blocks,
-                "flatfield_applied": apply_flatfield,
+                "flatfield_applied": basic_flatfield_applied,
+                "residual_correction_applied": residual_correction is not None,
                 "output_codec": args.output_codec,
                 "zstd_level": args.zstd_level,
                 "jpegxr_level": args.jpegxr_level,
             }
-            additional_json_inputs = (
-                {"fusion_candidate_plan": candidate_plan_path}
-                if candidate_plan_path is not None
-                else None
-            )
+            additional_json_inputs = {}
+            if candidate_plan_path is not None:
+                additional_json_inputs["fusion_candidate_plan"] = candidate_plan_path
+            if residual_correction is not None:
+                additional_json_inputs["residual_correction"] = residual_correction
             write_fusion_provenance(
                 output=fusion_output,
                 input_dir=input_dir,
@@ -9281,7 +9632,7 @@ def run_stitch_once(
                     if flatfield_dirs_by_source_view
                     else (() if flatfield_dir is None else (flatfield_dir,))
                 ),
-                additional_json_inputs=additional_json_inputs,
+                additional_json_inputs=additional_json_inputs or None,
             )
             log(
                 "Fusion output before final move: "
@@ -9527,11 +9878,6 @@ def main() -> int:
         track_registration_output = (
             insert_track_suffix(registration_output, track.slug) if split_by_track else registration_output
         )
-        track_registration_input = (
-            insert_track_suffix(registration_input, track.slug)
-            if registration_input is not None and split_by_track
-            else registration_input
-        )
         track_plots_dir = (
             track_registration_plots_dir(registration_plots_dir, track.slug)
             if split_by_track
@@ -9545,7 +9891,7 @@ def main() -> int:
                 track=track,
                 output=track_output,
                 registration_output=track_registration_output,
-                registration_input=track_registration_input,
+                registration_input=registration_input,
                 registration_plots_dir=track_plots_dir,
                 robust_boundary_qc_dir=track_robust_boundary_qc_dir,
                 selected_channels=track.channels,

@@ -16,6 +16,7 @@ import zarr
 from squisher.jpegxr_zarr import DEFAULT_JPEGXR_LEVEL
 
 from squisher_deconv.deconvolution import Deconvolver
+from squisher_deconv.tile_gains import load_tile_gains
 from squisher_deconv.metadata import (
     czi_dataset_metadata_payload,
     dependency_versions,
@@ -94,6 +95,7 @@ def sample_scale(
     deconvolver: Deconvolver | None,
     psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
+    tile_gains_path: Path | None = None,
     deconvolver_factory: Callable[[int], Deconvolver] | None = None,
     iterations: int | None = None,
     seed: int,
@@ -109,6 +111,9 @@ def sample_scale(
     t_workflow = time.perf_counter()
     _validate_queue_depth(queue_depth)
     paths = [Path(path) for path in inputs]
+    tile_gains = (
+        None if tile_gains_path is None else load_tile_gains(tile_gains_path, inputs=paths, channels=channels)
+    )
     psfs = tuple(Path(path) for path in (psf_paths or ()))
     _log(
         "sample-scale start "
@@ -156,6 +161,7 @@ def sample_scale(
             paths=paths,
             template_source=template_source,
             sample_dir=sample_dir,
+            tile_gains=tile_gains,
             deconvolver_factory=deconvolver_factory,
             devices=devices,
             queue_depth=queue_depth,
@@ -207,7 +213,12 @@ def sample_scale(
                         f"deconv start device={device} window[{scheduled.index:05d}] "
                         f"file={source.path.name} input_shape={slab.shape}"
                     )
-                    deconvolved = device_deconvolvers[int(device)].deconvolve(slab)
+                    gain_kwargs = (
+                        {}
+                        if tile_gains is None
+                        else {"channel_gains": tile_gains[str(source.path.resolve())]}
+                    )
+                    deconvolved = device_deconvolvers[int(device)].deconvolve(slab, raw_z_start=window.read_start, raw_z_size=source.z_count, **gain_kwargs)
                     _log(
                         f"deconv done device={device} window[{scheduled.index:05d}] "
                         f"file={source.path.name} output_shape={deconvolved.shape} "
@@ -274,6 +285,7 @@ def sample_scale(
         "iterations": None if iterations is None else int(iterations),
         "psfs": file_provenance_records(psfs),
         "basic_profiles": file_provenance_records(basic_paths or []),
+        "tile_gains": None if tile_gains_path is None else file_provenance_records([tile_gains_path])[0],
         "devices": [int(device) for device in devices],
         "queue_depth": int(queue_depth),
         "versions": dependency_versions(),
@@ -313,6 +325,7 @@ def run_streaming_deconv(
     slab_depth: int,
     psf_paths: Sequence[Path] | None,
     basic_paths: Sequence[Path] | None = None,
+    tile_gains_path: Path | None = None,
     deconvolver_factory: Callable[[int], Deconvolver] | None = None,
     devices: list[int],
     queue_depth: int,
@@ -328,6 +341,9 @@ def run_streaming_deconv(
     if deconvolver_factory is None or not getattr(deconvolver_factory, "process_safe", False):
         raise ValueError("run requires a process-safe deconvolver factory.")
     paths = [Path(path) for path in inputs]
+    tile_gains = (
+        None if tile_gains_path is None else load_tile_gains(tile_gains_path, inputs=paths, channels=channels)
+    )
     psfs = tuple(Path(path) for path in (psf_paths or ()))
     _log(
         "run start "
@@ -366,6 +382,7 @@ def run_streaming_deconv(
             },
             "psfs": file_provenance_records(psfs),
             "basic_profiles": file_provenance_records(basic_paths or []),
+            "tile_gains": None if tile_gains_path is None else file_provenance_records([tile_gains_path])[0],
             "scaling": file_provenance_records([scaling_path])[0],
         }
         work_paths = _resume_pending_paths(
@@ -403,6 +420,8 @@ def run_streaming_deconv(
             output_mode="u16",
             psf_paths=psfs,
             basic_paths=tuple(Path(path) for path in (basic_paths or ())),
+            tile_gains=tile_gains,
+            tile_gains_path=tile_gains_path,
             scaling_path=scaling_path,
             devices=tuple(int(device) for device in devices),
             queue_depth=queue_depth,
@@ -455,15 +474,18 @@ def _resume_pending_paths(
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ValueError(f"Cannot resume {source}: {sidecar} has invalid provenance.") from exc
         if provenance.get("source_file") != file_stat_record(source):
-            raise ValueError(f"Cannot resume {source}: recorded source identity differs from the current file.")
+            raise ValueError(
+                f"Cannot resume {source}: recorded source identity differs from the current file."
+            )
         expected_settings = expected_identity["run_settings"]
         recorded_settings = provenance.get("run_settings")
-        if not isinstance(recorded_settings, dict) or {
-            key: recorded_settings.get(key) for key in expected_settings
-        } != expected_settings:
+        if (
+            not isinstance(recorded_settings, dict)
+            or {key: recorded_settings.get(key) for key in expected_settings} != expected_settings
+        ):
             raise ValueError(f"Cannot resume {source}: recorded run settings differ from the current run.")
-        for key in ("psfs", "basic_profiles", "scaling"):
-            if provenance.get(key) != expected_identity[key]:
+        for key in ("psfs", "basic_profiles", "scaling", "tile_gains"):
+            if provenance.get(key) != expected_identity.get(key):
                 raise ValueError(f"Cannot resume {source}: recorded {key} differ from the current run.")
         source_summary = TiffLogicalSource.open(
             source,
@@ -485,7 +507,9 @@ def _resume_pending_paths(
                 f"differs from expected {expected_shape}."
             )
         if np.dtype(level0.dtype) != np.dtype(np.uint16):
-            raise ValueError(f"Cannot resume {source}: {output} level-0 dtype is {level0.dtype}, expected uint16.")
+            raise ValueError(
+                f"Cannot resume {source}: {output} level-0 dtype is {level0.dtype}, expected uint16."
+            )
     return pending
 
 

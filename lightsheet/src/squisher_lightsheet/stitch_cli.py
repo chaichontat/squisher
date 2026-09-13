@@ -77,7 +77,7 @@ def register(
     zarr_dir: Annotated[
         Path,
         typer.Option(
-            "--zarr-dir", exists=True, file_okay=False, help="Directory containing the tile OME-Zarrs."
+            "--zarr-dir", exists=True, file_okay=False, help="Directory containing OME-TIFF or OME-Zarr tiles."
         ),
     ],
     output_dir: Annotated[
@@ -91,6 +91,7 @@ def register(
         float,
         typer.Option("--threshold", min=0.0, help="Exact threshold selected from the reviewed TIFF."),
     ],
+    level: Annotated[int, typer.Option("--level", min=0, max=2, help="Pyramid level for phase registration.")] = 0,
     method8_summary: Annotated[
         Path | None,
         typer.Option(
@@ -121,7 +122,7 @@ def register(
     ] = DEFAULT_LIB_DIR,
     channel: Annotated[
         int,
-        typer.Option("--channel", min=0, help="Channel index for CZYX level-0 inputs."),
+        typer.Option("--channel", min=0, help="Channel index for CZYX inputs."),
     ] = 0,
     max_iterations: Annotated[int, typer.Option("--max-iterations", min=1)] = 300,
     ftol: Annotated[float, typer.Option("--ftol")] = 1e-4,
@@ -169,6 +170,9 @@ def register(
             help="Downweight phase fallback constraints before MVS optimization.",
         ),
     ] = 0.1,
+    exclude_disconnected: Annotated[
+        bool, typer.Option("--exclude-disconnected", help="Publish only the anchor-connected tiles and record exclusions.")
+    ] = False,
     allow_disconnected: Annotated[
         bool,
         typer.Option(
@@ -180,7 +184,7 @@ def register(
         ),
     ] = False,
 ) -> None:
-    """Run human-reviewed thresholding, level-2 screening, and level-0 registration."""
+    """Run reviewed thresholding, level-2 screening, and phase registration at the selected level."""
     outputs = run_registration_workflow(
         position_json=position_json,
         zarr_dir=zarr_dir,
@@ -192,6 +196,7 @@ def register(
         method8=method8,
         native_lib_dir=native_lib_dir,
         channel=channel,
+        level=level,
         max_iterations=max_iterations,
         ftol=ftol,
         min_corr=min_corr,
@@ -204,6 +209,7 @@ def register(
         min_phase_corr=min_phase_corr,
         phase_fallback_weight_scale=phase_fallback_weight_scale,
         allow_disconnected=allow_disconnected,
+        exclude_disconnected=exclude_disconnected,
         progress=typer.echo,
     )
     typer.echo(

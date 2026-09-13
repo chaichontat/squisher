@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from loguru import logger
+import pytest
 from typer.testing import CliRunner
 from typer.main import get_command
 
@@ -71,15 +72,157 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "align-lr-dumb-stitch",
         "tile-phase-align",
         "channel-affine-registration",
+        "apply-channel-affine",
+        "join-channel-affine-registrations",
+        "fit-residual",
+        "post-basic",
+        "cross-dataset-match",
+        "fit-planar-tilt",
         "cross-register-method8",
         "run-tltr",
     ):
         assert command in result.stdout
 
+    assert cli_options("fit-residual") == cli_options("post-basic")
+    assert readme_command_options("fit-residual") <= cli_options("fit-residual")
+    assert readme_command_options("cross-dataset-match") <= cli_options("cross-dataset-match")
+    assert readme_command_options("fit-planar-tilt") <= cli_options("fit-planar-tilt")
 
-def test_channel_affine_registration_cli_forwards_required_contract(
-    tmp_path: Path, monkeypatch
+
+def test_fit_planar_tilt_cli_forwards_complete_contract(tmp_path: Path, monkeypatch) -> None:
+    mask = tmp_path / "mask.nrrd"
+    mask.touch()
+    sources = [tmp_path / "ch0.ome.zarr", tmp_path / "ch1.ome.zarr"]
+    for source in sources:
+        source.mkdir()
+    output = tmp_path / "tilt.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output
+
+    monkeypatch.setattr(cli_module, "write_planar_tilt_fit", fake_write)
+    result = CliRunner().invoke(
+        app,
+        [
+            "fit-planar-tilt",
+            "--mask",
+            str(mask),
+            "--source",
+            str(sources[0]),
+            "--source",
+            str(sources[1]),
+            "--window",
+            "400,16000",
+            "--window",
+            "1550,18000",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(output)
+    assert captured == {
+        "mask_path": mask,
+        "source_paths": sources,
+        "windows": [(400.0, 16000.0), (1550.0, 18000.0)],
+        "output_path": output,
+        "level": 2,
+        "z_depth_um": 360.0,
+        "xy_step_um": 5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("source_count", "windows", "message"),
+    [
+        (2, ["1,2"], "one --window for each --source"),
+        (1, ["1"], "Expected MIN,MAX"),
+        (1, ["nan,2"], "finite MIN,MAX"),
+        (1, ["2,1"], "finite MIN,MAX"),
+    ],
+)
+def test_fit_planar_tilt_cli_rejects_invalid_windows(
+    tmp_path: Path,
+    monkeypatch,
+    source_count: int,
+    windows: list[str],
+    message: str,
 ) -> None:
+    mask = tmp_path / "mask.nrrd"
+    mask.touch()
+    sources = [tmp_path / f"ch{index}.ome.zarr" for index in range(source_count)]
+    for source in sources:
+        source.mkdir()
+    called = False
+
+    def fake_write(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(cli_module, "write_planar_tilt_fit", fake_write)
+    args = ["fit-planar-tilt", "--mask", str(mask), "--output", str(tmp_path / "tilt.json")]
+    for source in sources:
+        args.extend(("--source", str(source)))
+    for window in windows:
+        args.extend(("--window", window))
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 2
+    assert message in result.output
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--z-depth-um", "nan"),
+        ("--z-depth-um", "inf"),
+        ("--xy-step-um", "nan"),
+        ("--xy-step-um", "inf"),
+    ],
+)
+def test_fit_planar_tilt_cli_rejects_nonfinite_sampling(
+    tmp_path: Path, monkeypatch, option: str, value: str
+) -> None:
+    mask = tmp_path / "mask.nrrd"
+    source = tmp_path / "source.zarr"
+    mask.touch()
+    source.mkdir()
+    called = False
+
+    def fake_write(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(cli_module, "write_planar_tilt_fit", fake_write)
+    result = CliRunner().invoke(
+        app,
+        [
+            "fit-planar-tilt",
+            "--mask",
+            str(mask),
+            "--source",
+            str(source),
+            "--window",
+            "0,1",
+            "--output",
+            str(tmp_path / "tilt.json"),
+            option,
+            value,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert option in result.output
+    assert "finite" in result.output
+    assert called is False
+
+
+def test_channel_affine_registration_cli_forwards_required_contract(tmp_path: Path, monkeypatch) -> None:
     window_dir = tmp_path / "windows"
     window_dir.mkdir()
     reference = tmp_path / "reference.json"
@@ -127,6 +270,269 @@ def test_channel_affine_registration_cli_forwards_required_contract(
         "source_label": "638",
         "target_label": "561",
     }
+
+
+def test_join_channel_affine_registrations_cli_forwards_required_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reference = tmp_path / "reference.json"
+    first = tmp_path / "cl.json"
+    second = tmp_path / "cr.json"
+    for path in (reference, first, second):
+        path.touch()
+    output = tmp_path / "joined.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(cli_module, "write_joined_channel_affine_registration", fake_write)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "join-channel-affine-registrations",
+            "--reference-registration",
+            str(reference),
+            "--side-registration",
+            str(first),
+            "--side-registration",
+            str(second),
+            "--output-registration",
+            str(output),
+            "--source-label",
+            "514",
+            "--target-label",
+            "561",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(output.resolve())
+    assert captured == {
+        "reference_registration_input": reference,
+        "side_registration_inputs": [first, second],
+        "output_registration": output,
+        "source_label": "514",
+        "target_label": "561",
+    }
+
+
+def test_apply_channel_affine_cli_forwards_required_contract(tmp_path: Path, monkeypatch) -> None:
+    reference = tmp_path / "reference.json"
+    calibration = tmp_path / "calibration.json"
+    for path in (reference, calibration):
+        path.touch()
+    output = tmp_path / "output.json"
+    captured = {}
+
+    def fake_apply(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(cli_module, "apply_channel_affine_registration", fake_apply)
+    result = CliRunner().invoke(
+        app,
+        [
+            "apply-channel-affine",
+            "--reference-registration",
+            str(reference),
+            "--calibration-registration",
+            str(calibration),
+            "--expected-calibration-sha256",
+            "a" * 64,
+            "--output-registration",
+            str(output),
+            "--expected-moving-channel",
+            "1",
+            "--source-label",
+            "638",
+            "--target-label",
+            "561",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(output.resolve())
+    assert captured == {
+        "reference_registration_input": reference,
+        "calibration_registration_input": calibration,
+        "expected_calibration_sha256": "a" * 64,
+        "output_registration": output,
+        "expected_moving_channel": 1,
+        "source_label": "638",
+        "target_label": "561",
+    }
+
+
+@pytest.mark.parametrize("command", ["fit-residual", "post-basic"])
+def test_residual_cli_aliases_forward_one_contract(
+    tmp_path: Path,
+    monkeypatch,
+    command: str,
+) -> None:
+    import squisher_lightsheet.residual_correction as residual_module
+
+    fixed = tmp_path / "fixed.ome.zarr"
+    registration = tmp_path / "registration.json"
+    output = tmp_path / "residual"
+    fixed.mkdir()
+    registration.write_text("{}\n")
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return output / "manifest.json"
+
+    monkeypatch.setattr(residual_module, "fit_residual_correction", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            command,
+            "--fixed-fused",
+            str(fixed),
+            "--registration",
+            str(registration),
+            "--output-dir",
+            str(output),
+            "--channel",
+            "2",
+            "--source-level",
+            "1",
+            "--stride",
+            "2",
+            "--xy-degree",
+            "2",
+            "--z-degree",
+            "2",
+            "--source-field-penalty",
+            "0.2",
+            "--z-percentile",
+            "20",
+            "--z-percentile",
+            "60",
+            "--z-percentile",
+            "90",
+            "--workers",
+            "3",
+            "--seed",
+            "19",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        str(output / "manifest.json"),
+        f"QC figures: {output / 'qc'}",
+    ]
+    assert captured == {
+        "fixed_fused": fixed,
+        "registration": registration,
+        "output_dir": output,
+        "channel": 2,
+        "source_level": 1,
+        "z_percentiles": [20.0, 60.0, 90.0],
+        "z_degree": 2,
+        "xy_degree": 2,
+        "field_penalty": None,
+        "source_field_penalty": 0.2,
+        "stride": 2,
+        "workers": 3,
+        "seed": 19,
+    }
+
+
+def test_cross_dataset_match_cli_forwards_two_fixed_corrections(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import squisher_lightsheet.cross_dataset_match as match_module
+
+    fixed = tmp_path / "fixed.ome.zarr"
+    registration = tmp_path / "registration.json"
+    tl = tmp_path / "tl-correction.json"
+    tr = tmp_path / "tr-correction.json"
+    output = tmp_path / "matched"
+    fixed.mkdir()
+    registration.write_text("{}\n")
+    tl.write_text("{}\n")
+    tr.write_text("{}\n")
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return output / "manifest.json"
+
+    monkeypatch.setattr(match_module, "cross_dataset_match", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "cross-dataset-match",
+            "--fixed-fused",
+            str(fixed),
+            "--registration",
+            str(registration),
+            "--output-dir",
+            str(output),
+            "--correction-by-source-view",
+            f"TL={tl}",
+            "--correction-by-source-view",
+            f"TR={tr}",
+            "--reference-view",
+            "TL",
+            "--moving-view",
+            "TR",
+            "--channel",
+            "1",
+            "--source-level",
+            "1",
+            "--stride",
+            "2",
+            "--z-percentile",
+            "25",
+            "--z-percentile",
+            "75",
+            "--workers",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "registration": registration,
+        "fixed_fused": fixed,
+        "output_dir": output,
+        "corrections_by_view": {"TL": tl, "TR": tr},
+        "reference_view": "TL",
+        "moving_view": "TR",
+        "channel": 1,
+        "source_level": 1,
+        "stride": 2,
+        "z_percentiles": [25.0, 75.0],
+        "workers": 3,
+    }
+
+    captured.clear()
+    identity_output = tmp_path / "matched-identity"
+    result = CliRunner().invoke(
+        app,
+        [
+            "cross-dataset-match",
+            "--fixed-fused",
+            str(fixed),
+            "--registration",
+            str(registration),
+            "--output-dir",
+            str(identity_output),
+            "--reference-view",
+            "TL",
+            "--moving-view",
+            "TR",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["corrections_by_view"] == {}
 
 
 def test_cli_registers_jpegxr_codec_before_command(tmp_path: Path, monkeypatch) -> None:
@@ -412,6 +818,8 @@ def test_cross_register_method8_method8_forwards_runner_options(tmp_path: Path, 
             "528,528,528",
             "--workers",
             "4",
+            "--pair-mode",
+            "spatial-overlap",
             "--devices",
             "0,1",
             "--no-resume",
@@ -425,6 +833,7 @@ def test_cross_register_method8_method8_forwards_runner_options(tmp_path: Path, 
     assert captured["core_shape_zyx"] == (480, 480, 480)
     assert captured["window_shape_zyx"] == (528, 528, 528)
     assert captured["workers"] == 4
+    assert captured["pair_mode"] == "spatial-overlap"
     assert captured["devices"] == "0,1"
     assert captured["resume"] is False
 
@@ -540,6 +949,8 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
     moving_position = tmp_path / "moving.positions.json"
     source_registration.write_text('{"tiles":[]}\n')
     moving_position.write_text('{"tiles":[]}\n')
+    residual_correction = tmp_path / "correction.json"
+    residual_correction.write_text("{}\n")
     output_dir = tmp_path / "overlap"
     captured = {}
 
@@ -569,6 +980,10 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
             str(source_registration),
             "--moving-position",
             str(moving_position),
+            "--moving-source-dir",
+            str(tmp_path),
+            "--residual-correction",
+            str(residual_correction),
             "--output-dir",
             str(output_dir),
             "--output-codec",
@@ -584,6 +999,8 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
     assert captured["source_registration_input"] == source_registration
     assert captured["source_summary_input"] is None
     assert captured["moving_position_input"] == moving_position
+    assert captured["moving_source_dir"] == tmp_path
+    assert captured["residual_correction"] == residual_correction
     assert captured["output_dir"] == output_dir
     assert captured["core_shape_zyx"] == (480, 480, 480)
     assert captured["window_shape_zyx"] == (528, 528, 528)
@@ -854,8 +1271,27 @@ def test_fuse_cli_parses_output_chunksize_zyx(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert captured["output_chunksize_zyx"] == (12, 960, 960)
-    assert captured["batch_size"] == 1
+    assert captured["batch_size"] == "auto"
     assert captured["resume_fusion"] is True
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fuse",
+            str(input_dir),
+            "--position-input",
+            str(position),
+            "--registration-input",
+            str(registration),
+            "--output",
+            str(tmp_path / "fused.ome.zarr"),
+            "--batch-size",
+            "auto",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["batch_size"] == "auto"
 
 
 def test_fuse_cli_uses_level0_output_chunksize_by_default(tmp_path, monkeypatch) -> None:
@@ -889,6 +1325,7 @@ def test_fuse_cli_uses_level0_output_chunksize_by_default(tmp_path, monkeypatch)
 
     assert result.exit_code == 0
     assert captured["output_chunksize_zyx"] == (12, 960, 960)
+    assert captured["fusion_weight_mode"] == "crop-sharpness-seam"
 
 
 def test_registration_center_z_spotcheck_cli_passes_channels(tmp_path, monkeypatch) -> None:

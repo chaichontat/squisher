@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -175,6 +178,16 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
         + "\n"
     )
     calls = []
+    correction_path = tmp_path / "correction.json"
+    correction_path.write_text('{"model":"first"}\n')
+    correction = SimpleNamespace(fingerprint="source-correction-fingerprint")
+
+    def fake_load(path, *, moving_by_tile, moving_position_input, source_channel):
+        assert path == correction_path
+        assert moving_by_tile["tile.ome.tif"]["path"] == str(source)
+        assert moving_position_input == moving_position
+        assert source_channel == 0
+        return {str(source.resolve()): correction}
 
     def fake_materialize(**kwargs):
         calls.append(kwargs)
@@ -185,28 +198,45 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
         "_materialize_downsampled_channel_crop_ome_zarr",
         fake_materialize,
     )
+    monkeypatch.setattr(
+        tile_quadrant_fusion,
+        "_load_materialization_residual_corrections",
+        fake_load,
+    )
 
     outputs = export_fused_fixed_overlapping_materialized_chunks(
         source_registration_input=registration_input,
         moving_position_input=moving_position,
         output_dir=tmp_path / "out",
         output_codec="zstd",
+        residual_correction=correction_path,
     )
 
     assert len(calls) == 1
     np.testing.assert_array_equal(calls[0]["start_zyx"], [912, 912, 912])
     np.testing.assert_array_equal(calls[0]["stop_zyx"], [1440, 1440, 1440])
+    assert calls[0]["residual_correction"] is correction
     position = json.loads(outputs["position"].read_text())
     assert position["units"] == "micrometer"
     registration = json.loads(outputs["registration"].read_text())
     record = registration["tiles"][0]
     assert record["shape"] == [132, 132, 132]
     assert record["materialized_source_start_zyx"] == [912, 912, 912]
+    assert record["materialized_fixed_origin_um"] == record["stage_translation_um"]
+    assert record["materialized_fixed_spacing_um"] == record["stage_scale_um"]
+    assert record["materialized_fixed_shape_zyx"] == [132, 132, 132]
     assert record["stage_translation_um"] == {"z": 971.2, "y": 1985.6, "x": 2990.4}
     np.testing.assert_array_equal(record["registered_affine"]["matrix"], registered_affine)
     assert registration["materialization_grid"]["window_shape_zyx"] == [528, 528, 528]
     summary = json.loads(outputs["summary"].read_text())
     assert summary["output_codec"] == "zstd"
+    expected_identity = {
+        "path": str(correction_path.resolve()),
+        "sha256": hashlib.sha256(correction_path.read_bytes()).hexdigest(),
+    }
+    assert position["residual_correction"] == expected_identity
+    assert registration["residual_correction"] == expected_identity
+    assert summary["residual_correction"] == expected_identity
 
 
 def test_export_fused_fixed_uses_explicit_pixel_source_registration(monkeypatch, tmp_path) -> None:
@@ -462,6 +492,72 @@ def test_materialize_downsampled_channel_crop_writes_zyx_zstd(tmp_path) -> None:
     assert [codec["name"] for codec in output.metadata.to_dict()["codecs"]] == ["bytes", "zstd"]
 
 
+def test_materialize_corrects_native_level0_before_downsampling_and_preserves_layout(tmp_path) -> None:
+    zarr = pytest.importorskip("zarr")
+    source_path = tmp_path / "source.ome.zarr"
+    source_data = np.arange(1, 1 + 2 * 8 * 8 * 8, dtype=np.uint16).reshape(2, 8, 8, 8)
+    _source_ome_zarr(source_path, source_data, axes="CZYX", chunks=(1, 4, 4, 4))
+    root = zarr.open_group(str(source_path), mode="a")
+    pyramid_data = np.full((2, 4, 4, 4), 7, dtype=np.uint16)
+    pyramid = root.create_array(
+        "1",
+        shape=pyramid_data.shape,
+        chunks=(1, 2, 2, 2),
+        dtype=pyramid_data.dtype,
+        dimension_names=("c", "z", "y", "x"),
+    )
+    pyramid[:] = pyramid_data
+    root.attrs["multiscales"] = [{"datasets": [{"path": "0"}, {"path": "1"}]}]
+
+    zz, yy, xx = np.indices((8, 8, 8))
+    multiplier = (0.4 + 0.03 * zz + 0.02 * yy + 0.01 * xx).astype(np.float32)
+
+    class RecordingCorrection:
+        shape_zyx = (8, 8, 8)
+        fingerprint = "correction-fingerprint"
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        def block(self, *, z_slice, y_slice, x_slice):
+            self.requests.append((z_slice, y_slice, x_slice))
+            return multiplier[z_slice, y_slice, x_slice]
+
+    correction = RecordingCorrection()
+    correction_identity = {"path": "/correction.json", "sha256": "artifact-sha"}
+    output_path = tmp_path / "out.ome.zarr"
+    shape = _materialize_downsampled_channel_crop_ome_zarr(
+        source_path=source_path,
+        output_path=output_path,
+        source_record={"tile": "source.ome.zarr", "axes": "CZYX"},
+        source_channel=1,
+        start_zyx=np.asarray([0, 0, 0], dtype=np.int64),
+        stop_zyx=np.asarray([8, 8, 8], dtype=np.int64),
+        level_factor_zyx=np.asarray([2, 2, 2], dtype=np.int64),
+        spacing_zyx=np.asarray([1.2, 0.6, 0.6], dtype=np.float64),
+        output_codec="zstd",
+        zstd_level=3,
+        residual_correction=correction,
+        residual_correction_identity=correction_identity,
+    )
+
+    output_root = zarr.open_group(str(output_path), mode="r")
+    corrected = np.rint(source_data[1].astype(np.float32) * multiplier).astype(np.uint16)
+    expected = corrected.reshape(4, 2, 4, 2, 4, 2).mean(axis=(1, 3, 5)).astype(np.uint16)
+    assert shape == [4, 4, 4]
+    np.testing.assert_array_equal(output_root["0"][:], expected)
+    assert correction.requests == [(slice(0, 8), slice(0, 8), slice(0, 8))]
+    metadata = output_root.attrs["squisher_materialization"]
+    assert metadata["source_level"] == 0
+    assert metadata["residual_correction"] == correction_identity
+    assert metadata["residual_correction_fingerprint"] == "correction-fingerprint"
+    assert output_root["0"].chunks == (4, 4, 4)
+    assert [codec["name"] for codec in output_root["0"].metadata.to_dict()["codecs"]] == [
+        "bytes",
+        "zstd",
+    ]
+
+
 def test_materialize_downsampled_channel_crop_writes_explicit_zstd(tmp_path) -> None:
     zarr = pytest.importorskip("zarr")
     source_path = tmp_path / "source.ome.zarr"
@@ -586,6 +682,47 @@ def test_native_source_group_reuses_full_xy_slabs_and_writes_exact_zstd(
     assert tile_quadrant_fusion._completed_materialization_shape(tasks[1]) is None
 
 
+def test_native_source_group_applies_residual_and_preserves_jpegxr_layout(tmp_path) -> None:
+    zarr = pytest.importorskip("zarr")
+    source_path = tmp_path / "source.ome.zarr"
+    source_data = np.full((1, 4, 6, 6), 100, dtype=np.uint16)
+    _source_ome_zarr(source_path, source_data, axes="CZYX", chunks=(1, 2, 6, 6))
+
+    class HalfCorrection:
+        shape_zyx = (4, 6, 6)
+        fingerprint = "half"
+
+        def block(self, *, z_slice, y_slice, x_slice):
+            shape = (
+                z_slice.stop - z_slice.start,
+                y_slice.stop - y_slice.start,
+                x_slice.stop - x_slice.start,
+            )
+            return np.full(shape, 0.5, dtype=np.float32)
+
+    output_path = tmp_path / "out.ome.zarr"
+    task = {
+        "source_path": source_path,
+        "output_path": output_path,
+        "source_record": {"tile": "source.ome.zarr", "axes": "CZYX"},
+        "source_channel": 0,
+        "start_zyx": np.asarray([0, 1, 1]),
+        "stop_zyx": np.asarray([4, 5, 5]),
+        "level_factor_zyx": np.ones(3, dtype=np.int64),
+        "spacing_zyx": np.ones(3, dtype=np.float64),
+        "output_codec": "jpegxr",
+        "zstd_level": 3,
+        "jpegxr_level": 0.7,
+        "residual_correction": HalfCorrection(),
+        "residual_correction_identity": {"path": "/correction.json", "sha256": "sha"},
+    }
+
+    assert _materialize_native_source_group([task]) == [[4, 4, 4]]
+    output = zarr.open_group(str(output_path), mode="r")["0"]
+    np.testing.assert_allclose(output[:], 50, atol=8)
+    _assert_sharded_layout(output, chunks=(1, 4, 4), shards=(4, 4, 4))
+
+
 def test_native_source_group_rejects_crop_outside_source(monkeypatch, tmp_path) -> None:
     source_data = np.zeros((1, 4, 6, 6), dtype=np.uint16)
 
@@ -621,6 +758,100 @@ def test_native_source_group_rejects_crop_outside_source(monkeypatch, tmp_path) 
     assert not (tmp_path / "out.ome.zarr").exists()
 
 
+@pytest.mark.parametrize("failure", ["record-marker", "store-marker", "zyx"])
+def test_materialization_residual_rejects_non_original_sources(tmp_path, failure) -> None:
+    source_path = tmp_path / "source.ome.zarr"
+    axes = "ZYX" if failure == "zyx" else "CZYX"
+    data = (
+        np.zeros((4, 6, 8), dtype=np.uint16)
+        if axes == "ZYX"
+        else np.zeros((1, 4, 6, 8), dtype=np.uint16)
+    )
+    _source_ome_zarr(source_path, data, axes=axes, chunks=data.shape)
+    if failure == "store-marker":
+        pytest.importorskip("zarr").open_group(str(source_path), mode="a").attrs[
+            "squisher_materialization"
+        ] = {"source_path": "/original.ome.zarr"}
+    record = {
+        "tile": "source.ome.zarr",
+        "path": str(source_path),
+        "shape": list(data.shape),
+        "axes": axes,
+    }
+    if failure == "record-marker":
+        record["materialized_source_start_zyx"] = [0, 0, 0]
+
+    with pytest.raises(ValueError, match="original.*deconvolved|materialized input"):
+        tile_quadrant_fusion._load_materialization_residual_corrections(
+            tmp_path / "correction.json",
+            moving_by_tile={"source.ome.zarr": record},
+            moving_position_input=tmp_path / "moving.positions.json",
+            source_channel=0,
+        )
+
+
+def test_materialization_residual_loads_exact_source_channel_and_shape(monkeypatch, tmp_path) -> None:
+    source_path = tmp_path / "source.ome.zarr"
+    data = np.zeros((3, 4, 6, 8), dtype=np.uint16)
+    _source_ome_zarr(source_path, data, axes="CZYX", chunks=data.shape)
+    correction_path = tmp_path / "correction.json"
+    correction_path.write_text("{}\n")
+    expected = {str(source_path.resolve()): SimpleNamespace(fingerprint="expected")}
+
+    def fake_load(path, *, sources, shapes_zyx, channel):
+        assert path == correction_path
+        assert sources == [source_path.resolve()]
+        assert shapes_zyx == [(4, 6, 8)]
+        assert channel == 2
+        return expected
+
+    monkeypatch.setattr(tile_quadrant_fusion, "load_residual_corrections", fake_load)
+    actual = tile_quadrant_fusion._load_materialization_residual_corrections(
+        correction_path,
+        moving_by_tile={
+            "source.ome.zarr": {
+                "tile": "source.ome.zarr",
+                "path": str(source_path),
+                "shape": list(data.shape),
+                "axes": "CZYX",
+            }
+        },
+        moving_position_input=tmp_path / "moving.positions.json",
+        source_channel=2,
+    )
+
+    assert actual is expected
+
+
+def test_materialization_residual_rejects_recorded_shape_and_channel_mismatch(tmp_path) -> None:
+    source_path = tmp_path / "source.ome.zarr"
+    data = np.zeros((2, 4, 6, 8), dtype=np.uint16)
+    _source_ome_zarr(source_path, data, axes="CZYX", chunks=data.shape)
+    record = {
+        "tile": "source.ome.zarr",
+        "path": str(source_path),
+        "shape": [2, 5, 6, 8],
+        "axes": "CZYX",
+    }
+    kwargs = {
+        "path": tmp_path / "correction.json",
+        "moving_by_tile": {"source.ome.zarr": record},
+        "moving_position_input": tmp_path / "moving.positions.json",
+    }
+
+    with pytest.raises(ValueError, match="registration shape differs"):
+        tile_quadrant_fusion._load_materialization_residual_corrections(
+            **kwargs,
+            source_channel=1,
+        )
+    record["shape"] = list(data.shape)
+    with pytest.raises(ValueError, match="outside CZYX shape"):
+        tile_quadrant_fusion._load_materialization_residual_corrections(
+            **kwargs,
+            source_channel=2,
+        )
+
+
 def test_fused_fixed_resume_rejects_changed_plan(tmp_path) -> None:
     moving_position = tmp_path / "moving.positions.json"
     registration_input = tmp_path / "core.registration.json"
@@ -640,6 +871,39 @@ def test_fused_fixed_resume_rejects_changed_plan(tmp_path) -> None:
             moving_position_input=moving_position,
             output_dir=output_dir,
             output_codec="jpegxr",
+            resume=True,
+        )
+
+
+def test_fused_fixed_resume_rejects_changed_correction_at_same_path(monkeypatch, tmp_path) -> None:
+    moving_position = tmp_path / "moving.positions.json"
+    registration_input = tmp_path / "core.registration.json"
+    correction = tmp_path / "correction.json"
+    moving_position.write_text(json.dumps({"tiles": []}) + "\n")
+    registration_input.write_text(json.dumps({"tiles": []}) + "\n")
+    correction.write_text('{"model":"first"}\n')
+    monkeypatch.setattr(
+        tile_quadrant_fusion,
+        "_load_materialization_residual_corrections",
+        lambda *args, **kwargs: {},
+    )
+    output_dir = tmp_path / "out"
+    export_fused_fixed_overlapping_materialized_chunks(
+        source_registration_input=registration_input,
+        moving_position_input=moving_position,
+        residual_correction=correction,
+        output_dir=output_dir,
+        output_codec="zstd",
+    )
+
+    correction.write_text('{"model":"changed"}\n')
+    with pytest.raises(ValueError, match=r"materialization plan differs.*residual_correction"):
+        export_fused_fixed_overlapping_materialized_chunks(
+            source_registration_input=registration_input,
+            moving_position_input=moving_position,
+            residual_correction=correction,
+            output_dir=output_dir,
+            output_codec="zstd",
             resume=True,
         )
 
@@ -910,3 +1174,42 @@ def test_export_composes_method8_transform_into_registered_affine(
     assert registration["method8_transform_usage"].startswith("registered_affine maps")
     assert summary["diagnostics"][0]["materialized_inner_chunks"] == [1, 1, 4, 4]
     assert summary["diagnostics"][0]["materialized_shard_chunks"] == [1, 4, 4, 4]
+
+
+def test_pixel_source_directory_reuses_geometry_and_reads_new_pixels(tmp_path):
+    source_dir = tmp_path / "new"
+    source_dir.mkdir()
+    data = np.full((3, 8, 10, 12), 29, dtype=np.uint16)
+    _source_ome_zarr(source_dir / "tile.ome.zarr", data, axes="CZYX", chunks=(1, 4, 5, 6))
+    record = {
+        "tile": "tile.ome.tif",
+        "path": "/old/tile.ome.zarr",
+        "shape": [3, 8, 10, 12],
+        "axes": "CZYX",
+        "translation_um": {"z": 4, "y": 5, "x": 6},
+        "registered_affine": {"matrix": np.eye(4).tolist()},
+    }
+    result = tile_quadrant_fusion._merge_moving_pixel_sources({"tile.ome.tif": record}, None, source_dir)[
+        "tile.ome.tif"
+    ]
+    assert record["path"] == "/old/tile.ome.zarr"
+    assert result == record | {"path": str(source_dir / "tile.ome.zarr")}
+    array, axes = tile_quadrant_fusion._ome_level0_array_and_axes(Path(result["path"]))
+    np.testing.assert_array_equal(array[:], data)
+    assert axes == "CZYX"
+
+
+def test_pixel_source_directory_rejects_missing_replacement(tmp_path):
+    record = {"tile": "missing.ome.tif", "path": str(tmp_path / "old.ome.zarr")}
+    Path(record["path"]).mkdir()
+    with pytest.raises(FileNotFoundError, match="replacement"):
+        tile_quadrant_fusion._merge_moving_pixel_sources({"missing": record}, None, tmp_path)
+
+
+def test_pixel_source_directory_rejects_changed_shape(tmp_path):
+    _source_ome_zarr(
+        tmp_path / "tile.ome.zarr", np.zeros((1, 4, 6, 8), dtype=np.uint16), axes="CZYX", chunks=(1, 2, 3, 4)
+    )
+    record = {"tile": "tile.ome.tif", "path": "/old/tile.ome.zarr", "shape": [1, 8, 6, 8], "axes": "CZYX"}
+    with pytest.raises(ValueError, match="shape"):
+        tile_quadrant_fusion._merge_moving_pixel_sources({"tile": record}, None, tmp_path)

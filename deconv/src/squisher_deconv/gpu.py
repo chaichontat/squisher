@@ -12,11 +12,15 @@ import sys
 import tempfile
 from typing import Any, Sequence
 
+from squisher_deconv.basic_profiles import load_basic_profile_arrays
+from squisher_deconv.residual_field import spatial_log_fields
+
 import numpy as np
 import tifffile
 
 from squisher_deconv.deconvolution import Deconvolver
 from squisher_deconv.scaling import ScalingParameters
+from squisher_deconv.tile_gains import validate_channel_gains
 
 EPS = np.float32(1e-9)
 I_MAX = np.float32(2**16 - 1)
@@ -56,6 +60,11 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
             self._darkfield = None
             self._inv_flatfield = None
             self._basic_kernel = None
+        self._residual_maps = []
+        for path in basic_paths:
+            arrays = load_basic_profile_arrays(path)
+            coefficient = arrays.residual_coefficient
+            self._residual_maps.append(None if coefficient is None else cp.asarray(spatial_log_fields(coefficient, arrays.flatfield.shape), dtype=cp.float32))
         if not psf_paths:
             raise ValueError("At least one PSF path is required.")
         self._projectors = tuple(
@@ -73,8 +82,8 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
             int((forward.shape[0] - 1) + (backward.shape[0] - 1)) for forward, backward in self._projectors
         )
 
-    def deconvolve(self, volume: np.ndarray) -> np.ndarray:
-        result = self._deconvolve_gpu(volume)
+    def deconvolve(self, volume: np.ndarray, *, channel_gains: Sequence[float] | None = None, raw_z_start: int | None = None, raw_z_size: int | None = None) -> np.ndarray:
+        result = self._deconvolve_gpu(volume, channel_gains=channel_gains, raw_z_start=raw_z_start, raw_z_size=raw_z_size)
         return self._cp.asnumpy(result).astype(np.float32, copy=False)
 
     def deconvolve_core_u16(
@@ -84,12 +93,15 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
         core_start: int,
         core_stop: int,
         scaling: ScalingParameters,
+        channel_gains: Sequence[float] | None = None,
+        raw_z_start: int | None = None,
+        raw_z_size: int | None = None,
     ) -> np.ndarray:
         if volume.ndim != 4:
             raise ValueError(f"Expected (Z, C, Y, X) volume, got {volume.shape}")
         if not 0 <= core_start < core_stop <= volume.shape[0]:
             raise ValueError(f"Invalid core slice [{core_start}, {core_stop}) for input shape {volume.shape}")
-        result = self._deconvolve_gpu(volume)
+        result = self._deconvolve_gpu(volume, channel_gains=channel_gains, raw_z_start=raw_z_start, raw_z_size=raw_z_size)
         return _quantize_global_gpu(result[core_start:core_stop], scaling, cp=self._cp)
 
     def release_memory(self) -> None:
@@ -98,7 +110,7 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
         self._memory_pool.free_all_blocks()
         self._pinned_memory_pool.free_all_blocks()
 
-    def _deconvolve_gpu(self, volume: np.ndarray) -> Any:
+    def _deconvolve_gpu(self, volume: np.ndarray, *, channel_gains: Sequence[float] | None = None, raw_z_start: int | None = None, raw_z_size: int | None = None) -> Any:
         if volume.ndim != 4:
             raise ValueError(f"Expected (Z, C, Y, X) volume, got {volume.shape}")
         cp = self._cp
@@ -117,6 +129,21 @@ class CupyBasicRichardsonLucyDeconvolver(Deconvolver):
                     f"{self._darkfield.shape[1]} BaSiC profile(s) were loaded."
                 )
             self._basic_kernel(x, self._darkfield, self._inv_flatfield, x)
+        if any(maps is not None for maps in self._residual_maps):
+            if raw_z_start is None or raw_z_size is None or not 0 <= raw_z_start < raw_z_start + x.shape[0] <= raw_z_size:
+                raise ValueError("Z-dependent correction requires valid original raw slab coordinates")
+            z = cp.arange(raw_z_start, raw_z_start + x.shape[0], dtype=cp.float32) / max(raw_z_size - 1, 1)
+            for channel, maps in enumerate(self._residual_maps):
+                if maps is None:
+                    continue
+                degree = cp.arange(len(maps), dtype=cp.float32)
+                weights = cp.cos(cp.pi * z[:, None] * degree[None, :]) / (1 + degree[None, :] ** 2)
+                field = cp.einsum("zd,dyx->zyx", weights, maps)
+                cp.exp(field, out=field)
+                x[:, channel] *= field
+        if channel_gains is not None:
+            gains = validate_channel_gains(channel_gains, channels=x.shape[1])
+            x *= cp.asarray(gains)[None, :, None, None]
         out = cp.empty_like(x, dtype=cp.float32)
         for channel, projectors in enumerate(self._projectors):
             out[:, channel : channel + 1] = _deconvolve_lucyrichardson_guo(

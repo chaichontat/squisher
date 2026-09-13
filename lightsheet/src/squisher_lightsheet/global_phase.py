@@ -47,8 +47,8 @@ class GlobalPhaseResult:
     moving_mip: Path
     before_overlay: Path
     after_overlay: Path
-    orthogonal_summary: Path
-    orthogonal_contact_sheet: Path
+    orthogonal_summary: Path | None
+    orthogonal_contact_sheet: Path | None
 
 
 def render_position_canvas(
@@ -200,6 +200,7 @@ def run_global_phase(
     spatial_highpass_sigma: float | None = None,
     max_residual_shift_um: float = DEFAULT_MAX_RESIDUAL_SHIFT_UM,
     orthogonal_lateral_factor: int = DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
+    orthogonal_z: bool = True,
 ) -> GlobalPhaseResult:
     """Estimate and persist one global translation that moves a registered mosaic onto another."""
     if not np.isfinite(max_residual_shift_um) or max_residual_shift_um < 0:
@@ -324,20 +325,25 @@ def run_global_phase(
         total_shift_zyx_um=xy_total_shift_zyx_um,
         summary={"stage": "whole-mosaic XY placement"},
     )
-    orthogonal = run_orthogonal_dumb_phase(
-        fixed_payload=fixed_payload,
-        moving_payload=xy_payload,
-        fixed_tile_dir=fixed_tile_dir,
-        moving_tile_dir=moving_tile_dir,
-        fixed_channel=fixed_channel,
-        moving_channel=moving_channel,
-        fixed_transform=fixed_intensity_transform,
-        moving_transform=moving_intensity_transform,
-        output_dir=output_dir / "orthogonal",
-        max_shift_um=max_residual_shift_um,
-        lateral_factor=orthogonal_lateral_factor,
+    orthogonal_result = None
+    if orthogonal_z:
+        orthogonal_result = run_orthogonal_dumb_phase(
+            fixed_payload=fixed_payload,
+            moving_payload=xy_payload,
+            fixed_tile_dir=fixed_tile_dir,
+            moving_tile_dir=moving_tile_dir,
+            fixed_channel=fixed_channel,
+            moving_channel=moving_channel,
+            fixed_transform=fixed_intensity_transform,
+            moving_transform=moving_intensity_transform,
+            output_dir=output_dir / "orthogonal",
+            max_shift_um=max_residual_shift_um,
+            lateral_factor=orthogonal_lateral_factor,
+        )
+    orthogonal_z_residual_um = 0.0 if orthogonal_result is None else orthogonal_result.z_residual_um
+    orthogonal_z_shift_zyx_um = np.asarray(
+        [orthogonal_z_residual_um, 0.0, 0.0], dtype=np.float64
     )
-    orthogonal_z_shift_zyx_um = np.asarray([orthogonal.z_residual_um, 0.0, 0.0], dtype=np.float64)
     total_shift_zyx_um = xy_total_shift_zyx_um + orthogonal_z_shift_zyx_um
     summary: dict[str, Any] = {
         "schema_version": 1,
@@ -369,10 +375,13 @@ def run_global_phase(
         "phase_shift_to_apply_moving_zyx_um": phase_shift_zyx_um.tolist(),
         "residual_shift_from_coarse_zyx_um": residual_shift_zyx_um.tolist(),
         "xy_total_shift_to_apply_moving_zyx_um": xy_total_shift_zyx_um.tolist(),
-        "orthogonal_z_residual_um": orthogonal.z_residual_um,
+        "orthogonal_z_enabled": orthogonal_z,
+        "orthogonal_z_residual_um": orthogonal_z_residual_um,
         "orthogonal_lateral_components_applied": False,
-        "orthogonal_summary": str(orthogonal.summary),
-        "orthogonal_contact_sheet": str(orthogonal.contact_sheet),
+        "orthogonal_summary": None if orthogonal_result is None else str(orthogonal_result.summary),
+        "orthogonal_contact_sheet": (
+            None if orthogonal_result is None else str(orthogonal_result.contact_sheet)
+        ),
         "total_shift_to_apply_moving_zyx_um": total_shift_zyx_um.tolist(),
         "phase_metadata": phase_metadata,
         "corr_before": corr_before,
@@ -400,6 +409,8 @@ def run_global_phase(
         moving_mip=moving_mip.resolve(),
         before_overlay=before_overlay.resolve(),
         after_overlay=after_overlay.resolve(),
-        orthogonal_summary=orthogonal.summary,
-        orthogonal_contact_sheet=orthogonal.contact_sheet,
+        orthogonal_summary=None if orthogonal_result is None else orthogonal_result.summary,
+        orthogonal_contact_sheet=(
+            None if orthogonal_result is None else orthogonal_result.contact_sheet
+        ),
     )
