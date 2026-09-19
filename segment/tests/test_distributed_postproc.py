@@ -90,6 +90,7 @@ def test_postproc_gpu_smoothing_import_error_is_not_hidden(
     monkeypatch.setattr(postproc.cp, "asarray", np.asarray)
     monkeypatch.setattr(postproc.cp, "asnumpy", np.asarray)
     monkeypatch.setattr(postproc.cp, "unique", np.unique)
+    monkeypatch.setattr(postproc.cp, "searchsorted", np.searchsorted)
 
     def fail_gpu_smoothing(*_args: object, **_kwargs: object) -> None:
         raise ImportError("gpu unavailable")
@@ -110,6 +111,30 @@ def test_postproc_gpu_smoothing_import_error_is_not_hidden(
             nblocks=np.ones(3, dtype=int),
             postproc_kwargs={"sigma": 1.0},
         )
+
+
+@pytest.mark.parametrize(
+    "masks",
+    [
+        np.asarray([[[0, 10, 10], [42, 0, 7]]], dtype=np.uint32),
+        np.asarray([[[7, 42], [7, 99]]], dtype=np.uint32),
+        np.asarray([[[0, 2**31 + 5], [2**32 - 1, 2**31 + 5]]], dtype=np.uint32),
+    ],
+)
+def test_sequential_labels_cupy_matches_unique_inverse(
+    masks: np.ndarray,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(postproc.cp, "asarray", np.asarray)
+    monkeypatch.setattr(postproc.cp, "asnumpy", np.asarray)
+    monkeypatch.setattr(postproc.cp, "unique", np.unique)
+    monkeypatch.setattr(postproc.cp, "searchsorted", np.searchsorted)
+    expected = np.unique(masks, return_inverse=True)[1].reshape(masks.shape).astype(np.int32)
+
+    actual = postproc._sequential_labels_cupy(masks)
+
+    assert actual.dtype == np.int32
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_zyx_overlap_trimming_covers_each_voxel_once() -> None:

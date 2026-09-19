@@ -192,6 +192,17 @@ def _validate_tiling(
     return nblocks
 
 
+def _sequential_labels_cupy(masks: NDArray[np.integer[Any]]) -> NDArray[np.int32]:
+    """Map sparse integer labels to their sorted dense ranks on the GPU."""
+    masks_gpu = cp.asarray(masks)
+    labels = cp.unique(masks_gpu)
+    inverse = cp.searchsorted(labels, masks_gpu)
+    del masks_gpu, labels
+    dense = cp.asnumpy(inverse.astype(cp.int32, copy=False))
+    del inverse
+    return dense
+
+
 def _postproc_face(
     result: tuple[list[NDArray[Any]], NDArray[np.uint32], NDArray[np.uint64]],
     face_index: int,
@@ -400,10 +411,7 @@ def process_postproc_block(
     # Use CuPy for fast GPU-accelerated unique (~100ms vs 4-8s on CPU).
     max_label_before = int(masks.max())
     t_relabel = time.perf_counter()
-    masks_gpu = cp.asarray(masks)
-    _, inverse = cp.unique(masks_gpu, return_inverse=True)
-    masks = cp.asnumpy(inverse.reshape(masks.shape)).astype(np.int32)
-    del masks_gpu, inverse
+    masks = _sequential_labels_cupy(masks)
     t_relabel_done = time.perf_counter()
     logger.debug(
         f"  Block {block_index}: relabeled {max_label_before} -> {int(masks.max())} "
