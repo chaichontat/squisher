@@ -108,8 +108,11 @@ def measure_peak_boundaries(
         ],
         dtype=np.float64,
     )
-    direct_inner = np.isfinite(raw_inner)
-    direct_outer = np.isfinite(raw_outer)
+    # Log-domain fitting requires strictly positive depths. A crossing can land
+    # exactly on the zero-depth sample, so retain that raw measurement while
+    # treating it as unsupported for the fit and recovering it from neighbors.
+    direct_inner = np.isfinite(raw_inner) & (raw_inner > 0)
+    direct_outer = np.isfinite(raw_outer) & (raw_outer > 0)
     return raw_inner, raw_outer, direct_inner, direct_outer, direct_inner & direct_outer
 
 
