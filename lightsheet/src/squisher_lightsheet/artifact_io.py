@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
 
 from squisher_lightsheet.tile_input import resolve_tile_path
@@ -19,7 +22,24 @@ def _stat_fingerprint(path: Path) -> dict[str, str | int]:
 
 
 def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@contextmanager
+def atomic_output_directory(output_dir: Path) -> Iterator[Path]:
+    """Stage an output directory beside its destination and publish it on success."""
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
+    try:
+        yield stage
+        stage.replace(output_dir)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
 
 
 def registration_input_fingerprint(position_json: Path, zarr_dir: Path) -> dict[str, Any]:
