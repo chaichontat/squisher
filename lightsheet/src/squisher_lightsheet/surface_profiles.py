@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -19,6 +19,7 @@ from squisher_lightsheet.surface_geometry import (
     SurfaceProjection,
     SurfaceProjector,
     load_surface,
+    surface_projection_domain,
 )
 
 
@@ -256,6 +257,8 @@ def _extract_profiles(
     vertices_xyz_um: FloatArray,
     faces: IntArray,
     vertex_uv: FloatArray,
+    projection_vertex_mask: npt.NDArray[np.bool_],
+    projection_face_mask: npt.NDArray[np.bool_],
     z_start: int,
     z_stop: int,
     stride_zyx: tuple[int, int, int],
@@ -274,8 +277,14 @@ def _extract_profiles(
         source_origin_zyx_um[2] + x_index * source_scale_zyx_um[2],
         source_origin_zyx_um[1] + y_index * source_scale_zyx_um[1],
     )
-    projector = SurfaceProjector(vertices_xyz_um, faces, vertex_uv)
-    nearest_vertex = cKDTree(vertices_xyz_um)
+    projector = SurfaceProjector(
+        vertices_xyz_um,
+        faces,
+        vertex_uv,
+        face_mask=projection_face_mask,
+    )
+    projection_vertices = np.flatnonzero(projection_vertex_mask)
+    nearest_vertex = cKDTree(vertices_xyz_um[projection_vertices])
     retained_max_depth = float(depth_um[-1] + (depth_um[1] - depth_um[0]) / 2)
 
     for z_index in range(z_start, z_stop, z_stride):
@@ -300,7 +309,9 @@ def _extract_profiles(
         counters["tissue_nonrim_depth"] += int(keep.sum())
         if not np.any(keep):
             continue
-        assigned_vertex = nearest_vertex.query(projection.closest_xyz_um[keep], workers=-1)[1]
+        assigned_vertex = projection_vertices[
+            nearest_vertex.query(projection.closest_xyz_um[keep], workers=-1)[1]
+        ]
         depth_index = nearest_depth_bin(projection.r_vz_um[keep], depth_um)
         sums, counts = accumulate_samples(
             assigned_vertex, depth_index, values[keep], len(vertices_xyz_um), len(depth_um)
@@ -311,7 +322,12 @@ def _extract_profiles(
             raise OverflowError("Raw sample count exceeds uint64")
         raw_count += counts
 
-    neighborhood = intrinsic_neighborhoods(vertices_xyz_um, faces, radius_um, batch_size=geodesic_batch_size)
+    neighborhood = intrinsic_neighborhoods(
+        vertices_xyz_um,
+        faces[projection_face_mask],
+        radius_um,
+        batch_size=geodesic_batch_size,
+    )
     summed, count = aggregate_neighborhood(neighborhood, raw_sum, raw_count)
     intensity = np.full(summed.shape, np.nan, dtype=np.float32)
     np.divide(summed, count, out=intensity, where=count > 0)
@@ -322,6 +338,7 @@ def _extract_profiles(
         "valid_count": count,
         "valid_volume_um3": (count.astype(np.float64) * sample_volume_um3).astype(np.float32),
         "vertex_index": np.arange(len(vertices_xyz_um), dtype=np.int64),
+        "projection_domain_vertices": projection_vertex_mask,
     }
     counters["neighborhood_links"] = int(neighborhood.nnz)
     counters["nonempty_bins"] = int(np.count_nonzero(count))
@@ -343,6 +360,7 @@ def build_surface_profiles(
     radius_um: float = 20.0,
     max_depth_um: float = 280.8,
     depth_step_um: float = 4.8,
+    projection_domain: Literal["full", "ventricular-wall"] = "full",
     projection_chunk_size: int = 250_000,
     geodesic_batch_size: int = 256,
 ) -> Path:
@@ -365,6 +383,8 @@ def build_surface_profiles(
         raise ValueError("max_depth_um must be finite and exceed one depth step")
     if projection_chunk_size < 1 or geodesic_batch_size < 1:
         raise ValueError("projection and geodesic batch sizes must be positive")
+    if projection_domain not in ("full", "ventricular-wall"):
+        raise ValueError("projection_domain must be 'full' or 'ventricular-wall'")
 
     source_array, dataset_path, source_scale, source_origin = _source_geometry(source_zarr, level)
     final_z = source_array.shape[0] if z_stop is None else z_stop
@@ -376,6 +396,7 @@ def build_surface_profiles(
     mask_coefficients, mask_geometry = _mask_sampler(mask_path)
     surface = load_surface(surface_path)
     vertices, faces = surface.vertices_world_xyz_um, surface.faces
+    domain = surface_projection_domain(surface_path, surface, name=projection_domain)
     with np.load(chart_path) as chart:
         uv = np.asarray(chart["vertex_uv"], dtype=np.float64)
         if "mesh_sha256" in chart.files and str(chart["mesh_sha256"]) != sha256_file(surface_path):
@@ -389,6 +410,8 @@ def build_surface_profiles(
         vertices_xyz_um=vertices,
         faces=faces,
         vertex_uv=uv,
+        projection_vertex_mask=domain.vertex_mask,
+        projection_face_mask=domain.face_mask,
         z_start=z_start,
         z_stop=final_z,
         stride_zyx=stride_zyx,
@@ -432,7 +455,15 @@ def build_surface_profiles(
             "requested_max_depth_um_exclusive": max_depth_um,
             "depth_assignment": ("nearest center; exact closest-surface r_vz <= final center plus half-bin"),
             "maximum_retained_r_vz_um": float(depth[-1] + depth_step_um / 2),
-            "projection": "exact triangle closest point using one reusable AABB per surface",
+            "projection": "exact triangle closest point using one reusable AABB per selected domain",
+            "projection_domain": {
+                "name": domain.name,
+                "rule": domain.rule,
+                "vertex_mask_sha256": domain.digest,
+                "vertices": int(domain.vertex_mask.sum()),
+                "faces": int(domain.face_mask.sum()),
+                "parent_surface_sha256": domain.parent_surface_sha256,
+            },
             "selection": "cubic cortex score >=0.5, tissue side, non-boundary footpoint",
             "surface_assignment": "nearest physical mesh vertex to exact footpoint",
             "tangential_average": (

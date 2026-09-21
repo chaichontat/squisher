@@ -20,6 +20,7 @@ from squisher_lightsheet import ngff
 from squisher_lightsheet.artifact_io import atomic_output_directory, sha256_file
 from squisher_lightsheet.surface_geometry import (
     ImageGeometry,
+    SurfaceProjection,
     SurfaceProjector,
     load_surface,
 )
@@ -28,6 +29,7 @@ from squisher_lightsheet.surface_geometry import (
 FloatArray = npt.NDArray[np.float64]
 INNER_COLOR = "#00B8D9"
 OUTER_COLOR = "#FF4F9A"
+MASK_COLOR = "#FFD166"
 
 
 def _face_normals(vertices_xyz_um: FloatArray, faces: npt.NDArray[np.int64]) -> FloatArray:
@@ -49,6 +51,8 @@ def evaluate_boundary_fields(
     eligible_vertices: dict[str, npt.ArrayLike],
     inside_cortex: npt.ArrayLike | None = None,
     projector: SurfaceProjector | None = None,
+    projection: SurfaceProjection | None = None,
+    projection_continuous: npt.ArrayLike | None = None,
 ) -> tuple[dict[str, npt.NDArray[np.float64]], dict[str, int]]:
     """Evaluate ``r_vz - cutoff`` using exact projection and barycentric cutoffs.
 
@@ -72,7 +76,10 @@ def evaluate_boundary_fields(
         and np.array_equal(projector.vertex_uv, uv)
     ):
         raise ValueError("projector geometry does not match the supplied surface and chart")
-    projection = projector.project(points)
+    if projection is None:
+        projection = projector.project(points)
+    elif len(projection.face_index) != len(points):
+        raise ValueError("projection must contain one result per point")
     selected_faces = triangles[projection.face_index]
     normals = _face_normals(vertices, triangles)[projection.face_index]
     on_tissue_side = np.einsum("ij,ij->i", points - projection.closest_xyz_um, normals) <= 0
@@ -82,7 +89,13 @@ def evaluate_boundary_fields(
         cortex = np.asarray(inside_cortex)
         if cortex.shape != (len(points),) or cortex.dtype != np.bool_:
             raise ValueError("inside_cortex must be a boolean array with one value per point")
-    common_valid = ~projection.on_surface_boundary & on_tissue_side & cortex
+    if projection_continuous is None:
+        continuous = np.ones(len(points), dtype=bool)
+    else:
+        continuous = np.asarray(projection_continuous)
+        if continuous.shape != (len(points),) or continuous.dtype != np.bool_:
+            raise ValueError("projection_continuous must be boolean with one value per point")
+    common_valid = ~projection.on_surface_boundary & on_tissue_side & cortex & continuous
     fields: dict[str, npt.NDArray[np.float64]] = {}
     valid_counts: dict[str, int] = {}
     for name in cutoffs_um:
@@ -104,9 +117,33 @@ def evaluate_boundary_fields(
         "rim": int(np.count_nonzero(projection.on_surface_boundary)),
         "tissue_side": int(np.count_nonzero(on_tissue_side)),
         "inside_cortex": int(np.count_nonzero(cortex)),
+        "projection_continuous": int(np.count_nonzero(continuous)),
         **{f"valid_{name}": count for name, count in valid_counts.items()},
     }
     return fields, counts
+
+
+def projection_continuity_mask(
+    closest_xyz_um: npt.ArrayLike,
+    grid_shape: tuple[int, int],
+    *,
+    maximum_step_um: float,
+) -> npt.NDArray[np.bool_]:
+    """Invalidate grid points adjacent to a discontinuous closest-footpoint branch switch."""
+    closest = np.asarray(closest_xyz_um, dtype=np.float64)
+    if closest.shape != (int(np.prod(grid_shape)), 3) or not np.isfinite(closest).all():
+        raise ValueError("closest_xyz_um must be finite and match grid_shape")
+    if not np.isfinite(maximum_step_um) or maximum_step_um <= 0:
+        raise ValueError("maximum_step_um must be finite and positive")
+    grid = closest.reshape(*grid_shape, 3)
+    continuous = np.ones(grid_shape, dtype=bool)
+    vertical_jump = np.linalg.norm(np.diff(grid, axis=0), axis=2) > maximum_step_um
+    horizontal_jump = np.linalg.norm(np.diff(grid, axis=1), axis=2) > maximum_step_um
+    continuous[:-1] &= ~vertical_jump
+    continuous[1:] &= ~vertical_jump
+    continuous[:, :-1] &= ~horizontal_jump
+    continuous[:, 1:] &= ~horizontal_jump
+    return continuous.ravel()
 
 
 def _mask_geometry(
@@ -408,7 +445,22 @@ def build_surface_boundary_qc(
         for mode, (_, eligibility) in modes.items()
         for name, values in eligibility.items()
     }
-    projector = SurfaceProjector(vertices, faces, vertex_uv)
+    projection_face_mask = np.all(boundary_arrays["wall_support"][faces], axis=1)
+    if not projection_face_mask.any():
+        raise ValueError("boundary wall support contains no complete projection faces")
+    projector = SurfaceProjector(vertices, faces, vertex_uv, face_mask=projection_face_mask)
+    projection_faces = faces[projection_face_mask]
+    projection_edges = np.concatenate(
+        (
+            projection_faces[:, [0, 1]],
+            projection_faces[:, [1, 2]],
+            projection_faces[:, [2, 0]],
+        )
+    )
+    projection_edge_lengths = np.linalg.norm(
+        vertices[projection_edges[:, 0]] - vertices[projection_edges[:, 1]], axis=1
+    )
+    maximum_projection_step_um = 2 * float(np.quantile(projection_edge_lengths, 0.99))
     extent = (
         -geometry.spacing_xyz_um[0] / 2,
         (nx - 0.5) * geometry.spacing_xyz_um[0],
@@ -423,10 +475,15 @@ def build_surface_boundary_qc(
         for row, (record, image, full_world) in enumerate(
             zip(sections, section_images, world_grids, strict=True)
         ):
+            section_mask = cortex_mask[int(record["actual_index_z"])]
             sampled_world = full_world.reshape(ny, nx, 3)[np.ix_(sample_y, sample_x)].reshape(-1, 3)
-            sampled_inside_cortex = cortex_mask[int(record["actual_index_z"])][
-                np.ix_(sample_y, sample_x)
-            ].reshape(-1)
+            sampled_inside_cortex = section_mask[np.ix_(sample_y, sample_x)].reshape(-1)
+            projection = projector.project(sampled_world)
+            projection_continuous = projection_continuity_mask(
+                projection.closest_xyz_um,
+                sampled_grid_x.shape,
+                maximum_step_um=maximum_projection_step_um,
+            )
             fields, counts = evaluate_boundary_fields(
                 sampled_world,
                 vertices_world_xyz_um=vertices,
@@ -436,6 +493,8 @@ def build_surface_boundary_qc(
                 eligible_vertices=combined_eligibility,
                 inside_cortex=sampled_inside_cortex,
                 projector=projector,
+                projection=projection,
+                projection_continuous=projection_continuous,
             )
             mode_results: dict[str, object] = {}
             for column, mode in enumerate(modes):
@@ -448,12 +507,22 @@ def build_surface_boundary_qc(
                     extent=extent,
                     interpolation="nearest",
                 )
+                axis.contour(
+                    x_centers,
+                    y_centers,
+                    section_mask,
+                    levels=[0.5],
+                    colors=[MASK_COLOR],
+                    linewidths=0.8,
+                    linestyles="dashed",
+                )
                 contour_present: dict[str, bool] = {}
+                contour_components: dict[str, int] = {}
                 for name, color in (("inner", INNER_COLOR), ("outer", OUTER_COLOR)):
                     field = fields[f"{mode}_{name}"].reshape(sampled_grid_x.shape)
                     contour_present[name] = _has_zero_contour(field)
                     if contour_present[name]:
-                        axis.contour(
+                        contour_set = axis.contour(
                             sampled_grid_x,
                             sampled_grid_y,
                             field,
@@ -461,6 +530,11 @@ def build_surface_boundary_qc(
                             colors=[color],
                             linewidths=1.1,
                         )
+                        contour_components[name] = sum(
+                            len(segment) >= 2 for segment in contour_set.allsegs[0]
+                        )
+                    else:
+                        contour_components[name] = 0
                 axis.set(
                     title=(
                         f"{mode.capitalize()} fields · intrinsic z={record['actual_position_z_um']:.1f} µm"
@@ -475,19 +549,29 @@ def build_surface_boundary_qc(
                         "rim": counts["rim"],
                         "tissue_side": counts["tissue_side"],
                         "inside_cortex": counts["inside_cortex"],
+                        "projection_continuous": counts["projection_continuous"],
                         "valid_inner": counts[f"valid_{mode}_inner"],
                         "valid_outer": counts[f"valid_{mode}_outer"],
                     },
                     "contour_present": contour_present,
+                    "contour_components": contour_components,
                 }
             plane_results.append({**record, "modes": mode_results})
         figure.legend(
             handles=[
                 Line2D([0], [0], color=INNER_COLOR, lw=1.5, label="inner boundary"),
                 Line2D([0], [0], color=OUTER_COLOR, lw=1.5, label="outer boundary"),
+                Line2D(
+                    [0],
+                    [0],
+                    color=MASK_COLOR,
+                    lw=1.2,
+                    ls="--",
+                    label="NRRD mask boundary",
+                ),
             ],
             loc="upper center",
-            ncol=2,
+            ncol=3,
             frameon=False,
         )
     except BaseException:
@@ -515,6 +599,7 @@ def build_surface_boundary_qc(
             "boundary_metadata_sha256": sha256_file(boundary_metadata_path),
             "reference_mask": str(mask_path.resolve()),
             "reference_mask_sha256": sha256_file(mask_path),
+            "reference_mask_overlay": "0.5 contour of the binary mask in intrinsic XY coordinates",
             "reference_geometry": {
                 "shape_zyx": list(mask_shape),
                 "origin_world_xyz_um": geometry.origin_xyz_um.tolist(),
@@ -530,7 +615,15 @@ def build_surface_boundary_qc(
             "source_origin_zyx_um": source_origin.tolist(),
             "section_axis": "reference-mask intrinsic Z",
             "section_sampling": "one trilinearly sampled world-physical plane; no slab projection",
-            "field_definition": "exact closest-surface r_vz minus barycentric vertex cutoff",
+            "field_definition": (
+                "exact closest-wall-surface r_vz minus barycentric vertex cutoff; "
+                "candidate faces require three wall-support vertices"
+            ),
+            "maximum_adjacent_projection_step_um": maximum_projection_step_um,
+            "projection_continuity_rule": (
+                "invalidate both grid endpoints when adjacent closest footpoints differ by more than "
+                "twice the selected-domain 99th-percentile mesh-edge length"
+            ),
             "validity": {
                 "common": "inside cortex mask with tissue-side, non-rim closest-face projection",
                 "direct": "finite raw per-edge observations with per-edge direct support",

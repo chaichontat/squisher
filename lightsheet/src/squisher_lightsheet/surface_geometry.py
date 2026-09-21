@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
+from typing import Literal
 
 import igl
 import numpy as np
@@ -127,6 +130,18 @@ class SurfaceMesh:
     cavity_direction_world_xyz: FloatArray
 
 
+@dataclass(frozen=True)
+class SurfaceProjectionDomain:
+    """A hashable subset of full-mesh vertices and faces used for projection."""
+
+    name: str
+    vertex_mask: npt.NDArray[np.bool_]
+    face_mask: npt.NDArray[np.bool_]
+    digest: str
+    rule: str
+    parent_surface_sha256: str | None = None
+
+
 def load_surface(path: Path) -> SurfaceMesh:
     """Load a geometry-complete surface artifact."""
     with np.load(path) as artifact:
@@ -187,6 +202,114 @@ def load_surface(path: Path) -> SurfaceMesh:
         geometry,
         source_geometry,
         direction,
+    )
+
+
+def ventricular_wall_support(
+    vertices_intrinsic_xyz_um: npt.ArrayLike,
+    *,
+    cavity_x_sign: Literal[-1, 1] = 1,
+) -> tuple[npt.NDArray[np.bool_], FloatArray]:
+    """Select the ventricular wall between the two X turnarounds on each Z row."""
+    vertices = np.asarray(vertices_intrinsic_xyz_um, dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all():
+        raise ValueError("vertices_intrinsic_xyz_um must be finite with shape (n_vertices, 3)")
+    if cavity_x_sign not in (-1, 1):
+        raise ValueError("cavity_x_sign must be -1 or 1")
+    keep = np.zeros(len(vertices), dtype=bool)
+    bounds: list[list[float]] = []
+    for z in np.unique(vertices[:, 2]):
+        row = np.flatnonzero(vertices[:, 2] == z)
+        row = row[np.argsort(vertices[row, 1])]
+        if np.any(np.diff(vertices[row, 1]) <= 0):
+            raise ValueError("intrinsic surface must have unique increasing Y coordinates per Z row")
+        x = cavity_x_sign * vertices[row, 0]
+        valley = int(np.argmin(x))
+        start = int(np.argmax(x[: valley + 1]))
+        stop = valley + int(np.argmax(x[valley:]))
+        keep[row[start : stop + 1]] = True
+        bounds.append([float(z), float(vertices[row[start], 1]), float(vertices[row[stop], 1])])
+    return keep, np.asarray(bounds, dtype=np.float64).reshape(-1, 3)
+
+
+def _cavity_x_sign(surface: SurfaceMesh) -> Literal[-1, 1]:
+    intrinsic = surface.geometry.direction.T @ surface.cavity_direction_world_xyz
+    if not np.allclose(np.abs(intrinsic), [1.0, 0.0, 0.0], atol=1e-10, rtol=1e-10):
+        raise ValueError("surface cavity direction must align with intrinsic X")
+    return 1 if intrinsic[0] > 0 else -1
+
+
+def _mask_digest(mask: npt.NDArray[np.bool_]) -> str:
+    return hashlib.sha256(np.asarray(mask, dtype=np.uint8).tobytes()).hexdigest()
+
+
+def surface_projection_domain(
+    surface_path: Path,
+    surface: SurfaceMesh,
+    *,
+    name: Literal["full", "ventricular-wall"],
+) -> SurfaceProjectionDomain:
+    """Derive a projection domain, preserving reviewed repair provenance."""
+    if name == "full":
+        vertex_mask = np.ones(len(surface.vertices_world_xyz_um), dtype=bool)
+        face_mask = np.ones(len(surface.faces), dtype=bool)
+        return SurfaceProjectionDomain(
+            name=name,
+            vertex_mask=vertex_mask,
+            face_mask=face_mask,
+            digest=_mask_digest(vertex_mask),
+            rule="all surface vertices and faces",
+        )
+
+    surface_path = Path(surface_path)
+    metadata_path = surface_path.parent / "metadata.json"
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    repair = metadata.get("repair") if isinstance(metadata, dict) else None
+    parent_hash: str | None = None
+    if isinstance(repair, dict):
+        from squisher_lightsheet.artifact_io import sha256_file
+
+        parent_path = Path(str(repair.get("parent_surface", "")))
+        parent_hash = str(repair.get("parent_surface_sha256", ""))
+        if not parent_path.is_file() or sha256_file(parent_path) != parent_hash:
+            raise ValueError("repaired surface metadata does not bind an available parent surface")
+        parent = load_surface(parent_path)
+        parent_count = len(parent.vertices_world_xyz_um)
+        if parent_count >= len(surface.vertices_world_xyz_um) or not (
+            np.array_equal(surface.vertices_world_xyz_um[:parent_count], parent.vertices_world_xyz_um)
+            and np.array_equal(
+                surface.vertices_intrinsic_xyz_um[:parent_count], parent.vertices_intrinsic_xyz_um
+            )
+        ):
+            raise ValueError("repaired surface does not preserve the parent vertex prefix")
+        parent_mask, bounds = ventricular_wall_support(
+            parent.vertices_intrinsic_xyz_um, cavity_x_sign=_cavity_x_sign(parent)
+        )
+        vertex_mask = np.zeros(len(surface.vertices_world_xyz_um), dtype=bool)
+        vertex_mask[:parent_count] = parent_mask
+        added = surface.vertices_intrinsic_xyz_um[parent_count:]
+        lower = np.interp(added[:, 2], bounds[:, 0], bounds[:, 1], left=np.nan, right=np.nan)
+        upper = np.interp(added[:, 2], bounds[:, 0], bounds[:, 2], left=np.nan, right=np.nan)
+        vertex_mask[parent_count:] = (
+            np.isfinite(lower) & np.isfinite(upper) & (added[:, 1] >= lower) & (added[:, 1] <= upper)
+        )
+        rule = "parent wall support plus Z-interpolated parent Y bounds for appended vertices"
+    else:
+        vertex_mask, _ = ventricular_wall_support(
+            surface.vertices_intrinsic_xyz_um, cavity_x_sign=_cavity_x_sign(surface)
+        )
+        rule = "intrinsic per-Z wall between cavity-X turnarounds"
+
+    face_mask = np.all(vertex_mask[surface.faces], axis=1)
+    if not np.any(face_mask):
+        raise ValueError("ventricular-wall projection domain contains no complete faces")
+    return SurfaceProjectionDomain(
+        name=name,
+        vertex_mask=vertex_mask,
+        face_mask=face_mask,
+        digest=_mask_digest(vertex_mask),
+        rule=rule,
+        parent_surface_sha256=parent_hash,
     )
 
 
@@ -331,6 +454,7 @@ class SurfaceProjector:
         faces: npt.ArrayLike,
         vertex_uv: npt.ArrayLike,
         *,
+        face_mask: npt.ArrayLike | None = None,
         tolerance: float = 1e-10,
     ) -> None:
         self.vertices, self.faces = mesh_arrays(vertices_xyz_um, faces)
@@ -339,10 +463,20 @@ class SurfaceProjector:
             raise ValueError("vertex_uv must be finite with shape (n_vertices, 2)")
         if not np.isfinite(tolerance) or tolerance <= 0:
             raise ValueError("tolerance must be finite and positive")
+        if face_mask is None:
+            self.face_mask = np.ones(len(self.faces), dtype=bool)
+        else:
+            self.face_mask = np.asarray(face_mask)
+            if self.face_mask.shape != (len(self.faces),) or self.face_mask.dtype != np.bool_:
+                raise ValueError("face_mask must be boolean with one value per face")
+            if not self.face_mask.any():
+                raise ValueError("face_mask must select at least one face")
+        self._projection_face_index = np.flatnonzero(self.face_mask)
+        self._projection_faces = self.faces[self.face_mask]
         self.tolerance = tolerance
         self._tree = igl.AABB()
-        self._tree.init(self.vertices, self.faces)
-        self._boundary_edges = boundary_edges(self.faces)
+        self._tree.init(self.vertices, self._projection_faces)
+        self._boundary_edges = boundary_edges(self._projection_faces)
         self._boundary_vertices = np.fromiter(
             {vertex for edge in self._boundary_edges for vertex in edge}, dtype=np.int64
         )
@@ -354,7 +488,7 @@ class SurfaceProjector:
         chunk_size: int = 250_000,
     ) -> SurfaceProjection:
         vertices = self.vertices
-        triangles = self.faces
+        triangles = self._projection_faces
         uv_vertices = self.vertex_uv
         tolerance = self.tolerance
         points = np.asarray(points_xyz_um, dtype=np.float64)
@@ -371,9 +505,9 @@ class SurfaceProjector:
                 vertices, triangles, np.ascontiguousarray(points[start:stop])
             )
             squared_distance[start:stop] = sqr_d
-            face_index[start:stop] = selected
+            face_index[start:stop] = self._projection_face_index[selected]
             closest[start:stop] = closest_chunk
-        selected_faces = triangles[face_index]
+        selected_faces = self.faces[face_index]
         corners = vertices[selected_faces]
         barycentric = igl.barycentric_coordinates(closest, corners[:, 0], corners[:, 1], corners[:, 2])
         barycentric[np.abs(barycentric) <= tolerance] = 0.0

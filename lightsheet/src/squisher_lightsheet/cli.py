@@ -93,8 +93,25 @@ from squisher_lightsheet.qc import (
 )
 from squisher_lightsheet._legacy import stitch_20x_tl_multiview as legacy_registration
 from squisher_lightsheet.rough_phase import rough_phase_align
+from squisher_lightsheet.surface_intensity import build_surface_intensity_map
+from squisher_lightsheet.surface_boundaries import (
+    DEFAULT_INNER_FRACTION,
+    DEFAULT_INNER_SMOOTH_UM,
+    DEFAULT_MAX_RECOVERY_DISTANCE_UM,
+    DEFAULT_MIN_CROSSING_SAMPLES,
+    DEFAULT_OUTER_FRACTION,
+    DEFAULT_OUTER_SMOOTH_UM,
+    build_surface_boundaries,
+)
+from squisher_lightsheet.surface_boundary_qc import build_surface_boundary_qc
+from squisher_lightsheet.surface_profiles import build_surface_profiles
 from squisher_lightsheet.tile_phase import align_tiles_to_reference, parse_shape_zyx
 from squisher_lightsheet.track_z import run_track_z_diagnostics
+from squisher_lightsheet.uv_surface import (
+    DEFAULT_SMOOTHING_UM,
+    build_bilateral_ventricular_uv_surfaces,
+    build_ventricular_uv_surface,
+)
 from squisher_lightsheet.workflow import DEFAULT_LEVEL, DEFAULT_OVERLAP_FRACTION, run_tltr_workflow
 from squisher_lightsheet.zeiss_positions import plot_xy_positions
 from squisher_lightsheet.zeiss_tile_positions import create_zeiss_tile_position_file
@@ -137,6 +154,208 @@ def _parse_source_view_flatfield_dirs(values: list[str] | None) -> dict[str, Pat
 
 def _log_progress(message: str) -> None:
     logger.info(message)
+
+
+@app.command("uv-surface")
+def uv_surface(
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    smoothing_um: Annotated[float, typer.Option("--smoothing-um", min=0)] = DEFAULT_SMOOTHING_UM,
+    stride_zyx: Annotated[str, typer.Option("--stride-zyx")] = "1,1,1",
+    allow_multi_interval_rays: Annotated[
+        bool,
+        typer.Option(
+            "--allow-multi-interval-rays",
+            help="Use the outermost +X crossing when a source or strided ray has multiple intervals.",
+        ),
+    ] = False,
+) -> None:
+    """Build a +X ventricular mesh and geometric UV chart from a binary NRRD mask."""
+    typer.echo(
+        build_ventricular_uv_surface(
+            mask_path=mask,
+            output_dir=output_dir,
+            smoothing_um=smoothing_um,
+            stride_zyx=parse_shape_zyx(stride_zyx),
+            allow_multi_interval_rays=allow_multi_interval_rays,
+        )
+    )
+
+
+@app.command("bilateral-uv-surface")
+def bilateral_uv_surface(
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    split_x_index: Annotated[int, typer.Option("--split-x-index", min=1)],
+    smoothing_um: Annotated[float, typer.Option("--smoothing-um", min=0)] = DEFAULT_SMOOTHING_UM,
+    keep_main_sheet: Annotated[
+        bool,
+        typer.Option(
+            "--keep-main-sheet",
+            help="Trim the inferior/posterior wrap using the split bridge's upper Z envelope.",
+        ),
+    ] = False,
+    main_sheet_min_z_index: Annotated[
+        int | None,
+        typer.Option(
+            "--main-sheet-min-z-index",
+            min=0,
+            help="Optional original-grid lower Z bound applied with --keep-main-sheet.",
+        ),
+    ] = None,
+    max_face_edge_um: Annotated[
+        float | None,
+        typer.Option(
+            "--max-face-edge-um",
+            min=0,
+            help="Drop discontinuity-spanning faces before retaining the largest component.",
+        ),
+    ] = None,
+) -> None:
+    """Build separate medial UV charts for X-separated cerebral hemispheres."""
+    typer.echo(
+        build_bilateral_ventricular_uv_surfaces(
+            mask_path=mask,
+            output_dir=output_dir,
+            split_x_index=split_x_index,
+            smoothing_um=smoothing_um,
+            keep_main_sheet=keep_main_sheet,
+            main_sheet_min_z_index=main_sheet_min_z_index,
+            max_face_edge_um=max_face_edge_um,
+        )
+    )
+
+
+@app.command("surface-intensity-map")
+def surface_intensity_map(
+    surface_root: Annotated[Path, typer.Option("--surface-root", exists=True, file_okay=False)],
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    source_zarr: Annotated[Path, typer.Option("--source-zarr", exists=True, file_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    level: Annotated[int, typer.Option("--level", min=0)] = 2,
+    max_depth_um: Annotated[float, typer.Option("--max-depth-um", min=0)] = 2500.0,
+    depth_step_um: Annotated[float, typer.Option("--depth-step-um", min=0)] = 4.8,
+    uv_size: Annotated[int, typer.Option("--uv-size", min=2)] = 512,
+    batch_size: Annotated[int, typer.Option("--batch-size", min=1)] = 2048,
+) -> None:
+    """Max-project tissue-side intensity rays onto bilateral surface UV charts."""
+    typer.echo(
+        build_surface_intensity_map(
+            surface_root=surface_root,
+            mask_path=mask,
+            source_zarr=source_zarr,
+            output_dir=output_dir,
+            level=level,
+            max_depth_um=max_depth_um,
+            depth_step_um=depth_step_um,
+            uv_size=uv_size,
+            batch_size=batch_size,
+        )
+    )
+
+
+@app.command("eomes-profiles")
+def eomes_profiles(
+    surface: Annotated[Path, typer.Option("--surface", exists=True, dir_okay=False, readable=True)],
+    chart: Annotated[Path, typer.Option("--chart", exists=True, dir_okay=False, readable=True)],
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    source_zarr: Annotated[Path, typer.Option("--source-zarr", exists=True, file_okay=False)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    level: Annotated[int, typer.Option("--level", min=0)] = 2,
+    z_start: Annotated[int, typer.Option("--z-start", min=0)] = 0,
+    z_stop: Annotated[int | None, typer.Option("--z-stop", min=1)] = None,
+    stride_zyx: Annotated[str, typer.Option("--stride-zyx")] = "2,4,4",
+    radius_um: Annotated[float, typer.Option("--radius-um", min=0)] = 20.0,
+    max_depth_um: Annotated[float, typer.Option("--max-depth-um", min=0)] = 280.8,
+    depth_step_um: Annotated[float, typer.Option("--depth-step-um", min=0)] = 4.8,
+    projection_domain: Annotated[
+        Literal["full", "ventricular-wall"], typer.Option("--projection-domain")
+    ] = "full",
+) -> None:
+    """Bin 561 intensity by exact closest-surface distance and mesh neighborhood."""
+    typer.echo(
+        build_surface_profiles(
+            surface_path=surface,
+            chart_path=chart,
+            mask_path=mask,
+            source_zarr=source_zarr,
+            output_dir=output_dir,
+            level=level,
+            z_start=z_start,
+            z_stop=z_stop,
+            stride_zyx=parse_shape_zyx(stride_zyx),
+            radius_um=radius_um,
+            max_depth_um=max_depth_um,
+            depth_step_um=depth_step_um,
+            projection_domain=projection_domain,
+        )
+    )
+
+
+@app.command("eomes-boundaries")
+def eomes_boundaries(
+    profiles: Annotated[Path, typer.Option("--profiles", exists=True, dir_okay=False, readable=True)],
+    surface: Annotated[Path, typer.Option("--surface", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    inner_fraction: Annotated[float, typer.Option("--inner-fraction", min=0, max=1)] = DEFAULT_INNER_FRACTION,
+    inner_smooth_um: Annotated[float, typer.Option("--inner-smooth-um", min=0)] = DEFAULT_INNER_SMOOTH_UM,
+    outer_fraction: Annotated[float, typer.Option("--outer-fraction", min=0, max=1)] = DEFAULT_OUTER_FRACTION,
+    outer_smooth_um: Annotated[float, typer.Option("--outer-smooth-um", min=0)] = DEFAULT_OUTER_SMOOTH_UM,
+    min_crossing_samples: Annotated[int, typer.Option("--min-crossing-samples", min=1)] = (
+        DEFAULT_MIN_CROSSING_SAMPLES
+    ),
+    max_recovery_distance_um: Annotated[
+        float, typer.Option("--max-recovery-distance-um", min=0)
+    ] = DEFAULT_MAX_RECOVERY_DISTANCE_UM,
+    trim_caps: Annotated[bool, typer.Option("--trim-caps/--no-trim-caps")] = True,
+) -> None:
+    """Measure and recover ordered Eomes inner and outer surface boundaries."""
+    typer.echo(
+        build_surface_boundaries(
+            profiles_path=profiles,
+            surface_path=surface,
+            output_dir=output_dir,
+            inner_fraction=inner_fraction,
+            inner_smooth_um=inner_smooth_um,
+            outer_fraction=outer_fraction,
+            outer_smooth_um=outer_smooth_um,
+            min_crossing_samples=min_crossing_samples,
+            max_recovery_distance_um=max_recovery_distance_um,
+            trim_caps=trim_caps,
+        )
+    )
+
+
+@app.command("eomes-boundary-qc")
+def eomes_boundary_qc(
+    surface: Annotated[Path, typer.Option("--surface", exists=True, dir_okay=False, readable=True)],
+    chart: Annotated[Path, typer.Option("--chart", exists=True, dir_okay=False, readable=True)],
+    boundaries: Annotated[Path, typer.Option("--boundaries", exists=True, dir_okay=False, readable=True)],
+    mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
+    source_zarr: Annotated[Path, typer.Option("--source-zarr", exists=True, file_okay=False)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    source_level: Annotated[int, typer.Option("--source-level", min=0)] = 2,
+    intrinsic_z_index: Annotated[list[int] | None, typer.Option("--intrinsic-z-index", min=0)] = None,
+    intrinsic_z_position_um: Annotated[
+        list[float] | None, typer.Option("--intrinsic-z-position-um", min=0)
+    ] = None,
+    grid_stride: Annotated[int, typer.Option("--grid-stride", min=1)] = 2,
+) -> None:
+    """Render direct and recovered implicit Eomes contours on matched sections."""
+    typer.echo(
+        build_surface_boundary_qc(
+            surface_path=surface,
+            chart_path=chart,
+            boundaries_path=boundaries,
+            mask_path=mask,
+            source_zarr=source_zarr,
+            output_dir=output_dir,
+            source_level=source_level,
+            intrinsic_z_indices=intrinsic_z_index,
+            intrinsic_z_positions_um=intrinsic_z_position_um,
+            grid_stride=grid_stride,
+        )
+    )
 
 
 @app.command("fit-planar-tilt")

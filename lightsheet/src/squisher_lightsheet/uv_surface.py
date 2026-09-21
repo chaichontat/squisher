@@ -3,22 +3,26 @@ from __future__ import annotations
 import importlib.metadata
 import json
 from pathlib import Path
+import shutil
 from typing import Literal
 
 import igl
 import numpy as np
 import numpy.typing as npt
-from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, zoom
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, map_coordinates, zoom
 import SimpleITK as sitk
 
 from squisher_lightsheet.artifact_io import atomic_output_directory, sha256_file
 from squisher_lightsheet.surface_geometry import (
     ImageGeometry,
+    load_surface,
+    mesh_arrays,
     validate_manifold_disk,
 )
 
 
 DEFAULT_SMOOTHING_UM = 19.2
+MIN_PATCH_TRIANGLE_QUALITY = 0.01
 ARTIFACT_TYPE = "squisher_lightsheet.ventricular_uv_surface.v1"
 
 FloatArray = npt.NDArray[np.float64]
@@ -364,6 +368,256 @@ def _orient_faces(
     if not np.all(signed > 0):
         raise ValueError("surface faces do not consistently face the cavity direction")
     return faces
+
+
+def _patch_boundary(faces: IntArray) -> set[tuple[int, int]]:
+    """Return directed boundary edges, rejecting inconsistent interior winding."""
+    edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True)
+    directions = np.where(edges[:, 0] < edges[:, 1], 1, -1)
+    winding = np.bincount(inverse, weights=directions)
+    if np.any(counts > 2) or np.any((counts == 2) & (winding != 0)):
+        raise ValueError("patch faces must have consistent manifold winding")
+    return {tuple(edge) for edge in edges[counts[inverse] == 1]}
+
+
+def _splice_surface_patch(
+    vertices: FloatArray,
+    faces: IntArray,
+    removed: IntArray,
+    added: FloatArray,
+    replacement: IntArray,
+) -> tuple[FloatArray, IntArray, IntArray]:
+    if removed.ndim != 1 or not len(removed) or not np.issubdtype(removed.dtype, np.integer):
+        raise ValueError("replaced_face_indices must be a nonempty integer vector")
+    if len(np.unique(removed)) != len(removed) or removed.min() < 0 or removed.max() >= len(faces):
+        raise ValueError("replaced_face_indices must be unique valid parent face IDs")
+    if added.ndim != 2 or added.shape[1] != 3 or not len(added) or not np.isfinite(added).all():
+        raise ValueError("new_vertices_intrinsic_xyz_um must be a nonempty finite (N, 3) array")
+    if replacement.ndim != 2 or replacement.shape[1] != 3 or not np.issubdtype(replacement.dtype, np.integer):
+        raise ValueError("replacement_faces must be an integer (N, 3) array")
+    combined = np.concatenate((vertices, added))
+    _, replacement = mesh_arrays(combined, replacement)
+    referenced = np.unique(replacement)
+    old_references = referenced[referenced < len(vertices)]
+    if not np.isin(old_references, np.unique(faces[removed])).all():
+        raise ValueError("patch references original vertices outside the replaced strip")
+    if not np.array_equal(referenced[referenced >= len(vertices)], np.arange(len(vertices), len(combined))):
+        raise ValueError("patch must reference every appended vertex")
+    if igl.facet_components(faces[removed])[0] != 1 or igl.facet_components(replacement)[0] != 1:
+        raise ValueError("removed and replacement strips must each be connected")
+    seam = _patch_boundary(faces[removed])
+    if not seam or _patch_boundary(replacement) != seam:
+        raise ValueError("replacement patch must preserve the directed boundary of the removed strip")
+    retained = np.ones(len(faces), dtype=bool)
+    retained[removed] = False
+    result = np.concatenate((faces[retained], replacement))
+    _patch_boundary(result)
+    if not np.array_equal(np.unique(result), np.arange(len(combined))):
+        raise ValueError("repair must preserve and reference every original vertex")
+    return combined, result, np.asarray(sorted({v for edge in seam for v in edge}), dtype=np.int64)
+
+
+def _validate_patch_field(
+    vertices_intrinsic: FloatArray,
+    replacement: IntArray,
+    sampled: FloatArray,
+    spacing_zyx_um: FloatArray,
+    max_surface_error_um: float,
+) -> dict[str, float]:
+    """Check the patch against the sampled SDF, including face interiors."""
+    triangles = vertices_intrinsic[replacement]
+    weights = np.asarray(
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0.5, 0.5, 0], [0, 0.5, 0.5], [0.5, 0, 0.5], [1 / 3, 1 / 3, 1 / 3]],
+        dtype=np.float64,
+    )
+    points = np.einsum("ki,fij->fkj", weights, triangles)
+    index = points.reshape(-1, 3)[:, ::-1] / spacing_zyx_um
+    if np.any(index < 0.5) or np.any(index > np.asarray(sampled.shape) - 1.5):
+        raise ValueError("reviewed patch must lie inside the SDF grid with a gradient sampling margin")
+    values = map_coordinates(sampled, index.T, order=1, prefilter=False)
+    gradient_zyx = np.empty_like(index)
+    for axis in range(3):
+        offset = np.zeros(3)
+        offset[axis] = 0.5
+        positive = map_coordinates(sampled, (index + offset).T, order=1, prefilter=False)
+        negative = map_coordinates(sampled, (index - offset).T, order=1, prefilter=False)
+        gradient_zyx[:, axis] = (positive - negative) / spacing_zyx_um[axis]
+    lengths = np.linalg.norm(gradient_zyx, axis=1)
+    if not np.isfinite(lengths).all() or np.any(lengths <= 1e-8):
+        raise ValueError("patch has an undefined SDF gradient")
+    error = np.abs(values) / lengths
+    if np.any(error > max_surface_error_um):
+        raise ValueError(f"patch departs from the zero-level surface by {error.max():.6g} um")
+    normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    outward = (-gradient_zyx[:, ::-1] / lengths[:, None]).reshape(points.shape)
+    alignment = np.einsum("fj,fkj->fk", normals, outward)
+    if np.any(alignment <= 0):
+        raise ValueError("patch winding must point out of tissue along -gradient(SDF)")
+    return {
+        "maximum_sampled_surface_error_um": float(error.max()),
+        "minimum_normal_outward_cosine": float(alignment.min()),
+    }
+
+
+def _patch_triangle_quality(vertices: FloatArray, faces: IntArray) -> float:
+    """Return twice-area divided by squared longest edge, rejecting FEM slivers."""
+    triangles = vertices[faces]
+    edges = np.stack(
+        (
+            np.linalg.norm(triangles[:, 1] - triangles[:, 0], axis=1),
+            np.linalg.norm(triangles[:, 2] - triangles[:, 1], axis=1),
+            np.linalg.norm(triangles[:, 0] - triangles[:, 2], axis=1),
+        ),
+        axis=1,
+    )
+    twice_area = np.linalg.norm(
+        np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]),
+        axis=1,
+    )
+    minimum = float(np.min(twice_area / np.square(edges.max(axis=1))))
+    if minimum < MIN_PATCH_TRIANGLE_QUALITY:
+        raise ValueError(f"patch triangle quality {minimum:.6g} is below {MIN_PATCH_TRIANGLE_QUALITY:.6g}")
+    return minimum
+
+
+def build_repaired_ventricular_surface(
+    *,
+    surface_path: Path,
+    mask_path: Path,
+    patch_path: Path,
+    output_dir: Path,
+    max_surface_error_um: float = 2.0,
+) -> Path:
+    """Apply an explicit reviewed local strip without changing its parent boundary.
+
+    The NPZ patch binds parent_surface_sha256 and mask_sha256 and contains
+    replaced_face_indices, new_vertices_intrinsic_xyz_um, and replacement_faces.
+    Replacement indices address original vertices followed by appended vertices.
+    Face winding must match the original seam; this operation never flips faces
+    independently or derives anatomical correspondence from a bounding box.
+    """
+    surface_path, mask_path, patch_path, output_dir = map(
+        Path, (surface_path, mask_path, patch_path, output_dir)
+    )
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to overwrite existing output directory: {output_dir}")
+    if not np.isfinite(max_surface_error_um) or max_surface_error_um <= 0:
+        raise ValueError("max_surface_error_um must be finite and positive")
+    parent_hash, mask_hash, patch_hash = map(sha256_file, (surface_path, mask_path, patch_path))
+    metadata_path = surface_path.parent / "metadata.json"
+    parent = json.loads(metadata_path.read_text())
+    if (
+        parent.get("artifact_type") != ARTIFACT_TYPE
+        or parent.get("outputs", {}).get("surface.npz") != parent_hash
+    ):
+        raise ValueError("parent metadata does not bind the supplied ventricular surface")
+    if parent.get("mask_sha256") != mask_hash:
+        raise ValueError("parent surface and repair mask identities differ")
+    with np.load(patch_path, allow_pickle=False) as patch:
+        required = {
+            "parent_surface_sha256",
+            "mask_sha256",
+            "replaced_face_indices",
+            "new_vertices_intrinsic_xyz_um",
+            "replacement_faces",
+        }
+        if not required.issubset(patch.files):
+            raise ValueError(f"patch is missing arrays: {sorted(required.difference(patch.files))}")
+        if patch["parent_surface_sha256"].shape != () or str(patch["parent_surface_sha256"]) != parent_hash:
+            raise ValueError("patch parent_surface_sha256 does not match the supplied surface")
+        if patch["mask_sha256"].shape != () or str(patch["mask_sha256"]) != mask_hash:
+            raise ValueError("patch mask_sha256 does not match the supplied mask")
+        removed = patch["replaced_face_indices"]
+        added = np.asarray(patch["new_vertices_intrinsic_xyz_um"], dtype=np.float64)
+        replacement = patch["replacement_faces"]
+    surface = load_surface(surface_path)
+    intrinsic, faces, seam = _splice_surface_patch(
+        surface.vertices_intrinsic_xyz_um, surface.faces, removed, added, replacement
+    )
+    minimum_triangle_quality = _patch_triangle_quality(intrinsic, replacement)
+    world = surface.geometry.intrinsic_to_world(intrinsic)
+    # Preserve exact source coordinates, not a numerically round-tripped copy.
+    world[: len(surface.vertices_world_xyz_um)] = surface.vertices_world_xyz_um
+    topology, uv = _validate_surface(world, faces, "repaired surface", anchor_vertices=intrinsic)
+    from igl.copyleft.cgal import remesh_self_intersections
+
+    _, _, intersections, _, _ = remesh_self_intersections(world, faces, detect_only=True, first_only=True)
+    if len(intersections):
+        raise ValueError("repaired surface contains self-intersections")
+    image = sitk.ReadImage(mask_path)
+    source_geometry = ImageGeometry.from_sitk(image)
+    if not (
+        np.array_equal(source_geometry.origin_xyz_um, surface.source_geometry.origin_xyz_um)
+        and np.array_equal(source_geometry.spacing_xyz_um, surface.source_geometry.spacing_xyz_um)
+        and np.array_equal(source_geometry.direction, surface.source_geometry.direction)
+    ):
+        raise ValueError("mask geometry differs from the parent surface")
+    mask, geometry, _ = _stride_mask(
+        sitk.GetArrayFromImage(image), source_geometry, tuple(parent["stride_zyx"])
+    )
+    if not np.array_equal(geometry.spacing_xyz_um, surface.geometry.spacing_xyz_um):
+        raise ValueError("parent stride metadata differs from the recorded surface geometry")
+    if not np.array_equal(np.unique(mask), [0, 1]):
+        raise ValueError("repair mask must retain both binary values 0 and 1")
+    spacing = geometry.spacing_xyz_um[::-1]
+    field = distance_transform_edt(mask, sampling=spacing) - distance_transform_edt(
+        ~mask.astype(bool), sampling=spacing
+    )
+    smoothing = float(parent["signed_distance_smoothing_um"])
+    if not np.isfinite(smoothing) or smoothing < 0:
+        raise ValueError("parent signed_distance_smoothing_um must be finite and nonnegative")
+    if smoothing > 0:
+        field = gaussian_filter(field, sigma=smoothing / spacing, mode="nearest")
+    sampled, scale = cubic_resample(field)
+    # Winding is checked in intrinsic space, accounting for reflected world frames.
+    intrinsic_faces = replacement if np.linalg.det(geometry.direction) > 0 else replacement[:, [0, 2, 1]]
+    diagnostics = _validate_patch_field(
+        intrinsic, intrinsic_faces, sampled, spacing * scale, max_surface_error_um
+    )
+    with atomic_output_directory(output_dir) as stage:
+        outputs = _write_surface_bundle(
+            stage,
+            world,
+            intrinsic,
+            faces,
+            uv,
+            surface.geometry,
+            surface.source_geometry,
+            surface.cavity_direction_world_xyz,
+        )
+        shutil.copyfile(patch_path, stage / "patch.npz")
+        outputs["patch.npz"] = sha256_file(stage / "patch.npz")
+        if outputs["patch.npz"] != patch_hash:
+            raise ValueError("patch changed during repair")
+        metadata = {
+            **parent,
+            "selection": "reviewed zero-level overhang strip spliced into original ventricular mesh",
+            "topology": topology,
+            "outputs": outputs,
+            "repair": {
+                "parent_surface": str(surface_path.resolve()),
+                "parent_surface_sha256": parent_hash,
+                "parent_metadata_sha256": sha256_file(metadata_path),
+                "patch": str(patch_path.resolve()),
+                "patch_sha256": patch_hash,
+                "replaced_faces": len(removed),
+                "replacement_faces": len(replacement),
+                "appended_vertices": len(added),
+                "seam_vertex_ids": seam.tolist(),
+                "new_vertex_id_start": len(surface.vertices_world_xyz_um),
+                "max_surface_error_um": max_surface_error_um,
+                "minimum_patch_triangle_quality": minimum_triangle_quality,
+                "minimum_patch_triangle_quality_required": MIN_PATCH_TRIANGLE_QUALITY,
+                "field_check": "vertices, edge midpoints and centroids; |SDF| / |gradient(SDF)|",
+                "orientation": "unchanged seam winding; outward -gradient(SDF), not global +X",
+                "self_intersections": 0,
+                **diagnostics,
+            },
+        }
+        (stage / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    return (output_dir / "metadata.json").resolve()
 
 
 def build_ventricular_uv_surface(

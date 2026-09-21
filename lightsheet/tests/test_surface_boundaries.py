@@ -152,10 +152,15 @@ def test_wall_support_uses_intrinsic_turnarounds() -> None:
     np.testing.assert_allclose(mirrored_bounds, bounds)
 
 
+@pytest.mark.parametrize("trim_caps", [True, False])
 def test_builder_preserves_raw_measurements_and_masks_fitted_caps_once(
     tmp_path: Path,
+    trim_caps: bool,
 ) -> None:
     world, intrinsic, faces = _strip_mesh()
+    if not trim_caps:
+        # An overhang is not a unique X(Y) graph: two vertices share intrinsic Y.
+        intrinsic[2, 1] = intrinsic[1, 1]
     surface_path = tmp_path / "surface.npz"
     np.savez_compressed(
         surface_path,
@@ -192,6 +197,9 @@ def test_builder_preserves_raw_measurements_and_masks_fitted_caps_once(
         profiles_path=profiles_path,
         surface_path=surface_path,
         output_dir=output_dir,
+        min_crossing_samples=1,
+        max_recovery_distance_um=100.0,
+        trim_caps=trim_caps,
     )
 
     assert metadata_path == (output_dir / "metadata.json").resolve()
@@ -199,6 +207,7 @@ def test_builder_preserves_raw_measurements_and_masks_fitted_caps_once(
     assert metadata["artifact_type"] == ARTIFACT_TYPE
     assert metadata["inner"]["peak_fraction"] == 0.60
     assert metadata["outer"]["peak_fraction"] == 0.75
+    assert metadata["cap_trimming"] == ("intrinsic-x-turnarounds" if trim_caps else "none")
     with np.load(output_dir / "boundaries.npz") as result:
         assert set(result.files) == {
             "raw_inner_um",
@@ -208,16 +217,28 @@ def test_builder_preserves_raw_measurements_and_masks_fitted_caps_once(
             "direct_supported_inner",
             "direct_supported_outer",
             "direct_supported_joint",
+            "fit_supported_inner",
+            "fit_supported_outer",
+            "crossing_support_count_inner",
+            "crossing_support_count_outer",
+            "recovery_distance_inner_um",
+            "recovery_distance_outer_um",
             "wall_support",
             "estimated_inner",
             "estimated_outer",
             "recovered_missing_measurement_inner",
             "recovered_missing_measurement_outer",
         }
-        np.testing.assert_array_equal(result["wall_support"], [False, True, True, True, False] * 2)
+        expected_support = [False, True, True, True, False] * 2 if trim_caps else [True] * 10
+        np.testing.assert_array_equal(result["wall_support"], expected_support)
         assert np.isfinite(result["raw_inner_um"][[0, 4, 5, 9]]).all()
-        assert np.isnan(result["inner_um"][[0, 4, 5, 9]]).all()
-        assert np.isnan(result["outer_um"][[0, 4, 5, 9]]).all()
+        if trim_caps:
+            assert np.isnan(result["inner_um"][[0, 4, 5, 9]]).all()
+            assert np.isnan(result["outer_um"][[0, 4, 5, 9]]).all()
+        else:
+            assert np.isfinite(result["inner_um"]).all()
+            assert np.isfinite(result["outer_um"]).all()
+            assert metadata["terminal_bounds_intrinsic_z_ymin_ymax_um"] == []
         assert result["recovered_missing_measurement_inner"][2]
         assert result["recovered_missing_measurement_outer"][7]
         estimated = result["estimated_inner"] & result["estimated_outer"]
