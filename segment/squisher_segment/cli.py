@@ -153,6 +153,13 @@ def segment_run(
         str | None,
         typer.Option(help="Comma-separated Z,Y,X crop size."),
     ] = None,
+    max_project: Annotated[
+        bool,
+        typer.Option(
+            "--max-project-2d/--no-max-project-2d",
+            help="Max-project the selected Z range and run Cellpose in 2D.",
+        ),
+    ] = False,
     nonempty_threshold: Annotated[
         int,
         typer.Option(
@@ -168,7 +175,7 @@ def segment_run(
     ] = 5.0,
     stitch_mode: Annotated[
         str, typer.Option(help="Block stitching mode: face or overlap-iou.")
-    ] = "face",
+    ] = "overlap-iou",
     stitch_iou_threshold: Annotated[
         float, typer.Option(min=0.0, max=1.0, help="Minimum reciprocal overlap IoU.")
     ] = 0.25,
@@ -204,6 +211,7 @@ def segment_run(
         stagger_seconds=stagger_seconds,
         start_zyx=parsed_start,
         box_size_zyx=parsed_box_size,
+        max_project=max_project,
         stitch_mode=parsed_stitch_mode,
         stitch_iou_threshold=parsed_iou_threshold,
     )

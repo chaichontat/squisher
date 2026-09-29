@@ -678,7 +678,7 @@ def _build_run_identity(
     nonempty_rule: dict[str, Any],
     mask: NDArray[Any] | None,
     runtime_artifacts: dict[str, Any],
-    stitch_mode: str = overlap_stitch.FACE_MODE,
+    stitch_mode: str = overlap_stitch.DEFAULT_MODE,
     stitch_iou_threshold: float = 0.25,
 ) -> dict[str, Any]:
     _validate_runtime_artifacts(runtime_artifacts)
@@ -1170,6 +1170,66 @@ class CroppedZYXCInput:
         return np.asarray(self.source[mapped])
 
 
+@dataclass(frozen=True)
+class MaxProjectedZYXCInput:
+    """Expose a chunked Z maximum as a singleton-Z ZYXC input."""
+
+    source: Any
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        return (1, *(int(value) for value in self.source.shape[1:]))
+
+    @property
+    def chunks(self) -> tuple[int, int, int, int]:
+        return (1, *(int(value) for value in self.source.chunks[1:]))
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return np.dtype(self.source.dtype)
+
+    @property
+    def ndim(self) -> int:
+        return 4
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        return dict(self.source.attrs)
+
+    def get_orthogonal_selection(self, selection: object) -> NDArray[Any]:
+        selectors = _normalize_array_key(selection, self.ndim)
+        z_indices, z_result_selector = _selector_indices(selectors[0], 1)
+        getter = getattr(self.source, "get_orthogonal_selection", None)
+
+        def read(z_selector: slice) -> NDArray[Any]:
+            source_selection = (z_selector, *selectors[1:])
+            if getter is not None:
+                return np.asarray(getter(source_selection))
+            return np.asarray(self.source[source_selection])
+
+        if not z_indices:
+            return read(slice(0, 0))[z_result_selector]
+
+        projected: NDArray[Any] | None = None
+        z_chunk = max(1, int(self.source.chunks[0]))
+        for start in range(0, int(self.source.shape[0]), z_chunk):
+            slab_max = read(slice(start, min(start + z_chunk, int(self.source.shape[0])))).max(
+                axis=0,
+                keepdims=True,
+            )
+            if projected is None:
+                projected = slab_max
+            else:
+                np.maximum(projected, slab_max, out=projected)
+        if projected is None:
+            raise ValueError("Cannot max-project an input with an empty Z axis.")
+        logical = np.repeat(projected, len(z_indices), axis=0)
+        return logical[z_result_selector]
+
+    def __getitem__(self, key: object) -> NDArray[Any]:
+        return self.get_orthogonal_selection(key)
+
+
 def _crop_zyxc_input(
     input_array: Any,
     input_identity: dict[str, Any],
@@ -1464,6 +1524,7 @@ def _build_cellpose_eval_kwargs(
     ortho_weights: list[float] | None,
     flow3d_smooth: float,
     skip_empty_tiles: bool = True,
+    max_project: bool = False,
 ) -> dict[str, Any]:
     eval_kwargs: dict[str, Any] = {
         "diameter": diameter,
@@ -1471,20 +1532,25 @@ def _build_cellpose_eval_kwargs(
         "normalize": normalization,
         "flow_threshold": 0,
         "cellprob_threshold": 0,
-        "anisotropy": 1.0,
         "resample": False,
-        "flow3D_smooth": flow3d_smooth,
         "niter": 1000,
-        "do_3D": True,
         "min_size": 500,
-        "channel_axis": 3,
+        "channel_axis": 2 if max_project else 3,
         "return_flows": False,
         "skip_empty_tiles": skip_empty_tiles,
         "use_kde_clustering": True,
-        "z_axis": 0,
+        "do_3D": not max_project,
+        "z_axis": None if max_project else 0,
     }
-    if ortho_weights is not None:
-        eval_kwargs["ortho_weights"] = ortho_weights
+    if not max_project:
+        eval_kwargs.update(
+            {
+                "anisotropy": 1.0,
+                "flow3D_smooth": flow3d_smooth,
+            }
+        )
+        if ortho_weights is not None:
+            eval_kwargs["ortho_weights"] = ortho_weights
     return eval_kwargs
 
 
@@ -1803,10 +1869,22 @@ def read_preprocess_and_segment(
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
 
+    do_3d = eval_kwargs.get("do_3D", True)
+    if not do_3d:
+        if image.ndim != 4 or image.shape[0] != 1:
+            raise ValueError(f"2D Cellpose requires singleton-Z ZYXC input; got {image.shape}.")
+        model_input = image[0]
+    else:
+        model_input = image
+
     model = get_cached_model(model_kwargs)
-    outputs = model.eval(image, **eval_kwargs)
+    outputs = model.eval(model_input, **eval_kwargs)
     masks = outputs[0].astype(np.uint32)
     del outputs
+    if not do_3d:
+        if masks.ndim != 2:
+            raise ValueError(f"2D Cellpose returned masks with shape {masks.shape}; expected YX.")
+        masks = masks[np.newaxis]
 
     # Multiple worker processes cannot reuse another process's cached blocks.
     # Return inactive allocations to CUDA after each complete Cellpose block.
@@ -1865,6 +1943,9 @@ def _wait_for_futures_collect_errors(
             )
         except Exception as exc:
             raise RuntimeError(f"{stage} completion handling failed for {label}: {exc!r}") from exc
+        # The checkpoint now records this block. Holding its result would make
+        # Dask recompute the block if the worker storing it dies.
+        fut.release()
     return failures
 
 
@@ -2588,7 +2669,8 @@ def _run_single_input(
     start_zyx: tuple[int, int, int] | None = None,
     box_size_zyx: tuple[int, int, int] | None = None,
     workers_per_device: tuple[int, ...] | None = None,
-    stitch_mode: str = overlap_stitch.FACE_MODE,
+    max_project: bool = False,
+    stitch_mode: str = overlap_stitch.DEFAULT_MODE,
     stitch_iou_threshold: float = 0.25,
 ) -> None:
     if not input_path.exists() or input_path.suffix not in {".zarr", ".json"}:
@@ -2630,7 +2712,7 @@ def _run_single_input(
         "gpu": True,
     }
     pretrained_model_ortho = config.get("pretrained_model_ortho")
-    if pretrained_model_ortho is not None:
+    if pretrained_model_ortho is not None and not max_project:
         if not isinstance(pretrained_model_ortho, (str, os.PathLike)) or not os.fspath(
             pretrained_model_ortho
         ):
@@ -2680,6 +2762,17 @@ def _run_single_input(
         start_zyx=start_zyx,
         box_size_zyx=box_size_zyx,
     )
+    if max_project:
+        projected = MaxProjectedZYXCInput(input_zarr_array)
+        input_identity = {
+            "kind": "max-projected-zyxc",
+            "source": input_identity,
+            "shape": list(projected.shape),
+            "chunks": list(projected.chunks),
+            "dtype": str(projected.dtype),
+            "attrs": projected.attrs,
+        }
+        input_zarr_array = projected
     if input_zarr_array.ndim != 4:
         raise ValueError(f"Input Zarr must have ZYXC shape; got {input_zarr_array.shape}.")
     channel_indices, channel_names = _resolve_channel_selection(input_zarr_array, channels)
@@ -2774,6 +2867,7 @@ def _run_single_input(
         ortho_weights=ortho_weights,
         flow3d_smooth=float(flow3d_smooth),
         skip_empty_tiles=skip_empty_tiles,
+        max_project=max_project,
     )
 
     run_identity = _build_run_identity(
@@ -2922,6 +3016,13 @@ def cli() -> None:
 @click.option("--start-zyx", default=None, type=str, help="Comma-separated Z,Y,X crop start.")
 @click.option("--box-size-zyx", default=None, type=str, help="Comma-separated Z,Y,X crop size.")
 @click.option(
+    "--max-project-2d/--no-max-project-2d",
+    "max_project",
+    default=False,
+    show_default=True,
+    help="Max-project the selected Z range and run Cellpose in 2D.",
+)
+@click.option(
     "--nonempty-threshold",
     default=DEFAULT_NONEMPTY_THRESHOLD,
     show_default=True,
@@ -2943,7 +3044,7 @@ def cli() -> None:
 )
 @click.option(
     "--stitch-mode",
-    default=overlap_stitch.FACE_MODE,
+    default=overlap_stitch.DEFAULT_MODE,
     show_default=True,
     type=click.Choice(overlap_stitch.STITCH_MODES, case_sensitive=False),
     help="Block stitching mode.",
@@ -2970,6 +3071,7 @@ def run(
     target_nx: int | None,
     start_zyx: str | None,
     box_size_zyx: str | None,
+    max_project: bool,
     nonempty_threshold: int,
     cellpose_only: bool,
     stagger_seconds: float,
@@ -3006,6 +3108,7 @@ def run(
         stagger_seconds=stagger_seconds,
         start_zyx=parsed_start,
         box_size_zyx=parsed_box_size,
+        max_project=max_project,
         stitch_mode=parsed_stitch_mode,
         stitch_iou_threshold=parsed_iou_threshold,
     )

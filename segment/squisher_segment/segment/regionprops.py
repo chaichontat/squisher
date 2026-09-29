@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import polars as pl
@@ -17,6 +18,15 @@ import zarr
 from loguru import logger
 from skimage.measure import regionprops_table
 from squisher.jpegxr_zarr import register_jpegxr_codec
+
+
+class IntensityTransform(Protocol):
+    """Serializable pixel transform with provenance for resumable measurements."""
+
+    @property
+    def identity(self) -> dict[str, object]: ...
+
+    def __call__(self, name: str, block: np.ndarray, origin_zyx: tuple[int, int, int]) -> np.ndarray: ...
 
 
 MOMENT_SCHEMA = {
@@ -262,11 +272,7 @@ def finalize_measurements(moments: pl.DataFrame, planes: pl.DataFrame) -> pl.Dat
         )
     best_planes = (
         planes.join(moments.select("label", "centroid_z"), on="label", how="inner")
-        .with_columns(
-            (pl.col("plane_z").cast(pl.Float64) - pl.col("centroid_z"))
-            .abs()
-            .alias("z_distance")
-        )
+        .with_columns((pl.col("plane_z").cast(pl.Float64) - pl.col("centroid_z")).abs().alias("z_distance"))
         .sort(
             ["label", "plane_area", "z_distance", "plane_z"],
             descending=[False, True, False, False],
@@ -332,6 +338,7 @@ def _measure_source_chunk(
     intensity_sources: tuple[tuple[str, str], ...],
     bounds: ChunkBounds,
     base_offset_zyx: tuple[int, int, int],
+    intensity_transform: IntensityTransform | None = None,
 ) -> tuple[ChunkBounds, pl.DataFrame, pl.DataFrame]:
     labels = zarr.open_array(labels_path, mode="r")
     z0, z1, y0, y1, x0, x1 = bounds
@@ -342,10 +349,17 @@ def _measure_source_chunk(
         intensity_arrays = [_open_image_array(Path(path))[0] for _, path in intensity_sources]
         intensity_image = np.empty(
             (*block.shape, len(intensity_arrays)),
-            dtype=intensity_arrays[0].dtype,
+            dtype=np.float32 if intensity_transform is not None else intensity_arrays[0].dtype,
         )
         for channel, array in enumerate(intensity_arrays):
-            intensity_image[..., channel] = array[z0:z1, y0:y1, x0:x1]
+            pixels = np.asarray(array[z0:z1, y0:y1, x0:x1])
+            if intensity_transform is not None:
+                pixels = intensity_transform(intensity_names[channel], pixels, (z0, y0, x0))
+                if pixels.shape != block.shape or pixels.dtype != np.float32:
+                    raise ValueError(
+                        "Intensity transforms must preserve block shape and return float32 pixels"
+                    )
+            intensity_image[..., channel] = pixels
     moments, planes = measure_block(
         block,
         offset_zyx=(
@@ -386,9 +400,7 @@ def _source_identity(labels_path: Path, labels: zarr.Array) -> dict[str, object]
     if not metadata_path.is_file():
         metadata_path = labels_path / ".zarray"
     metadata_sha256 = (
-        hashlib.sha256(metadata_path.read_bytes()).hexdigest()
-        if metadata_path.is_file()
-        else None
+        hashlib.sha256(metadata_path.read_bytes()).hexdigest() if metadata_path.is_file() else None
     )
     return {
         "schema_version": 1,
@@ -397,8 +409,7 @@ def _source_identity(labels_path: Path, labels: zarr.Array) -> dict[str, object]
         "chunks": list(labels.chunks),
         "dtype": str(labels.dtype),
         "metadata_sha256": metadata_sha256,
-        "artifact_key": labels.attrs.get("squisher_postproc_key")
-        or labels.attrs.get("squisher_run_key"),
+        "artifact_key": labels.attrs.get("squisher_postproc_key") or labels.attrs.get("squisher_run_key"),
     }
 
 
@@ -464,6 +475,7 @@ def _measure_pending_chunks(
     *,
     workers: int,
     offset_zyx: tuple[int, int, int],
+    intensity_transform: IntensityTransform | None = None,
 ) -> None:
     if workers == 1:
         for index, bounds in enumerate(pending, start=1):
@@ -474,6 +486,7 @@ def _measure_pending_chunks(
                     intensity_sources,
                     bounds,
                     offset_zyx,
+                    intensity_transform,
                 ),
             )
             if index % 10 == 0 or index == len(pending):
@@ -497,6 +510,7 @@ def _measure_pending_chunks(
                     intensity_sources,
                     bounds,
                     offset_zyx,
+                    intensity_transform,
                 )
             ] = bounds
 
@@ -520,6 +534,7 @@ def _measure_pending_chunks(
                         intensity_sources,
                         bounds,
                         offset_zyx,
+                        intensity_transform,
                     )
                 ] = bounds
 
@@ -549,6 +564,7 @@ def measure_zarr(
     offset_zyx: tuple[int, int, int] = (0, 0, 0),
     resume: bool = True,
     overwrite: bool = False,
+    intensity_transform: IntensityTransform | None = None,
 ) -> Path:
     """Measure a 3-D label Zarr with bounded process concurrency.
 
@@ -562,7 +578,9 @@ def measure_zarr(
         raise ValueError(f"workers must be positive, got {workers}.")
     labels = zarr.open_array(labels_path, mode="r")
     if labels.ndim != 3 or not np.issubdtype(labels.dtype, np.integer):
-        raise ValueError(f"Expected a 3-D integer label Zarr, got shape={labels.shape}, dtype={labels.dtype}.")
+        raise ValueError(
+            f"Expected a 3-D integer label Zarr, got shape={labels.shape}, dtype={labels.dtype}."
+        )
     _validate_block(np.empty((0, 0, 0), dtype=labels.dtype), offset_zyx)
     intensity_paths = dict(intensity_paths or {})
     intensity_names = tuple(sorted(_validate_intensity_names(intensity_paths)))
@@ -603,13 +621,17 @@ def measure_zarr(
             }
             for name, source_path, array_path, intensity in intensity_sources
         }
+    if intensity_transform is not None:
+        if not intensity_sources:
+            raise ValueError("Intensity transformation requires intensity sources")
+        identity["intensity_transform"] = intensity_transform.identity
     _prepare_partial_dir(partial_dir, identity, resume=resume)
 
     bounds = _chunk_bounds(tuple(labels.shape), tuple(labels.chunks))
+    if intensity_transform is not None:
+        bounds.sort(key=lambda b: (b[2], b[4], b[0]))
     pending = [
-        chunk
-        for chunk in bounds
-        if not all(path.is_file() for path in _partial_paths(partial_dir, chunk))
+        chunk for chunk in bounds if not all(path.is_file() for path in _partial_paths(partial_dir, chunk))
     ]
     logger.info(f"Label chunks total={len(bounds)} pending={len(pending)} workers={workers}")
     _measure_pending_chunks(
@@ -619,15 +641,14 @@ def measure_zarr(
         partial_dir,
         workers=workers,
         offset_zyx=offset_zyx,
+        intensity_transform=intensity_transform,
     )
 
     if bounds:
         cells = _reduce_partial_files(partial_dir)
     else:
         cells = finalize_measurements(
-            pl.DataFrame(
-                schema={**MOMENT_SCHEMA, **_intensity_moment_schema(intensity_names)}
-            ),
+            pl.DataFrame(schema={**MOMENT_SCHEMA, **_intensity_moment_schema(intensity_names)}),
             pl.DataFrame(schema=PLANE_SCHEMA),
         )
     _write_parquet_atomic(cells, output_path)

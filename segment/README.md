@@ -92,6 +92,11 @@ describe the same integer mean-downsampling transitions.
 channel-separated ZYX OME-Zarrs and a shared `source_roi_zyx`; workers stack only
 the requested crop, avoiding a full intermediate multichannel volume.
 
+Use `--max-project-2d` to max-project the selected Z range lazily and run
+Cellpose in 2D. The label output retains a singleton Z axis so the existing
+distributed stitching and Zarr output contract remain unchanged. When combined
+with `--start-zyx` and `--box-size-zyx`, projection is limited to that Z crop.
+
 `--channels` fixes model channel order. The same order is used for bounded,
 cached normalization, background masking, and training exports. On a nonempty
 cache miss, a core runs only when at least 5% of raw channel `561` is strictly
@@ -151,14 +156,15 @@ The matching reference model configuration is:
 
 ### Stitching modes
 
-Face contact remains the default and preserves the established behavior:
+Overlap-IoU is the default because block-local masks may not touch after their
+halos are trimmed, even when they describe the same cell:
 
 ```bash
-squisher-segment segment run registered.json --stitch-mode face
+squisher-segment segment run registered.json
 ```
 
-`--stitch-mode overlap-iou` is an alternate identity rule for labels that
-disagree at a block boundary. Before inference, the run allocates three sparse,
+Use `--stitch-mode face` only to request the legacy face-contact behavior.
+Before overlap-IoU inference, the run allocates three sparse,
 pair-centric Zarr arrays. Workers store their local `uint32` labels over the
 full shared halo, limited transversely to the owned core. Pair-side chunks have
 one writer, use Zstd level 1 without shuffle, and stay at or below 32 MiB.

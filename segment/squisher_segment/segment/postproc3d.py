@@ -93,7 +93,7 @@ Performance Notes
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 from numba import njit, prange  # type: ignore[import]
@@ -1115,12 +1115,64 @@ def gaussian_smooth_labels(
     return result
 
 
+def _iter_gaussian_label_batches(
+    slices_list: Sequence[tuple[slice, ...] | None],
+    *,
+    volume_shape: tuple[int, int, int],
+    margin: int,
+    workspace_bytes: int,
+) -> Iterator[tuple[list[tuple[int, tuple[slice, ...]]], tuple[int, int, int]]]:
+    """Yield ascending-label ROI batches bounded by padded GPU workspace."""
+    if workspace_bytes <= 0:
+        raise ValueError("workspace_bytes must be positive")
+
+    batch: list[tuple[int, tuple[slice, ...]]] = []
+    batch_shape = (0, 0, 0)
+    bytes_per_voxel = 3 * np.dtype(np.float32).itemsize
+
+    for label, base_slices in enumerate(slices_list, start=1):
+        if base_slices is None:
+            continue
+        expanded = tuple(
+            slice(max(0, axis_slice.start - margin), min(axis_size, axis_slice.stop + margin))
+            for axis_slice, axis_size in zip(base_slices, volume_shape, strict=True)
+        )
+        roi_shape = tuple(axis_slice.stop - axis_slice.start for axis_slice in expanded)
+        candidate_shape = tuple(max(current, incoming) for current, incoming in zip(batch_shape, roi_shape))
+        candidate_bytes = bytes_per_voxel * (len(batch) + 1) * math.prod(candidate_shape)
+
+        if batch and candidate_bytes > workspace_bytes:
+            yield batch, batch_shape
+            batch = []
+            batch_shape = (0, 0, 0)
+
+        batch.append((label, expanded))
+        batch_shape = tuple(max(current, incoming) for current, incoming in zip(batch_shape, roi_shape))
+
+    if batch:
+        yield batch, batch_shape
+
+
+def _gaussian_batch_offset(
+    expanded: tuple[slice, ...],
+    batch_shape: tuple[int, int, int],
+    volume_shape: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    """Place clipped ROIs against the matching physical-volume boundary."""
+    offsets = []
+    for axis_slice, canvas_size, volume_size in zip(expanded, batch_shape, volume_shape, strict=True):
+        roi_size = axis_slice.stop - axis_slice.start
+        offsets.append(canvas_size - roi_size if axis_slice.stop == volume_size else 0)
+    return tuple(offsets)
+
+
 def gaussian_smooth_labels_cupy(
     masks: np.ndarray,
     sigma: float | Sequence[float] = (1.5, 3.0, 3.0),
     in_place: bool = True,
     bg_scale: float = 1.0,
     max_expansion: int = 2,
+    batch_workspace_bytes: int = 256 << 20,
 ) -> np.ndarray:
     """
     GPU-accelerated Gaussian label smoothing using CuPy.
@@ -1149,6 +1201,9 @@ def gaussian_smooth_labels_cupy(
     max_expansion : int
         Maximum voxels labels can expand beyond the original foreground.
         Set to 0 to disable expansion constraint. Default 2.
+    batch_workspace_bytes : int
+        Maximum estimated CuPy workspace for a padded label batch. Labels are
+        processed in ascending order, and an oversized ROI runs alone.
 
     Returns
     -------
@@ -1215,34 +1270,33 @@ def gaussian_smooth_labels_cupy(
     # sigma to derive a scalar margin for bounding box expansion.
     margin = int(math.ceil(4.0 * sigma_max))
 
-    for k in range(1, max_label + 1):
-        sl = slices_list[k - 1] if k - 1 < len(slices_list) else None
-        if sl is None:
-            continue
+    volume_shape = tuple(int(size) for size in masks_dev.shape)
+    for batch, batch_shape in _iter_gaussian_label_batches(
+        slices_list,
+        volume_shape=volume_shape,
+        margin=margin,
+        workspace_bytes=batch_workspace_bytes,
+    ):
+        indicators = cp.zeros((len(batch), *batch_shape), dtype=cp.float32)
+        destinations = []
+        for batch_index, (label, expanded) in enumerate(batch):
+            offset = _gaussian_batch_offset(expanded, batch_shape, volume_shape)
+            roi_shape = tuple(axis_slice.stop - axis_slice.start for axis_slice in expanded)
+            destination = tuple(slice(start, start + size) for start, size in zip(offset, roi_shape))
+            indicators[(batch_index, *destination)] = masks_dev[expanded] == label
+            destinations.append(destination)
 
-        # Expand bounding box by margin, clipped to volume
-        base_slices = sl
-        exp_slices = tuple(
-            slice(max(0, s.start - margin), min(dim, s.stop + margin))
-            for s, dim in zip(base_slices, masks_dev.shape)
-        )
+        scores = cp_gaussian_filter(indicators, sigma=(0.0, *sigma_zyx))
+        del indicators
 
-        # Local indicator and Gaussian convolution on device
-        local_mask = masks_dev[exp_slices]
-        local_indicator = (local_mask == k).astype(cp.float32)
-        if not cp.any(local_indicator):
-            continue
-
-        local_score = cp_gaussian_filter(local_indicator, sigma_zyx)
-
-        # Update where this label wins
-        local_best = best_score[exp_slices]
-        update = local_score > local_best
-
-        result_slice = result[exp_slices]
-        result_slice = cp.where(update, k, result_slice)
-        result[exp_slices] = result_slice
-        best_score[exp_slices] = cp.maximum(local_best, local_score)
+        # Preserve the serial strict-greater-than voting and ascending-label tie order.
+        for batch_index, ((label, expanded), destination) in enumerate(zip(batch, destinations, strict=True)):
+            local_score = scores[(batch_index, *destination)]
+            local_best = best_score[expanded]
+            update = local_score > local_best
+            result[expanded] = cp.where(update, label, result[expanded])
+            best_score[expanded] = cp.maximum(local_best, local_score)
+        del scores
 
     # Constrain result to dilated original foreground
     result = cp.where(dilated_constraint, result, 0)

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 FACE_MODE = "face"
 IOU_MODE = "overlap-iou"
+DEFAULT_MODE = IOU_MODE
 STITCH_MODES = (FACE_MODE, IOU_MODE)
 EVIDENCE_SCHEMA = 1
 MAX_CHUNK_BYTES = 32 * 1024**2

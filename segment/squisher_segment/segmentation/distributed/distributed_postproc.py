@@ -106,6 +106,7 @@ import click
 import zarr
 from loguru import logger
 from numpy.typing import NDArray
+from squisher.gpu_retry import run_with_cuda_oom_retry
 
 from squisher_segment.segment.postproc3d import (  # noqa: F401
     absorb_encircled_rois,
@@ -394,22 +395,36 @@ def process_postproc_block(
     t0 = time.perf_counter()
     masks = np.asarray(input_zarr[crop])
     t_read = time.perf_counter()
+    max_label_before = int(masks.max())
     logger.debug(f"  Block {block_index}: read {masks.shape} in {(t_read - t0) * 1000:.1f} ms")
     logger.debug(
         f"  Block {block_index}: dtype={masks.dtype}, contiguous={masks.flags.c_contiguous}, "
-        f"strides={masks.strides}, max_label={int(masks.max())}"
+        f"strides={masks.strides}, max_label={max_label_before}"
     )
 
     # Ensure integer dtype
     if not np.issubdtype(masks.dtype, np.integer):
         masks = masks.astype(np.int32)
 
+    # The unstitched output is a fresh fill-zero Zarr. Preserve zero boundary
+    # faces for stitching, but avoid GPU work and materializing an empty chunk.
+    if max_label_before == 0:
+        masks_cropped, _ = remove_overlaps(masks, crop, overlap, blocksize)
+        faces = [np.zeros(face.shape, dtype=np.uint32) for face in block_faces(masks_cropped)]
+        elapsed_ms = (time.perf_counter() - t_block_start) * 1000
+        logger.debug(f"  Block {block_index}: empty fast path")
+        logger.debug(f"  Block {block_index}: TOTAL {elapsed_ms:.1f} ms (empty fast path)")
+        return (
+            faces,
+            np.empty(0, dtype=np.uint32),
+            np.empty(0, dtype=np.uint64),
+        )
+
     # Relabel to sequential values for efficient processing.
     # Input from distributed_segmentation has sparse bit-packed global IDs which
     # cause O(max_label) allocations in postproc functions. Sequential labels
     # reduce max_label from millions to the actual label count (~1000).
     # Use CuPy for fast GPU-accelerated unique (~100ms vs 4-8s on CPU).
-    max_label_before = int(masks.max())
     t_relabel = time.perf_counter()
     masks = _sequential_labels_cupy(masks)
     t_relabel_done = time.perf_counter()
@@ -431,12 +446,15 @@ def process_postproc_block(
     bg_scale = postproc_kwargs.get("bg_scale", bg_scale)
 
     t1 = time.perf_counter()
-    masks = gaussian_smooth_labels_cupy(
-        masks,
-        sigma=sigma,
-        in_place=True,
-        bg_scale=bg_scale,
-        max_expansion=max_expansion,
+    run_with_cuda_oom_retry(
+        lambda current=masks: gaussian_smooth_labels_cupy(
+            current,
+            sigma=sigma,
+            in_place=True,
+            bg_scale=bg_scale,
+            max_expansion=max_expansion,
+        ),
+        label=f"postproc Gaussian smoothing block {block_index}",
     )
     t_phase1 = time.perf_counter()
     logger.debug(f"  Block {block_index}: Phase 1 (gaussian_smooth) in {(t_phase1 - t1) * 1000:.1f} ms")

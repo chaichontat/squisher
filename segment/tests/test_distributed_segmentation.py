@@ -4,6 +4,7 @@ import warnings
 from pathlib import Path
 
 import dask
+import distributed
 import numpy as np
 import pytest
 import zarr
@@ -440,6 +441,76 @@ def test_cellpose_eval_can_disable_empty_tile_checks() -> None:
     )
 
     assert eval_kwargs["skip_empty_tiles"] is False
+
+
+def test_max_projected_input_reads_source_z_in_chunks(tmp_path: Path) -> None:
+    data = np.arange(5 * 4 * 6 * 2, dtype=np.uint16).reshape(5, 4, 6, 2)
+    source = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=data,
+        chunks=(2, 2, 3, 1),
+    )
+
+    projected = segmentation.MaxProjectedZYXCInput(source)
+
+    assert projected.shape == (1, 4, 6, 2)
+    assert projected.chunks == (1, 2, 3, 1)
+    np.testing.assert_array_equal(
+        projected[0, slice(1, 4), slice(2, 6), :],
+        data[:, 1:4, 2:6, :].max(axis=0),
+    )
+
+
+def test_cellpose_eval_uses_2d_contract_for_max_projection() -> None:
+    eval_kwargs = segmentation._build_cellpose_eval_kwargs(
+        diameter=30,
+        normalization={"lowhigh": [[0.0, 1.0]] * 3},
+        ortho_weights=[3, 1.0, 1.0],
+        flow3d_smooth=1.0,
+        max_project=True,
+    )
+
+    assert eval_kwargs["do_3D"] is False
+    assert eval_kwargs["channel_axis"] == 2
+    assert eval_kwargs["z_axis"] is None
+    assert "ortho_weights" not in eval_kwargs
+
+
+def test_max_project_cellpose_squeezes_input_and_restores_singleton_z(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, data = _write_input(tmp_path / "input.zarr")
+    projected = segmentation.MaxProjectedZYXCInput(source)
+    captured: dict[str, object] = {}
+
+    class Model:
+        def eval(self, image: np.ndarray, **kwargs: object):
+            captured["shape"] = image.shape
+            return np.ones(image.shape[:-1], dtype=np.uint32), [], None, None
+
+    monkeypatch.setattr(segmentation, "get_cached_model", lambda kwargs: Model())
+    monkeypatch.setattr(segmentation.cellpose.io, "logger_setup", lambda **kwargs: None)
+    monkeypatch.setattr(
+        segmentation.cp,
+        "get_default_memory_pool",
+        lambda: type("Pool", (), {"free_all_blocks": lambda self: None})(),
+    )
+
+    masks = segmentation.read_preprocess_and_segment(
+        projected,
+        (slice(0, 1), slice(0, 4), slice(0, 5), slice(0, 3)),
+        (0, 1, 2),
+        None,
+        None,
+        [],
+        {},
+        {"do_3D": False, "channel_axis": 2, "z_axis": None},
+        None,
+    )
+
+    assert captured["shape"] == data.shape[1:]
+    assert masks.shape == (1, 4, 5)
 
 
 def test_channel_selection_rejects_ambiguous_metadata(tmp_path: Path) -> None:
@@ -971,6 +1042,24 @@ def test_typer_segment_run_propagates_nonempty_threshold(
     assert captured["nonempty_threshold"] == 750
 
 
+def test_typer_segment_run_propagates_max_project_2d(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(
+        app,
+        ["segment", "run", str(input_path), "--max-project-2d"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["max_project"] is True
+
+
 def test_typer_segment_run_propagates_overlap_iou(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -998,6 +1087,21 @@ def test_typer_segment_run_propagates_overlap_iou(
     assert captured["stitch_iou_threshold"] == 0.4
 
 
+def test_typer_segment_run_defaults_to_overlap_iou(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = TyperCliRunner().invoke(app, ["segment", "run", str(input_path)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["stitch_mode"] == "overlap-iou"
+
+
 def test_click_segment_run_propagates_nonempty_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1014,6 +1118,39 @@ def test_click_segment_run_propagates_nonempty_threshold(
 
     assert result.exit_code == 0, result.output
     assert captured["nonempty_threshold"] == 750
+
+
+def test_click_segment_run_defaults_to_overlap_iou(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = ClickCliRunner().invoke(segmentation.cli, ["run", str(input_path)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["stitch_mode"] == "overlap-iou"
+
+
+def test_click_segment_run_propagates_max_project_2d(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.zarr"
+    input_path.mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(segmentation, "_run_single_input", lambda **kwargs: captured.update(kwargs))
+
+    result = ClickCliRunner().invoke(
+        segmentation.cli,
+        ["run", str(input_path), "--max-project-2d"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["max_project"] is True
 
 
 def test_typer_segment_run_propagates_per_device_workers(
@@ -1327,11 +1464,15 @@ def test_driver_checkpoints_only_successful_futures(
             self._result = result
             self._error = error
             self.key = "test-future"
+            self.released = False
 
         def result(self) -> object:
             if self._error is not None:
                 raise self._error
             return self._result
+
+        def release(self) -> None:
+            self.released = True
 
     success = ImmediateFuture({"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.25, "n_masks": 4})
     interrupted = ImmediateFuture(error=RuntimeError("worker stopped before completion"))
@@ -1348,6 +1489,8 @@ def test_driver_checkpoints_only_successful_futures(
 
     assert len(failures) == 1
     assert segmentation.load_checkpoint(checkpoint_path) == {(0, 0, 0, 0)}
+    assert success.released
+    assert not interrupted.released
 
 
 def test_driver_waits_before_retrying_failed_block_once(
@@ -1362,6 +1505,9 @@ def test_driver_waits_before_retrying_failed_block_once(
             if self.attempt == 0:
                 raise RuntimeError("worker stopped before completion")
             return {"index": (0, 0, 0, 0), "worker": "gpu-1", "duration_s": 2.0, "n_masks": 3}
+
+        def release(self) -> None:
+            pass
 
     class Client:
         retried: list[object] = []
@@ -1427,6 +1573,79 @@ def test_driver_does_not_retry_checkpoint_failure(
             log=segmentation.logger,
             checkpoint_path=tmp_path / "checkpoint.jsonl",
         )
+
+
+def test_worker_loss_does_not_recompute_checkpointed_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocks = [(0, 0, 0, 0), (0, 0, 1, 0)]
+    retried_block = blocks[1]
+
+    def execution_log(block_index: tuple[int, ...]) -> Path:
+        return tmp_path / f"executions-{'-'.join(map(str, block_index))}.log"
+
+    def run_block(block_index: tuple[int, ...]) -> dict[str, object]:
+        with execution_log(block_index).open("a") as handle:
+            handle.write("run\n")
+        attempts = len(execution_log(block_index).read_text().splitlines())
+        if block_index == retried_block and attempts == 1:
+            raise RuntimeError("worker stopped before completion")
+        return {
+            "index": block_index,
+            "worker": distributed.get_worker().address,
+            "duration_s": 0.0,
+            "n_masks": 1,
+        }
+
+    def execution_counts() -> dict[tuple[int, ...], int]:
+        return {block: len(execution_log(block).read_text().splitlines()) for block in blocks}
+
+    async def lose_worker(dask_scheduler: distributed.Scheduler, address: str) -> None:
+        await dask_scheduler.remove_worker(address, stimulus_id="test-worker-died")
+
+    monkeypatch.setattr(segmentation, "SEGMENTATION_RETRY_DELAY_SECONDS", 0.0)
+    checkpoint_path = tmp_path / "checkpoint.jsonl"
+    with (
+        distributed.LocalCluster(
+            n_workers=3,
+            threads_per_worker=1,
+            processes=False,
+            dashboard_address=":0",
+        ) as cluster,
+        distributed.Client(cluster) as client,
+    ):
+        # Like distributed_eval, the caller keeps every submitted future alive.
+        futures = client.map(run_block, blocks)
+        failures = segmentation._wait_for_futures_retry_once(
+            client=client,
+            futures=futures,
+            future_labels={
+                future: f"block={block}" for future, block in zip(futures, blocks, strict=True)
+            },
+            stage="Segmentation",
+            log=segmentation.logger,
+            checkpoint_path=checkpoint_path,
+        )
+        assert failures == []
+        assert segmentation.load_checkpoint(checkpoint_path) == set(blocks)
+        assert execution_counts() == {blocks[0]: 1, blocks[1]: 2}
+
+        # Driver-to-scheduler messages share one ordered stream, but a released
+        # future's message is queued one client-loop turn later; the second
+        # round trip is therefore handled after every message the driver sent.
+        for _ in range(2):
+            client.submit(int, pure=False).result()
+        result_workers = {
+            json.loads(line)["worker"] for line in checkpoint_path.read_text().splitlines()
+        }
+        for address in result_workers:
+            client.run_on_scheduler(lose_worker, address=address)
+        # Worker removal schedules any recomputation before this later, lower
+        # priority task can run on the surviving single-threaded worker.
+        client.submit(int, pure=False).result()
+
+    assert execution_counts() == {blocks[0]: 1, blocks[1]: 2}
 
 
 def test_stitch_failure_never_exposes_partial_final_output(

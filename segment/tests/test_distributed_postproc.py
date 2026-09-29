@@ -76,6 +76,8 @@ def test_postproc_gpu_smoothing_import_error_is_not_hidden(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from squisher import gpu_retry
+
     input_zarr = zarr.create_array(
         tmp_path / "input.zarr",
         data=np.ones((1, 2, 2), dtype=np.uint32),
@@ -91,6 +93,7 @@ def test_postproc_gpu_smoothing_import_error_is_not_hidden(
     monkeypatch.setattr(postproc.cp, "asnumpy", np.asarray)
     monkeypatch.setattr(postproc.cp, "unique", np.unique)
     monkeypatch.setattr(postproc.cp, "searchsorted", np.searchsorted)
+    monkeypatch.setattr(gpu_retry, "_current_device", lambda: 0)
 
     def fail_gpu_smoothing(*_args: object, **_kwargs: object) -> None:
         raise ImportError("gpu unavailable")
@@ -135,6 +138,113 @@ def test_sequential_labels_cupy_matches_unique_inverse(
 
     assert actual.dtype == np.int32
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_gaussian_smoothing_retries_cuda_oom(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from squisher import gpu_retry
+
+    class FakeCudaOOM(RuntimeError):
+        __module__ = "cupy.cuda.memory"
+
+    attempts = 0
+    cleanups: list[int] = []
+
+    def smooth(masks: np.ndarray, **_kwargs: Any) -> np.ndarray:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FakeCudaOOM("CUDA out of memory")
+        return masks
+
+    monkeypatch.setenv("SQUISHER_GPU_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("SQUISHER_CUDA_OOM_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("SQUISHER_CUDA_OOM_INITIAL_DELAY_SECONDS", "0.01")
+    monkeypatch.setattr(gpu_retry, "_current_device", lambda: 0)
+    monkeypatch.setattr(gpu_retry, "_clear_cuda_memory", cleanups.append)
+    monkeypatch.setattr(gpu_retry.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(postproc, "gaussian_smooth_labels_cupy", smooth)
+    monkeypatch.setattr(postproc.cp, "asarray", np.asarray)
+    monkeypatch.setattr(postproc.cp, "asnumpy", np.asarray)
+    monkeypatch.setattr(postproc.cp, "unique", np.unique)
+    monkeypatch.setattr(postproc.cp, "searchsorted", np.searchsorted)
+    monkeypatch.setattr(
+        postproc.cp,
+        "get_default_memory_pool",
+        lambda: type("Pool", (), {"free_all_blocks": lambda self: None})(),
+    )
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        data=np.ones((2, 3, 4), dtype=np.uint32),
+        chunks=(2, 3, 4),
+    )
+    output_zarr = zarr.create_array(
+        tmp_path / "output.zarr",
+        shape=input_zarr.shape,
+        chunks=input_zarr.chunks,
+        dtype=np.uint32,
+    )
+
+    postproc.process_postproc_block(
+        block_index=(0, 0, 0),
+        crop=tuple(slice(0, size) for size in input_zarr.shape),
+        input_zarr=input_zarr,
+        output_zarr=output_zarr,
+        blocksize=input_zarr.shape,
+        overlap=0,
+        nblocks=np.ones(3, dtype=int),
+        postproc_kwargs={"sigma": (1.0, 2.0, 2.0)},
+    )
+
+    assert attempts == 2
+    assert cleanups == [0]
+
+
+def test_empty_postproc_block_skips_gpu_and_output_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_zarr = zarr.create_array(
+        tmp_path / "input.zarr",
+        shape=(2, 3, 4),
+        chunks=(2, 3, 4),
+        dtype=np.uint32,
+    )
+
+    def reject_gpu(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("empty blocks must not reach the GPU")
+
+    class RejectOutputWrite:
+        def __setitem__(self, _key: object, _value: object) -> None:
+            raise AssertionError("fresh fill-zero output needs no empty chunk write")
+
+    monkeypatch.setattr(postproc.cp, "asarray", reject_gpu)
+
+    faces, box_ids, core_counts = postproc.process_postproc_block(
+        block_index=(0, 0, 0),
+        crop=(slice(0, 2), slice(0, 3), slice(0, 4)),
+        input_zarr=input_zarr,
+        output_zarr=RejectOutputWrite(),
+        blocksize=input_zarr.shape,
+        overlap=0,
+        nblocks=np.ones(3, dtype=int),
+        postproc_kwargs={"sigma": 1.0},
+    )
+
+    assert [face.shape for face in faces] == [
+        (1, 3, 4),
+        (1, 3, 4),
+        (2, 1, 4),
+        (2, 1, 4),
+        (2, 3, 1),
+        (2, 3, 1),
+    ]
+    assert all(not np.any(face) for face in faces)
+    assert box_ids.dtype == np.uint32
+    assert core_counts.dtype == np.uint64
+    assert box_ids.size == core_counts.size == 0
 
 
 def test_zyx_overlap_trimming_covers_each_voxel_once() -> None:
