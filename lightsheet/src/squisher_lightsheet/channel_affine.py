@@ -15,7 +15,9 @@ from scipy.spatial.transform import Rotation
 from squisher_lightsheet import phase_metrics
 from squisher_lightsheet.artifact_io import sha256_file
 from squisher_lightsheet.artifacts import stamp_artifact
+from squisher.gpu_retry import cuda_oom_retry
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
+from squisher_lightsheet._legacy.stitch_20x_tl_multiview import SourceChunkCache
 from squisher_lightsheet.tile_phase import (
     DIMENSIONS,
     _rgb_overlay,
@@ -60,6 +62,8 @@ class RegistrationTransformContract(BaseModel):
             "reference_stage_translation_um",
             "moving_to_reference_channel_affine_um",
             "inverse_moving_stage_translation_um",
+            "fixed_world_residual_affine",
+            "baseline_registered_affine",
         ],
         ...,
     ]
@@ -178,6 +182,7 @@ def _ncc_from_sums(values: np.ndarray, *, min_count: int) -> float | None:
     return float(cross_centered / denominator)
 
 
+@cuda_oom_retry("masked GPU correlation")
 def _corr_gpu(fixed: Any, moving: Any, fixed_mask: Any | None = None) -> float | None:
     import cupy as cp
 
@@ -282,6 +287,7 @@ def _robust_norm_and_content_stats_cupy(volume: Any) -> tuple[Any, dict[str, flo
     return cp.ascontiguousarray(normalized.astype(cp.float32, copy=False)), stats
 
 
+@cuda_oom_retry("GPU robust normalization")
 def _robust_norm_and_content_stats_gpu(volume: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
     import cupy as cp
 
@@ -607,9 +613,11 @@ def apply_channel_affine_registration(
     adapted = json.loads(json.dumps(reference))
     for record in adapted["tiles"]:
         stage = _record_stage_translation_um(record)
+        # The calibration lives in acquisition axes; reflect it onto negatively scaled stage axes.
+        orientation = np.diag([*np.sign(_record_vector_zyx(record, "stage_scale_um")), 1.0])
         record["registered_affine"] = compose_registration_affine(
             reference_affine=record["registered_affine"],
-            channel_affine_um=channel_affine,
+            channel_affine_um=orientation @ channel_affine @ orientation,
             stage_translation_um_zyx=stage,
             moving_stage_translation_um_zyx=stage,
         )
@@ -890,6 +898,7 @@ def _compose_delta(
     )
 
 
+@cuda_oom_retry("channel translation")
 def estimate_translation_gpu(
     fixed_zyx: np.ndarray,
     moving_zyx: np.ndarray,
@@ -941,6 +950,89 @@ def estimate_translation_gpu(
     return float(shift_cpu[0]), float(shift_cpu[1]), float(shift_cpu[2])
 
 
+class StructuralTranslation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    shift_zyx: tuple[float, float, float]
+    peak_ncc: float
+    second_peak_ncc: float
+    at_search_edge: bool
+
+
+@cuda_oom_retry("masked structural translation")
+def masked_structural_translation_gpu(
+    fixed_zyx: Any,
+    moving_zyx: Any,
+    *,
+    fixed_mask: Any,
+    moving_support: Any,
+    max_shift_zyx: tuple[int, int, int],
+    highpass_sigma_zyx: tuple[float, float, float],
+    exclusion_radius_zyx: tuple[int, int, int],
+    overlap_ratio: float = 0.3,
+) -> StructuralTranslation:
+    """Bounded masked-NCC translation search on in-mask high-passed structure.
+
+    The shift follows ``estimate_translation_gpu``: it is the translation to apply
+    to ``moving_zyx`` to register it onto ``fixed_zyx``. The second peak is the
+    best score outside ``exclusion_radius_zyx`` of the peak within the bounds.
+    """
+    import cupy as cp
+    from cucim.skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
+    from cupyx.scipy.ndimage import gaussian_filter
+
+    fixed = cp.asarray(fixed_zyx, dtype=cp.float32)
+    moving = cp.asarray(moving_zyx, dtype=cp.float32)
+    fixed_valid = cp.asarray(fixed_mask, dtype=cp.bool_)
+    moving_valid = cp.asarray(moving_support, dtype=cp.bool_)
+    if not (fixed.shape == moving.shape == fixed_valid.shape == moving_valid.shape):
+        raise ValueError(
+            "structural translation inputs must share one shape, got "
+            f"{fixed.shape}, {moving.shape}, {fixed_valid.shape}, {moving_valid.shape}"
+        )
+
+    def highpass(values: Any, valid: Any) -> Any:
+        weight = valid.astype(cp.float32)
+        local_mean = gaussian_filter(values * weight, highpass_sigma_zyx) / cp.maximum(
+            gaussian_filter(weight, highpass_sigma_zyx), cp.float32(1e-6)
+        )
+        return cp.where(valid, values - local_mean, cp.float32(0.0))
+
+    xcorr = cross_correlate_masked(
+        highpass(moving, moving_valid),
+        highpass(fixed, fixed_valid),
+        moving_valid,
+        fixed_valid,
+        axes=(0, 1, 2),
+        mode="full",
+        overlap_ratio=float(overlap_ratio),
+    )
+    # cucim maps full-mode index i to shift (shape - 1 - i).
+    origin = np.asarray(fixed.shape, dtype=np.int64) - 1
+    bounds = np.asarray(max_shift_zyx, dtype=np.int64)
+    window = cp.nan_to_num(
+        xcorr[tuple(slice(o - b, o + b + 1) for o, b in zip(origin, bounds, strict=True))],
+        nan=-1.0,
+    )
+    peak_index = np.asarray(
+        [int(value) for value in cp.unravel_index(cp.argmax(window), window.shape)], dtype=np.int64
+    )
+    peak = float(window[tuple(peak_index)])
+    radius = np.asarray(exclusion_radius_zyx, dtype=np.int64)
+    excluded = window.copy()
+    excluded[
+        tuple(slice(max(0, int(i - r)), int(i + r + 1)) for i, r in zip(peak_index, radius, strict=True))
+    ] = -1.0
+    shift = -(peak_index - bounds)
+    return StructuralTranslation(
+        shift_zyx=(float(shift[0]), float(shift[1]), float(shift[2])),
+        peak_ncc=peak,
+        second_peak_ncc=float(cp.max(excluded)),
+        at_search_edge=bool(np.any(np.abs(shift) == bounds)),
+    )
+
+
+@cuda_oom_retry("channel affine fit")
 def fit_affine_gpu(
     fixed: np.ndarray,
     moving: np.ndarray,
@@ -1018,12 +1110,14 @@ def _transform_volume_cupy(volume: Any, matrix: np.ndarray, translation: np.ndar
     )
 
 
+@cuda_oom_retry("channel volume transform")
 def transform_volume_gpu(volume: np.ndarray, matrix: np.ndarray, translation: np.ndarray) -> np.ndarray:
     import cupy as cp
 
     return cp.asnumpy(_transform_volume_cupy(volume, matrix, translation))
 
 
+@cuda_oom_retry("transformed channel correlation")
 def transformed_corr_gpu(
     fixed: np.ndarray,
     moving: np.ndarray,
@@ -1223,6 +1317,7 @@ def _ncc_from_axis_sums(values: np.ndarray) -> list[float]:
     return components
 
 
+@cuda_oom_retry("gradient-component NCC")
 def gradient_component_ncc_3d_gpu_fused(fixed: np.ndarray, moving: np.ndarray, fixed_mask: Any | None = None) -> dict[str, Any]:
     """Compute Sobel-component NCC in one CUDA pass over the interior voxels.
 
@@ -1287,6 +1382,7 @@ def _read_level0_crop(
     channel: int,
     start_zyx: np.ndarray,
     crop_shape_zyx: tuple[int, int, int],
+    source_cache: SourceChunkCache | None = None,
 ) -> tuple[np.ndarray, list[list[int]]]:
     starts = [int(value) for value in start_zyx]
     stops = [start + int(crop) for start, crop in zip(starts, crop_shape_zyx, strict=True)]
@@ -1297,6 +1393,7 @@ def _read_level0_crop(
         z_indices=z_indices,
         y_slice=slice(starts[1], stops[1]),
         x_slice=slice(starts[2], stops[2]),
+        source_cache=source_cache,
     )
     return volume, [[int(start), int(stop)] for start, stop in zip(starts, stops, strict=True)]
 
@@ -1321,6 +1418,7 @@ def _candidate_starts(size: int, window: int) -> list[int]:
     return starts
 
 
+@cuda_oom_retry("content-selection maps")
 def _content_selection_maps_gpu(
     fixed_sampled: np.ndarray,
     moving_registered_sampled: np.ndarray,

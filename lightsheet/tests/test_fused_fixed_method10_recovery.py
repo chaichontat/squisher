@@ -12,14 +12,11 @@ from scipy.linalg import polar
 from scipy.spatial.transform import Rotation
 import zarr
 
+from squisher_lightsheet import fused_fixed_recovery
+
 
 def _load_recovery():
-    path = Path(__file__).parents[1] / "scripts" / "recover_fused_fixed_method10_outliers.py"
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return fused_fixed_recovery
 
 
 def _load_trial():
@@ -161,7 +158,7 @@ def test_linear_field_prediction_is_global_least_squares_model() -> None:
 
 def test_decomposed_affine_mean_wraps_rotations_and_averages_stretch() -> None:
     recovery = _load_recovery()
-    rotations = Rotation.from_euler("z", [179.0, -179.0], degrees=True).as_matrix()
+    rotations = Rotation.from_euler("z", [[179.0], [-179.0]], degrees=True).as_matrix()
     stretches = np.asarray(
         [
             [[1.0, 0.01, 0.0], [0.01, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -441,6 +438,77 @@ def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path) ->
     assert result["native_rerun_selected"] is True
 
 
+def test_finalized_native_rerun_is_stable_on_resume(tmp_path: Path) -> None:
+    recovery = _load_recovery()
+    original_path = tmp_path / "input" / "window.json"
+    output_dir = tmp_path / "output"
+    output_path = output_dir / "window_json" / original_path.name
+    row = {
+        **_recovery_row(),
+        "status": "rejected",
+        "rejection_reason": "quality_gate_grad_ncc",
+    }
+    recovery._write_json(
+        output_path,
+        {
+            **row,
+            "method8_attempts": [{"name": "native"}],
+            "selected_gradient_component_ncc_mean": 0.2,
+        },
+    )
+    task = {
+        "row": row,
+        "original_path": original_path,
+        "transform": np.r_[np.eye(3).ravel(), [1.0, 2.0, 3.0]],
+        "provenance": {
+            "source_window_json": str(original_path.resolve()),
+            "maximum_refit_displacement_px": 10.0,
+        },
+    }
+
+    first = recovery._finalize_native_rerun(
+        task,
+        output_dir=output_dir,
+        native_method="method6",
+    )
+    first_row = recovery._read_json(output_path)
+    second = recovery._finalize_native_rerun(
+        task,
+        output_dir=output_dir,
+        native_method="method6",
+    )
+
+    assert second == first
+    assert recovery._read_json(output_path) == first_row
+
+
+def test_aggregate_status_counts_replace_inherited_counts() -> None:
+    recovery = _load_recovery()
+    summary = {
+        "aggregate": {
+            "window_count": 99,
+            "accepted_window_count": 99,
+            "rejected_window_count": 0,
+            "error_window_count": 0,
+        },
+        "windows": [
+            {"status": "accepted"},
+            {"status": "rejected"},
+            {"status": "error"},
+        ],
+    }
+
+    assert recovery._aggregate_with_status_counts(summary) == {
+        "window_count": 3,
+        "accepted_window_count": 1,
+        "rejected_window_count": 1,
+        "error_window_count": 1,
+        "accepted": 1,
+        "rejected": 1,
+        "error": 1,
+    }
+
+
 def test_improving_spatial_refit_ignores_displacement_bound(tmp_path: Path) -> None:
     recovery = _load_recovery()
     original_path = tmp_path / "input" / "window.json"
@@ -717,6 +785,7 @@ def test_final_linear_replacement_skips_insufficient_support(
             output_dir=tmp_path / "output",
             minimum_smoothing_samples=4,
             maximum_outlier_px=5.0,
+            replacement_image_ncc_margin=0.02,
         )
     )
     result = recovery._read_json(result_path)
@@ -727,6 +796,108 @@ def test_final_linear_replacement_skips_insufficient_support(
     assert result["final_linear_interpolation"]["tiles"][0]["status"] == (
         "skipped_insufficient_support"
     )
+
+
+@pytest.mark.parametrize(
+    ("scores", "replaced"),
+    [
+        (([0.6, 0.6], [0.3, 0.3]), False),
+        (([0.6, 0.6], [0.61, 0.61]), False),
+        (([0.3, 0.3], [0.6, 0.6]), True),
+        (([0.3, 0.7], [0.6, 0.6]), False),
+        (([], []), False),
+    ],
+)
+def test_final_linear_replacement_requires_image_evidence(
+    tmp_path: Path, monkeypatch, scores, replaced
+) -> None:
+    recovery = _load_recovery()
+    moving_position_path = tmp_path / "positions.json"
+    fixed_path = tmp_path / "fixed.zarr"
+    recovery._write_json(
+        moving_position_path,
+        {
+            "tiles": [
+                {
+                    "tile": "sample.001",
+                    "scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+                    "translation_um": {"z": 0.0, "y": 0.0, "x": 0.0},
+                }
+            ]
+        },
+    )
+    zarr.open_group(fixed_path, mode="w")
+    monkeypatch.setattr(
+        recovery.ngff,
+        "scale_translation",
+        lambda _group: (["z", "y", "x"], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], True, True),
+    )
+    scored = []
+
+    def plane_scores(row, transforms):
+        scored.append((row["moving_start_l0_zyx"], [transform.copy() for transform in transforms]))
+        return [list(value) for value in scores]
+
+    monkeypatch.setattr(
+        recovery, "window_image_scorer", lambda _summary: SimpleNamespace(plane_scores=plane_scores)
+    )
+    outlier_index = 4
+    compact = []
+    for index, (z, y) in enumerate((z, y) for z in range(3) for y in range(2)):
+        start = [10 * z, 10 * y, 0]
+        row = {
+            **_recovery_row(),
+            "moving_tile": "sample.001",
+            "selected_attempt": "native_method6_from_phase_primed_initializer",
+            "moving_start_l0_zyx": start,
+            "moving_stop_l0_zyx": [value + 10 for value in start],
+            "fixed_start_zyx": start,
+            "fixed_stop_zyx": [value + 10 for value in start],
+            "selected_local_translation_zyx": [0.0, 0.0, 50.0 if index == outlier_index else 0.0],
+        }
+        path = tmp_path / "input" / f"window-{index}.json"
+        path.parent.mkdir(exist_ok=True)
+        recovery._write_json(path, row)
+        compact.append({"level0_json": str(path), "status": "accepted"})
+    summary_path = tmp_path / "summary.json"
+    recovery._write_json(
+        summary_path,
+        {
+            "moving_position": str(moving_position_path),
+            "fixed_fused": str(fixed_path),
+            "cache_config": {"native_method": "method6"},
+            "windows": compact,
+        },
+    )
+
+    result = recovery._read_json(
+        recovery.smooth_final_linear_mapping(
+            SimpleNamespace(
+                summary=summary_path,
+                output_dir=tmp_path / "output",
+                minimum_smoothing_samples=4,
+                maximum_outlier_px=5.0,
+                replacement_image_ncc_margin=0.02,
+            )
+        )
+    )
+    outlier = recovery._read_json(Path(result["windows"][outlier_index]["level0_json"]))
+
+    assert [start for start, _transforms in scored] == [[20, 0, 0]]
+    np.testing.assert_allclose(scored[0][1][0][9:], [0.0, 0.0, 50.0])
+    np.testing.assert_allclose(scored[0][1][1][9:], [0.0, 0.0, 0.0], atol=1e-9)
+    report = result["final_linear_interpolation"]
+    assert report["interpolated_window_count"] == int(replaced)
+    assert report["image_retained_outlier_count"] == int(not replaced)
+    if replaced:
+        assert outlier["selected_attempt"] == "linear_interpolated_method6_outlier_replacement"
+        assert outlier["final_linear_interpolation"]["replacement_image_ncc_planes"] == scores[1]
+        assert "final_linear_image_retained" not in outlier
+    else:
+        assert outlier["selected_attempt"] == "native_method6_from_phase_primed_initializer"
+        assert outlier["selected_local_translation_zyx"] == [0.0, 0.0, 50.0]
+        assert outlier["final_linear_image_retained"]["fitted_image_ncc_planes"] == scores[0]
+        assert "final_linear_interpolation" not in outlier
 
 
 def test_adjacent_translation_initializer_collapses_duplicate_window_coordinates() -> None:
@@ -766,7 +937,11 @@ def test_recovery_uses_persistent_sweep_worker(monkeypatch) -> None:
     recovery = _load_recovery()
     parsed: list[str] = []
     parser = SimpleNamespace(parse_args=lambda arguments: parsed.extend(arguments) or arguments)
-    monkeypatch.setattr(recovery, "_load_sweep_module", lambda: SimpleNamespace(build_parser=lambda: parser))
+    monkeypatch.setattr(
+        recovery,
+        "_load_sweep_module",
+        lambda _sweep_runner: SimpleNamespace(build_parser=lambda: parser),
+    )
     cache = {
         "native_method": "method6",
         "fit_intensity_transform": "linear",
@@ -802,7 +977,7 @@ def test_recovery_uses_persistent_sweep_worker(monkeypatch) -> None:
         "resume": True,
     }
 
-    recovery._persistent_sweep_args(cache=cache, **sweep_kwargs)
+    recovery._persistent_sweep_args(cache=cache, source_cache_max_gib=8.0, **sweep_kwargs)
 
     assert parsed[parsed.index("--level0-initializer") + 1] == "window-interpolated"
     assert parsed[parsed.index("--native-method") + 1] == "method6"
@@ -810,6 +985,7 @@ def test_recovery_uses_persistent_sweep_worker(monkeypatch) -> None:
     assert "--starting-affine-matrix-zyx" not in parsed
     assert parsed[parsed.index("--workers") + 1] == "1"
     assert parsed[parsed.index("--max-tasks-per-worker") + 1] == "711"
+    assert parsed[parsed.index("--source-cache-max-gib") + 1] == "8.0"
     assert "--resume" in parsed
     assert "--no-resume" not in parsed
 
@@ -825,3 +1001,107 @@ def test_persistent_sweep_worker_is_picklable_for_spawn() -> None:
     sweep = recovery._load_sweep_module()
 
     pickle.dumps(sweep._init_cuda_worker)
+
+
+def _manual_entry(**overrides):
+    entry = {
+        "moving_tile": "sample.001",
+        "moving_start_l0_zyx": [0, 0, 0],
+        "local_matrix_zyx": np.eye(3).tolist(),
+        "local_translation_zyx": [1.0, 2.0, 44.0],
+        "seed_origin": "manual",
+        "evidence": "candidate c1 on candidates_514.png",
+    }
+    return {**entry, **overrides}
+
+
+def _write_manual(path: Path, entries: dict) -> None:
+    path.write_text(
+        json.dumps({"artifact_type": fused_fixed_recovery.MANUAL_INITIALIZATIONS_ARTIFACT, "channels": {"514": entries}})
+    )
+
+
+def test_manual_initializations_load_by_channel(tmp_path: Path) -> None:
+    path = tmp_path / "manual.json"
+    _write_manual(path, {"w.json": _manual_entry()})
+
+    assert set(fused_fixed_recovery.load_manual_initializations(path, channel="514")) == {"w.json"}
+    assert fused_fixed_recovery.load_manual_initializations(path, channel="405") == {}
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ({k: v for k, v in _manual_entry().items() if k != "evidence"}, "missing"),
+        (_manual_entry(seed_origin="guess"), "seed_origin"),
+        (_manual_entry(local_matrix_zyx=(2 * np.eye(3)).tolist()), "plausible"),
+    ],
+)
+def test_manual_initializations_reject_invalid_entries(tmp_path: Path, entry, message) -> None:
+    path = tmp_path / "manual.json"
+    _write_manual(path, {"w.json": entry})
+
+    with pytest.raises(ValueError, match=message):
+        fused_fixed_recovery.load_manual_initializations(path, channel="514")
+
+
+def _manual_records(tmp_path: Path):
+    rows = {
+        "interpolated.json": {**_recovery_row(), "moving_tile": "sample.001", "status": "rejected"},
+        "untargeted.json": {**_recovery_row(), "moving_tile": "sample.001", "moving_start_l0_zyx": [0, 0, 480]},
+        "masked.json": {
+            **_recovery_row(),
+            "moving_tile": "sample.001",
+            "status": "rejected",
+            "rejection_reason": "fixed_threshold_mask_empty",
+        },
+    }
+    return [(tmp_path / name, row) for name, row in rows.items()]
+
+
+def test_manual_initialization_replaces_or_adds_recovery_seed(tmp_path: Path) -> None:
+    records = _manual_records(tmp_path)
+    interpolated = np.concatenate([np.eye(3).ravel(), [0.0, 0.0, 5.0]])
+    recovery_by_path = {
+        records[0][0]: {"row": records[0][1], "transform": interpolated, "provenance": {"reason": "interp"}}
+    }
+
+    fused_fixed_recovery._apply_manual_initializations(
+        entries={
+            "interpolated.json": _manual_entry(),
+            "untargeted.json": _manual_entry(moving_start_l0_zyx=[0, 0, 480], local_translation_zyx=[0.0, 0.0, 7.0]),
+        },
+        records=records,
+        recovery_by_path=recovery_by_path,
+        provenance_base=lambda _path, _row: {"reason": "manual_initialization"},
+        source={"path": "manual.json", "sha256": "abc", "channel": "514"},
+    )
+
+    replaced = recovery_by_path[records[0][0]]
+    added = recovery_by_path[records[1][0]]
+    np.testing.assert_allclose(replaced["transform"][9:], [1.0, 2.0, 44.0])
+    assert replaced["provenance"]["reason"] == "interp"
+    assert replaced["provenance"]["initializer_source"] == "manual"
+    assert replaced["provenance"]["manual_initialization"]["replaced_initializer_local_translation_zyx"] == [0.0, 0.0, 5.0]
+    np.testing.assert_allclose(added["transform"][9:], [0.0, 0.0, 7.0])
+    assert added["provenance"]["reason"] == "manual_initialization"
+    assert added["provenance"]["manual_initialization"]["replaced_initializer_local_translation_zyx"] is None
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ({"gone.json": _manual_entry()}, "absent from the summary"),
+        ({"interpolated.json": _manual_entry(moving_start_l0_zyx=[0, 0, 4])}, "moving_start_l0_zyx"),
+        ({"masked.json": _manual_entry()}, "mask-rejected"),
+    ],
+)
+def test_manual_initialization_fails_on_stale_or_unfittable_entries(tmp_path: Path, entries, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        fused_fixed_recovery._apply_manual_initializations(
+            entries=entries,
+            records=_manual_records(tmp_path),
+            recovery_by_path={},
+            provenance_base=lambda _path, _row: {},
+            source={},
+        )

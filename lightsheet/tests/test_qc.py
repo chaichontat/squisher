@@ -97,6 +97,81 @@ def test_write_contact_sheet_stacks_images_with_titles(tmp_path) -> None:
     assert sheet.size == (20, 76)
 
 
+def _write_complete_fused_store(
+    path: Path, data: np.ndarray, *, scale: list[float] | None = None
+) -> None:
+    root = zarr.open_group(path, mode="w")
+    array = root.create_array(
+        "0", data=data.astype(np.uint16), chunks=(1, *data.shape[1:])
+    )
+    assert array.shape == data.shape
+    root.attrs["squisher_complete"] = True
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {
+                                "type": "scale",
+                                "scale": [1.0, 2.0, 2.0]
+                                if scale is None
+                                else scale,
+                            },
+                            {"type": "translation", "translation": [5.0, 0.0, 0.0]},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_render_fused_middle_z_qc_validates_grid_and_writes_pngs(tmp_path) -> None:
+    fixed = tmp_path / "fixed.ome.zarr"
+    moving = tmp_path / "moving.ome.zarr"
+    data = np.arange(3 * 8 * 10, dtype=np.uint16).reshape(3, 8, 10)
+    _write_complete_fused_store(fixed, data)
+    _write_complete_fused_store(moving, data + 10)
+
+    result = qc.render_fused_middle_z_qc(
+        channels=[("fixed", fixed), ("moving", moving)],
+        fixed_volume=fixed,
+        output_dir=tmp_path / "qc",
+        level=0,
+        contact_sheet_name="review.png",
+    )
+
+    assert len(result.images) == 2
+    assert all(path.is_file() for path in result.images)
+    assert result.contact_sheet is not None and result.contact_sheet.is_file()
+    image = Image.open(result.images[0])
+    assert image.size == (10, 84)
+    assert image.text["Fixed Z index"] == "1"
+    assert image.text["Plane statistic"] == (
+        "single fixed-grid middle-Z plane; no Z projection"
+    )
+
+
+def test_render_fused_middle_z_qc_rejects_transform_mismatch(tmp_path) -> None:
+    fixed = tmp_path / "fixed.ome.zarr"
+    moving = tmp_path / "moving.ome.zarr"
+    data = np.ones((3, 8, 10), dtype=np.uint16)
+    _write_complete_fused_store(fixed, data)
+    _write_complete_fused_store(moving, data, scale=[1.0, 3.0, 2.0])
+
+    with pytest.raises(ValueError, match="grid transform differs"):
+        qc.render_fused_middle_z_qc(
+            channels=[("fixed", fixed), ("moving", moving)],
+            fixed_volume=fixed,
+            output_dir=tmp_path / "qc",
+            level=0,
+        )
+
+
 def test_default_fused_tile_index_overlay_path_replaces_level0_token() -> None:
     path = Path("/run/Image_10.in-Image_14.fused.level0.ch1.ome.zarr")
 

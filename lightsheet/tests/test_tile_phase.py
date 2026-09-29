@@ -9,6 +9,7 @@ import pytest
 
 from squisher_lightsheet import cli as cli_module
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
+from squisher_lightsheet._legacy import stitch_20x_tl_multiview as fusion_legacy
 from squisher_lightsheet import tile_phase as tile_phase_module
 from squisher_lightsheet.tile_phase import (
     adapt_registration_from_reference,
@@ -113,6 +114,14 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
         y_slice=slice(2, 5),
         x_slice=slice(1, 4),
     )
+    moving_cached_patch = tile_phase_module.read_tile_indexed_z_patch(
+        moving,
+        channel=1,
+        z_indices=np.arange(1, 3, dtype=np.int64),
+        y_slice=slice(2, 5),
+        x_slice=slice(1, 4),
+        source_cache=fusion_legacy.SourceChunkCache(max_bytes=4096),
+    )
     moving_from_path = tile_phase_module.make_moving_tile_record(reference, czyx_path)
     scout, scale_zyx, source_level, available_levels, z_indices_l0 = tile_phase_module.sampled_tile_volume_from_subifd(
         moving,
@@ -136,6 +145,7 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
     np.testing.assert_array_equal(fixed_patch, zyx_level0[1:3, 2:5, 1:4])
     np.testing.assert_array_equal(moving_patch, czyx_level0[1, 1:3, 2:5, 1:4])
     np.testing.assert_array_equal(moving_indexed_patch, czyx_level0[1, 1:3, 2:5, 1:4])
+    np.testing.assert_array_equal(moving_cached_patch, moving_indexed_patch)
     np.testing.assert_array_equal(scout, czyx_level1[1])
     np.testing.assert_array_equal(scale_zyx, [2.0, 2.0, 2.0])
     np.testing.assert_array_equal(z_indices_l0, [0, 2])
@@ -148,6 +158,96 @@ def test_tile_phase_reads_zyx_and_czyx_ome_zarr_tiles(tmp_path) -> None:
     assert position_record["translation_um"] == {"z": 1.5, "y": 3.5, "x": 5.5}
     assert source_level == 1
     assert available_levels == 2
+
+
+def test_indexed_z_crop_reuses_raw_shards_without_changing_pixels(tmp_path: Path) -> None:
+    import zarr
+
+    path = tmp_path / "tile.ome.zarr"
+    data = np.arange(2 * 5 * 6 * 8, dtype=np.uint16).reshape(2, 5, 6, 8)
+    group = zarr.open_group(str(path), mode="w", zarr_format=3)
+    group.create_array(
+        "0",
+        data=data,
+        chunks=(1, 1, 2, 2),
+        shards=(1, 2, 4, 4),
+        dimension_names=("c", "z", "y", "x"),
+    )
+    tile = rough_legacy.TileRecord(
+        tile=path.name,
+        side="L",
+        path=path,
+        translation_zyx_um=np.zeros(3),
+        scale_zyx_um=np.ones(3),
+        shape_zyx=np.asarray([5, 6, 8]),
+        axes="CZYX",
+    )
+    cache = fusion_legacy.SourceChunkCache(max_bytes=1024)
+
+    first = tile_phase_module.read_tile_indexed_z_patch(
+        tile,
+        channel=0,
+        z_indices=np.arange(0, 3),
+        y_slice=slice(1, 5),
+        x_slice=slice(1, 5),
+        source_cache=cache,
+    )
+    first[:] = 0
+    second = tile_phase_module.read_tile_indexed_z_patch(
+        tile,
+        channel=0,
+        z_indices=np.arange(1, 4),
+        y_slice=slice(2, 5),
+        x_slice=slice(2, 6),
+        source_cache=cache,
+    )
+    np.testing.assert_array_equal(second, data[0, 1:4, 2:5, 2:6])
+    assert cache.cache.hits == 8
+    assert cache.cache.misses == 8
+
+    reversed_tile = rough_legacy.TileRecord(
+        tile=path.name,
+        side="L",
+        path=path,
+        translation_zyx_um=np.zeros(3),
+        scale_zyx_um=-np.ones(3),
+        shape_zyx=np.asarray([5, 6, 8]),
+        axes="CZYX",
+    )
+    reversed_crop = tile_phase_module.read_tile_indexed_z_patch(
+        reversed_tile,
+        channel=1,
+        z_indices=np.asarray([4, 3, 2]),
+        y_slice=slice(1, 5),
+        x_slice=slice(1, 5),
+        source_cache=cache,
+    )
+    np.testing.assert_array_equal(reversed_crop, np.flip(data[1], axis=(0, 1, 2))[4:1:-1, 1:5, 1:5])
+    assert cache.cache.misses > 8
+
+    uncached = fusion_legacy.SourceChunkCache(max_bytes=0)
+    no_cache_crop = tile_phase_module.read_tile_indexed_z_patch(
+        tile,
+        channel=0,
+        z_indices=np.arange(0, 3),
+        y_slice=slice(1, 5),
+        x_slice=slice(1, 5),
+        source_cache=uncached,
+    )
+    np.testing.assert_array_equal(no_cache_crop, data[0, 0:3, 1:5, 1:5])
+    assert uncached.cache.hits == uncached.cache.misses == 0
+
+    small_cache = fusion_legacy.SourceChunkCache(max_bytes=64)
+    evicted_crop = tile_phase_module.read_tile_indexed_z_patch(
+        tile,
+        channel=0,
+        z_indices=np.arange(0, 3),
+        y_slice=slice(1, 5),
+        x_slice=slice(1, 5),
+        source_cache=small_cache,
+    )
+    np.testing.assert_array_equal(evicted_crop, data[0, 0:3, 1:5, 1:5])
+    assert small_cache.cache.evictions > 0
 
 
 @pytest.mark.parametrize(

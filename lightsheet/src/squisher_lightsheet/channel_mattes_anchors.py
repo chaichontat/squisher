@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as rough_legacy
+from squisher.gpu_retry import cuda_oom_retry, run_with_cuda_oom_retry
 from squisher_lightsheet.tiff import choose_tiff_source_level
 
 
@@ -319,6 +320,7 @@ def highpass_gpu(values: np.ndarray, sigma_zyx: tuple[float, float, float]) -> A
     return gpu
 
 
+@cuda_oom_retry("high-frequency content score")
 def high_frequency_content_score(
     values: np.ndarray,
     *,
@@ -387,21 +389,30 @@ def highpass_candidate_centers_for_site(
         float(sigma * level_spacing[index] / source_spacing[index])
         for index, sigma in enumerate(parameters.high_frequency_content_sigma_zyx)
     )
-    highpass = highpass_gpu(crop, sigma_source)
-    score_map_gpu = structure_tensor_response_gpu(highpass)
-    footprint = cp.ones(tuple(int(max(value // 4, 3)) for value in patch_shape_source), dtype=cp.bool_)
-    coords_gpu = cu_feature.corner_peaks(
-        score_map_gpu,
-        min_distance=1,
-        threshold_rel=0.0,
-        exclude_border=False,
-        footprint=footprint,
-        num_peaks=parameters.candidate_pool_size,
+    def detect_candidates():
+        highpass = highpass_gpu(crop, sigma_source)
+        score_map_gpu = structure_tensor_response_gpu(highpass)
+        footprint = cp.ones(
+            tuple(int(max(value // 4, 3)) for value in patch_shape_source),
+            dtype=cp.bool_,
+        )
+        coords_gpu = cu_feature.corner_peaks(
+            score_map_gpu,
+            min_distance=1,
+            threshold_rel=0.0,
+            exclude_border=False,
+            footprint=footprint,
+            num_peaks=parameters.candidate_pool_size,
+        )
+        result = cp.asnumpy(score_map_gpu), cp.asnumpy(coords_gpu)
+        del highpass, score_map_gpu, coords_gpu, footprint
+        cp.get_default_memory_pool().free_all_blocks()
+        return result
+
+    score_map, coords = run_with_cuda_oom_retry(
+        detect_candidates,
+        label="Mattes anchor candidate detection",
     )
-    score_map = cp.asnumpy(score_map_gpu)
-    coords = cp.asnumpy(coords_gpu)
-    del highpass, score_map_gpu, coords_gpu, footprint
-    cp.get_default_memory_pool().free_all_blocks()
 
     records = []
     for local_coord in coords:
@@ -856,6 +867,7 @@ def fft_gaussian_highpass_weight(shape: tuple[int, ...], sigma_zyx: tuple[float,
     return (1.0 - cp.exp(-exponent)).astype(cp.float32, copy=False)
 
 
+@cuda_oom_retry("phase correlation")
 def phasecorr_shift_gpu(
     fixed: np.ndarray,
     moving: np.ndarray,

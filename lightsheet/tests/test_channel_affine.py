@@ -1376,3 +1376,65 @@ def test_affine_12dof_batch_still_uses_rigid_quaternion_prior(tmp_path, monkeypa
     assert summary["running_affine_mean"]["fit_mode"] == "affine-12dof"
     assert summary["running_affine_mean"]["method"] == "rigid_quaternion_rotation_mean"
     assert summary["running_affine_mean"]["prior_transform_family"] == "rigid"
+
+
+def test_apply_channel_affine_conjugates_by_negative_stage_axes(tmp_path: Path) -> None:
+    flipped = _czyx_registration_record(
+        tmp_path / "flipped.ome.zarr",
+        tile="flipped.ome.zarr",
+        stage=(4.0, 80.0, 100.0),
+        registered=np.eye(4),
+        scale_zyx=(-0.6, 0.3, -0.3),
+    )
+    reference_path = tmp_path / "reference.json"
+    reference_path.write_text(json.dumps({"tiles": [flipped]}))
+    channel_affine = np.eye(4, dtype=np.float64)
+    channel_affine[:3, :3] = [[1.0, 0.01, 0.02], [0.03, 1.001, 0.04], [0.05, 0.06, 0.999]]
+    channel_affine[:3, 3] = [0.5, 0.6, 0.7]
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "squisher_lightsheet.global_channel_affine_registration.v1",
+                "transform_contract": RegistrationTransformContract(
+                    registered_affine_semantics="moving_tile_stage_um_to_reference_registered_um",
+                    source_space="638_stage_um",
+                    target_space="561_registered_um",
+                    composition_order=(
+                        "reference_registered_affine",
+                        "reference_stage_translation_um",
+                        "moving_to_reference_channel_affine_um",
+                        "inverse_moving_stage_translation_um",
+                    ),
+                    registered_affine_contains_full_channel_affine=True,
+                    stage_translation_source="reference_registration_input",
+                ).model_dump(mode="json", by_alias=True),
+                "diagnostics": {
+                    "global_channel_affine": {"channel_affine_um_zyx_homogeneous": channel_affine.tolist()}
+                },
+            }
+        )
+    )
+    output_path = tmp_path / "output.json"
+
+    apply_channel_affine_registration(
+        reference_registration_input=reference_path,
+        calibration_registration_input=calibration_path,
+        expected_calibration_sha256=hashlib.sha256(calibration_path.read_bytes()).hexdigest(),
+        output_registration=output_path,
+        expected_moving_channel=1,
+        source_label="638",
+        target_label="561",
+    )
+
+    # The calibration lives in acquisition axes; a tile stored with negative Z/X stage scales sees
+    # it reflected on those axes about its index-zero stage position.
+    reflection = np.diag([-1.0, 1.0, -1.0, 1.0])
+    expected = compose_registration_affine(
+        reference_affine=flipped["registered_affine"],
+        channel_affine_um=reflection @ channel_affine @ reflection,
+        stage_translation_um_zyx=np.asarray([4.0, 80.0, 100.0]),
+        moving_stage_translation_um_zyx=np.asarray([4.0, 80.0, 100.0]),
+    )
+    output = json.loads(output_path.read_text())
+    np.testing.assert_allclose(output["tiles"][0]["registered_affine"]["matrix"], expected["matrix"])

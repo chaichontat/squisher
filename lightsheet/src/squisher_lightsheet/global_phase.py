@@ -8,11 +8,11 @@ from typing import Any
 
 import numpy as np
 from scipy import ndimage
+from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 
 from squisher.jpegxr_zarr import register_jpegxr_codec
 from squisher_lightsheet import phase_metrics, qc
 from squisher_lightsheet._legacy import rough_align_tltr_center_z_phase as legacy
-from squisher_lightsheet.channel_mattes_anchors import phasecorr_shift_gpu
 from squisher_lightsheet.orthogonal_phase import (
     DEFAULT_LATERAL_FACTOR as DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
     IntensityTransform,
@@ -25,7 +25,8 @@ from squisher_lightsheet.orthogonal_phase import (
 DIMENSIONS = ("z", "y", "x")
 DEFAULT_LEVEL = 4
 DEFAULT_Z_SLAB_PLANES = 32
-DEFAULT_FFT_HIGHPASS_SIGMA_ZYX = (1.0, 4.0, 1.0)
+DEFAULT_HIGHPASS_SIGMA_PX = 8.0
+DEFAULT_OVERLAP_RATIO = 0.3
 DEFAULT_MAX_RESIDUAL_SHIFT_UM = 100.0
 
 
@@ -101,6 +102,65 @@ def pad_to_shape(array: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
     output = np.zeros(shape, dtype=array.dtype)
     output[tuple(slice(0, size) for size in array.shape)] = array
     return output
+
+
+def masked_highpass(image: np.ndarray, coverage: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Normalize covered pixels and subtract their coverage-weighted local mean.
+
+    Tile-brightness steps and mosaic outlines sit at the same canvas positions in
+    channels acquired on a shared stage lattice; removing them keeps the
+    correlation on tissue structure.
+    """
+    low, high = np.percentile(image[coverage], [1.0, 99.8])
+    normalized = np.sqrt(np.clip((image - low) / max(float(high - low), 1e-6), 0.0, 1.0))
+    weight = coverage.astype(np.float64)
+    local_mean = ndimage.gaussian_filter(normalized * weight, sigma_px) / np.maximum(
+        ndimage.gaussian_filter(weight, sigma_px), 1e-6
+    )
+    return np.where(coverage, normalized - local_mean, 0.0)
+
+
+def masked_ncc_shift_yx(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    fixed_coverage: np.ndarray,
+    moving_coverage: np.ndarray,
+    *,
+    search_center_yx: np.ndarray,
+    max_shift_from_center_yx: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Return the YX shift to apply to moving that maximizes NCC over the coverage overlap."""
+    ncc = cross_correlate_masked(
+        moving,
+        fixed,
+        moving_coverage,
+        fixed_coverage,
+        axes=(0, 1),
+        mode="full",
+        overlap_ratio=DEFAULT_OVERLAP_RATIO,
+    )
+    # Full-mode index i along an axis corresponds to shifting moving by fixed.shape - 1 - i.
+    shifts = [fixed.shape[axis] - 1 - np.arange(ncc.shape[axis], dtype=np.float64) for axis in range(2)]
+    valid = (np.abs(shifts[0] - search_center_yx[0]) <= max_shift_from_center_yx[0])[:, None] & (
+        np.abs(shifts[1] - search_center_yx[1]) <= max_shift_from_center_yx[1]
+    )[None, :]
+    search = np.where(valid, ncc, -np.inf)
+    peak = np.unravel_index(int(np.argmax(search)), search.shape)
+    if not np.isfinite(search[peak]):
+        raise ValueError("Masked NCC search window contains no candidate shifts")
+    shift_yx = np.empty(2, dtype=np.float64)
+    for axis in range(2):
+        before, after = list(peak), list(peak)
+        before[axis] -= 1
+        after[axis] += 1
+        offset = 0.0
+        if before[axis] >= 0 and after[axis] < ncc.shape[axis]:
+            low, center, high = search[tuple(before)], search[peak], search[tuple(after)]
+            curvature = low - 2.0 * center + high
+            if np.isfinite(low) and np.isfinite(high) and curvature < 0:
+                offset = 0.5 * (low - high) / curvature
+        shift_yx[axis] = shifts[axis][peak[axis]] - offset
+    return shift_yx, float(ncc[peak])
 
 
 def expanded_shifted_pair(
@@ -196,8 +256,7 @@ def run_global_phase(
     z_slab_planes: int = DEFAULT_Z_SLAB_PLANES,
     fixed_intensity_transform: IntensityTransform = "log1p",
     moving_intensity_transform: IntensityTransform = "identity",
-    fft_highpass_sigma_zyx: tuple[float, float, float] | None = DEFAULT_FFT_HIGHPASS_SIGMA_ZYX,
-    spatial_highpass_sigma: float | None = None,
+    highpass_sigma_px: float = DEFAULT_HIGHPASS_SIGMA_PX,
     max_residual_shift_um: float = DEFAULT_MAX_RESIDUAL_SHIFT_UM,
     orthogonal_lateral_factor: int = DEFAULT_ORTHOGONAL_LATERAL_FACTOR,
     orthogonal_z: bool = True,
@@ -205,6 +264,8 @@ def run_global_phase(
     """Estimate and persist one global translation that moves a registered mosaic onto another."""
     if not np.isfinite(max_residual_shift_um) or max_residual_shift_um < 0:
         raise ValueError("max_residual_shift_um must be finite and nonnegative")
+    if not np.isfinite(highpass_sigma_px) or highpass_sigma_px <= 0:
+        raise ValueError("highpass_sigma_px must be finite and positive")
     fixed_canvas = render_position_canvas(
         fixed_position,
         tile_dir=fixed_tile_dir,
@@ -252,15 +313,23 @@ def run_global_phase(
     ) / fixed_canvas.spacing_zyx_um[1:]
     max_residual_shift_zyx_px = max_residual_shift_um / fixed_canvas.spacing_zyx_um
     max_residual_shift_zyx_px[0] = 0.0
-    shift_zyx_px, phase_metadata = phasecorr_shift_gpu(
-        fixed,
-        moving,
-        fft_highpass_sigma_zyx=fft_highpass_sigma_zyx,
-        spatial_highpass_sigma=spatial_highpass_sigma,
-        search_center_zyx=before_shift_zyx_px,
-        max_shift_from_center_zyx=max_residual_shift_zyx_px,
+    shift_yx_px, peak_ncc = masked_ncc_shift_yx(
+        masked_highpass(fixed[0], fixed_coverage[0], highpass_sigma_px),
+        masked_highpass(moving[0], moving_coverage[0], highpass_sigma_px),
+        fixed_coverage[0],
+        moving_coverage[0],
+        search_center_yx=before_shift_zyx_px[1:],
+        max_shift_from_center_yx=max_residual_shift_zyx_px[1:],
     )
-    shift_zyx_px = np.asarray(shift_zyx_px, dtype=np.float64)
+    shift_zyx_px = np.asarray([0.0, *shift_yx_px], dtype=np.float64)
+    phase_metadata = {
+        "estimator": "coverage_overlap_masked_ncc",
+        "peak_ncc": peak_ncc,
+        "highpass_sigma_px": highpass_sigma_px,
+        "overlap_ratio": DEFAULT_OVERLAP_RATIO,
+        "search_center_zyx": before_shift_zyx_px.tolist(),
+        "max_shift_from_center_zyx": max_residual_shift_zyx_px.tolist(),
+    }
     residual_shift_zyx_um = (shift_zyx_px - before_shift_zyx_px) * fixed_canvas.spacing_zyx_um
     max_residual_shift_zyx_um = max_residual_shift_zyx_px * fixed_canvas.spacing_zyx_um
     if not np.all(np.isfinite(shift_zyx_px)) or np.any(

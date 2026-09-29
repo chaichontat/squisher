@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from squisher.gpu_retry import cuda_oom_retry
 from numpy.ctypeslib import ndpointer
 
 
@@ -395,6 +396,7 @@ def _require_cupy_mask_float32_zyx(array: Any, *, name: str, device: int) -> Any
     return cp.ascontiguousarray(array, dtype=cp.float32)
 
 
+@cuda_oom_retry("native reg_3dgpu", device_parameter="device")
 def _run_reg_3dgpu(
     fixed_zyx: np.ndarray,
     moving_zyx: np.ndarray,

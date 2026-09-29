@@ -345,6 +345,90 @@ def test_fusion_source_cache_reuses_canonical_raw_chunks_across_requests(monkeyp
     np.testing.assert_array_equal(repeated.data, first.data)
 
 
+def test_direct_fusion_prepare_reuses_raw_region_for_gpu_correction(monkeypatch, tmp_path):
+    source = zarr.open_array(
+        tmp_path / "source.zarr",
+        mode="w",
+        shape=(4, 4, 4),
+        chunks=(2, 2, 2),
+        dtype="u2",
+        dimension_names=("z", "y", "x"),
+    )
+    data = np.arange(4**3, dtype=np.uint16).reshape(4, 4, 4)
+    source[:] = data
+    sim = si_utils.get_sim_from_array(
+        source,
+        dims=("z", "y", "x"),
+        scale={"z": 1.0, "y": 1.0, "x": 1.0},
+        translation={"z": 0.0, "y": 0.0, "x": 0.0},
+    )
+    sim.attrs["fusion_source_cache_key"] = "tile-a::ch0"
+    original_deserialize = si_utils.deserialize_zarr_backed_sim
+    calls = []
+
+    def counting_deserialize(*args, **kwargs):
+        if kwargs.get("reconstruct_slice"):
+            calls.append(kwargs["overlap_bb"])
+        return original_deserialize(*args, **kwargs)
+
+    fake_cupy = SimpleNamespace(
+        asarray=np.asarray,
+        float32=np.float32,
+        ndarray=np.ndarray,
+        rint=np.rint,
+        clip=np.clip,
+        cuda=SimpleNamespace(runtime=SimpleNamespace(getDevice=lambda: 0)),
+    )
+    monkeypatch.setattr(si_utils, "deserialize_zarr_backed_sim", counting_deserialize)
+    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
+    overlap = {
+        "origin": {"z": 0.0, "y": 0.0, "x": 0.0},
+        "shape": {"z": 3, "y": 3, "x": 3},
+    }
+
+    with legacy.basic_corrected_zarr_reads(
+        np.full((4, 4), 2.0, dtype=np.float32),
+        cache_key_attr="fusion_source_cache_key",
+        source_cache_max_bytes=1024 * 1024,
+    ):
+        info = si_utils.serialize_zarr_backed_sim(sim)
+        session = legacy._ACTIVE_DIRECT_SOURCE_READ_SESSION
+        assert session is not None
+        prepared = session.prepare(
+            {"views": [{"tile_info": info, "tile_overlap_bb": overlap}]},
+            {},
+        )
+        raw_call_count = len(calls)
+        with session.consume(prepared):
+            corrected = si_utils.deserialize_zarr_backed_sim(
+                info,
+                reconstruct_slice=True,
+                overlap_bb=overlap,
+            )
+
+    assert len(calls) == raw_call_count
+    np.testing.assert_array_equal(corrected.data, data[:3, :3, :3] * 2)
+
+
+def test_prepared_source_reads_can_be_consumed_again_after_failed_gpu_attempt():
+    info = {}
+    overlap = {}
+    source = object()
+    session = legacy.DirectSourceReadSession(lambda *_args: source)
+    prepared = session.prepare(
+        {"views": [{"tile_info": info, "tile_overlap_bb": overlap}]},
+        {},
+    )
+
+    with pytest.raises(RuntimeError, match="gpu attempt failed"):
+        with session.consume(prepared):
+            assert session.take(info, overlap, {}) is source
+            raise RuntimeError("gpu attempt failed")
+
+    with session.consume(prepared):
+        assert session.take(info, overlap, {}) is source
+
+
 def test_fusion_source_cache_also_applies_without_correction(monkeypatch, tmp_path):
     source = zarr.open_array(
         tmp_path / "source.zarr",

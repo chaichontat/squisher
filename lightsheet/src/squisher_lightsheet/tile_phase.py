@@ -497,6 +497,62 @@ def raw_z_indexer(indices: np.ndarray) -> tuple[slice | np.ndarray, bool]:
     return indices, False
 
 
+def _read_cached_ome_zarr_crop(
+    array: Any,
+    *,
+    path: Path,
+    channel: int,
+    slices_zyx: tuple[slice, slice, slice],
+    source_cache: stitch_legacy.SourceChunkCache,
+) -> np.ndarray:
+    block_shape = tuple(int(size) for size in (getattr(array, "shards", None) or array.chunks)[1:])
+    shape = tuple(int(s.stop - s.start) for s in slices_zyx)
+    output = np.empty(shape, dtype=array.dtype)
+    source_id = (str(path.resolve()), str(array.path), channel)
+    block_ranges = [
+        range(s.start // size, (s.stop - 1) // size + 1)
+        for s, size in zip(slices_zyx, block_shape, strict=True)
+    ]
+    for z_block in block_ranges[0]:
+        for y_block in block_ranges[1]:
+            for x_block in block_ranges[2]:
+                block_index = (z_block, y_block, x_block)
+                starts = tuple(index * size for index, size in zip(block_index, block_shape, strict=True))
+                stops = tuple(
+                    min(start + size, int(axis_size))
+                    for start, size, axis_size in zip(starts, block_shape, array.shape[1:], strict=True)
+                )
+                block_slices = tuple(slice(start, stop) for start, stop in zip(starts, stops, strict=True))
+
+                def load_block() -> dict[str, np.ndarray]:
+                    return {"data": np.asarray(array[(channel, *block_slices)])}
+
+                cached = source_cache.get_or_load(
+                    (*source_id, block_index),
+                    expected_bytes=int(
+                        np.prod([stop - start for start, stop in zip(starts, stops, strict=True)])
+                        * array.dtype.itemsize
+                    ),
+                    loader=load_block,
+                )["data"]
+                overlap_start = tuple(
+                    max(s.start, start) for s, start in zip(slices_zyx, starts, strict=True)
+                )
+                overlap_stop = tuple(
+                    min(s.stop, stop) for s, stop in zip(slices_zyx, stops, strict=True)
+                )
+                destination = tuple(
+                    slice(a - s.start, b - s.start)
+                    for a, b, s in zip(overlap_start, overlap_stop, slices_zyx, strict=True)
+                )
+                source = tuple(
+                    slice(a - start, b - start)
+                    for a, b, start in zip(overlap_start, overlap_stop, starts, strict=True)
+                )
+                output[destination] = cached[source]
+    return output
+
+
 def read_tile_indexed_z_patch(
     tile: rough_legacy.TileRecord,
     *,
@@ -504,6 +560,7 @@ def read_tile_indexed_z_patch(
     z_indices: np.ndarray,
     y_slice: slice,
     x_slice: slice,
+    source_cache: stitch_legacy.SourceChunkCache | None = None,
 ) -> np.ndarray:
     z_indices = np.asarray(z_indices, dtype=np.int64)
     if z_indices.ndim != 1 or z_indices.size == 0:
@@ -545,7 +602,16 @@ def read_tile_indexed_z_patch(
         if tile.axes == "CZYX":
             if channel < 0 or channel >= int(array.shape[0]):
                 raise ValueError(f"Channel {channel} is outside {tile.path} channel count {array.shape[0]}")
-            patch = array[(channel, raw_z_selection, raw_y_slice, raw_x_slice)]
+            if direct_zarr and source_cache is not None and source_cache.cache.max_bytes:
+                patch = _read_cached_ome_zarr_crop(
+                    array,
+                    path=tile.path,
+                    channel=channel,
+                    slices_zyx=(raw_z_selection, raw_y_slice, raw_x_slice),
+                    source_cache=source_cache,
+                )
+            else:
+                patch = array[(channel, raw_z_selection, raw_y_slice, raw_x_slice)]
         elif tile.axes == "ZYX":
             channels = flattened_channel_count(tile.path)
             if channel < 0 or channel >= channels:

@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from squisher_lightsheet._legacy.rough_align_tltr_center_z_phase import TileRecord
+from squisher_lightsheet._legacy.rough_align_tltr_center_z_phase import TileRecord, tile_bounds_zyx_um
 from squisher_lightsheet.channel_affine import (
     _block_mean_downsample_zyx_cupy,
     _corr_gpu,
@@ -31,6 +31,7 @@ from squisher_lightsheet.channel_affine import (
     output_to_input_to_model,
 )
 from squisher_lightsheet.native_reg3dgpu import DEFAULT_LIB_DIR, register_method8_device, zyx_to_xyz_3x4
+from squisher.gpu_retry import is_cuda_oom, run_with_cuda_oom_retry
 from squisher_lightsheet.tile_phase import (
     _open_tile_level_array,
     flattened_channel_count,
@@ -212,13 +213,9 @@ def preseeded_level0_model(
     moving_tile: TileRecord,
     preseed_matrix_zyx: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if tuple(fixed_tile.shape_zyx.tolist()) != tuple(moving_tile.shape_zyx.tolist()):
-        raise ValueError(
-            f"fixed/moving logical tile shapes differ for {fixed_tile.tile}: "
-            f"{fixed_tile.shape_zyx.tolist()} vs {moving_tile.shape_zyx.tolist()}"
-        )
-    fixed_origin_um = np.asarray(fixed_tile.translation_zyx_um, dtype=np.float64)
-    moving_origin_um = np.asarray(moving_tile.translation_zyx_um, dtype=np.float64)
+    # Windows are read in oriented voxel order, so voxel zero sits at each tile's low physical bound.
+    fixed_origin_um = tile_bounds_zyx_um(fixed_tile)[0]
+    moving_origin_um = tile_bounds_zyx_um(moving_tile)[0]
     fixed_scale_um = np.abs(np.asarray(fixed_tile.scale_zyx_um, dtype=np.float64))
     moving_scale_um = np.abs(np.asarray(moving_tile.scale_zyx_um, dtype=np.float64))
     fixed_center = (np.asarray(fixed_tile.shape_zyx, dtype=np.float64) - 1.0) / 2.0
@@ -737,7 +734,9 @@ def _build_tasks(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[d
                     pairs.append((fixed_tile, moving_tile, windows))
 
     for fixed_tile, moving_tile, windows in pairs:
-        if tuple(fixed_tile.shape_zyx.tolist()) != tuple(moving_tile.shape_zyx.tolist()):
+        if pair_mode == "tile-number" and tuple(fixed_tile.shape_zyx.tolist()) != tuple(
+            moving_tile.shape_zyx.tolist()
+        ):
             raise ValueError(
                 f"fixed/moving logical tile shapes differ for {fixed_tile.tile}: "
                 f"{fixed_tile.shape_zyx.tolist()} vs {moving_tile.shape_zyx.tolist()}"
@@ -1130,6 +1129,8 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
         if selected_attempt.get("error") is not None:
             row["error"] = selected_attempt["error"]
     except Exception as exc:
+        if is_cuda_oom(exc):
+            raise
         row.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
     finally:
         row.setdefault("timing_seconds", {})["total"] = time.perf_counter() - started
@@ -1137,7 +1138,12 @@ def _measure_window(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _measure_window_to_path(task: dict[str, Any]) -> None:
-    row = _measure_window(task)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(task["device"]))
+    row = run_with_cuda_oom_retry(
+        lambda: _measure_window(task),
+        label="cross-dataset method8 window",
+        device=0,
+    )
     _write_json(Path(task["output_path"]), row)
 
 
@@ -1271,24 +1277,18 @@ def _validate_completed_rows(rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _position_vector(record: dict[str, Any], key: str) -> np.ndarray:
-    values = record.get(key)
-    if not isinstance(values, dict):
-        raise ValueError(f"position record {record.get('tile')!r} has no {key!r} object")
-    vector = np.asarray([values.get(axis) for axis in "zyx"], dtype=np.float64)
-    if not np.all(np.isfinite(vector)):
-        raise ValueError(f"position record {record.get('tile')!r} has invalid {key!r}: {values!r}")
-    return vector
-
-
 def _physical_crop_center_correspondences(
     rows: list[dict[str, Any]],
     *,
     fixed_position: dict[str, Any],
     moving_position: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, list[tuple[str, str]]]:
-    fixed_by_tile = {str(record["tile"]): record for record in fixed_position["tiles"]}
-    moving_by_tile = {str(record["tile"]): record for record in moving_position["tiles"]}
+    fixed_by_tile = {
+        str(record["tile"]): tile_record_from_position_record(record) for record in fixed_position["tiles"]
+    }
+    moving_by_tile = {
+        str(record["tile"]): tile_record_from_position_record(record) for record in moving_position["tiles"]
+    }
     source: list[np.ndarray] = []
     target: list[np.ndarray] = []
     pairs: list[tuple[str, str]] = []
@@ -1308,12 +1308,11 @@ def _physical_crop_center_correspondences(
             raise ValueError(f"invalid accepted Method8 geometry for {fixed_name!r}, {moving_name!r}")
         center = (window_shape - 1.0) / 2.0
         source.append(
-            _position_vector(moving, "translation_um")
-            + _position_vector(moving, "scale_um") * (moving_start + center)
+            tile_bounds_zyx_um(moving)[0] + np.abs(moving.scale_zyx_um) * (moving_start + center)
         )
         target.append(
-            _position_vector(fixed, "translation_um")
-            + _position_vector(fixed, "scale_um") * (fixed_start + center + local_translation)
+            tile_bounds_zyx_um(fixed)[0]
+            + np.abs(fixed.scale_zyx_um) * (fixed_start + center + local_translation)
         )
         pairs.append((fixed_name, moving_name))
     return np.asarray(source, dtype=np.float64).reshape(-1, 3), np.asarray(target, dtype=np.float64).reshape(-1, 3), pairs

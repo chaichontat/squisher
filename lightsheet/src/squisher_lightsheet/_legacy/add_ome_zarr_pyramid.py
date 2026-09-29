@@ -28,6 +28,7 @@ from squisher_lightsheet.pyramid import (
     pyramid_shard_chunks,
     pyramid_relative_factors,
 )
+from squisher.gpu_retry import cuda_oom_retry
 import zarr
 
 
@@ -61,6 +62,7 @@ def output_shape(shape: tuple[int, ...], dims: tuple[str, ...], factors: dict[st
     return tuple(int(size) // int(factors[dim]) for size, dim in zip(shape, dims, strict=True))
 
 
+@cuda_oom_retry("OME-Zarr pyramid chunk")
 def reduced_chunk(source: zarr.Array, selection: tuple[slice, ...], factors: tuple[int, ...]) -> np.ndarray:
     source_selection = tuple(
         slice(dim_slice.start * factor, dim_slice.stop * factor)

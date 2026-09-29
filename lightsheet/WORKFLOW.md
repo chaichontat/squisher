@@ -166,11 +166,14 @@ correlation, reruns failed or ambiguous edges with axis-prior shifted crops,
 and optimizes positions from the accepted phase constraints. Use `--method8`
 only for an explicitly requested native refinement experiment.
 
-By default, registration refuses to emit fusion-ready canonical artifacts when
-the accepted constraint graph is disconnected. Use `--allow-disconnected` only
-after explicitly accepting that condition. The canonical provenance retains
-both the total and connected tile counts; the option does not infer missing
-constraints or claim that disconnected tiles were registered.
+By default, registration retains disconnected tiles when every tile outside the
+anchor-connected component is on the acquisition edge. Edge membership comes
+from the complete level-2 screened face-adjacency graph: tiles with fewer than
+four candidate neighbors are edge tiles. Canonical provenance records the edge
+tiles retained by this policy. Registration still refuses an interior
+disconnection; use `--allow-disconnected` only after explicitly accepting that
+condition. The option does not infer missing constraints or claim that
+disconnected tiles were registered.
 Alternatively, use `--exclude-disconnected` to publish only the anchor-connected
 component. Both canonical outputs omit those tiles and record their identities
 under `registration_run.connectivity.excluded_tiles` in provenance. The two
@@ -199,6 +202,11 @@ position optimizer.
 
 The CL/CR merge places CR into CL space after the two source views already have
 side-internal geometry.
+
+Generate the joined metadata placement with `lr_z_endview_flip_xz`, never the
+TL/TR X-join mode. Preserve CR's negative Z/X orientation when adapting its
+side-internal registered geometry. Use `content-preibisch-coarse` within each
+side; use seam-weighted fusion only when combining CL and CR.
 
 1. Render a level-2 z-median dumb stitch for CL and CR. Use tile positions based
    on the Li/side-internal geometry.
@@ -273,6 +281,32 @@ The 405 acquisition is registered into the 488 coordinate frame without losing
 
 Good 405 seam residuals do not prove good 405-to-488 alignment. Always inspect
 overall 405 red / 488 green overlays when judging the mapping.
+
+## Fit-residual Correction
+
+Run `lightsheet fit-residual` after accepting a side's registration and
+building its fixed fused preview. This stage fits residual camera-coordinate
+fields and per-source gains from registered deconvolved tiles; it does not run
+BaSiC again.
+
+```bash
+lightsheet fit-residual \
+  --fixed-fused SIDE_PREVIEW/fused.ch3.ome.zarr \
+  --registration SIDE_REGISTRATION/registration.json \
+  --output-dir SIDE_FIT_RESIDUAL \
+  --channel 3 \
+  --source-level 2 \
+  --stride 4 \
+  --xy-degree 1 \
+  --z-degree 1 \
+  --workers 8
+```
+
+Review `SIDE_BASIC_RESIDUAL/qc` before using
+`SIDE_BASIC_RESIDUAL/correction.json`. For separately fitted CL and CR sides,
+keep one correction per side and pass the matching correction to each side's
+fusion. Use `cross-dataset-match` only after both corrected sides share the
+accepted CL/CR coordinate frame.
 
 ## Fusion
 

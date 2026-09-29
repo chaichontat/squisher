@@ -178,8 +178,8 @@ def register(
         typer.Option(
             "--allow-disconnected",
             help=(
-                "Write canonical registration outputs even when the constraint graph is disconnected; "
-                "connectivity remains recorded in provenance."
+                "Write canonical outputs for any disconnected graph. Edge-only disconnections are "
+                "already retained by default; connectivity remains recorded in provenance."
             ),
         ),
     ] = False,

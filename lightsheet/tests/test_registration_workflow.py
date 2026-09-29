@@ -248,8 +248,134 @@ def test_write_canonical_registration_allows_explicit_disconnected_override(tmp_
     registration_run = json.loads(registration_output.read_text())["metrics"]["registration_run"]
     assert registration_run["connectivity"] == {
         "allow_disconnected": True,
+        "auto_allowed_edge_disconnected": False,
         "tile_count": 2,
         "connected_tile_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("disconnected_index", "expected_edge_only"),
+    [(0, True), (4, False)],
+)
+def test_disconnected_edge_status_uses_screen_adjacency(
+    tmp_path, disconnected_index, expected_edge_only
+) -> None:
+    names = [f"sample.{index:03}.ome.zarr" for index in range(9)]
+    records = [{"tile": name} for name in names]
+    pairs = []
+    for row in range(3):
+        for column in range(3):
+            index = row * 3 + column
+            if column < 2:
+                pairs.append((index, index + 1))
+            if row < 2:
+                pairs.append((index, index + 3))
+    screen = tmp_path / "level2-screen.json"
+    screen.write_text(
+        json.dumps(
+            {
+                "pairs": [
+                    {"fixed_tile": names[fixed], "moving_tile": names[moving]}
+                    for fixed, moving in pairs
+                ]
+            }
+        )
+    )
+    constraints = tmp_path / "constraints.jsonl"
+    constraints.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "fixed": fixed,
+                    "moving": moving,
+                    "accepted": disconnected_index not in (fixed, moving),
+                }
+            )
+            + "\n"
+            for fixed, moving in pairs
+        )
+    )
+    diagnostics = {
+        "tile_count": 9,
+        "connected_tile_count": 8,
+        "anchor_tile_index": next(index for index in range(9) if index != disconnected_index),
+        "outputs": {"constraints_jsonl": str(constraints)},
+    }
+    summary = {"settings": {"level2_screen": str(screen)}}
+
+    status = registration_workflow._disconnected_edge_status(
+        position_records=records,
+        diagnostics_payload=diagnostics,
+        summary_payload=summary,
+    )
+
+    assert status.disconnected == {disconnected_index}
+    assert status.edge_only is expected_edge_only
+
+
+def test_write_canonical_registration_allows_edge_disconnection_by_default(tmp_path) -> None:
+    zarr_dir = tmp_path / "tiles"
+    zarr_dir.mkdir()
+    names = [f"sample.{index:03}.ome.zarr" for index in range(4)]
+    for name in names:
+        _write_tile(zarr_dir / name, np.ones((1, 3, 8, 8), dtype=np.uint16))
+    optimized = tmp_path / "optimized.json"
+    _write_positions(optimized, zarr_dir, names)
+    screen = tmp_path / "level2-screen.json"
+    screen.write_text(
+        json.dumps(
+            {
+                "pairs": [
+                    {"fixed_tile": names[fixed], "moving_tile": names[moving]}
+                    for fixed, moving in ((0, 1), (0, 2), (1, 3), (2, 3))
+                ]
+            }
+        )
+    )
+    summary = tmp_path / "measurements.json"
+    summary.write_text(json.dumps({"settings": {"level2_screen": str(screen)}}))
+    constraints = tmp_path / "constraints.jsonl"
+    constraints.write_text(
+        "".join(
+            json.dumps({"fixed": fixed, "moving": moving, "accepted": moving != 3}) + "\n"
+            for fixed, moving in ((0, 1), (0, 2), (1, 3), (2, 3))
+        )
+    )
+    diagnostics = tmp_path / "diagnostics.json"
+    diagnostics.write_text(
+        json.dumps(
+            {
+                "tile_count": 4,
+                "connected_tile_count": 3,
+                "anchor_tile_index": 0,
+                "outputs": {"constraints_jsonl": str(constraints)},
+            }
+        )
+    )
+    threshold = tmp_path / "threshold.json"
+    threshold.write_text(json.dumps({"threshold": 90.0}))
+    registration_output = tmp_path / "registration.json"
+
+    write_canonical_registration(
+        optimized_position=optimized,
+        zarr_dir=zarr_dir,
+        position_output=tmp_path / "registration.positions.json",
+        registration_output=registration_output,
+        measurement_summary=summary,
+        diagnostics=diagnostics,
+        threshold_record=threshold,
+    )
+
+    connectivity = json.loads(registration_output.read_text())["metrics"]["registration_run"][
+        "connectivity"
+    ]
+    assert connectivity == {
+        "allow_disconnected": False,
+        "auto_allowed_edge_disconnected": True,
+        "tile_count": 4,
+        "connected_tile_count": 3,
+        "disconnected_edge_tiles": [names[3]],
     }
 
 
@@ -483,6 +609,7 @@ def test_run_registration_workflow_emits_complete_cli_contract(tmp_path, monkeyp
                     "zarr_dir": str(zarr_dir.resolve()),
                     "input_fingerprint": artifact_io.registration_input_fingerprint(positions, zarr_dir),
                     "settings": {
+                        "level": kwargs["level"],
                         "pairs": [],
                         "all_adjacent": True,
                         "channel": kwargs["channel"],
@@ -526,6 +653,7 @@ def test_run_registration_workflow_emits_complete_cli_contract(tmp_path, monkeyp
                     "method8_summary_sha256": artifact_io.sha256_file(summary),
                     "position_json": str(positions.resolve()),
                     "settings": {
+                        "level": kwargs["level"],
                         "zarr_dir": str(zarr_dir.resolve()),
                         "max_grad_regression": kwargs["max_grad_regression"],
                         "max_corr_regression": kwargs["max_corr_regression"],
@@ -577,3 +705,40 @@ def test_run_registration_workflow_emits_complete_cli_contract(tmp_path, monkeyp
     assert "reviewed_dumb_tiff_sha256" not in threshold_record
     assert (output_dir / "level2-screen.json").is_file()
     assert json.loads(outputs.registration_json.read_text())["tiles"][0]["axes"] == "CZYX"
+
+
+def test_canonical_publication_excludes_unconnected_tiles(tmp_path):
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    names = [f"tile.{i:03}.ome.zarr" for i in range(3)]
+    for name in names:
+        _write_tile(tiles / name, np.ones((1, 3, 8, 8), dtype=np.uint16))
+    optimized = tmp_path / "optimized.json"
+    _write_positions(optimized, tiles, names)
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"settings": {"channel": 0, "level": 2}}))
+    constraints = tmp_path / "constraints.jsonl"
+    constraints.write_text(json.dumps({"fixed": 0, "moving": 1, "accepted": True}) + "\n"
+                           + json.dumps({"fixed": 1, "moving": 2, "accepted": False}) + "\n")
+    diagnostics = tmp_path / "diagnostics.json"
+    diagnostics.write_text(json.dumps({"tile_count": 3, "connected_tile_count": 2,
+                                      "anchor_tile_index": 0,
+                                      "outputs": {"constraints_jsonl": str(constraints)}}))
+    threshold = tmp_path / "threshold.json"
+    threshold.write_text(json.dumps({"threshold": 200}))
+    positions_out = tmp_path / "out.positions.json"
+    registration_out = tmp_path / "out.json"
+    write_canonical_registration(
+        optimized_position=optimized, zarr_dir=tiles, position_output=positions_out,
+        registration_output=registration_out, measurement_summary=summary,
+        diagnostics=diagnostics, threshold_record=threshold, exclude_disconnected=True,
+    )
+    positions = json.loads(positions_out.read_text())
+    registration = json.loads(registration_out.read_text())
+    assert [t["tile"] for t in positions["tiles"]] == names[:2]
+    assert [t["tile"] for t in registration["tiles"]] == names[:2]
+    connectivity = positions["registration_run"]["connectivity"]
+    assert connectivity["tile_count"] == connectivity["connected_tile_count"] == 2
+    assert connectivity["source_tile_count"] == 3
+    assert connectivity["excluded_tiles"] == [names[2]]
+    assert len(json.loads(optimized.read_text())["tiles"]) == 3

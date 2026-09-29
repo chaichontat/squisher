@@ -16,6 +16,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from squisher_lightsheet import ngff
+from squisher.gpu_retry import cuda_oom_retry
 
 
 DEFAULT_MVS_SEAM_QUALITY_THRESHOLD = 0.25
@@ -1270,6 +1271,7 @@ def _native_shift_scale_zyx_for_edge_level(
     return source_scale
 
 
+@cuda_oom_retry("MVS seam phase refinement")
 def _phase_refine_shift(
     fixed_patch: np.ndarray,
     moving_patch: np.ndarray,

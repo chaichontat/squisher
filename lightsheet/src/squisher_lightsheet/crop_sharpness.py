@@ -18,15 +18,16 @@ from scipy.optimize import linprog
 from scipy.spatial import HalfspaceIntersection
 
 from squisher_lightsheet.artifact_io import write_text_set_atomic
+from squisher.gpu_retry import run_with_cuda_oom_retry
 from squisher_lightsheet.seam_fusion import feather_ownership
 
 
-def native_crop_scores(views, sigma: tuple[float, ...]) -> list[float]:
+def native_crop_scores(views, sigma: tuple[float, ...]) -> list[float] | None:
     """Compare high-pass energy on the same native pixels, normalized for gain."""
     xp = cp if isinstance(views, cp.ndarray) else np
     common = xp.isfinite(views).all(axis=0)
     if not bool(common.any()):
-        raise ValueError("Sharpness crops have no common native support")
+        return None
     scores = []
     for view in views:
         masked = xp.where(common, view, xp.nan)
@@ -157,28 +158,53 @@ def fit_crop_preferences(
                     raise ValueError(
                         f"Native crop does not intersect both sources: {source_paths[i]}, {source_paths[j]}"
                     )
-                views = []
-                for view in entry["views"]:
-                    section = si_utils.deserialize_zarr_backed_sim(
-                        view["tile_info"],
-                        reconstruct_slice=True,
-                        overlap_bb=view["tile_overlap_bb"],
-                        sim_coord_dict=selection,
-                    )
-                    section = section.copy(
-                        data=cp.asarray(si_utils._get_backend_data(section), dtype=cp.float32)
-                    )
-                    pulled = transformation.transform_sim(
-                        section,
-                        np.linalg.inv(view["sparam"]),
-                        output_stack_properties=box,
-                        order=1,
-                        cval=np.nan,
-                    )
-                    views.append(si_utils._get_backend_data(pulled))
-                scores = native_crop_scores(cp.stack(views), sigma)
-                crop_records.append({"box": box, "scores": scores})
-            scores = np.mean([item["scores"] for item in crop_records], axis=0)
+                def score_crop():
+                    views = []
+                    for view in entry["views"]:
+                        section = si_utils.deserialize_zarr_backed_sim(
+                            view["tile_info"],
+                            reconstruct_slice=True,
+                            overlap_bb=view["tile_overlap_bb"],
+                            sim_coord_dict=selection,
+                        )
+                        section = section.copy(
+                            data=cp.asarray(si_utils._get_backend_data(section), dtype=cp.float32)
+                        )
+                        pulled = transformation.transform_sim(
+                            section,
+                            np.linalg.inv(view["sparam"]),
+                            output_stack_properties=box,
+                            order=1,
+                            cval=np.nan,
+                        )
+                        views.append(si_utils._get_backend_data(pulled))
+                    return native_crop_scores(cp.stack(views), sigma)
+
+                scores = run_with_cuda_oom_retry(
+                    score_crop,
+                    label=f"crop-sharpness score {i}/{j}",
+                )
+                if scores is None:
+                    crop_records.append({"box": box, "status": "no_common_native_support"})
+                else:
+                    crop_records.append({"box": box, "scores": scores})
+            supported_scores = [item["scores"] for item in crop_records if "scores" in item]
+            if not supported_scores:
+                records.append(
+                    {
+                        "first": i,
+                        "second": j,
+                        "status": "no_common_native_support",
+                        "crops": crop_records,
+                    }
+                )
+                logger.info(
+                    "Native sharpness crops: pair ({}, {}) has no shared native support; leaving preference tied",
+                    i,
+                    j,
+                )
+                continue
+            scores = np.mean(supported_scores, axis=0)
             preference = int(np.sign(scores[0] - scores[1]))
             matrix[i, j], matrix[j, i] = preference, -preference
             records.append({"first": i, "second": j, "scores": scores.tolist(), "crops": crop_records})
@@ -222,6 +248,10 @@ def crop_sharpness_fusion(
     source_indices,
     feather_radius: tuple[int, ...],
     intensity_threshold: float | None = None,
+    source_views: list[str] | None = None,
+    registered_view_correction: str | None = None,
+    output_origin_zyx_um: tuple[float, float, float] | None = None,
+    output_spacing_zyx_um: tuple[float, float, float] | None = None,
 ):
     """Use crop pair preferences among valid sources; feather only native interfaces.
 
@@ -248,4 +278,33 @@ def crop_sharpness_fusion(
         xp.copyto(best, votes, where=better)
         xp.copyto(ownership, i, where=better)
     weights = feather_ownership(ownership, valid, feather_radius)
-    return (xp.where(valid, transformed_views, 0) * weights).sum(axis=0).astype(transformed_views.dtype)
+    field = None
+    correction = None
+    if registered_view_correction is not None:
+        from squisher_lightsheet.registered_view_correction import (
+            load_registered_view_correction,
+        )
+
+        if source_views is None or len(source_views) != len(valid):
+            raise ValueError("Registered-view correction requires one source view per transformed source")
+        if output_origin_zyx_um is None or output_spacing_zyx_um is None or valid.ndim != 4:
+            raise ValueError("Registered-view correction requires a 3D registered output block")
+        correction = load_registered_view_correction(Path(registered_view_correction))
+        field = correction.log_ratio_block(
+            origin_zyx_um=output_origin_zyx_um,
+            spacing_zyx_um=output_spacing_zyx_um,
+            shape_zyx=tuple(int(value) for value in valid.shape[1:]),
+            xp=xp,
+        )
+    fused = xp.zeros_like(transformed_views[0])
+    weighted_view = xp.zeros_like(transformed_views[0])
+    for i in range(len(valid)):
+        weighted_view.fill(0)
+        xp.copyto(weighted_view, transformed_views[i], where=valid[i])
+        weighted_view *= weights[i]
+        if correction is not None:
+            weighted_view *= correction.common_scale
+            if source_views[i] == correction.moving_view:
+                weighted_view *= xp.exp(-field)
+        fused += weighted_view
+    return fused.astype(transformed_views.dtype)

@@ -118,6 +118,36 @@ def test_join_registration_uses_reference_order_and_side_affines(tmp_path: Path)
     assert provenance["tile_count"] == 3
 
 
+def test_join_registration_accepts_explicit_constrained_side_artifact(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.json"
+    side = tmp_path / "side.json"
+    tile = _tile("L.001")
+    _write_registration(reference, [tile], side=False)
+    _write_registration(side, [copy.deepcopy(tile)], side=True)
+    payload = json.loads(side.read_text())
+    payload["artifact_type"] = (
+        "squisher_lightsheet.constrained_tile_channel_affine_registration.v2"
+    )
+    payload["diagnostics"] = {
+        "constrained_tile_channel_affine": {"status": "awaiting_human_qc"}
+    }
+    side.write_text(json.dumps(payload) + "\n")
+
+    output = tmp_path / "joined.json"
+    write_joined_channel_affine_registration(
+        reference_registration_input=reference,
+        side_registration_inputs=[side],
+        output_registration=output,
+        source_label="488",
+        target_label="514",
+    )
+
+    provenance = json.loads(output.read_text())["diagnostics"]["registration_join"]
+    assert provenance["side_registrations"][0]["constrained_tile_channel_affine"] == {
+        "status": "awaiting_human_qc"
+    }
+
+
 @pytest.mark.parametrize(
     ("side_tile_names", "message"),
     [

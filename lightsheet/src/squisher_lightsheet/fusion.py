@@ -121,6 +121,9 @@ def fuse_tiles(
     seam_width_um: float = 10.0,
     batch_size: BatchSize = "auto",
     source_cache_max_gib: float = 64.0,
+    pipeline_staging_max_gib: float = 8.0,
+    fusion_gpu_memory_max_gib: float = 0.0,
+    per_chunk_cupy_cleanup: bool = True,
     output_chunksize_zyx: tuple[int, int, int] = DEFAULT_OUTPUT_CHUNKSIZE_ZYX,
     output_grid_template: Path | None = None,
     output_grid_template_level: int = 0,
@@ -129,6 +132,7 @@ def fuse_tiles(
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
     flatfield_dirs_by_source_view: dict[str, Path] | None = None,
     residual_correction: Path | None = None,
+    registered_view_correction: Path | None = None,
     resume_fusion: bool = False,
     dry_run: bool = False,
 ) -> str:
@@ -159,6 +163,10 @@ def fuse_tiles(
         str(batch_size),
         "--source-cache-max-gib",
         str(source_cache_max_gib),
+        "--pipeline-staging-max-gib",
+        str(pipeline_staging_max_gib),
+        "--fusion-gpu-memory-max-gib",
+        str(fusion_gpu_memory_max_gib),
         "--jpegxr-level",
         str(jpegxr_level),
         "--output-codec",
@@ -167,6 +175,7 @@ def fuse_tiles(
         str(zstd_level),
     ]
     args.extend(["--output-chunksize", *(str(value) for value in output_chunksize_zyx)])
+    args.append("--per-chunk-cupy-cleanup" if per_chunk_cupy_cleanup else "--retain-cupy-pool")
     if output_grid_template is not None:
         args.extend(["--output-grid-template", str(output_grid_template)])
         args.extend(["--output-grid-template-level", str(output_grid_template_level)])
@@ -176,6 +185,8 @@ def fuse_tiles(
             args.extend(["--flatfield-dir-by-source-view", f"{view}={flatfield_dir}"])
     if residual_correction is not None:
         args.extend(["--residual-correction", str(residual_correction)])
+    if registered_view_correction is not None:
+        args.extend(["--registered-view-correction", str(registered_view_correction)])
     if channels is not None:
         args.extend(["--channels", *(str(channel) for channel in channels)])
     if resume_fusion:

@@ -13,6 +13,10 @@ from squisher_lightsheet.channel_affine import RegistrationTransformContract
 
 JOINED_ARTIFACT_TYPE = "squisher_lightsheet.joined_channel_affine_registration.v1"
 SIDE_ARTIFACT_TYPE = "squisher_lightsheet.global_channel_affine_registration.v1"
+CONSTRAINED_SIDE_ARTIFACT_TYPE = (
+    "squisher_lightsheet.constrained_tile_channel_affine_registration.v2"
+)
+SIDE_ARTIFACT_TYPES = {SIDE_ARTIFACT_TYPE, CONSTRAINED_SIDE_ARTIFACT_TYPE}
 
 
 def _read_registration(path: Path, *, label: str) -> dict[str, Any]:
@@ -87,10 +91,10 @@ def write_joined_channel_affine_registration(
     reference_tiles = set(reference_by_tile)
     for path in side_registration_inputs:
         side = _read_registration(path, label=f"side registration {path}")
-        if side.get("artifact_type") != SIDE_ARTIFACT_TYPE:
+        if side.get("artifact_type") not in SIDE_ARTIFACT_TYPES:
             raise ValueError(
                 f"Side registration {path} has artifact_type={side.get('artifact_type')!r}; "
-                f"expected {SIDE_ARTIFACT_TYPE!r}"
+                f"expected one of {sorted(SIDE_ARTIFACT_TYPES)!r}"
             )
         side_by_tile = _records_by_tile(side, label=f"side registration {path}")
         unknown = sorted(set(side_by_tile) - reference_tiles)
@@ -115,6 +119,9 @@ def write_joined_channel_affine_registration(
                 "transform_contract": side.get("transform_contract"),
                 "global_channel_affine": side.get("diagnostics", {}).get(
                     "global_channel_affine"
+                ),
+                "constrained_tile_channel_affine": side.get("diagnostics", {}).get(
+                    "constrained_tile_channel_affine"
                 ),
             }
         )

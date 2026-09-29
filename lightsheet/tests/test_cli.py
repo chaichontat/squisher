@@ -67,26 +67,90 @@ def test_cli_exposes_lean_stitching_subcommands() -> None:
         "mvs-edge-audit",
         "mvs-refine-level0",
         "rechunk-ome-zarr",
+        "export-nrrd",
         "subtract-channel",
         "track-z-diagnostics",
         "align-lr-dumb-stitch",
         "tile-phase-align",
+        "registered-grid-channel-anchors",
         "channel-affine-registration",
         "apply-channel-affine",
         "join-channel-affine-registrations",
         "fit-residual",
-        "post-basic",
+        "basic-residual",
         "cross-dataset-match",
+        "uv-surface",
+        "bilateral-uv-surface",
+        "surface-intensity-map",
+        "eomes-profiles",
+        "eomes-boundaries",
+        "eomes-boundary-qc",
         "fit-planar-tilt",
         "cross-register-method8",
         "run-tltr",
     ):
         assert command in result.stdout
+    assert "post-basic" not in result.stdout
+    assert "registered-view-correction-fit" not in result.stdout
 
-    assert cli_options("fit-residual") == cli_options("post-basic")
+    assert cli_options("fit-residual") == cli_options("basic-residual")
     assert readme_command_options("fit-residual") <= cli_options("fit-residual")
     assert readme_command_options("cross-dataset-match") <= cli_options("cross-dataset-match")
     assert readme_command_options("fit-planar-tilt") <= cli_options("fit-planar-tilt")
+
+
+def test_surface_intensity_map_cli_forwards_complete_contract(tmp_path: Path, monkeypatch) -> None:
+    surface_root = tmp_path / "surface"
+    surface_root.mkdir()
+    mask = tmp_path / "mask.nrrd"
+    mask.touch()
+    source = tmp_path / "source.ome.zarr"
+    source.mkdir()
+    output = tmp_path / "map"
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return output / "metadata.json"
+
+    monkeypatch.setattr(cli_module, "build_surface_intensity_map", fake_build)
+    result = CliRunner().invoke(
+        app,
+        [
+            "surface-intensity-map",
+            "--surface-root",
+            str(surface_root),
+            "--mask",
+            str(mask),
+            "--source-zarr",
+            str(source),
+            "--output-dir",
+            str(output),
+            "--level",
+            "3",
+            "--max-depth-um",
+            "900",
+            "--depth-step-um",
+            "6",
+            "--uv-size",
+            "256",
+            "--batch-size",
+            "512",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "surface_root": surface_root,
+        "mask_path": mask,
+        "source_zarr": source,
+        "output_dir": output,
+        "level": 3,
+        "max_depth_um": 900.0,
+        "depth_step_um": 6.0,
+        "uv_size": 256,
+        "batch_size": 512,
+    }
 
 
 def test_fit_planar_tilt_cli_forwards_complete_contract(tmp_path: Path, monkeypatch) -> None:
@@ -272,6 +336,115 @@ def test_channel_affine_registration_cli_forwards_required_contract(tmp_path: Pa
     }
 
 
+def test_registered_grid_channel_anchors_cli_requires_manual_threshold(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixed = tmp_path / "fixed.json"
+    moving = tmp_path / "moving.json"
+    fixed.touch()
+    moving.touch()
+    output = tmp_path / "anchors.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(cli_module, "write_registered_grid_channel_anchors", fake_write)
+    result = CliRunner().invoke(
+        app,
+        [
+            "registered-grid-channel-anchors",
+            "--fixed-registration",
+            str(fixed),
+            "--moving-baseline-registration",
+            str(moving),
+            "--fixed-threshold",
+            "400",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "fixed_registration": fixed,
+        "moving_baseline_registration": moving,
+        "output": output,
+        "fixed_threshold": 400.0,
+        "level": 2,
+        "workers": 4,
+        "progress": cli_module._log_progress,
+    }
+
+
+def test_constrained_channel_affine_registration_cli_forwards_seam_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    window_dir = tmp_path / "windows"
+    window_dir.mkdir()
+    reference = tmp_path / "reference.json"
+    baseline = tmp_path / "baseline.json"
+    seams = tmp_path / "seams.json"
+    anchors = tmp_path / "anchors.json"
+    for path in (reference, baseline, seams, anchors):
+        path.touch()
+    fixed_fused = tmp_path / "fixed.ome.zarr"
+    fixed_fused.mkdir()
+    output = tmp_path / "output.json"
+    captured = {}
+
+    def fake_write(**kwargs):
+        captured.update(kwargs)
+        return output.resolve()
+
+    monkeypatch.setattr(
+        cli_module, "write_constrained_tile_channel_affine_registration", fake_write
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "channel-affine-registration",
+            "--model",
+            "constrained-tile",
+            "--window-dir",
+            str(window_dir),
+            "--reference-registration",
+            str(reference),
+            "--baseline-registration",
+            str(baseline),
+            "--seam-measurements",
+            str(seams),
+            "--verified-anchor",
+            str(anchors),
+            "--output-registration",
+            str(output),
+            "--expected-moving-channel",
+            "0",
+            "--expected-fixed-fused",
+            str(fixed_fused),
+            "--source-label",
+            "488-L",
+            "--target-label",
+            "514",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "window_dir": window_dir,
+        "reference_registration_input": reference,
+        "baseline_registration_input": baseline,
+        "seam_measurements_input": seams,
+        "verified_anchor_input": anchors,
+        "output_registration": output,
+        "expected_moving_channel": 0,
+        "expected_fixed_fused": fixed_fused,
+        "source_label": "488-L",
+        "target_label": "514",
+    }
+
+
 def test_join_channel_affine_registrations_cli_forwards_required_contract(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -366,7 +539,7 @@ def test_apply_channel_affine_cli_forwards_required_contract(tmp_path: Path, mon
     }
 
 
-@pytest.mark.parametrize("command", ["fit-residual", "post-basic"])
+@pytest.mark.parametrize("command", ["fit-residual", "basic-residual"])
 def test_residual_cli_aliases_forward_one_contract(
     tmp_path: Path,
     monkeypatch,
@@ -416,6 +589,8 @@ def test_residual_cli_aliases_forward_one_contract(
             "90",
             "--workers",
             "3",
+            "--validation-workers",
+            "2",
             "--seed",
             "19",
         ],
@@ -439,6 +614,7 @@ def test_residual_cli_aliases_forward_one_contract(
         "source_field_penalty": 0.2,
         "stride": 2,
         "workers": 3,
+        "validation_workers": 2,
         "seed": 19,
     }
 
@@ -495,10 +671,18 @@ def test_cross_dataset_match_cli_forwards_two_fixed_corrections(
             "75",
             "--workers",
             "3",
+            "--grid-spacing-zyx-um",
+            "80,160,240",
         ],
     )
 
     assert result.exit_code == 0, result.output
+    assert result.stdout.strip().splitlines() == [
+        str(output / "manifest.json"),
+        f"Base correction: {output / 'correction.json'}",
+        f"Registered correction: {output / 'registered-view-correction.json'}",
+        f"QC figure: {output / 'cross-dataset-match-qc.png'}",
+    ]
     assert captured == {
         "registration": registration,
         "fixed_fused": fixed,
@@ -511,6 +695,7 @@ def test_cross_dataset_match_cli_forwards_two_fixed_corrections(
         "stride": 2,
         "z_percentiles": [25.0, 75.0],
         "workers": 3,
+        "grid_spacing_zyx_um": (80.0, 160.0, 240.0),
     }
 
     captured.clear()
@@ -533,6 +718,7 @@ def test_cross_dataset_match_cli_forwards_two_fixed_corrections(
     )
     assert result.exit_code == 0, result.output
     assert captured["corrections_by_view"] == {}
+    assert captured["grid_spacing_zyx_um"] == (100.0, 200.0, 200.0)
 
 
 def test_cli_registers_jpegxr_codec_before_command(tmp_path: Path, monkeypatch) -> None:
@@ -1004,7 +1190,7 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
     assert captured["output_dir"] == output_dir
     assert captured["core_shape_zyx"] == (480, 480, 480)
     assert captured["window_shape_zyx"] == (528, 528, 528)
-    assert captured["level_factor_zyx"] == (4, 4, 4)
+    assert captured["level_factor_zyx"] == (1, 1, 1)
     assert captured["source_channel"] == 0
     assert captured["output_codec"] == "zstd"
     assert captured["jpegxr_level"] == 0.7
@@ -1326,6 +1512,25 @@ def test_fuse_cli_uses_level0_output_chunksize_by_default(tmp_path, monkeypatch)
     assert result.exit_code == 0
     assert captured["output_chunksize_zyx"] == (12, 960, 960)
     assert captured["fusion_weight_mode"] == "crop-sharpness-seam"
+    assert captured["per_chunk_cupy_cleanup"] is True
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "fuse",
+            str(input_dir),
+            "--position-input",
+            str(position),
+            "--registration-input",
+            str(registration),
+            "--output",
+            str(tmp_path / "fused.ome.zarr"),
+            "--retain-cupy-pool",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["per_chunk_cupy_cleanup"] is False
 
 
 def test_registration_center_z_spotcheck_cli_passes_channels(tmp_path, monkeypatch) -> None:

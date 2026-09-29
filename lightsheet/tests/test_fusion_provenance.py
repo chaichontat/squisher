@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from squisher_lightsheet.fusion_provenance import write_fusion_provenance
+from squisher_lightsheet.fusion_provenance import _json_references, write_fusion_provenance
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -247,6 +247,34 @@ def test_missing_transitive_json_records_partial_coverage(tmp_path: Path) -> Non
     manifest = json.loads((output / "provenance" / "manifest.json").read_text())
     assert index["status"] == "partial"
     assert any(item["path"].endswith("missing-summary.json") for item in manifest["coverage"]["unresolved"])
+
+
+def test_internal_uri_like_json_identity_is_not_a_file_reference() -> None:
+    assert _json_references({"input_summary": "recovery-stage:/01-filter/summary.json"}) == []
+
+
+def test_relocated_project_json_is_resolved_from_direct_input_anchor(tmp_path: Path) -> None:
+    position, registration, _deconv, _summary = _fixture_inputs(tmp_path)
+    relocated = _write_json(tmp_path / "upstream" / "summary.json", {"artifact_type": "upstream.v1"})
+    payload = json.loads(registration.read_text())
+    payload["relocated_summary"] = f"/working/{tmp_path.name}/upstream/summary.json"
+    registration.write_text(json.dumps(payload) + "\n")
+    output = tmp_path / "fused.ch0.ome.zarr"
+    _write_output_store(output)
+
+    index = write_fusion_provenance(
+        output=output,
+        input_dir=tmp_path,
+        position_input=position,
+        registration_input=registration,
+        channel=0,
+        requested_settings={},
+        resolved_settings={},
+    )
+
+    assert index["status"] == "complete"
+    manifest = json.loads((output / "provenance" / "manifest.json").read_text())
+    assert str(relocated.resolve()) in {artifact["source_path"] for artifact in manifest["artifacts"]}
 
 
 def test_historical_nan_json_is_preserved_verbatim(tmp_path: Path) -> None:

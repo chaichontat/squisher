@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
-import re
 from pathlib import Path
-from typing import Any, Literal
+import re
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from squisher_lightsheet import ngff
 from squisher_lightsheet.legacy_runner import run_legacy_script
 
+if TYPE_CHECKING:
+    from PIL import Image, ImageFont, PngImagePlugin
+
 
 SIDES = ("L", "R")
+DEFAULT_FUSED_MIDDLE_Z_LEVEL = 2
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,24 @@ class LiveFusionPreviewResult:
     sampled_plane_count: int
     selected_z: tuple[int, ...]
     selected_nonzero_pixels: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FusedMiddleZQCResult:
+    images: tuple[Path, ...]
+    contact_sheet: Path | None
+
+
+@dataclass(frozen=True)
+class _RenderedMiddleZPlane:
+    label: str
+    source: Path
+    image: Image.Image
+    z_index: int
+    z_um: float
+    pixel_size_x_um: float
+    low: float
+    high: float
 
 
 def scale_u8(image: np.ndarray) -> np.ndarray:
@@ -49,6 +72,240 @@ def scale_u8_with_limits(image: np.ndarray) -> tuple[np.ndarray, tuple[float, fl
         high = float(np.max(sample)) if float(np.max(sample)) > low else low + 1.0
     scaled = np.clip((image - low) / max(float(high - low), 1e-6), 0.0, 1.0)
     return np.rint(scaled * 255.0).astype(np.uint8), (float(low), float(high))
+
+
+def load_qc_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    from PIL import ImageFont
+
+    for path in (
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ):
+        if path.is_file():
+            return ImageFont.truetype(str(path), size)
+    return ImageFont.load_default()
+
+
+def _middle_z_pnginfo(
+    rendered: _RenderedMiddleZPlane, *, level: int, fixed_volume: Path
+) -> PngImagePlugin.PngInfo:
+    from PIL import PngImagePlugin
+
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("Source", str(rendered.source.resolve()))
+    metadata.add_text("Fixed volume", str(fixed_volume.resolve()))
+    metadata.add_text("Pyramid level", str(level))
+    metadata.add_text("Fixed Z index", str(rendered.z_index))
+    metadata.add_text("Physical Z (um)", f"{rendered.z_um:.6f}")
+    metadata.add_text(
+        "Display percentile range", f"{rendered.low:.6f}, {rendered.high:.6f}"
+    )
+    metadata.add_text(
+        "Plane statistic", "single fixed-grid middle-Z plane; no Z projection"
+    )
+    return metadata
+
+
+def _render_fused_middle_z_plane(
+    *,
+    label: str,
+    source: Path,
+    fixed_shape: tuple[int, ...],
+    fixed_transform: object,
+    level: int,
+) -> _RenderedMiddleZPlane:
+    from PIL import Image
+    import zarr
+
+    root = zarr.open_group(source, mode="r")
+    if root.attrs.get("squisher_complete") is not True:
+        raise ValueError(f"fusion is not complete: {source}")
+    dataset_path = ngff.level_path(root, level=level, context=source)
+    array = root[dataset_path]
+    axes = list(ngff.axes(root, array).lower())
+    if axes != ["z", "y", "x"] or np.dtype(array.dtype) != np.dtype(np.uint16):
+        raise ValueError(
+            f"expected a ZYX uint16 array, got axes={axes} "
+            f"shape={array.shape} dtype={array.dtype}: {source}"
+        )
+    if tuple(array.shape) != fixed_shape:
+        raise ValueError(
+            f"channel grid shape differs from fixed volume: {array.shape} != {fixed_shape}"
+        )
+    datasets = root.attrs["ome"]["multiscales"][0]["datasets"]
+    dataset = next(item for item in datasets if item["path"] == dataset_path)
+    if dataset["coordinateTransformations"] != fixed_transform:
+        raise ValueError(f"channel grid transform differs from fixed volume: {source}")
+
+    z_index = (array.shape[0] - 1) // 2
+    plane = np.asarray(array[z_index])
+    display, (low, high) = scale_u8_with_limits(plane)
+    dataset_index = ngff.dataset_paths(root).index(dataset_path)
+    transform_axes, scale, translation, _has_scale, _has_translation = (
+        ngff.scale_translation(root, dataset_index=dataset_index)
+    )
+    if transform_axes != axes:
+        raise ValueError(
+            f"OME-Zarr transform axes {transform_axes} differ from array axes {axes}"
+        )
+    return _RenderedMiddleZPlane(
+        label=label,
+        source=source,
+        image=Image.fromarray(display, mode="L"),
+        z_index=z_index,
+        z_um=float(translation[0] + scale[0] * z_index),
+        pixel_size_x_um=float(scale[-1]),
+        low=low,
+        high=high,
+    )
+
+
+def _middle_z_individual_image(
+    rendered: _RenderedMiddleZPlane, *, level: int
+) -> Image.Image:
+    from PIL import Image, ImageDraw
+
+    header_height = 76
+    canvas = Image.new(
+        "L", (rendered.image.width, rendered.image.height + header_height), 0
+    )
+    canvas.paste(rendered.image, (0, header_height))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((18, 10), rendered.label, font=load_qc_font(28), fill=255)
+    draw.text(
+        (18, 43),
+        f"fixed-grid level {level} | middle z={rendered.z_index} "
+        f"({rendered.z_um:.2f} um)",
+        font=load_qc_font(20),
+        fill=210,
+    )
+    return canvas
+
+
+def _middle_z_contact_sheet(
+    rendered: list[_RenderedMiddleZPlane], *, level: int
+) -> Image.Image:
+    from PIL import Image, ImageDraw
+
+    if len(rendered) < 2:
+        raise ValueError("a contact sheet requires at least two channels")
+    columns = 2
+    rows = (len(rendered) + columns - 1) // columns
+    panel_width = 987
+    panel_height = round(
+        rendered[0].image.height * panel_width / rendered[0].image.width
+    )
+    title_height = 54
+    gap = 16
+    sheet = Image.new(
+        "L",
+        (
+            columns * panel_width + (columns - 1) * gap,
+            rows * (panel_height + title_height) + (rows - 1) * gap,
+        ),
+        0,
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, item in enumerate(rendered):
+        row, column = divmod(index, columns)
+        x = column * (panel_width + gap)
+        y = row * (panel_height + title_height)
+        panel = item.image.resize(
+            (panel_width, panel_height), Image.Resampling.LANCZOS
+        )
+        sheet.paste(panel, (x, y + title_height))
+        draw.text((x + 12, y + 8), item.label, font=load_qc_font(30), fill=255)
+        draw.text(
+            (x + 110, y + 15),
+            f"level {level}, z={item.z_index} ({item.z_um:.2f} um)",
+            font=load_qc_font(20),
+            fill=205,
+        )
+
+    last = rendered[-1]
+    row, column = divmod(len(rendered) - 1, columns)
+    x = column * (panel_width + gap)
+    y = row * (panel_height + title_height) + title_height
+    displayed_pixel_size_um = last.pixel_size_x_um * last.image.width / panel_width
+    bar_pixels = round(500.0 / displayed_pixel_size_um)
+    bar_y = y + panel_height - 34
+    bar_x = x + panel_width - bar_pixels - 28
+    draw.rectangle((bar_x, bar_y, bar_x + bar_pixels, bar_y + 7), fill=255)
+    return sheet
+
+
+def render_fused_middle_z_qc(
+    *,
+    channels: Sequence[tuple[str, Path]],
+    fixed_volume: Path,
+    output_dir: Path,
+    level: int = DEFAULT_FUSED_MIDDLE_Z_LEVEL,
+    contact_sheet_name: str | None = None,
+) -> FusedMiddleZQCResult:
+    """Render same-grid fused channels at their shared middle-Z plane."""
+    if not channels:
+        raise ValueError("at least one channel is required")
+    labels = [label for label, _source in channels]
+    if len(labels) != len(set(labels)):
+        raise ValueError(f"channel labels must be unique: {labels}")
+    if (
+        contact_sheet_name is not None
+        and Path(contact_sheet_name).name != contact_sheet_name
+    ):
+        raise ValueError("contact_sheet_name must be a filename")
+
+    import zarr
+
+    fixed = zarr.open_group(fixed_volume, mode="r")
+    if fixed.attrs.get("squisher_complete") is not True:
+        raise ValueError(f"fixed fusion is not complete: {fixed_volume}")
+    fixed_path = ngff.level_path(fixed, level=level, context=fixed_volume)
+    fixed_array = fixed[fixed_path]
+    fixed_axes = list(ngff.axes(fixed, fixed_array).lower())
+    if fixed_axes != ["z", "y", "x"]:
+        raise ValueError(f"fixed volume must have ZYX axes, got {fixed_axes}")
+    fixed_dataset = next(
+        item
+        for item in fixed.attrs["ome"]["multiscales"][0]["datasets"]
+        if item["path"] == fixed_path
+    )
+    fixed_shape = tuple(fixed_array.shape)
+    fixed_transform = fixed_dataset["coordinateTransformations"]
+    rendered = [
+        _render_fused_middle_z_plane(
+            label=label,
+            source=source,
+            fixed_shape=fixed_shape,
+            fixed_transform=fixed_transform,
+            level=level,
+        )
+        for label, source in channels
+    ]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = []
+    for item in rendered:
+        output = output_dir / f"middle-z-{item.label}.png"
+        _middle_z_individual_image(item, level=level).save(
+            output,
+            pnginfo=_middle_z_pnginfo(
+                item, level=level, fixed_volume=fixed_volume
+            ),
+        )
+        outputs.append(output.resolve())
+
+    contact_sheet = None
+    if contact_sheet_name is not None:
+        if len(rendered) < 2:
+            raise ValueError("contact sheet output requires at least two channels")
+        contact_sheet = (output_dir / contact_sheet_name).resolve()
+        _middle_z_contact_sheet(rendered, level=level).save(
+            contact_sheet,
+            pnginfo=_middle_z_pnginfo(
+                rendered[0], level=level, fixed_volume=fixed_volume
+            ),
+        )
+    return FusedMiddleZQCResult(tuple(outputs), contact_sheet)
 
 
 def scale_positive_u8(image: np.ndarray, high_percentile: float = 99.7) -> np.ndarray:

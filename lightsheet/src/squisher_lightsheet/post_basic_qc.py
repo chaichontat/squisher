@@ -1,4 +1,4 @@
-"""Consolidated channel QC from the post-BaSiC sampler's saved artifacts."""
+"""Consolidated channel QC from the basic-residual sampler's saved artifacts."""
 
 from __future__ import annotations
 
@@ -60,22 +60,22 @@ def _write_report(
     qc_dir = output / "qc"
     qc_dir.mkdir()
     residual_only = manifest.get("input_stage") == "deconvolved"
-    report_title = "Residual calibration QC" if residual_only else "Post-BaSiC QC"
+    report_title = "Residual calibration QC" if residual_only else "BaSiC residual QC"
     comparison_titles = (
         ["(a) Deconvolved", "(b) Residual corrected"]
         if residual_only
-        else ["(a) BaSiC only", "(b) BaSiC + post-BaSiC"]
+        else ["(a) BaSiC only", "(b) BaSiC + residual"]
     )
     field_titles = (
         ["(d) Input field · identity", "(e) Shared residual · raw Z 50%"]
         if residual_only
-        else ["(d) BaSiC flatfield · divisor", "(e) Post-BaSiC · raw Z 50%"]
+        else ["(d) BaSiC flatfield · divisor", "(e) BaSiC residual · raw Z 50%"]
     )
     correction_stage_names = (
-        ("Input", "Residual", "Applied") if residual_only else ("BaSiC", "Post-BaSiC", "Combined")
+        ("Input", "Residual", "Applied") if residual_only else ("BaSiC", "Residual", "Combined")
     )
     if flatfields is None and not residual_only:
-        raise ValueError("Post-BaSiC QC requires the fitted BaSiC flatfields")
+        raise ValueError("BaSiC residual QC requires the fitted BaSiC flatfields")
     gains = json.loads((output / "tile-gains.json").read_text())["tiles"]
     spacing_y, spacing_x = np.asarray(manifest["fixed_spacing_um"][1:]) * manifest["stride"]
     origin_y, origin_x = manifest["fixed_origin_um"][1:]
@@ -482,7 +482,7 @@ Tile labels are source indices mapped to deconvolved sources in tile_gains.csv.
 Color and bars show 100 × (gain − 1).
 """
     else:
-        caption = f"""# Post-BaSiC QC
+        caption = f"""# BaSiC Residual QC
 
 Before is BaSiC-only; after includes the residual field and saved tile gains.
 Each image pair shares the recorded intensity range. The plane is fixed-grid

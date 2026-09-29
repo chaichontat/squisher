@@ -49,6 +49,102 @@ class RegistrationWorkflowOutputs:
     registration_json: Path
 
 
+@dataclass(frozen=True)
+class _DisconnectedEdgeStatus:
+    disconnected: set[int]
+    edge_tiles: set[int]
+    edge_only: bool
+
+
+def _normalized_tile_name(value: str) -> str:
+    name = Path(value).name
+    for suffix in (".ome.tif", ".ome.tiff"):
+        if name.endswith(suffix):
+            return f"{name[: -len(suffix)]}.ome.zarr"
+    return name
+
+
+def _accepted_component(
+    *, tile_count: int, diagnostics_payload: dict[str, Any]
+) -> set[int] | None:
+    outputs = diagnostics_payload.get("outputs")
+    anchor = diagnostics_payload.get("anchor_tile_index")
+    if not isinstance(outputs, dict) or not isinstance(outputs.get("constraints_jsonl"), str):
+        return None
+    if not isinstance(anchor, int) or not 0 <= anchor < tile_count:
+        return None
+    constraints = Path(outputs["constraints_jsonl"])
+    if not constraints.is_file():
+        return None
+    graph = nx.Graph()
+    graph.add_nodes_from(range(tile_count))
+    for line in constraints.read_text().splitlines():
+        row = json.loads(line)
+        fixed = row.get("fixed")
+        moving = row.get("moving")
+        if not isinstance(fixed, int) or not isinstance(moving, int):
+            raise ValueError(f"{constraints} contains a constraint without integer tile indexes")
+        if fixed not in graph or moving not in graph:
+            raise ValueError("Constraint tile indexes are outside the optimized positions")
+        if row.get("accepted") is True:
+            graph.add_edge(fixed, moving)
+    return set(nx.node_connected_component(graph, anchor))
+
+
+def _disconnected_edge_status(
+    *,
+    position_records: list[dict[str, Any]],
+    diagnostics_payload: dict[str, Any],
+    summary_payload: dict[str, Any],
+) -> _DisconnectedEdgeStatus:
+    """Classify anchor-disconnected tiles against the screened 2-D adjacency graph."""
+    tile_count = len(position_records)
+    connected = _accepted_component(tile_count=tile_count, diagnostics_payload=diagnostics_payload)
+    if connected is None:
+        return _DisconnectedEdgeStatus(set(), set(), False)
+    disconnected = set(range(tile_count)) - connected
+    settings = summary_payload.get("settings")
+    screen_value = settings.get("level2_screen") if isinstance(settings, dict) else None
+    if not isinstance(screen_value, str) or not Path(screen_value).is_file():
+        return _DisconnectedEdgeStatus(disconnected, set(), False)
+
+    names: dict[str, int] = {}
+    for index, record in enumerate(position_records):
+        tile = record.get("tile")
+        if not isinstance(tile, str) or not tile:
+            raise ValueError(f"optimized position tile {index} is missing its name")
+        normalized = _normalized_tile_name(tile)
+        if normalized in names:
+            raise ValueError(f"duplicate optimized position tile name {normalized!r}")
+        names[normalized] = index
+
+    screen = Path(screen_value)
+    screen_payload = json.loads(screen.read_text())
+    pairs = screen_payload.get("pairs")
+    if not isinstance(pairs, list):
+        raise ValueError(f"{screen} is missing pairs")
+    candidate_graph = nx.Graph()
+    candidate_graph.add_nodes_from(range(tile_count))
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            raise ValueError(f"{screen} contains a non-object pair")
+        fixed_name = pair.get("fixed_tile")
+        moving_name = pair.get("moving_tile")
+        if not isinstance(fixed_name, str) or not isinstance(moving_name, str):
+            raise ValueError(f"{screen} contains a pair without tile names")
+        try:
+            fixed = names[_normalized_tile_name(fixed_name)]
+            moving = names[_normalized_tile_name(moving_name)]
+        except KeyError as exc:
+            raise ValueError(f"{screen} contains a tile absent from the optimized positions") from exc
+        candidate_graph.add_edge(fixed, moving)
+
+    # Face-adjacent 2-D acquisition interiors have four candidate neighbors.
+    # A missing cardinal neighbor places the tile on the acquisition boundary.
+    edge_tiles = {index for index, degree in candidate_graph.degree() if degree < 4}
+    return _DisconnectedEdgeStatus(disconnected, edge_tiles, disconnected <= edge_tiles)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -128,11 +224,6 @@ def _validate_optimization_diagnostics(
     for key in ("tile_count", "connected_tile_count"):
         if not isinstance(payload.get(key), int):
             raise ValueError(f"{artifact} is missing integer {key}")
-    if not allow_disconnected and payload["connected_tile_count"] != payload["tile_count"]:
-        raise ValueError(
-            f"registration graph is not fully connected: "
-            f"{payload['connected_tile_count']}/{payload['tile_count']} tiles"
-        )
     recorded_outputs = payload.get("outputs")
     if not isinstance(recorded_outputs, dict):
         raise ValueError(f"{artifact} is missing outputs")
@@ -140,6 +231,21 @@ def _validate_optimization_diagnostics(
         value = recorded_outputs.get(key)
         if not isinstance(value, str) or Path(value).resolve() != expected_path.resolve():
             raise ValueError(f"{artifact} output {key}={value!r} differs from {expected_path.resolve()}")
+    if not allow_disconnected and payload["connected_tile_count"] != payload["tile_count"]:
+        position_payload = json.loads(position_json.read_text())
+        position_records = position_payload.get("tiles")
+        if not isinstance(position_records, list):
+            raise ValueError(f"{position_json} is missing tiles")
+        status = _disconnected_edge_status(
+            position_records=position_records,
+            diagnostics_payload=payload,
+            summary_payload=json.loads(method8_summary.read_text()),
+        )
+        if not status.edge_only:
+            raise ValueError(
+                f"registration graph is not fully connected: "
+                f"{payload['connected_tile_count']}/{payload['tile_count']} tiles"
+            )
 
 
 def _record_vector(record: dict[str, Any], key: str) -> np.ndarray:
@@ -348,20 +454,26 @@ def write_canonical_registration(
             f"{diagnostics} tile_count={tile_count} differs from {optimized_position} tiles={len(position_records)}"
         )
     included = set(range(tile_count))
+    connectivity_status: _DisconnectedEdgeStatus | None = None
+    auto_allowed_edge_disconnected = False
+    if connected_count != tile_count:
+        connectivity_status = _disconnected_edge_status(
+            position_records=position_records,
+            diagnostics_payload=diagnostics_payload,
+            summary_payload=summary_payload,
+        )
     if exclude_disconnected and connected_count != tile_count:
-        graph = nx.Graph()
-        graph.add_nodes_from(included)
-        constraints = Path(diagnostics_payload["outputs"]["constraints_jsonl"])
-        for line in constraints.read_text().splitlines():
-            row = json.loads(line)
-            if row["fixed"] not in included or row["moving"] not in included:
-                raise ValueError(f"Constraint tile indexes are outside {optimized_position}")
-            if row["accepted"]:
-                graph.add_edge(row["fixed"], row["moving"])
-        included = set(nx.node_connected_component(graph, diagnostics_payload["anchor_tile_index"]))
+        component = _accepted_component(tile_count=tile_count, diagnostics_payload=diagnostics_payload)
+        if component is None:
+            raise ValueError(f"{diagnostics} cannot identify the anchor-connected component")
+        included = component
         if len(included) != connected_count:
             raise ValueError("Accepted constraint graph differs from the optimization connectivity record")
-    if not allow_disconnected and connected_count != len(included):
+    elif not allow_disconnected and connected_count != tile_count:
+        auto_allowed_edge_disconnected = bool(
+            connectivity_status is not None and connectivity_status.edge_only
+        )
+    if not allow_disconnected and not auto_allowed_edge_disconnected and connected_count != len(included):
         raise ValueError(f"registration graph is not fully connected: {connected_count}/{tile_count} tiles")
 
     level = int(summary_payload.get("settings", {}).get("level", 0))
@@ -380,10 +492,15 @@ def write_canonical_registration(
         "threshold": threshold_payload,
         "connectivity": {
             "allow_disconnected": bool(allow_disconnected),
+            "auto_allowed_edge_disconnected": auto_allowed_edge_disconnected,
             "tile_count": len(included),
             "connected_tile_count": int(connected_count),
         },
     }
+    if auto_allowed_edge_disconnected and connectivity_status is not None:
+        provenance["connectivity"]["disconnected_edge_tiles"] = [
+            position_records[index]["tile"] for index in sorted(connectivity_status.disconnected)
+        ]
     if exclude_disconnected:
         provenance["connectivity"].update({
             "source_tile_count": tile_count,

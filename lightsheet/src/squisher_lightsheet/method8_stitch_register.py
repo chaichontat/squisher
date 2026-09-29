@@ -26,6 +26,7 @@ from squisher_lightsheet.channel_affine import (
     gradient_component_ncc_3d_gpu,
     output_to_input_to_model,
 )
+from squisher.gpu_retry import cuda_oom_retry
 from squisher_lightsheet.native_reg3dgpu import DEFAULT_LIB_DIR, register_method8_device, zyx_to_xyz_3x4
 from squisher_lightsheet.ngff import axes as ngff_axes
 from squisher_lightsheet.tile_input import open_array, resolve_tile_path, level_scale_ratio, source_axes
@@ -415,6 +416,7 @@ def _axis_priors_from_phase_rows(
     return priors, set(grouped), diagnostics
 
 
+@cuda_oom_retry("prior-shifted method8 phase chunk", device_parameter="device")
 def _measure_prior_shifted_phase_z_chunk(
     *,
     fixed: TileInfo,
@@ -684,6 +686,7 @@ def _all_adjacent_pairs(tiles: dict[str, TileInfo]) -> list[str]:
     return [pair for _sort_key, pair in sorted(pairs)]
 
 
+@cuda_oom_retry("method8 registration chunk", device_parameter="device")
 def _measure_z_chunk(
     *,
     fixed: TileInfo,

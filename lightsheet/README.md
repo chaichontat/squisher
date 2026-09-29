@@ -10,6 +10,131 @@ coordinate contracts, QC gates, and canonical final output layout.
 uv run --package squisher-lightsheet lightsheet --help
 ```
 
+## Ventricular UV surface
+
+Build the outward `+X` face of a binary cortex mask and flatten the resulting
+manifold disk into a geometric UV chart:
+
+```bash
+uv run --package squisher-lightsheet lightsheet uv-surface \
+  --mask /path/to/cortex.seg.nrrd \
+  --output-dir /path/to/vz-surface \
+  --stride-zyx 1,1,1 \
+  --smoothing-um 19.2
+```
+
+The mask must be a 3-D binary NRRD with orthonormal physical direction and one
+contiguous interval on every nonempty intrinsic-X ray. The command smooths its
+physical signed-distance field, extracts the outermost intrinsic-`+X` zero
+crossing, requires a single manifold disk, and uses an intrinsic-coordinate
+anchored Tutte embedding. Reflections and rotations are preserved in the world
+coordinates and face winding. `--stride-zyx` starts at source index zero and is
+recorded separately from the original mask geometry. The strict default rejects
+multi-interval rays before and after striding; `--allow-multi-interval-rays` is
+the explicit opt-in to select the outermost crossing. The command refuses an
+existing output directory and atomically publishes `surface.npz`, `surface.ply`,
+`chart.npz`, and `metadata.json`.
+
+For a bilateral cortex joined across the midline, build the two medial sheets
+separately with an explicit array-X split:
+
+```bash
+uv run --package squisher-lightsheet lightsheet bilateral-uv-surface \
+  --mask /path/to/cortex.seg.nrrd \
+  --output-dir /path/to/bilateral-vz-surface \
+  --split-x-index 226 \
+  --keep-main-sheet \
+  --max-face-edge-um 100 \
+  --smoothing-um 19.2
+```
+
+The low-X half uses its `+X` face and the high-X half its `-X` face. Rays occupied
+on both sides of the split are excluded, including their refined-grid neighbors,
+so the artificial cut cap cannot enter either surface. Both retained sheets must
+independently satisfy the manifold-disk contract. If cap exclusion leaves detached
+surface fragments, the largest connected face component is retained and the
+discarded vertex, face, and component counts are recorded. Outputs are stored
+under `low-x/` and `high-x/`, with shared provenance in `bilateral.json`.
+For masks with an inferior bridge, `--keep-main-sheet` additionally keeps the
+surface above the bridge's per-Y upper Z envelope and removes the posterior wrap.
+Use `--max-face-edge-um` to break faces that span a physical discontinuity before
+the largest-component selection, avoiding a blunt global Z cutoff when appendages
+attach through implausibly long triangles. Use `--main-sheet-min-z-index` only
+when a reviewed global lower Z cutoff is still needed.
+
+Project an aligned intensity volume through the first tissue interval along each
+surface's negative oriented normal and max-reduce it onto the bilateral UV charts:
+
+```bash
+uv run --package squisher-lightsheet lightsheet surface-intensity-map \
+  --surface-root /path/to/bilateral-vz-surface \
+  --mask /path/to/cortex.seg.nrrd \
+  --source-zarr /path/to/fused.channel.ome.zarr \
+  --output-dir /path/to/surface-intensity \
+  --level 2 \
+  --max-depth-um 2500 \
+  --depth-step-um 4.8 \
+  --uv-size 512
+```
+
+The command refuses incomplete or misaligned metadata contracts and any ray whose
+first tissue interval reaches the requested depth cap. It stores raw per-vertex
+maxima, sampling support, last in-tissue depth, and a piecewise-linear UV raster
+for each hemisphere, plus a shared PNG and hashed `metadata.json` provenance.
+
+## Eomes surface profiles and boundaries
+
+Run the canonical prod2 estimator against one ventricular surface and the
+co-registered 561 OME-Zarr. It bins sampled volume by exact closest-triangle
+distance, assigns each footpoint to its nearest physical mesh vertex, and pools
+raw sums and counts over mesh-edge geodesic neighborhoods:
+
+```bash
+lightsheet eomes-profiles \
+  --surface /path/to/vz-surface/surface.npz \
+  --chart /path/to/vz-surface/chart.npz \
+  --mask /path/to/cortex.seg.nrrd \
+  --source-zarr /path/to/fused-561.ome.zarr \
+  --output-dir /path/to/eomes-profiles
+
+lightsheet eomes-boundaries \
+  --profiles /path/to/eomes-profiles/profiles.npz \
+  --surface /path/to/vz-surface/surface.npz \
+  --output-dir /path/to/eomes-boundaries
+```
+
+The profile defaults reproduce the prod2 sampling contract: OME-Zarr level 2,
+stride `2,4,4`, 20 µm geodesic neighborhoods, and 4.8 µm depth centers below the
+exclusive 280.8 µm limit. Boundary defaults use the rising 0.60 crossing with
+30 µm smoothing for the inner edge and the falling 0.75 crossing with 80 µm
+smoothing for the outer edge. Each fit requires direct support on every mesh
+component. The outer field is constrained to be at least the inner field on the
+retained intrinsic wall; raw measurements remain unchanged as evidence. Boundary
+fitting requires the sibling profile `metadata.json` to bind the profile array to
+the supplied surface.
+
+Render the direct measurements beside the recovered fields at reviewed
+intrinsic-Z planes:
+
+```bash
+lightsheet eomes-boundary-qc \
+  --surface /path/to/vz-surface/surface.npz \
+  --chart /path/to/vz-surface/chart.npz \
+  --boundaries /path/to/eomes-boundaries/boundaries.npz \
+  --mask /path/to/cortex.seg.nrrd \
+  --source-zarr /path/to/fused-561.ome.zarr \
+  --output-dir /path/to/eomes-boundary-qc \
+  --intrinsic-z-index 180 \
+  --intrinsic-z-index 240 \
+  --intrinsic-z-index 300
+```
+
+Use repeated `--intrinsic-z-position-um` values instead of indices when physical
+positions are easier to review; the two forms are mutually exclusive. QC samples
+one world-physical plane per requested intrinsic Z with no slab projection and
+publishes PNG, PDF, SVG, and JSON only. Cell projection and layer assignment are
+intentionally deferred until these contours pass review.
+
 ## Planar tissue tilt
 
 Fit one two-axis tissue-plane normal from one or more co-registered OME-Zarr
@@ -50,10 +175,10 @@ channels.
 ## Fit residual calibration after deconvolution
 
 [System design and single-/multi-side workflows](RESIDUAL_CORRECTION.md).
-[Fit acceptance workflow](POST_BASIC.md).
+[Fit-residual acceptance workflow](POST_BASIC.md).
 
-`fit-residual` is the canonical post-deconvolution workflow; `post-basic` is an
-exact CLI alias. It samples registered deconvolved CZYX OME-Zarr sources across
+`fit-residual` is the canonical post-deconvolution workflow. It samples
+registered deconvolved CZYX OME-Zarr sources across
 the fixed fused grid, fits shared and source-specific depth-aware
 camera-coordinate fields plus one gain per source, evaluates held-out source
 pairs and held-out Z planes, then refits
@@ -136,19 +261,20 @@ publishing the directory.
 
 ### Match separately corrected datasets
 
-Use `cross-dataset-match` after separate per-dataset `post-basic` fits and
+Use `cross-dataset-match` after separate per-dataset `fit-residual` fits and
 after the datasets have been registered into one coordinate frame. This stage
 keeps every existing per-tile gain and spatial field fixed. It samples only
-cross-view overlaps and fits one robust multiplicative factor for the moving
-dataset; it does not fit tile gains or fields and does not run cross-validation.
+cross-view overlaps, fits a smooth correction field in registered physical
+coordinates, and evaluates that field with held-out spatial blocks. Unsupported
+regions fade to the robust mean correction.
 
 ```bash
 lightsheet cross-dataset-match \
   --fixed-fused /path/to/preliminary-joined-reference.ome.zarr \
   --registration /path/to/joined.registration.json \
   --output-dir /path/to/cross-dataset-match \
-  --correction-by-source-view TL=/path/to/tl/post-basic/correction.json \
-  --correction-by-source-view TR=/path/to/tr/post-basic/correction.json \
+  --correction-by-source-view TL=/path/to/tl/fit-residual/correction.json \
+  --correction-by-source-view TR=/path/to/tr/fit-residual/correction.json \
   --reference-view TL \
   --moving-view TR \
   --channel 0 \
@@ -159,24 +285,33 @@ lightsheet cross-dataset-match \
   --z-percentile 50 \
   --z-percentile 65 \
   --z-percentile 80 \
+  --grid-spacing-zyx-um 100,200,200 \
   --workers 8
 ```
 
 Each `--correction-by-source-view` is optional. Omit it when that view has no
-post-BaSiC residual correction; the command records and uses an explicit
+fit-residual correction; the command records and uses an explicit
 identity correction for those registered sources.
 
-The output `correction.json` composes supplied and identity corrections into the ordinary
-residual-correction schema consumed by `lightsheet fuse --residual-correction`.
-Reference-view sources retain their prior relative corrections. Moving-view
-sources retain their prior relative tile gains and fields, with the single
-fitted dataset factor applied uniformly. If necessary, one common scale is
-applied to every source so the conservative maximum correction multiplier is
-at most one; this changes neither within-view relative corrections nor the
-fitted between-view ratio. The manifest distinguishes supplied correction
-files from generated identity inputs.
-Inspect `cross-dataset-match-qc.png` before final fusion; it shows the measured
-moving/reference log-ratios before and after the fitted factor.
+The output `correction.json` composes only the supplied and identity base
+corrections into the ordinary residual-correction schema. The between-view
+adjustment lives exclusively in `registered-view-correction.json`, preventing
+the mean correction from being applied twice. Use both artifacts for final
+fusion:
+
+```bash
+lightsheet fuse \
+  --residual-correction /path/to/cross-dataset-match/correction.json \
+  --registered-view-correction /path/to/cross-dataset-match/registered-view-correction.json \
+  --fusion-weight-mode crop-sharpness-seam \
+  ...
+```
+
+The registered field is supported by direct level-0 crop-sharpness fusion. The
+manifest distinguishes supplied corrections from identity inputs and binds the
+field to the registration hash. Inspect `cross-dataset-match-qc.png`; it is a
+contact sheet of sequential field and support planes. Held-out before/after
+metrics are recorded in `match.json`.
 
 ### Review residual-calibration QC
 
@@ -246,6 +381,25 @@ lightsheet rechunk-ome-zarr SOURCE.ome.zarr PREVIEW.ome.zarr \
 The command writes through `.PREVIEW.ome.zarr.tmp`, sets
 `squisher_complete=true` only after every selected level is copied, and refuses
 existing output unless `--overwrite` is passed.
+
+## Export an OME-Zarr level as NRRD
+
+Use `export-nrrd` to stream one 3-D ZYX pyramid level into a gzip-compressed
+NRRD for 3D Slicer without materializing the full volume in memory:
+
+```bash
+lightsheet export-nrrd SOURCE.ome.zarr CHANNEL.nrrd \
+  --level 3 \
+  --channel 561 \
+  --summary-output CHANNEL.json
+```
+
+The command preserves decoded uint16 values and the selected NGFF scale and
+translation. Acquisition XYZ is stored as identity-direction LPS XYZ in
+millimetres; no anatomical orientation is inferred. The final path is published
+only after SimpleITK accepts the header and a streamed gzip readback matches the
+source voxel hash and byte count. Existing output and temporary paths are never
+overwritten.
 
 ## WGACtrl-405-L2 Run Record (2026-07-10)
 
@@ -489,6 +643,25 @@ print("native lib dir:", DEFAULT_LIB_DIR)
 PY
 ```
 
+### Shared GPU admission and OOM retry
+
+Lightsheet host-to-host CUDA operations share an interprocess lease for each
+visible GPU. Separate fusion, registration, channel-subtraction, phase, affine,
+and pyramid processes can therefore remain running concurrently without the
+caller manually scheduling their GPU turns. The lease is taken at reconstructible
+transaction boundaries such as one fusion block, registration window, subtraction
+slab, or pyramid chunk; CPU preparation and output writing remain independent.
+
+After a recognized CUDA allocation failure, the operation releases cached CuPy
+memory, preserves the original inputs, and retries with exponential backoff. It
+does not retry validation errors or other runtime failures, and it re-raises the
+original OOM after the configured limit. Defaults are 12 attempts, a 5-second
+initial delay, and a 60-second delay cap. Override them with
+`SQUISHER_CUDA_OOM_MAX_ATTEMPTS`, `SQUISHER_CUDA_OOM_INITIAL_DELAY_SECONDS`, and
+`SQUISHER_CUDA_OOM_MAX_DELAY_SECONDS`. `SQUISHER_GPU_LOCK_DIR` changes the
+per-user lock directory; lock files are advisory and are released automatically
+when a process exits.
+
 For within-acquisition stitching, the packaged command accepts only the
 human-gated workflow. The required exact threshold is the review confirmation.
 The command records it, screens every adjacent pair and planned Z chunk at
@@ -696,6 +869,9 @@ lightsheet cross-register method6 \
   --output-dir RUN_DIR/method6 \
   --output-registration RUN_DIR/registration.json \
   --moving-channel 0 \
+  --fit-intensity-transform log1p \
+  --starting-affine-matrix-zyx 1,0,0,0,1,0,0,0,1 \
+  --min-grad-ncc 0.24 \
   --fixed-mask-threshold 50 \
   --source-label 638 \
   --target-label 571 \
@@ -703,10 +879,28 @@ lightsheet cross-register method6 \
   --devices 0,1
 ```
 
-This command fixes the native method to Method 6, applies `log1p` to the fit
-inputs, starts level 0 from level-2 Method 8, and uses the identity linear
-initializer. Before writing the canonical registration, it validates those
-settings and the input paths against the completed or resumed sweep summary.
+This command fixes the native method to Method 6 and starts level 0 from
+level-2 Method 8. The fit intensity transform and row-major 3x3 initializer
+are explicit public inputs; omitted values remain `log1p` and identity for
+backward compatibility. Before writing the canonical registration, it validates
+those settings, the gradient-NCC threshold, and the input paths against the
+completed or resumed sweep summary. The initializer must contain nine finite
+values and be invertible.
+It also reads the fixed fusion's provenance. When that fusion used non-identity
+registered affines but the supplied position files still contain pre-affine
+stage coordinates, the command writes deterministic fused-coordinate position
+proxies under `OUTPUT_DIR/fused-coordinate-inputs/` and uses them for the fit.
+Already-baked and identity-affine position files keep their existing behavior;
+ambiguous mixed-frame inputs fail before any GPU work starts.
+
+For this Method6 sweep, `--devices` uses physical GPU indices when
+`CUDA_VISIBLE_DEVICES` is unset. When a visibility mask is present, `--devices`
+uses local indices within that mask. For example,
+`CUDA_VISIBLE_DEVICES=GPU-... lightsheet cross-register method6 ... --devices 0`
+keeps the worker on that UUID, while an unmasked `--workers 2 --devices 0,1`
+selects physical GPUs 0 and 1. A local index outside the inherited mask fails
+before GPU work starts. `recover-native --devices` follows the same mapping
+because its reruns use this sweep runner.
 
 Apply an accepted physical channel calibration to another acquisition without
 rerunning the estimator:
@@ -727,6 +921,48 @@ stage-conjugates its isolated physical affine into every reference tile. It
 preserves tile order and source geometry; it never copies the calibration
 artifact's already-applied per-tile matrices.
 
+The default `channel-affine-registration` finalizer estimates one reusable
+physical calibration. If the accepted window transforms vary systematically by
+tile or depth, finalize that acquisition with the constrained tile model instead:
+
+```bash
+lightsheet registered-grid-channel-anchors \
+  --fixed-registration FIXED_MATCHED_TILES.registration.json \
+  --moving-baseline-registration MOVING.global.registration.json \
+  --fixed-threshold HUMAN_REVIEWED_FIXED_THRESHOLD \
+  --level 2 \
+  --workers 4 \
+  --output MOVING.registered-grid-anchors.json
+
+lightsheet channel-affine-registration \
+  --model constrained-tile \
+  --window-dir CORRECTED_METHOD6/window_json \
+  --reference-registration MOVING.source.registration.json \
+  --baseline-registration MOVING.global.registration.json \
+  --seam-measurements MOVING_SAME_CHANNEL/registration.measurements.json \
+  --verified-anchor MOVING.registered-grid-anchors.json \
+  --output-registration MOVING.constrained.registration.json \
+  --expected-moving-channel 0 \
+  --expected-fixed-fused FIXED/fused.ch0.ome.zarr \
+  --source-label 488-L \
+  --target-label 514
+```
+
+Measure the seam input from the moving channel itself and select its mask
+threshold by manual native-intensity review. A different channel's adjacency may
+define which tiles touch, but it is not seam evidence. Cross-channel anchors are
+measured directly between matched fixed and moving tile sources sampled on the
+same registered grid; the fixed threshold is a separate manual review in the
+fixed channel's intensity space. Method6 windows remain initializer and
+provenance evidence and are not fitted as independent anchors. The constrained
+model holds out whole depth bands of both anchors and seam segments when selecting
+regularization, fits lateral residual affines, and copies the baseline fixed-world
+Z row exactly. Its adjacent `fit-qc.json` and `fit-qc.png` report the after-fit
+anchor residuals and the measured moving-channel seam mismatch before and after
+fitting. The output remains
+`awaiting_human_qc`; do not use it for subtraction or fusion until those QC
+artifacts and exact-grid overlays are accepted.
+
 When separate source views were fitted against subsets of one combined reference
 registration, join their full-tile registrations with the packaged owner:
 
@@ -740,11 +976,20 @@ lightsheet join-channel-affine-registrations \
   --target-label 561
 ```
 
-The side registrations must be global channel-affine artifacts whose tile sets
-form an exact, disjoint partition of the reference. The command rejects changed
+The side registrations may be global or constrained channel-affine artifacts;
+their tile sets must form an exact, disjoint partition of the reference. The command rejects changed
 source paths or geometry, writes tiles in reference order, and substitutes only
 each side's `registered_affine`. Output provenance records hashes, tile coverage,
-transform contracts, and the global-affine diagnostics from every side input.
+transform contracts, and the finalizer diagnostics from every side input.
+
+When `lightsheet fuse` receives both `--position-input` and
+`--registration-input`, the position file follows the established
+`lightsheet.position.v1` convention used by prod2: each tile's `translation_um`
+is its source stage placement and must equal the registration record's
+`stage_translation_um`. The `registered_affine` carries the complete correction.
+Do not bake the registered tile origin into `translation_um`; that applies the
+same placement twice. Fusion rejects mismatched pairs before building the output
+grid.
 
 The overlap in step 6 is required. Materializing only the 480-voxel level-0
 source cores gives the blending weights no shared pixels at core boundaries
@@ -754,10 +999,9 @@ stage origin, and retains its selected affine in `registered_affine`.
 
 ### Recovery, Filtering, and Outlier-Only Replacement
 
-The commands below recover and finalize an existing fused-fixed native-method
-summary; coarse placement and the initial sweep are prerequisites. Recovery
-uses the native method and intensity transform recorded by that summary, so a
-Method6 input is rerun with Method6 rather than Method10.
+The commands below recover and finalize an existing fused-fixed Method 6
+summary; coarse placement and the initial sweep are prerequisites. Native
+recovery uses the method and intensity transform recorded by that summary.
 Accepted fits seed recovery only when their leave-one-out transform differs
 from the remaining fits by no more than the configured corner-displacement
 tolerance. Outliers become recovery targets and cannot seed their own tile or
@@ -769,36 +1013,65 @@ The historical filename remains `fused_fixed_method8_summary.json`. Each
 command writes a new directory and refuses to overwrite an existing result.
 
 ```bash
-RECOVERY_SCRIPT=lightsheet/scripts/recover_fused_fixed_method10_outliers.py
 RAW_SUMMARY=/path/to/native-run/fused_fixed_method8_summary.json
 MOVING_TILE_ADJACENCY=/path/to/moving-registration/registration.measurements.json
 RECOVERED_DIR=/path/to/native-spatial-recovery
-FILTERED_DIR=/path/to/native-linear-filter
-CORRECTED_DIR=/path/to/native-final
+COMPLETE_DIR=/path/to/complete-recovery
 
-python "$RECOVERY_SCRIPT" \
+lightsheet cross-register recover-native \
   --summary "$RAW_SUMMARY" \
   --output-dir "$RECOVERED_DIR" \
   --adjacency-json "$MOVING_TILE_ADJACENCY" \
   --devices 0,1
 
-python "$RECOVERY_SCRIPT" \
-  --summary "$RECOVERED_DIR/fused_fixed_method8_summary.json" \
-  --output-dir "$FILTERED_DIR" \
-  --exclude-nonlinear-only
-
-python "$RECOVERY_SCRIPT" \
-  --summary "$FILTERED_DIR/fused_fixed_method8_summary.json" \
-  --output-dir "$CORRECTED_DIR" \
-  --smooth-retained-linear
+lightsheet cross-register complete-recovery \
+  --native-summary "$RECOVERED_DIR/fused_fixed_method8_summary.json" \
+  --output-dir "$COMPLETE_DIR"
 ```
 
-Despite its historical flag name, `--smooth-retained-linear` does not smooth
-the entire retained field. It detects leave-one-out corner-displacement outliers and
-changes only flagged rows. Their translation comes from the inlier spatial
-field; their complete affine linear block comes from the same polar-decomposed
-SO(3)/stretch mean used by recovery. The output report records replaced and
-exactly preserved counts.
+`complete-recovery` accepts completed native Method 6 or Method 10 Mattes recovery checkpoints.
+It applies the physical linear filter, retained-affine-outlier replacement,
+validated spatial fallback promotion, and linear-mapping recovery in that fixed
+order. A fitted transform is replaced by a linear-field prediction only when
+zero-shift high-passed NCC against the fixed volume, on shared level-2 planes,
+favors the prediction by `--replacement-image-ncc-margin`. Spatial promotion
+keeps a native rerun rejected by the correlation or gradient-NCC gate when its
+gradient NCC beats the interpolated initializer's by
+`--native-rerun-grad-ncc-margin`, or when it failed only correlation while
+meeting the gradient-NCC minimum. Intermediate stage outputs remain temporary.
+The command atomically
+publishes the final windows, stage reports, and an identity manifest; repeated
+use succeeds only when the input content, settings, and complete output hashes
+still match.
+
+Before materialization, render geometric coverage and the windows accepted from
+interpolation:
+
+```bash
+lightsheet cross-register prefusion-qc \
+  --summary 514="$COMPLETE_DIR/fused_fixed_method8_summary.json" \
+  --fixed-volume /path/to/fixed/fused.ch0.ome.zarr \
+  --fixed-threshold REVIEWED_THRESHOLD \
+  --output-dir /path/to/prefusion-qc
+
+lightsheet cross-register interpolated-window-qc \
+  --summary "$COMPLETE_DIR/fused_fixed_method8_summary.json" \
+  --moving-label 514 \
+  --fixed-label 561 \
+  --output /path/to/prefusion-qc/interpolated-514.png
+```
+
+After fusion, render same-grid middle-Z PNGs and a combined contact sheet:
+
+```bash
+lightsheet fused-middle-z-qc \
+  --channel 561=/path/to/561/fused.ome.zarr \
+  --channel 514=/path/to/514/fused.ome.zarr \
+  --fixed-volume /path/to/561/fused.ome.zarr \
+  --output-dir /path/to/fused-qc \
+  --level 2 \
+  --contact-sheet-name combined-middle-z.png
+```
 
 ### Overlapping Materialization, Fusion, and QC
 
@@ -806,15 +1079,19 @@ Pass the filtered, outlier-replaced summary through `--source-summary`; it
 contains the final accepted rows and selected transforms. A manifest generated
 before those stages contains stale acceptance and affine data.
 
+The materializer defaults to native level 0 (`--level-factor-zyx 1,1,1`). Set
+`--level-factor-zyx 4,4,4` explicitly when producing a downsampled level-2
+review artifact, as in the preview example below.
+
 ```bash
 MOVING_POSITIONS=/path/to/moving.positions.json
 FIXED_FUSED=/path/to/fixed/fused.ch1.ome.zarr
-MAT_DIR="$CORRECTED_DIR/materialized-level2-overlap528"
+MAT_DIR="$COMPLETE_DIR/materialized-level2-overlap528"
 FUSION_DIR=/path/to/cross-registered-fusion
 
 lightsheet fused-fixed-materialize-overlap \
   --moving-position "$MOVING_POSITIONS" \
-  --source-summary "$CORRECTED_DIR/fused_fixed_method8_summary.json" \
+  --source-summary "$COMPLETE_DIR/fused_fixed_method8_summary.json" \
   --output-dir "$MAT_DIR" \
   --source-channel 0 \
   --residual-correction /path/to/residual-calibration/correction.json \
@@ -1060,6 +1337,23 @@ crop-score provenance and the fusion resume plan. During fusion,
 `--source-cache-max-gib` bounds a channel-session cache of canonical raw Zarr
 chunks. Corrections are applied to exact requested ROIs on the active GPU;
 fusion does not materialize corrected source slabs or a corrected disk cache.
+The direct Zarr fuser overlaps three bounded stages: CPU raw-region assembly,
+one serialized fusion queue per GPU, and writes serialized in output-block
+order. `--pipeline-staging-max-gib` is the session-wide host-memory limit for
+prepared inputs and pending outputs (default `8` GiB); set it to `0` only to
+diagnose or disable this pipeline. A block larger than the limit runs alone and
+is logged explicitly. Keep `--batch-size auto`: batching supplies enough blocks
+to overlap these stages without materializing a full corrected intermediate.
+For unusually dense direct-Zarr blocks, `--fusion-gpu-memory-max-gib` sets an
+opt-in working-memory budget (default `0`, disabled). The planner partitions the
+GPU computation in x/y while preserving the output chunk and its source-voting
+context, then assembles the original chunk before writing. It fails explicitly
+if even the smallest x/y sub-block exceeds the budget. This setting affects
+execution and minor affine-resampling roundoff only, so it is not resume state.
+Fusion releases unused CuPy allocations after every completed output block by
+default so allocator caching does not retain a channel-wide high-water mark.
+Use `--retain-cupy-pool` only when measured allocator reuse is worth the extra
+resident VRAM.
 Cache eviction changes performance only and is not resume state. Resume
 identity uses content hashes for JSON and Zarr metadata, so rewriting identical
 metadata does not discard valid progress; raw files without a content hash still

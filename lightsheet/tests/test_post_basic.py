@@ -21,6 +21,7 @@ from squisher_lightsheet.post_basic import (
     _pair_folds,
     _SampledTile,
     _seam_samples,
+    fit_residual_model,
     parse_channel_spec,
     run_post_basic,
 )
@@ -521,7 +522,7 @@ def test_post_basic_does_not_publish_when_qc_rendering_fails(tmp_path: Path, mon
             stride=1,
         )
     assert not output.exists()
-    assert not list(tmp_path.glob(".post-basic-*"))
+    assert not list(tmp_path.glob(".basic-residual-*"))
 
 
 def test_repeated_source_pairs_stay_in_one_fold_across_z_planes() -> None:
@@ -796,9 +797,78 @@ def test_source_fields_recover_source_specific_spatial_residuals():
     assert fitted["heldout_with_source_field"]["median"] < shared["heldout_after"]["median"] * 0.25
 
 
-def test_z_validation_accepts_sparse_per_plane_pair_support():
-    from squisher_lightsheet.post_basic import _validate_z_models
+def test_deployment_refit_skips_sources_without_overlap_support() -> None:
+    rng = np.random.default_rng(43)
+    sources = [Path(str(index)) for index in range(7)]
+    rows = []
+    for first in range(5):
+        ya, yb = rng.random((2, 40, 2))
+        rows.append(
+            {
+                "first": first,
+                "second": first + 1,
+                "pair_id": f"{first}-{first + 1}",
+                "z": 0,
+                "ya": ya,
+                "yb": yb,
+                "target": np.full(40, 0.02 * (first + 1)),
+            }
+        )
 
+    _, gains, result = fit_residual_model(
+        rows=rows,
+        sources=sources,
+        seed=43,
+        fit_tile_gains=True,
+        fit_source_fields=True,
+        z_degree=0,
+        xy_degree=1,
+        field_penalty=0.03,
+        source_field_penalty=0.03,
+    )
+
+    assert gains[6] == 1
+    assert result["tile_gain_zero_support_policy"] == "identity"
+    assert result["tile_gain_unestimated_sources"] == [str(sources[6])]
+    assert result["tile_gains"][6]["training_pairs"] == 0
+    assert result["source_field_zero_support_policy"] == "zero"
+    assert result["source_field_unestimated_sources"] == [str(sources[6])]
+    assert result["source_fields"][6]["training_pairs"] == 0
+    np.testing.assert_array_equal(result["source_fields"][6]["coefficient"], 0)
+
+
+def test_deployment_refit_rejects_disconnected_supported_sources() -> None:
+    rng = np.random.default_rng(47)
+    rows = []
+    for first, second in ((0, 1), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5)):
+        ya, yb = rng.random((2, 40, 2))
+        rows.append(
+            {
+                "first": first,
+                "second": second,
+                "pair_id": f"{first}-{second}",
+                "z": 0,
+                "ya": ya,
+                "yb": yb,
+                "target": np.zeros(40),
+            }
+        )
+
+    with pytest.raises(ValueError, match="connected overlap graph across supported sources"):
+        fit_residual_model(
+            rows=rows,
+            sources=[Path(str(index)) for index in range(7)],
+            seed=47,
+            fit_tile_gains=True,
+            fit_source_fields=True,
+            z_degree=0,
+            xy_degree=1,
+            field_penalty=0.03,
+            source_field_penalty=0.03,
+        )
+
+
+def _sparse_z_validation_rows() -> list[dict[str, object]]:
     rng = np.random.default_rng(53)
     plane_pairs = (
         ((0, 1), (1, 2), (2, 3), (0, 3)),
@@ -822,9 +892,14 @@ def test_z_validation_accepts_sparse_per_plane_pair_support():
                     "target": np.zeros(40),
                 }
             )
+    return rows
 
-    result = _validate_z_models(
-        rows,
+
+def _run_sparse_z_validation(validation_workers: int) -> list[dict[str, object]]:
+    from squisher_lightsheet.post_basic import _validate_z_models
+
+    return _validate_z_models(
+        _sparse_z_validation_rows(),
         sources=[Path(str(index)) for index in range(4)],
         reference_z=1,
         seed=53,
@@ -833,6 +908,46 @@ def test_z_validation_accepts_sparse_per_plane_pair_support():
         z_degree=1,
         field_penalty=0.03,
         source_field_penalty=0.03,
+        validation_workers=validation_workers,
     )
 
+
+def test_z_validation_accepts_sparse_per_plane_pair_support():
+    result = _run_sparse_z_validation(validation_workers=1)
+
     assert len(result) == 3
+
+
+@pytest.mark.parametrize("validation_workers", [2, 8])
+def test_spawned_z_validation_matches_serial_in_plane_order(validation_workers: int) -> None:
+    serial = _run_sparse_z_validation(validation_workers=1)
+    parallel = _run_sparse_z_validation(validation_workers=validation_workers)
+
+    assert [row["heldout_z"] for row in parallel] == [0, 1, 2]
+    assert parallel == serial
+
+
+def test_z_validation_rejects_nonpositive_worker_count() -> None:
+    with pytest.raises(ValueError, match="Validation workers must be positive"):
+        _run_sparse_z_validation(validation_workers=0)
+
+
+def test_spawned_z_validation_reports_worker_failure_with_plane_context() -> None:
+    rows = _sparse_z_validation_rows()
+    del rows[0]["target"]
+
+    from squisher_lightsheet.post_basic import _validate_z_models
+
+    with pytest.raises(RuntimeError, match=r"Held-out Z validation failed for Z \d"):
+        _validate_z_models(
+            rows,
+            sources=[Path(str(index)) for index in range(4)],
+            reference_z=1,
+            seed=53,
+            fit_tile_gains=True,
+            fit_source_fields=True,
+            z_degree=1,
+            field_penalty=0.03,
+            source_field_penalty=0.03,
+            validation_workers=2,
+        )

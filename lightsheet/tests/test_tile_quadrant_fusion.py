@@ -104,7 +104,10 @@ def test_fused_fixed_registered_affine_maps_local_model_to_fixed_physical_space(
         "selected_local_translation_zyx": [2.0, 3.0, 4.0],
     }
 
-    affine, fixed_origin = _fused_fixed_registered_affine_um(row)
+    moving_scale = np.asarray([0.61, 0.29, 0.19])
+    affine, fixed_origin = _fused_fixed_registered_affine_um(
+        row, moving_scale_zyx=moving_scale
+    )
 
     scale = np.asarray(row["fused_scale_zyx"])
     fixed_translation = np.asarray(row["fused_translation_zyx"])
@@ -114,7 +117,7 @@ def test_fused_fixed_registered_affine_maps_local_model_to_fixed_physical_space(
     center = (np.asarray(row["moving_shape_zyx"]) - 1.0) / 2.0
     np.testing.assert_allclose(fixed_origin, fixed_translation + fixed_start * scale)
     for local_pixel in (np.zeros(3), center, np.asarray([479.0, 479.0, 479.0])):
-        stage_um = fixed_origin + scale * local_pixel
+        stage_um = fixed_origin + moving_scale * local_pixel
         actual = affine @ np.r_[stage_um, 1.0]
         fixed_local = matrix @ (local_pixel - center) + center + translation
         expected = fixed_translation + scale * (fixed_start + fixed_local)
@@ -210,6 +213,7 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
         output_dir=tmp_path / "out",
         output_codec="zstd",
         residual_correction=correction_path,
+        level_factor_zyx=(4, 4, 4),
     )
 
     assert len(calls) == 1
@@ -319,6 +323,7 @@ def test_export_fused_fixed_uses_explicit_pixel_source_registration(monkeypatch,
         moving_source_input=moving_sources,
         output_dir=tmp_path / "out",
         output_codec="zstd",
+        level_factor_zyx=(4, 4, 4),
     )
 
     assert calls[0]["source_path"] == source_zarr
@@ -344,6 +349,7 @@ def test_export_fused_fixed_allows_overlap_with_full_extent_axis(tmp_path) -> No
     registration = json.loads(outputs["registration"].read_text())
     assert registration["materialization_grid"]["core_shape_zyx"] == [320, 640, 640]
     assert registration["materialization_grid"]["window_shape_zyx"] == [352, 704, 640]
+    assert registration["materialization_grid"]["level_factor_zyx"] == [1, 1, 1]
 
     with pytest.raises(ValueError, match="must be larger on at least one axis"):
         export_fused_fixed_overlapping_materialized_chunks(
@@ -425,6 +431,7 @@ def test_export_fused_fixed_builds_registration_from_selected_window_summary(mon
         moving_position_input=moving_position,
         output_dir=tmp_path / "out",
         output_codec="zstd",
+        level_factor_zyx=(4, 4, 4),
     )
 
     assert len(calls) == 1
@@ -1213,3 +1220,166 @@ def test_pixel_source_directory_rejects_changed_shape(tmp_path):
     record = {"tile": "tile.ome.tif", "path": "/old/tile.ome.zarr", "shape": [1, 8, 6, 8], "axes": "CZYX"}
     with pytest.raises(ValueError, match="shape"):
         tile_quadrant_fusion._merge_moving_pixel_sources({"tile": record}, None, tmp_path)
+
+
+def test_materialize_flipped_source_writes_oriented_window_with_raw_correction(tmp_path) -> None:
+    zarr = pytest.importorskip("zarr")
+    source_path = tmp_path / "source.ome.zarr"
+    source_data = np.arange(1, 1 + 8 * 8 * 8, dtype=np.uint16).reshape(1, 8, 8, 8)
+    _source_ome_zarr(source_path, source_data, axes="CZYX", chunks=(1, 4, 4, 4))
+    zz, yy, xx = np.indices((8, 8, 8))
+    multiplier = (0.4 + 0.03 * zz + 0.02 * yy + 0.01 * xx).astype(np.float32)
+
+    class RecordingCorrection:
+        shape_zyx = (8, 8, 8)
+        fingerprint = "correction-fingerprint"
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        def block(self, *, z_slice, y_slice, x_slice):
+            self.requests.append((z_slice, y_slice, x_slice))
+            return multiplier[z_slice, y_slice, x_slice]
+
+    correction = RecordingCorrection()
+    output_path = tmp_path / "out.ome.zarr"
+    shape = _materialize_downsampled_channel_crop_ome_zarr(
+        source_path=source_path,
+        output_path=output_path,
+        source_record={
+            "tile": "source.ome.zarr",
+            "axes": "CZYX",
+            "scale_um": {"z": -1.0, "y": 1.0, "x": -1.0},
+        },
+        source_channel=0,
+        start_zyx=np.asarray([2, 0, 4], dtype=np.int64),
+        stop_zyx=np.asarray([6, 8, 8], dtype=np.int64),
+        level_factor_zyx=np.asarray([1, 1, 1], dtype=np.int64),
+        spacing_zyx=np.asarray([1.0, 1.0, 1.0], dtype=np.float64),
+        output_codec="zstd",
+        zstd_level=3,
+        residual_correction=correction,
+        residual_correction_identity={"path": "/correction.json", "sha256": "artifact-sha"},
+    )
+
+    # Window indices are oriented (reversed Z and X); the correction stays in raw source coordinates.
+    corrected = np.rint(source_data[0].astype(np.float32) * multiplier).astype(np.uint16)
+    oriented = corrected[::-1, :, ::-1]
+    assert shape == [4, 8, 4]
+    np.testing.assert_array_equal(zarr.open_group(str(output_path), mode="r")["0"][:], oriented[2:6, 0:8, 4:8])
+    assert correction.requests == [(slice(2, 6), slice(0, 8), slice(0, 4))]
+
+
+def test_export_fused_fixed_summary_places_flipped_moving_window_by_oriented_origin(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "source.ome.zarr"
+    source.mkdir()
+    moving_position = tmp_path / "moving.positions.json"
+    # Index zero of each negative axis is its high bound; the oriented tile starts at (10, 20, 30).
+    moving_position.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "tile.ome.tif",
+                        "path": str(source),
+                        "axes": "CZYX",
+                        "shape": [2, 1440, 1440, 1440],
+                        "translation_um": {"z": 874.0, "y": 20.0, "x": 318.0},
+                        "scale_um": {"z": -0.6, "y": 0.3, "x": -0.2},
+                    }
+                ]
+            }
+        )
+        + "\n"
+    )
+    accepted = {
+        "status": "accepted",
+        "moving_tile": "tile.ome.tif",
+        "quadrant": "qy2_qx1",
+        "moving_start_l0_zyx": [912, 912, 912],
+        "moving_stop_l0_zyx": [1440, 1440, 1440],
+        "moving_shape_zyx": [528, 528, 528],
+        "fixed_start_zyx": [100, 200, 300],
+        "fused_scale_zyx": [0.6, 0.3, 0.2],
+        "fused_translation_zyx": [-5.0, 7.0, 11.0],
+        "selected_attempt": "measured_inlier",
+        "selected_local_matrix_zyx": np.eye(3).tolist(),
+        "selected_local_translation_zyx": [2.0, 3.0, 4.0],
+    }
+    accepted_path = tmp_path / "accepted.json"
+    accepted_path.write_text(json.dumps(accepted) + "\n")
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps({"fixed_fused": "/fixed.ome.zarr", "windows": [{"level0_json": str(accepted_path)}]}) + "\n"
+    )
+    calls = []
+
+    def fake_materialize(**kwargs):
+        calls.append(kwargs)
+        return [132, 132, 132]
+
+    monkeypatch.setattr(tile_quadrant_fusion, "_materialize_downsampled_channel_crop_ome_zarr", fake_materialize)
+
+    outputs = export_fused_fixed_overlapping_materialized_chunks(
+        source_summary_input=summary_path,
+        moving_position_input=moving_position,
+        output_dir=tmp_path / "out",
+        output_codec="zstd",
+        level_factor_zyx=(4, 4, 4),
+    )
+
+    record = json.loads(outputs["registration"].read_text())["tiles"][0]
+    np.testing.assert_allclose([record["stage_scale_um"][axis] for axis in "zyx"], [2.4, 1.2, 0.8])
+    np.testing.assert_allclose(
+        [record["source_origin_um"][axis] for axis in "zyx"],
+        [10.0 + 912 * 0.6, 20.0 + 912 * 0.3, 30.0 + 912 * 0.2],
+    )
+    expected_affine, _origin = _fused_fixed_registered_affine_um(
+        accepted, moving_scale_zyx=np.asarray([0.6, 0.3, 0.2])
+    )
+    np.testing.assert_allclose(record["registered_affine"]["matrix"], expected_affine)
+    np.testing.assert_allclose(calls[0]["spacing_zyx"], [2.4, 1.2, 0.8])
+
+
+def test_native_source_group_writes_oriented_windows_for_flipped_source(monkeypatch, tmp_path) -> None:
+    zarr = pytest.importorskip("zarr")
+    source_data = np.arange(1 * 6 * 6 * 6, dtype=np.uint16).reshape(1, 6, 6, 6)
+
+    class SlabArray:
+        shape = source_data.shape
+        chunks = (1, 2, 6, 6)
+        dtype = source_data.dtype
+
+        def __getitem__(self, selection):
+            return source_data[selection]
+
+    monkeypatch.setattr(
+        tile_quadrant_fusion,
+        "_ome_downsample_source",
+        lambda _path, _factors: (SlabArray(), "CZYX", 0, np.ones(3, dtype=np.int64)),
+    )
+    task = {
+        "source_path": tmp_path / "source.ome.zarr",
+        "source_record": {
+            "tile": "source.ome.zarr",
+            "axes": "CZYX",
+            "scale_um": {"z": -1.0, "y": 1.0, "x": -1.0},
+        },
+        "source_channel": 0,
+        "level_factor_zyx": np.ones(3, dtype=np.int64),
+        "spacing_zyx": np.ones(3, dtype=np.float64),
+        "output_codec": "zstd",
+        "zstd_level": 3,
+        "jpegxr_level": 0.7,
+        "output_path": tmp_path / "window.ome.zarr",
+        "start_zyx": np.asarray([1, 0, 2]),
+        "stop_zyx": np.asarray([4, 6, 6]),
+    }
+
+    assert _materialize_native_source_group([task]) == [[3, 6, 4]]
+    oriented = source_data[0, ::-1, :, ::-1]
+    np.testing.assert_array_equal(
+        zarr.open_group(str(tmp_path / "window.ome.zarr"), mode="r")["0"][:], oriented[1:4, 0:6, 2:6]
+    )

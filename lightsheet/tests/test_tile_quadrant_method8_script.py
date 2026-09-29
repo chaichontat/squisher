@@ -81,6 +81,38 @@ def test_spatial_overlap_windows_cover_only_intersection(tmp_path: Path) -> None
     assert {window["fixed_start_zyx"][0] for window in windows} == {0, 480, 833}
 
 
+def test_spatial_overlap_windows_support_different_fixed_and_moving_z_lengths(
+    tmp_path: Path,
+) -> None:
+    fixed = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="229Tnc-CL.000.ome.zarr",
+            translation_zyx_um=(0.0, 0.0, 0.0),
+            shape=(1024, 1920, 1920),
+            scale_zyx_um=(1.0, 1.0, 1.0),
+        )
+    )
+    moving = tile_quadrant_method8.tile_record_from_position_record(
+        _position_record(
+            tmp_path,
+            tile="229Tnc-CR.000.ome.zarr",
+            translation_zyx_um=(52.0, 200.0, 1600.0),
+            shape=(920, 1920, 1920),
+            scale_zyx_um=(1.0, 1.0, 1.0),
+        )
+    )
+
+    windows = tile_quadrant_method8.spatial_overlap_windows(
+        fixed,
+        moving,
+        preseed_matrix_zyx=np.eye(3),
+    )
+
+    assert windows
+    assert all(window["fixed_stop_zyx"][0] <= 1024 for window in windows)
+
+
 def test_spatial_overlap_windows_reject_crop_below_minimum_after_exact_clipping(
     tmp_path: Path,
 ) -> None:
@@ -542,3 +574,68 @@ def test_native_phase_only_attempts_are_never_resumable() -> None:
         },
         cache_config=cache_config,
     )
+
+
+def test_preseeded_level0_model_places_flipped_moving_tile_by_oriented_origin(tmp_path: Path) -> None:
+    fixed = _position_record(
+        tmp_path,
+        tile="sample-CL.000.ome.zarr",
+        translation_zyx_um=(0.0, 0.0, 0.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(1.0, 1.0, 1.0),
+    )
+    # Index zero of a negative axis is its high bound; the oriented box starts at (10, 20, 30).
+    moving = _position_record(
+        tmp_path,
+        tile="sample-CR.000.ome.zarr",
+        translation_zyx_um=(110.0, 20.0, 130.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(-1.0, 1.0, -1.0),
+    )
+
+    _matrix, translation = tile_quadrant_method8.preseeded_level0_model(
+        fixed_tile=tile_quadrant_method8.tile_record_from_position_record(fixed),
+        moving_tile=tile_quadrant_method8.tile_record_from_position_record(moving),
+        preseed_matrix_zyx=np.eye(3),
+    )
+
+    np.testing.assert_allclose(translation, [10.0, 20.0, 30.0])
+
+
+def test_physical_crop_center_correspondences_use_oriented_origin_for_flipped_tiles(
+    tmp_path: Path,
+) -> None:
+    fixed = _position_record(
+        tmp_path,
+        tile="fixed.ome.zarr",
+        translation_zyx_um=(0.0, 0.0, 0.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(1.0, 1.0, 1.0),
+    )
+    moving = _position_record(
+        tmp_path,
+        tile="moving.ome.zarr",
+        translation_zyx_um=(110.0, 20.0, 130.0),
+        shape=(100, 100, 100),
+        scale_zyx_um=(-1.0, 1.0, -1.0),
+    )
+    rows = [
+        {
+            "status": "accepted",
+            "fixed_tile": fixed["tile"],
+            "moving_tile": moving["tile"],
+            "window_shape_zyx": [5, 7, 9],
+            "fixed_start_zyx": [4, 6, 8],
+            "moving_start_zyx": [1, 2, 3],
+            "local_translation_zyx": [0.5, -1.0, 2.0],
+        }
+    ]
+
+    source, target, _pairs = tile_quadrant_method8._physical_crop_center_correspondences(
+        rows,
+        fixed_position={"tiles": [fixed]},
+        moving_position={"tiles": [moving]},
+    )
+
+    np.testing.assert_allclose(source[0], [13.0, 25.0, 37.0])
+    np.testing.assert_allclose(target[0], [6.5, 8.0, 14.0])

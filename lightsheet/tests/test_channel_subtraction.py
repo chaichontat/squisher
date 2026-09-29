@@ -36,6 +36,192 @@ class ConstantCorrection:
         )
 
 
+def _registration_record(
+    *,
+    tile: str = "tile.ome.zarr",
+    stage: tuple[float, float, float] = (10.0, 20.0, 30.0),
+    scale: tuple[float, float, float] = (2.0, 0.5, 0.25),
+    affine: np.ndarray | None = None,
+) -> dict[str, object]:
+    matrix = np.eye(4) if affine is None else affine
+    return {
+        "tile": tile,
+        "stage_translation_um": dict(zip("zyx", stage, strict=True)),
+        "stage_scale_um": dict(zip("zyx", scale, strict=True)),
+        "registered_affine": {"matrix": matrix.tolist()},
+    }
+
+
+def test_paired_pull_maps_cropped_target_indices_to_reference_indices() -> None:
+    target = _registration_record()
+    reference = _registration_record()
+
+    pull, output_to_registered = channel_subtraction._paired_pull_affine(
+        target_record=target,
+        reference_record=reference,
+        crop_yx_px=20,
+    )
+
+    np.testing.assert_allclose(pull[:3, :3], np.eye(3))
+    np.testing.assert_allclose(pull[:3, 3], [0.0, 20.0, 20.0])
+    output_index = np.asarray([3.0, 4.0, 5.0, 1.0])
+    np.testing.assert_allclose(
+        output_to_registered @ output_index,
+        [16.0, 32.0, 36.25, 1.0],
+    )
+
+
+def test_paired_pull_uses_inverse_reference_affine() -> None:
+    target = _registration_record(stage=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0))
+    reference_affine = np.eye(4)
+    reference_affine[2, 3] = 7.0
+    reference = _registration_record(
+        stage=(0.0, 0.0, 0.0),
+        scale=(1.0, 1.0, 1.0),
+        affine=reference_affine,
+    )
+
+    pull, _output_to_registered = channel_subtraction._paired_pull_affine(
+        target_record=target,
+        reference_record=reference,
+        crop_yx_px=0,
+    )
+
+    np.testing.assert_allclose(pull[:3, :3], np.eye(3))
+    np.testing.assert_allclose(pull[:3, 3], [0.0, 0.0, -7.0])
+
+
+def test_position_registration_pair_rejects_different_canonical_ids(tmp_path: Path) -> None:
+    position = tmp_path / "input.positions.json"
+    registration = tmp_path / "input.registration.json"
+    position.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "target.ome.zarr",
+                        "side": "L",
+                        "path": str(tmp_path / "source.ome.zarr"),
+                        "translation_um": {"z": 0, "y": 0, "x": 0},
+                    }
+                ]
+            }
+        )
+    )
+    registration.write_text(
+        json.dumps(
+            {
+                "tiles": [
+                    {
+                        "tile": "other.ome.zarr",
+                        "source_view": "L",
+                        "path": str(tmp_path / "source.ome.zarr"),
+                        "stage_translation_um": {"z": 0, "y": 0, "x": 0},
+                    }
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="canonical tile IDs differ"):
+        channel_subtraction._validate_position_registration_pair(
+            position_path=position,
+            registration_path=registration,
+            side="L",
+        )
+
+
+def test_paired_tile_ids_use_intersection_and_report_unmatched_sources() -> None:
+    paired, target_only, reference_only = channel_subtraction._paired_tile_ids(
+        {"L.001": {}, "L.009": {}, "L.002": {}},
+        {"L.002": {}, "L.001": {}},
+    )
+
+    assert paired == ["L.001", "L.002"]
+    assert target_only == ["L.009"]
+    assert reference_only == []
+
+
+def test_canonical_pair_records_match_wavelength_specific_tile_names() -> None:
+    records = {
+        "230-Ptprz1-TL-514.009.ome.zarr": {
+            "source_view": "L",
+            "path": "/tmp/514.009.ome.zarr",
+        }
+    }
+
+    assert list(channel_subtraction._canonical_pair_records(records)) == ["L.009"]
+
+
+def test_join_paired_subtraction_sides_publishes_exact_disjoint_union(tmp_path: Path) -> None:
+    output_root = tmp_path / "subtraction"
+    output_root.mkdir()
+    side_dirs = []
+    for side, canonical in (("L", "canonical-left"), ("R", "canonical-right")):
+        side_dir = output_root / side
+        tile_dir = side_dir / "tiles"
+        tile_dir.mkdir(parents=True)
+        tile = tile_dir / f"{side}.ome.zarr"
+        channel_subtraction._write_ome_zarr_czyx(
+            tile,
+            np.ones((2, 3, 4), dtype=np.uint16),
+            translation_um={"z": 0.0, "y": 0.0, "x": 0.0},
+            scale_um={"z": 1.0, "y": 1.0, "x": 1.0},
+            channel_name="514-minus-488",
+            zstd_level=3,
+            chunk_shape_zyx=(2, 3, 4),
+        )
+        position_record = {
+            "tile": tile.name,
+            "source_tile": canonical,
+            "side": side,
+            "path": str(tile),
+            "axes": "CZYX",
+            "shape": [1, 2, 3, 4],
+            "channels": ["514-minus-488"],
+            "translation_um": {"z": 0.0, "y": 0.0, "x": 0.0},
+            "scale_um": {"z": 1.0, "y": 1.0, "x": 1.0},
+        }
+        registration_record = {
+            **position_record,
+            "source_view": side,
+            "stage_translation_um": position_record["translation_um"],
+            "stage_scale_um": position_record["scale_um"],
+            "registered_affine": {"matrix": np.eye(4).tolist()},
+        }
+        (side_dir / f"{side}.positions.json").write_text(
+            json.dumps({"tiles": [position_record]}) + "\n"
+        )
+        (side_dir / f"{side}.registration.json").write_text(
+            json.dumps({"input_dir": str(tile_dir), "tiles": [registration_record]}) + "\n"
+        )
+        (side_dir / f"{side}.summary.json").write_text(
+            json.dumps({"status": "complete", "side": side, "tile_count": 1}) + "\n"
+        )
+        side_dirs.append(side_dir)
+
+    result = channel_subtraction.join_paired_subtraction_sides(
+        side_output_dirs=side_dirs,
+        output_root=output_root,
+    )
+
+    assert result.tile_count == 2
+    positions = json.loads(result.position_output.read_text())
+    registrations = json.loads(result.registration_output.read_text())
+    summary = json.loads(result.summary_output.read_text())
+    assert summary["status"] == "complete"
+    assert summary["side_counts"] == {"L": 1, "R": 1}
+    assert {row["source_tile"] for row in positions["tiles"]} == {
+        "canonical-left",
+        "canonical-right",
+    }
+    assert len(registrations["tiles"]) == 2
+    for row in positions["tiles"]:
+        path = Path(row["path"])
+        assert path.is_symlink()
+        assert zarr.open_group(str(path), mode="r").attrs["squisher_complete"] is True
+
+
 def test_subtraction_applies_target_and_reference_corrections_before_subtracting(monkeypatch) -> None:
     target = np.full((3, 4, 5), 20, dtype=np.uint16)
     reference = np.full((3, 4, 5), 4, dtype=np.uint16)

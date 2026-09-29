@@ -6,8 +6,7 @@ acquisition side and a joined acquisition with multiple sides. Side count
 changes the registration and source set; it does not select a different fitting
 algorithm.
 
-`lightsheet post-basic` is an exact alias for `lightsheet fit-residual`. Both
-names accept the same post-deconvolution inputs and run the same code. The
+`lightsheet fit-residual` is the canonical post-deconvolution command. The
 workflow does not compose raw BaSiC profiles or apply another BaSiC correction
 during fusion.
 
@@ -278,7 +277,7 @@ The main artifacts are:
 Review low, middle, and high Z planes, the applied multiplier field, tile
 interiors, and tile boundaries together. Accept the artifact only when the
 visual result and held-out seam measurements agree. The detailed review rules
-are in [POST_BASIC.md](POST_BASIC.md).
+are in the [fit-residual acceptance guide](POST_BASIC.md).
 
 For multiple channels, run the complete fit once per channel. A correction
 artifact records one channel and fusion rejects it for any other channel.

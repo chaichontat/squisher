@@ -326,7 +326,17 @@ def _zarr_level_shape(path: Path, level: int = 0) -> tuple[int, ...] | None:
     return tuple(int(value) for value in open_level_array(path, level=level).shape)
 
 
-def _infer_shape_czyx(records: list[dict[str, Any]], deconv_root: Path, channels: list[str]) -> list[int] | None:
+def _explicit_shape_czyx(record: dict[str, Any], channel_count: int) -> list[int] | None:
+    shape = record.get("shape")
+    axes = str(record.get("axes", ""))
+    if isinstance(shape, list) and axes == "CZYX":
+        return [int(value) for value in shape]
+    if isinstance(shape, list) and axes == "ZYX":
+        return [channel_count, *(int(value) for value in shape)]
+    return None
+
+
+def _infer_shape_czyx(records: list[dict[str, Any]], deconv_root: Path, channels: list[str]) -> list[list[int]]:
     inferred: set[tuple[int, ...]] = set()
     for record in records:
         shape = record.get("shape")
@@ -340,11 +350,7 @@ def _infer_shape_czyx(records: list[dict[str, Any]], deconv_root: Path, channels
         zarr_shape = _zarr_level_shape(deconv_root / _source_zarr_name(record), level=0)
         if zarr_shape is not None:
             inferred.add(zarr_shape)
-    if not inferred:
-        return None
-    if len(inferred) != 1:
-        raise ValueError(f"inconsistent inferred CZYX shapes: {sorted(inferred)}")
-    return list(next(iter(inferred)))
+    return [list(shape) for shape in sorted(inferred)]
 
 
 def _resolve_shape_czyx(
@@ -354,16 +360,21 @@ def _resolve_shape_czyx(
     deconv_root: Path,
     channels: list[str],
 ) -> list[int]:
-    inferred = _infer_shape_czyx(left_records + right_records, deconv_root, channels)
-    if inferred is None:
+    records = left_records + right_records
+    shapes = _infer_shape_czyx(records, deconv_root, channels)
+    if len(shapes) > 1 and any(_explicit_shape_czyx(record, len(channels)) is None for record in records):
+        # Tiles of different depths keep their own shapes; a shared default would misplace some.
+        raise ValueError(f"inconsistent CZYX shapes {shapes} require explicit per-record shapes")
+    if not shapes:
         if cli_shape_czyx is None:
             raise ValueError("could not infer CZYX shape from records or deconvolved OME-Zarrs; pass --shape-czyx")
-        inferred = cli_shape_czyx
-    elif cli_shape_czyx is not None and cli_shape_czyx != inferred:
-        raise ValueError(f"--shape-czyx {cli_shape_czyx} disagrees with inferred deconvolved CZYX shape {inferred}")
-    if inferred[0] != len(channels):
-        raise ValueError(f"channel list {channels} has {len(channels)} entries but inferred C dimension is {inferred[0]}")
-    return inferred
+        shapes = [cli_shape_czyx]
+    elif cli_shape_czyx is not None and shapes != [cli_shape_czyx]:
+        raise ValueError(f"--shape-czyx {cli_shape_czyx} disagrees with inferred deconvolved CZYX shapes {shapes}")
+    for shape in shapes:
+        if shape[0] != len(channels):
+            raise ValueError(f"channel list {channels} has {len(channels)} entries but inferred C dimension is {shape[0]}")
+    return shapes[0]
 
 
 def _tile_sort_key(record: dict[str, Any]) -> tuple[str, str]:
@@ -400,13 +411,18 @@ def build_clspace_position_payload(
         raise ValueError(
             f"CL/CR absolute scales differ: {np.abs(left_scale_um)} versus {np.abs(right_scale_um)}"
         )
-    phase_yx_um = np.asarray(phasecorr["phase_shift_to_apply_to_cr_yx_um"], dtype=np.float64)
-    phase_shift_um = np.asarray([0.0, phase_yx_um[0], phase_yx_um[1]], dtype=np.float64)
+    if phasecorr.get("artifact_type") == "squisher_lightsheet.registered_lr_phasecorr.v1":
+        # align-registered-lr bakes its whole CR shift, phase or manual, into the side positions.
+        phase_shift_um = np.asarray(phasecorr["total_shift_to_apply_to_cr_zyx_um"], dtype=np.float64)
+    else:
+        phase_yx_um = np.asarray(phasecorr["phase_shift_to_apply_to_cr_yx_um"], dtype=np.float64)
+        phase_shift_um = np.asarray([0.0, phase_yx_um[0], phase_yx_um[1]], dtype=np.float64)
     accepted_translations = _method8_accepted_local_translations(method8_summary)
     method8_median_px = np.median(accepted_translations, axis=0)
     method8_mean_px = np.mean(accepted_translations, axis=0)
-    method8_median_um = method8_median_px * right_scale_um
-    method8_mean_um = method8_mean_px * right_scale_um
+    # Method8 local translations are in fixed CL voxels, which run along +Z/Y/X on both sides.
+    method8_median_um = method8_median_px * np.abs(left_scale_um)
+    method8_mean_um = method8_mean_px * np.abs(left_scale_um)
 
     left_offset = metadata_centers["CL"] - _record_centers(left_records, shape_czyx)
     right_offset = metadata_centers["CR"] - _record_centers(right_records, shape_czyx)
@@ -429,7 +445,7 @@ def build_clspace_position_payload(
                 "translation_um": _dict_zyx(_vector(record, "translation_um") + offset),
                 "scale_um": _dict_zyx(_vector(record, "scale_um")),
                 "spacing_um": _dict_zyx(np.abs(_vector(record, "scale_um"))),
-                "shape": shape_czyx,
+                "shape": _explicit_shape_czyx(record, len(channels)) or shape_czyx,
                 "axes": "CZYX",
                 "channels": channels,
                 "tracks": [{"slug": "track0", "track_id": "all", "channels": channel_indexes, "channel_names": channels}],
@@ -494,7 +510,7 @@ def build_identity_registration_payload(
             {
                 "tile": record["tile"],
                 "path": str(deconv_root / record["tile"]),
-                "source_view": "C" + str(record["side"]),
+                "source_view": str(record["side"]),
                 "stage_translation_um": deepcopy(record["translation_um"]),
                 "stage_scale_um": deepcopy(record["scale_um"]),
                 "spacing_um": deepcopy(record["spacing_um"]),

@@ -42,6 +42,13 @@ def atomic_output_directory(output_dir: Path) -> Iterator[Path]:
         raise
 
 
+def read_json_object(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return payload
+
+
 def registration_input_fingerprint(position_json: Path, zarr_dir: Path) -> dict[str, Any]:
     """Fingerprint registration placement plus each level-0 store boundary."""
     position_bytes = position_json.read_bytes()

@@ -92,6 +92,8 @@ def _sample_tiles(
     channel: int,
     level: int,
     workers: int,
+    *,
+    allow_materialized: bool = False,
 ) -> list[_SampledTile]:
     """Pull registered locations using the source's actual NGFF level transforms."""
 
@@ -102,23 +104,51 @@ def _sample_tiles(
         array = level_array(group, level=level)
         axes, scale0, origin0, _, _ = scale_translation(group, dataset_index=0)
         axes_n, scale_n, origin_n, _, _ = scale_translation(group, dataset_index=level)
-        if axes != ["c", "z", "y", "x"] or axes_n != axes:
-            raise ValueError(f"Residual fitting requires CZYX deconvolved sources: {path}")
-        if not 0 <= channel < native.shape[0]:
-            raise ValueError(f"Channel {channel} is outside {path}")
-        if record.get("materialized_source_start_zyx") is not None:
-            raise ValueError("Residual fitting requires original deconvolved tiles, not materialized crops")
+        materialized = record.get("materialized_source_start_zyx") is not None
+        if materialized:
+            if not allow_materialized:
+                raise ValueError("Residual fitting requires original deconvolved tiles, not materialized crops")
+            if axes != ["z", "y", "x"] or axes_n != axes or channel != 0 or level != 0:
+                raise ValueError(
+                    f"Cross-dataset matching requires level-0 single-channel ZYX materialized sources: {path}"
+                )
+            start = np.asarray(record["materialized_source_start_zyx"], dtype=np.int64)
+            stop = np.asarray(record.get("materialized_source_stop_zyx"), dtype=np.int64)
+            if (
+                start.shape != (3,)
+                or stop.shape != (3,)
+                or np.any(start < 0)
+                or tuple(stop - start) != tuple(native.shape)
+            ):
+                raise ValueError(f"Materialized source bounds do not match the stored shape: {path}")
+            source_shape = tuple(int(value) for value in stop)
+            spatial_scale0 = np.asarray(scale0)
+            spatial_scale_n = np.asarray(scale_n)
+            spatial_origin0 = np.asarray(origin0)
+            spatial_origin_n = np.asarray(origin_n)
+        else:
+            if axes != ["c", "z", "y", "x"] or axes_n != axes:
+                raise ValueError(f"Residual fitting requires CZYX deconvolved sources: {path}")
+            if not 0 <= channel < native.shape[0]:
+                raise ValueError(f"Channel {channel} is outside {path}")
+            start = np.zeros(3, dtype=np.int64)
+            source_shape = tuple(native.shape[-3:])
+            spatial_scale0 = np.asarray(scale0[1:])
+            spatial_scale_n = np.asarray(scale_n[1:])
+            spatial_origin0 = np.asarray(origin0[1:])
+            spatial_origin_n = np.asarray(origin_n[1:])
         shape = tuple(native.shape[-3:])
-        if record.get("axes") != "CZYX" or tuple(record["shape"][-3:]) != shape:
+        expected_axes = "ZYX" if materialized else "CZYX"
+        if record.get("axes") != expected_axes or tuple(record["shape"][-3:]) != shape:
             raise ValueError(f"Registration shape/axes do not match source: {path}")
-        plan = _plan_record(record=record, source=path, source_shape=shape, grid=grid)
+        plan = _plan_record(record=record, source=path, source_shape=source_shape, grid=grid)
         if plan is None:
             return None
         camera = _pull_grid(plan, grid)
         coordinates = (
-            camera * np.asarray(scale0[1:])[:, None, None]
-            + (np.asarray(origin0[1:]) - origin_n[1:])[:, None, None]
-        ) / np.asarray(scale_n[1:])[:, None, None]
+            (camera - start[:, None, None]) * spatial_scale0[:, None, None]
+            + (spatial_origin0 - spatial_origin_n)[:, None, None]
+        ) / spatial_scale_n[:, None, None]
         valid = np.all(
             (camera >= plan.source_start[:, None, None]) & (camera <= (plan.source_stop - 1)[:, None, None]),
             axis=0,
@@ -130,15 +160,20 @@ def _sample_tiles(
             return None
         lo = np.maximum(0, np.floor(coordinates[:, valid].min(axis=1)).astype(int))
         hi = np.minimum(array.shape[-3:], np.ceil(coordinates[:, valid].max(axis=1)).astype(int) + 1)
+        spatial_slices = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
         crop = np.asarray(
-            array[(channel,) + tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))], dtype=np.float32
+            array[spatial_slices if materialized else (channel,) + spatial_slices], dtype=np.float32
         )
         data = map_coordinates(
             crop, coordinates - lo[:, None, None], order=1, prefilter=False, mode="constant"
         )
         data[~valid] = 0
-        yx = np.moveaxis(camera[1:] / (np.asarray(shape[1:]) - 1)[:, None, None], 0, -1).astype(np.float32)
-        camera_z = (camera[0] / max(shape[0] - 1, 1)).astype(np.float32)
+        yx = np.moveaxis(
+            (camera[1:] - start[1:, None, None]) / (np.asarray(shape[1:]) - 1)[:, None, None],
+            0,
+            -1,
+        ).astype(np.float32)
+        camera_z = ((camera[0] - start[0]) / max(shape[0] - 1, 1)).astype(np.float32)
         return _SampledTile(path, plan.lo, plan.hi, data, yx, valid, camera_z)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -207,13 +242,23 @@ def fit_residual_correction(
     source_field_penalty: float | None = None,
     z_percentiles: Sequence[float] = DEFAULT_Z_PERCENTILES,
     workers: int = 8,
+    validation_workers: int = 1,
     seed: int = 0,
 ) -> Path:
     """Fit, validate, and atomically publish one post-deconvolution correction."""
     if output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite residual correction output: {output_dir}")
-    if channel < 0 or source_level < 0 or stride < 1 or workers < 1 or xy_degree not in (1, 2):
-        raise ValueError("Invalid residual fitting channel, source level, stride, workers, or XY degree")
+    if (
+        channel < 0
+        or source_level < 0
+        or stride < 1
+        or workers < 1
+        or validation_workers < 1
+        or xy_degree not in (1, 2)
+    ):
+        raise ValueError(
+            "Invalid residual fitting channel, source level, stride, workers, validation workers, or XY degree"
+        )
     if not 0 <= z_degree <= 3:
         raise ValueError("Z degree must be between 0 and 3")
     if field_penalty is not None and (not np.isfinite(field_penalty) or field_penalty <= 0):
@@ -339,6 +384,7 @@ def fit_residual_correction(
             "z_degree": z_degree,
             "field_penalty": field_penalty,
             "source_field_penalty": source_field_penalty,
+            "validation_workers": validation_workers,
             "seed": seed,
             "planes": [
                 {
@@ -436,6 +482,7 @@ def fit_residual_correction(
             xy_degree=xy_degree,
             field_penalty=field_penalty,
             source_field_penalty=source_field_penalty,
+            validation_workers=validation_workers,
         )
         for plane in planes:
             if plane is preview:
@@ -493,6 +540,7 @@ def fit_residual_correction(
             "fixed_spacing_um": base.scale.tolist(),
             "fixed_origin_um": base.origin.tolist(),
             "stride": stride,
+            "validation_workers": validation_workers,
             "output_shape_yx": list(base.output_shape),
             "seed": seed,
             "inputs": input_snapshot,

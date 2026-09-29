@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy import ndimage
 from typer.testing import CliRunner
 
 from squisher_lightsheet import cli as cli_module
@@ -65,13 +66,13 @@ def test_global_phase_applies_phase_and_origin_shift_to_moving_only(
         return fixed if position == fixed_position else moving
 
     monkeypatch.setattr(global_phase, "render_position_canvas", fake_render)
-    phase_kwargs = {}
+    ncc_kwargs = {}
 
-    def fake_phasecorr(*_args, **kwargs):
-        phase_kwargs.update(kwargs)
-        return np.asarray([0.0, 1.0, -1.0]), {"peak_value": 0.9}
+    def fake_masked_ncc(*_args, **kwargs):
+        ncc_kwargs.update(kwargs)
+        return np.asarray([1.0, -1.0]), 0.9
 
-    monkeypatch.setattr(global_phase, "phasecorr_shift_gpu", fake_phasecorr)
+    monkeypatch.setattr(global_phase, "masked_ncc_shift_yx", fake_masked_ncc)
     correlations = iter([0.1, 0.9])
     monkeypatch.setattr(
         global_phase.phase_metrics,
@@ -129,8 +130,10 @@ def test_global_phase_applies_phase_and_origin_shift_to_moving_only(
     )
     assert result.before_overlay.exists()
     assert result.after_overlay.exists()
-    assert np.allclose(phase_kwargs["search_center_zyx"], [0.0, -1.0, -1.0])
-    assert np.allclose(phase_kwargs["max_shift_from_center_zyx"], [0.0, 25.0, 25.0])
+    assert np.allclose(ncc_kwargs["search_center_yx"], [-1.0, -1.0])
+    assert np.allclose(ncc_kwargs["max_shift_from_center_yx"], [25.0, 25.0])
+    assert summary["phase_metadata"]["estimator"] == "coverage_overlap_masked_ncc"
+    assert summary["phase_metadata"]["peak_ncc"] == 0.9
 
 
 def test_global_phase_rejects_mismatched_physical_spacing(
@@ -173,8 +176,8 @@ def test_global_phase_can_skip_orthogonal_z_for_single_fused_sources(
     )
     monkeypatch.setattr(
         global_phase,
-        "phasecorr_shift_gpu",
-        lambda *_args, **_kwargs: (np.asarray([0.0, 1.0, -1.0]), {"peak_value": 0.9}),
+        "masked_ncc_shift_yx",
+        lambda *_args, **_kwargs: (np.asarray([1.0, -1.0]), 0.9),
     )
     correlations = iter([0.1, 0.9])
     monkeypatch.setattr(
@@ -214,8 +217,8 @@ def test_global_phase_rejects_translation_without_coverage_overlap(
     monkeypatch.setattr(global_phase, "render_position_canvas", lambda *_args, **_kwargs: rendered)
     monkeypatch.setattr(
         global_phase,
-        "phasecorr_shift_gpu",
-        lambda *_args, **_kwargs: (np.asarray([0.0, 10.0, 0.0]), {"peak_value": 0.1}),
+        "masked_ncc_shift_yx",
+        lambda *_args, **_kwargs: (np.asarray([10.0, 0.0]), 0.1),
     )
 
     with pytest.raises(ValueError, match="no fixed/moving coverage overlap"):
@@ -238,8 +241,8 @@ def test_global_phase_rejects_nonimproving_correlation_without_positions(
     monkeypatch.setattr(global_phase, "render_position_canvas", lambda *_args, **_kwargs: rendered)
     monkeypatch.setattr(
         global_phase,
-        "phasecorr_shift_gpu",
-        lambda *_args, **_kwargs: (np.asarray([0.0, 0.0, 0.0]), {"peak_value": 0.1}),
+        "masked_ncc_shift_yx",
+        lambda *_args, **_kwargs: (np.asarray([0.0, 0.0]), 0.1),
     )
     correlations = iter([0.9, 0.8])
     monkeypatch.setattr(
@@ -273,8 +276,8 @@ def test_global_phase_rejects_out_of_window_phase_result(
     monkeypatch.setattr(global_phase, "render_position_canvas", lambda *_args, **_kwargs: rendered)
     monkeypatch.setattr(
         global_phase,
-        "phasecorr_shift_gpu",
-        lambda *_args, **_kwargs: (np.asarray([0.0, 26.0, 0.0]), {"peak_value": 0.1}),
+        "masked_ncc_shift_yx",
+        lambda *_args, **_kwargs: (np.asarray([26.0, 0.0]), 0.1),
     )
     output_position = tmp_path / "run" / "positions.json"
 
@@ -287,6 +290,89 @@ def test_global_phase_rejects_out_of_window_phase_result(
         )
 
     assert not output_position.exists()
+
+
+def shared_lattice_canvases(
+    content_offset_yx: tuple[int, int], *, size: int = 256, tile: int = 64
+) -> tuple[global_phase.GlobalPhaseCanvas, global_phase.GlobalPhaseCanvas]:
+    """Weakly correlated tissue displaced between channels inside an outline and seams shared in place.
+
+    Different labels share tissue structure only partly; mosaics acquired on the same stage
+    lattice share their coverage outline and tile seams exactly.
+    """
+    rng = np.random.default_rng(0)
+    texture = ndimage.gaussian_filter(rng.random((size + 64, size + 64)), 3.0)
+    texture = (texture - texture.mean()) / texture.std()
+    dy, dx = content_offset_yx
+    fixed_tissue = texture[32 : 32 + size, 32 : 32 + size]
+    moving_tissue = texture[32 + dy : 32 + dy + size, 32 + dx : 32 + dx + size]
+    moving_tissue = moving_tissue + 2.0 * rng.standard_normal(moving_tissue.shape)
+    seams = np.zeros((size, size))
+    seams[::tile, :] = 1.0
+    seams[:, ::tile] = 1.0
+    coverage = np.ones((size, size), dtype=bool)
+    coverage[:tile, : 2 * tile] = False
+    coverage[-tile:, -tile:] = False
+    fixed = canvas(np.where(coverage, 5.0 + seams + fixed_tissue, 0.0)[None])
+    moving = canvas(np.where(coverage, 5.0 + seams + moving_tissue, 0.0)[None])
+    return (
+        global_phase.GlobalPhaseCanvas(**{**fixed.__dict__, "coverage": coverage[None]}),
+        global_phase.GlobalPhaseCanvas(**{**moving.__dict__, "coverage": coverage[None]}),
+    )
+
+
+def test_global_phase_follows_tissue_not_shared_tile_lattice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed_position = tmp_path / "fixed.json"
+    moving_position = tmp_path / "moving.json"
+    write_position(fixed_position)
+    write_position(moving_position)
+    fixed, moving = shared_lattice_canvases((-9, -13))
+    monkeypatch.setattr(
+        global_phase,
+        "render_position_canvas",
+        lambda position, **_kwargs: fixed if position == fixed_position else moving,
+    )
+
+    result = global_phase.run_global_phase(
+        fixed_position=fixed_position,
+        moving_position=moving_position,
+        output_dir=tmp_path / "run",
+        output_position=tmp_path / "run" / "global-phase.positions.json",
+        fixed_intensity_transform="identity",
+        orthogonal_z=False,
+    )
+
+    summary = json.loads(result.summary.read_text())
+    assert np.allclose(summary["phase_shift_to_apply_moving_level_px_zyx"], [0.0, -9.0, -13.0], atol=0.25)
+    assert np.allclose(summary["total_shift_to_apply_moving_zyx_um"], [0.0, -36.0, -52.0], atol=1.0)
+
+
+def test_masked_ncc_rejects_search_window_without_candidates() -> None:
+    fixed, moving = shared_lattice_canvases((0, 0), size=64, tile=32)
+    coverage = fixed.coverage[0]
+
+    with pytest.raises(ValueError, match="no candidate shifts"):
+        global_phase.masked_ncc_shift_yx(
+            fixed.image[0],
+            moving.image[0],
+            coverage,
+            coverage,
+            search_center_yx=np.asarray([500.0, 0.0]),
+            max_shift_from_center_yx=np.asarray([10.0, 10.0]),
+        )
+
+
+def test_global_phase_rejects_nonpositive_highpass_sigma(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="highpass_sigma_px"):
+        global_phase.run_global_phase(
+            fixed_position=tmp_path / "fixed.json",
+            moving_position=tmp_path / "moving.json",
+            output_dir=tmp_path / "run",
+            output_position=tmp_path / "run" / "positions.json",
+            highpass_sigma_px=0.0,
+        )
 
 
 def test_expanded_before_qc_respects_physical_origin_offset() -> None:
@@ -413,8 +499,8 @@ def test_cross_register_global_phase_cli_forwards_contract_and_writes_manifest(
             "3",
             "--z-slab-planes",
             "16",
-            "--fft-highpass-sigma-zyx",
-            "1,2,3",
+            "--highpass-sigma-px",
+            "5",
         ],
     )
 
@@ -429,7 +515,7 @@ def test_cross_register_global_phase_cli_forwards_contract_and_writes_manifest(
     assert captured["z_slab_planes"] == 16
     assert captured["fixed_intensity_transform"] == "log1p"
     assert captured["moving_intensity_transform"] == "identity"
-    assert captured["fft_highpass_sigma_zyx"] == (1.0, 2.0, 3.0)
+    assert captured["highpass_sigma_px"] == 5.0
     assert captured["max_residual_shift_um"] == 100.0
     assert captured["orthogonal_lateral_factor"] == 4
     assert captured["orthogonal_z"] is True

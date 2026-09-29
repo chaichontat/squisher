@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 import hashlib
 import itertools
 import json
+import multiprocessing
 from pathlib import Path
 import re
 import shutil
@@ -99,6 +100,24 @@ class _SampledPlane:
     owner: np.ndarray
     cutoff: float
     sampling: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _ZValidationConfig:
+    sources: tuple[Path, ...]
+    planes: tuple[int, ...]
+    reference_z: int
+    seed: int
+    fit_tile_gains: bool
+    fit_source_fields: bool
+    z_degree: int
+    xy_degree: int
+    field_penalty: float | None
+    source_field_penalty: float | None
+
+
+_Z_VALIDATION_ROWS: Sequence[Mapping[str, object]] | None = None
+_Z_VALIDATION_CONFIG: _ZValidationConfig | None = None
 
 
 def parse_channel_spec(value: str) -> PostBasicChannel:
@@ -1035,12 +1054,10 @@ def _refit_seams(
         )
     support = np.count_nonzero(incidence, axis=0)
     if require_full_support and (fit_tile_gains or fit_source_fields):
-        if np.any(support == 0):
-            unsupported = [str(source) for source, count in zip(sources, support, strict=True) if count == 0]
-            raise ValueError(f"No overlap support for sources: {unsupported}")
-        adjacency = np.abs(incidence).T @ np.abs(incidence)
+        supported = support > 0
+        adjacency = (np.abs(incidence).T @ np.abs(incidence))[np.ix_(supported, supported)]
         if connected_components(adjacency, directed=False, return_labels=False) != 1:
-            raise ValueError("Residual correction requires a connected overlap graph across all sources")
+            raise ValueError("Residual correction requires a connected overlap graph across supported sources")
 
     gains = np.ones(len(sources), dtype=np.float64)
     if fit_tile_gains:
@@ -1051,6 +1068,7 @@ def _refit_seams(
                 float(selection["tile_gain_selected_penalty"]),
             )
         )
+        gains[support == 0] = 1
 
     source_fields: list[dict[str, object]] = []
     if fit_source_fields:
@@ -1076,6 +1094,7 @@ def _refit_seams(
             z_degree=z_degree,
             active=active_indexes,
         )
+        expanded[support == 0] = 0
         source_fields = [
             {
                 "source": str(source),
@@ -1124,8 +1143,12 @@ def fit_residual_model(
     result["evaluation_coefficient"] = result["coefficient"]
     result["coefficient"] = coefficient.tolist()
     result["deployment_training"] = "all eligible source pairs"
+    unsupported_sources = [
+        str(source) for source, count in zip(sources, support, strict=True) if count == 0
+    ]
     if fit_tile_gains:
-        result["tile_gain_unestimated_sources"] = []
+        result["tile_gain_zero_support_policy"] = "identity"
+        result["tile_gain_unestimated_sources"] = unsupported_sources
         result["tile_gains"] = [
             {
                 "source": str(source),
@@ -1137,8 +1160,151 @@ def fit_residual_model(
 
     if fit_source_fields:
         result["evaluation_source_fields"] = result["source_fields"]
+        result["source_field_zero_support_policy"] = "zero"
+        result["source_field_unestimated_sources"] = unsupported_sources
         result["source_fields"] = source_fields
     return coefficient, gains, result
+
+
+def _validate_one_z(
+    rows: Sequence[Mapping[str, object]],
+    heldout_z: int,
+    config: _ZValidationConfig,
+) -> dict[str, object]:
+    training_z = [z for z in config.planes if z != heldout_z]
+    training = [row for row in rows if row["z"] != heldout_z]
+    test_rows = [row for row in rows if row["z"] == heldout_z]
+    single_z = min(training_z, key=lambda z: (abs(z - config.reference_z), z))
+    shared_evaluation = _fit_seams(
+        rows=training,
+        sources=config.sources,
+        seed=config.seed,
+        fit_tile_gains=config.fit_tile_gains,
+        fit_source_fields=config.fit_source_fields,
+        xy_degree=config.xy_degree,
+        field_penalty=config.field_penalty,
+        source_field_penalty=config.source_field_penalty,
+        z_degree=config.z_degree,
+    )
+    shared_coefficient, shared_gains, shared_fields, _ = _refit_seams(
+        rows=training,
+        sources=config.sources,
+        selection=shared_evaluation[2],
+        fit_tile_gains=config.fit_tile_gains,
+        fit_source_fields=config.fit_source_fields,
+        z_degree=config.z_degree,
+        xy_degree=config.xy_degree,
+        require_full_support=False,
+    )
+    shared_result = dict(shared_evaluation[2])
+    shared_result["source_fields"] = shared_fields
+    shared = (shared_coefficient, shared_gains, shared_result)
+    shared_2d = shared
+    if config.z_degree:
+        shared_2d_evaluation = _fit_seams(
+            rows=training,
+            sources=config.sources,
+            seed=config.seed,
+            fit_tile_gains=config.fit_tile_gains,
+            fit_source_fields=config.fit_source_fields,
+            xy_degree=config.xy_degree,
+            field_penalty=config.field_penalty,
+            source_field_penalty=config.source_field_penalty,
+        )
+        shared_2d_coefficient, shared_2d_gains, shared_2d_fields, _ = _refit_seams(
+            rows=training,
+            sources=config.sources,
+            selection=shared_2d_evaluation[2],
+            fit_tile_gains=config.fit_tile_gains,
+            fit_source_fields=config.fit_source_fields,
+            z_degree=0,
+            xy_degree=config.xy_degree,
+            require_full_support=False,
+        )
+        shared_2d_result = dict(shared_2d_evaluation[2])
+        shared_2d_result["source_fields"] = shared_2d_fields
+        shared_2d = (shared_2d_coefficient, shared_2d_gains, shared_2d_result)
+    single_rows = [row for row in rows if row["z"] == single_z]
+    single_coefficient, single_gains, single_fields, _ = _refit_seams(
+        rows=single_rows,
+        sources=config.sources,
+        selection=shared_2d[2],
+        fit_tile_gains=config.fit_tile_gains,
+        fit_source_fields=config.fit_source_fields,
+        z_degree=0,
+        xy_degree=config.xy_degree,
+        require_full_support=False,
+    )
+    single = (single_coefficient, single_gains, {"source_fields": single_fields})
+    target = np.concatenate([np.asarray(row["target"]) for row in test_rows])
+    pair = np.concatenate(
+        [np.full(len(np.asarray(row["target"])), index) for index, row in enumerate(test_rows)]
+    )
+    evaluation = {
+        "heldout_z": heldout_z,
+        "training_z": training_z,
+        "single_plane_z": single_z,
+        "before": _pair_metrics(-target / np.log(2), pair),
+    }
+    models = [("single_plane", single), ("shared", shared)]
+    if config.z_degree:
+        models.append(("shared_2d", shared_2d))
+    for name, (coefficient, gains, model_result) in models:
+        model_z_degree = len(coefficient) // 5 - 1
+        fitted_source_fields = model_result.get("source_fields", [])
+        if fitted_source_fields and [Path(row["source"]) for row in fitted_source_fields] != list(
+            config.sources
+        ):
+            raise RuntimeError("Source fields do not align with validation sources")
+        source_fields = (
+            np.asarray([row["coefficient"] for row in fitted_source_fields])
+            if fitted_source_fields
+            else np.zeros((len(config.sources), len(coefficient)))
+        )
+        residual = np.concatenate(
+            [
+                _row_design(row, model_z_degree) @ coefficient
+                - np.asarray(row["target"])
+                + np.log(gains[int(row["first"])])
+                - np.log(gains[int(row["second"])])
+                + _basis(
+                    np.asarray(row["ya"]),
+                    z=row.get("za"),
+                    z_degree=model_z_degree,
+                )
+                @ source_fields[int(row["first"])]
+                - _basis(
+                    np.asarray(row["yb"]),
+                    z=row.get("zb"),
+                    z_degree=model_z_degree,
+                )
+                @ source_fields[int(row["second"])]
+                for row in test_rows
+            ]
+        )
+        evaluation[name] = _pair_metrics(residual / np.log(2), pair)
+    return evaluation
+
+
+def _initialize_z_validation_worker(
+    rows: Sequence[Mapping[str, object]],
+    config: _ZValidationConfig,
+) -> None:
+    global _Z_VALIDATION_CONFIG, _Z_VALIDATION_ROWS
+    _Z_VALIDATION_ROWS = rows
+    _Z_VALIDATION_CONFIG = config
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        logger.warning("threadpoolctl unavailable; native validation threads are not limited")
+    else:
+        threadpool_limits(limits=1)
+
+
+def _validate_z_worker(heldout_z: int) -> dict[str, object]:
+    if _Z_VALIDATION_ROWS is None or _Z_VALIDATION_CONFIG is None:
+        raise RuntimeError("Held-out Z validation worker was not initialized")
+    return _validate_one_z(_Z_VALIDATION_ROWS, heldout_z, _Z_VALIDATION_CONFIG)
 
 
 def _validate_z_models(
@@ -1153,132 +1319,73 @@ def _validate_z_models(
     xy_degree: int = 2,
     field_penalty: float | None = None,
     source_field_penalty: float | None = None,
+    validation_workers: int = 1,
 ) -> list[dict[str, object]]:
     """Compare pooled-plane and single-plane fits on wholly excluded Z planes.
 
     Penalty selection and source-pair splits run only within the training planes.
     Source indices remain fixed across planes so each tile has one shared gain.
     """
-    planes = sorted({int(row["z"]) for row in rows})
-    evaluations = []
-    for heldout_z in planes:
-        training_z = [z for z in planes if z != heldout_z]
-        training = [row for row in rows if row["z"] != heldout_z]
-        test_rows = [row for row in rows if row["z"] == heldout_z]
-        single_z = min(training_z, key=lambda z: (abs(z - reference_z), z))
-        shared_evaluation = _fit_seams(
-            rows=training,
-            sources=sources,
-            seed=seed,
-            fit_tile_gains=fit_tile_gains,
-            fit_source_fields=fit_source_fields,
-            xy_degree=xy_degree,
-            field_penalty=field_penalty,
-            source_field_penalty=source_field_penalty,
-            z_degree=z_degree,
-        )
-        shared_coefficient, shared_gains, shared_fields, _ = _refit_seams(
-            rows=training,
-            sources=sources,
-            selection=shared_evaluation[2],
-            fit_tile_gains=fit_tile_gains,
-            fit_source_fields=fit_source_fields,
-            z_degree=z_degree,
-            xy_degree=xy_degree,
-            require_full_support=False,
-        )
-        shared_result = dict(shared_evaluation[2])
-        shared_result["source_fields"] = shared_fields
-        shared = (shared_coefficient, shared_gains, shared_result)
-        shared_2d = shared
-        if z_degree:
-            shared_2d_evaluation = _fit_seams(
-                rows=training,
-                sources=sources,
-                seed=seed,
-                fit_tile_gains=fit_tile_gains,
-                fit_source_fields=fit_source_fields,
-                xy_degree=xy_degree,
-                field_penalty=field_penalty,
-                source_field_penalty=source_field_penalty,
+    if validation_workers < 1:
+        raise ValueError("Validation workers must be positive")
+    planes = tuple(sorted({int(row["z"]) for row in rows}))
+    if len(planes) < 2:
+        raise ValueError("Held-out Z validation requires at least two planes")
+    config = _ZValidationConfig(
+        sources=tuple(sources),
+        planes=planes,
+        reference_z=reference_z,
+        seed=seed,
+        fit_tile_gains=fit_tile_gains,
+        fit_source_fields=fit_source_fields,
+        z_degree=z_degree,
+        xy_degree=xy_degree,
+        field_penalty=field_penalty,
+        source_field_penalty=source_field_penalty,
+    )
+    if validation_workers == 1:
+        evaluations = []
+        for heldout_z in planes:
+            evaluations.append(_validate_one_z(rows, heldout_z, config))
+            logger.info(
+                "Residual model validated held-out Z {} ({}/{})",
+                heldout_z,
+                len(evaluations),
+                len(planes),
             )
-            shared_2d_coefficient, shared_2d_gains, shared_2d_fields, _ = _refit_seams(
-                rows=training,
-                sources=sources,
-                selection=shared_2d_evaluation[2],
-                fit_tile_gains=fit_tile_gains,
-                fit_source_fields=fit_source_fields,
-                z_degree=0,
-                xy_degree=xy_degree,
-                require_full_support=False,
-            )
-            shared_2d_result = dict(shared_2d_evaluation[2])
-            shared_2d_result["source_fields"] = shared_2d_fields
-            shared_2d = (shared_2d_coefficient, shared_2d_gains, shared_2d_result)
-        single_rows = [row for row in rows if row["z"] == single_z]
-        single_coefficient, single_gains, single_fields, _ = _refit_seams(
-            rows=single_rows,
-            sources=sources,
-            selection=shared_2d[2],
-            fit_tile_gains=fit_tile_gains,
-            fit_source_fields=fit_source_fields,
-            z_degree=0,
-            xy_degree=xy_degree,
-            require_full_support=False,
-        )
-        single = (single_coefficient, single_gains, {"source_fields": single_fields})
-        target = np.concatenate([np.asarray(row["target"]) for row in test_rows])
-        pair = np.concatenate(
-            [np.full(len(np.asarray(row["target"])), index) for index, row in enumerate(test_rows)]
-        )
-        evaluation = {
-            "heldout_z": heldout_z,
-            "training_z": training_z,
-            "single_plane_z": single_z,
-            "before": _pair_metrics(-target / np.log(2), pair),
+        return evaluations
+
+    evaluations: list[dict[str, object] | None] = [None] * len(planes)
+    process_count = min(validation_workers, len(planes))
+    with ProcessPoolExecutor(
+        max_workers=process_count,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_z_validation_worker,
+        initargs=(rows, config),
+    ) as executor:
+        pending = {
+            executor.submit(_validate_z_worker, heldout_z): (index, heldout_z)
+            for index, heldout_z in enumerate(planes)
         }
-        models = [("single_plane", single), ("shared", shared)]
-        if z_degree:
-            models.append(("shared_2d", shared_2d))
-        for name, (coefficient, gains, model_result) in models:
-            model_z_degree = len(coefficient) // 5 - 1
-            fitted_source_fields = model_result.get("source_fields", [])
-            if fitted_source_fields and [Path(row["source"]) for row in fitted_source_fields] != list(
-                sources
-            ):
-                raise RuntimeError("Source fields do not align with validation sources")
-            source_fields = (
-                np.asarray([row["coefficient"] for row in fitted_source_fields])
-                if fitted_source_fields
-                else np.zeros((len(sources), len(coefficient)))
-            )
-            residual = np.concatenate(
-                [
-                    _row_design(row, model_z_degree) @ coefficient
-                    - np.asarray(row["target"])
-                    + np.log(gains[int(row["first"])])
-                    - np.log(gains[int(row["second"])])
-                    + _basis(
-                        np.asarray(row["ya"]),
-                        z=row.get("za"),
-                        z_degree=model_z_degree,
-                    )
-                    @ source_fields[int(row["first"])]
-                    - _basis(
-                        np.asarray(row["yb"]),
-                        z=row.get("zb"),
-                        z_degree=model_z_degree,
-                    )
-                    @ source_fields[int(row["second"])]
-                    for row in test_rows
-                ]
-            )
-            evaluation[name] = _pair_metrics(residual / np.log(2), pair)
-        evaluations.append(evaluation)
-        logger.info(
-            "Residual model validated held-out Z {} ({}/{})", heldout_z, len(evaluations), len(planes)
-        )
-    return evaluations
+        completed = 0
+        try:
+            for future in as_completed(pending):
+                index, heldout_z = pending[future]
+                evaluations[index] = future.result()
+                completed += 1
+                logger.info(
+                    "Residual model validated held-out Z {} ({}/{})",
+                    heldout_z,
+                    completed,
+                    len(planes),
+                )
+        except Exception as error:
+            for future in pending:
+                future.cancel()
+            raise RuntimeError(f"Held-out Z validation failed for Z {heldout_z}") from error
+    if any(evaluation is None for evaluation in evaluations):
+        raise RuntimeError("Held-out Z validation completed without every plane result")
+    return [evaluation for evaluation in evaluations if evaluation is not None]
 
 
 def _corrected_tiles(
@@ -1440,7 +1547,7 @@ def _validated_basic_profile(basic_dir: Path, profile_path: Path, channel: int) 
     serialized = load_basic_profile_arrays(profile_path)
     if serialized.residual_coefficient is not None:
         raise ValueError(
-            f"Post-BaSiC fitting requires a base profile without a Z-dependent residual: {profile_path}"
+            f"Basic-residual fitting requires a base profile without a Z-dependent residual: {profile_path}"
         )
     if not np.array_equal(sidecar.flatfield, serialized.flatfield):
         raise ValueError(
@@ -1550,19 +1657,20 @@ def run_post_basic(
     field_penalty: float | None = None,
     stride: int = 4,
     workers: int = 8,
+    validation_workers: int = 1,
     seed: int = 20260907,
 ) -> Path:
-    """Fit and compose post-BaSiC corrections using channel-correct saved geometry."""
+    """Fit and compose basic-residual corrections using channel-correct saved geometry."""
     if output_dir.exists():
-        raise FileExistsError(f"Refusing to overwrite post-BaSiC output: {output_dir}")
+        raise FileExistsError(f"Refusing to overwrite basic-residual output: {output_dir}")
     if not channels:
-        raise ValueError("At least one post-BaSiC channel specification is required")
-    if stride < 1 or workers < 1:
-        raise ValueError("Post-BaSiC stride and workers must be positive")
+        raise ValueError("At least one basic-residual channel specification is required")
+    if stride < 1 or workers < 1 or validation_workers < 1:
+        raise ValueError("Basic-residual stride, workers, and validation workers must be positive")
     indexes = [spec.index for spec in channels]
     labels = [spec.label for spec in channels]
     if len(set(indexes)) != len(indexes) or len(set(labels)) != len(labels):
-        raise ValueError("Post-BaSiC channel indexes and labels must be unique")
+        raise ValueError("Basic-residual channel indexes and labels must be unique")
     if not tile_gain_channels <= set(indexes):
         raise ValueError("Tile-gain channels must be included in the channel specifications")
     for spec in channels:
@@ -1614,7 +1722,7 @@ def run_post_basic(
         sample_z = [grid.z]
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=".post-basic-", dir=output_dir.parent))
+    stage = Path(tempfile.mkdtemp(prefix=".basic-residual-", dir=output_dir.parent))
     try:
         channel_results: dict[int, dict[str, object]] = {}
         masks: dict[int, Path] = {}
@@ -1622,7 +1730,7 @@ def run_post_basic(
         excluded_sources: dict[int, set[Path]] = {}
         for spec in specs:
             logger.info(
-                "Post-BaSiC channel {} ({}) sampling from {}",
+                "Basic-residual channel {} ({}) sampling from {}",
                 spec.index,
                 spec.label,
                 spec.registration,
@@ -1658,7 +1766,7 @@ def run_post_basic(
                     raise ValueError(f"Channel {spec.index} Z {z} has insufficient positive sampled pixels")
                 cutoff = float(np.expm1(threshold_otsu(np.log1p(positive))))
                 planes.append(_SampledPlane(plane_grid, tiles, before, owner, cutoff, sampling))
-                logger.info("Post-BaSiC channel {} sampled Z {} from {} sources", spec.index, z, len(tiles))
+                logger.info("Basic-residual channel {} sampled Z {} from {} sources", spec.index, z, len(tiles))
             sampled_sources = sorted({tile.source for plane in planes for tile in plane.tiles})
             source_indices = {source: index for index, source in enumerate(sampled_sources)}
             rows = []
@@ -1690,9 +1798,10 @@ def run_post_basic(
                     z_degree=z_degree,
                     xy_degree=xy_degree,
                     field_penalty=field_penalty,
+                    validation_workers=validation_workers,
                 )
             logger.info(
-                "Post-BaSiC channel {} fitted {} sources and {} plane/seam pairs",
+                "Basic-residual channel {} fitted {} sources and {} plane/seam pairs",
                 spec.index,
                 len(sampled_sources),
                 len(result["pairs"]),
@@ -1724,7 +1833,7 @@ def run_post_basic(
                 unsupported = result["tile_gain_unestimated_sources"]
                 if unsupported:
                     logger.warning(
-                        "Post-BaSiC channel {} uses identity gain for {} source(s) without "
+                        "Basic-residual channel {} uses identity gain for {} source(s) without "
                         "non-test seam-pair support",
                         spec.index,
                         len(unsupported),
@@ -1755,7 +1864,7 @@ def run_post_basic(
                 )
                 after, owner = _mosaic(grid.output_shape, corrected)
                 if not np.array_equal(plane.owner, owner):
-                    raise RuntimeError("Post-BaSiC QC owner map changed during correction")
+                    raise RuntimeError("Basic-residual QC owner map changed during correction")
                 artifacts = _write_qc(
                     plane_dir,
                     root=stage,
@@ -1797,7 +1906,7 @@ def run_post_basic(
                 if source not in excluded_sources[channel]:
                     gain_matrix[row, channel] = fitted_gains[channel][source]
         gains_path = write_tile_gains(stage / "tile-gains.json", sources=raw_sources, gains=gain_matrix)
-        logger.info("Post-BaSiC composing {} BaSiC profile(s)", len(profiles))
+        logger.info("Basic-residual composing {} BaSiC profile(s)", len(profiles))
         profile_artifacts = _copy_or_compose_profiles(
             profiles=profiles,
             basic_profiles=basic_profiles,
@@ -1821,6 +1930,7 @@ def run_post_basic(
             "fixed_spacing_um": grid.scale.tolist(),
             "fixed_origin_um": grid.origin.tolist(),
             "stride": stride,
+            "validation_workers": validation_workers,
             "output_shape_yx": list(grid.output_shape),
             "seed": seed,
             "algorithm": {
@@ -1839,7 +1949,7 @@ def run_post_basic(
             if z_degree
             else "clip((raw - darkfield) / composed_flatfield, 0, inf) * tile_gain",
         }
-        logger.info("Post-BaSiC rendering consolidated channel QC")
+        logger.info("Basic-residual rendering consolidated channel QC")
         write_post_basic_qc(
             stage,
             manifest=manifest,
@@ -1857,7 +1967,7 @@ def run_post_basic(
             )
             != input_snapshot
         ):
-            raise RuntimeError("Post-BaSiC inputs changed while the workflow was running")
+            raise RuntimeError("Basic-residual inputs changed while the workflow was running")
         manifest_path = stage / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -1867,9 +1977,9 @@ def run_post_basic(
                     continue
                 path = stage / str(artifact["path"])
                 if not path.is_file() or _sha256(path) != artifact["sha256"]:
-                    raise RuntimeError(f"Post-BaSiC artifact validation failed: {path}")
+                    raise RuntimeError(f"Basic-residual artifact validation failed: {path}")
         stage.replace(output_dir)
-        logger.info("Post-BaSiC output complete: {}", output_dir)
+        logger.info("Basic-residual output complete: {}", output_dir)
         return output_dir / "manifest.json"
     except BaseException:
         shutil.rmtree(stage, ignore_errors=False)

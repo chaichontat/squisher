@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 
 ARTIFACT_TYPE = "squisher_lightsheet.fusion_provenance.v1"
@@ -30,6 +31,7 @@ _PACKAGE_DISTRIBUTIONS = {
 
 @dataclass
 class _ArtifactCollector:
+    relocation_anchors: tuple[Path, ...] = ()
     files: dict[Path, str] = field(default_factory=dict)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     unresolved: list[dict[str, str]] = field(default_factory=list)
@@ -38,7 +40,7 @@ class _ArtifactCollector:
     _failed_sources: set[Path] = field(default_factory=set)
 
     def add_json(self, source: Path, *, role: str, required: bool = False) -> dict[str, Any] | None:
-        resolved = source.expanduser().resolve()
+        resolved = _resolve_relocated_artifact(source, anchors=self.relocation_anchors)
         existing = self._artifact_by_source.get(resolved)
         if existing is not None:
             roles = existing.setdefault("roles", [existing["role"]])
@@ -110,7 +112,12 @@ def write_fusion_provenance(
     if not (output / "zarr.json").is_file():
         raise FileNotFoundError(f"Fusion output does not contain root Zarr metadata: {output}")
 
-    collector = _ArtifactCollector()
+    collector = _ArtifactCollector(
+        relocation_anchors=tuple(
+            path.expanduser().resolve()
+            for path in (output, input_dir, position_input, registration_input)
+        )
+    )
     position_payload = collector.add_json(position_input, role="position_input", required=True)
     registration_payload = collector.add_json(registration_input, role="registration_input", required=True)
     assert position_payload is not None
@@ -271,10 +278,36 @@ def _json_references(payload: object, path: tuple[str, ...] = ()) -> list[tuple[
     elif isinstance(payload, list):
         for index, value in enumerate(payload):
             references.extend(_json_references(value, (*path, str(index))))
-    elif isinstance(payload, str) and payload.lower().endswith(".json"):
+    elif (
+        isinstance(payload, str)
+        and payload.lower().endswith(".json")
+        and not urlsplit(payload).scheme
+    ):
         role = next((part for part in reversed(path) if not part.isdigit()), "referenced_json")
         references.append((role, payload))
     return references
+
+
+def _resolve_relocated_artifact(source: Path, *, anchors: Sequence[Path]) -> Path:
+    resolved = source.expanduser().resolve()
+    if resolved.exists() or not source.is_absolute():
+        return resolved
+
+    source_parts = source.parts
+    candidates: list[Path] = []
+    for source_index in range(len(source_parts) - 1, 0, -1):
+        root_name = source_parts[source_index]
+        suffix = source_parts[source_index + 1 :]
+        for anchor in anchors:
+            for parent in (anchor, *anchor.parents):
+                if parent.name == root_name:
+                    candidate = parent.joinpath(*suffix)
+                    if candidate.is_file():
+                        candidates.append(candidate.resolve())
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique[0]
+    return resolved
 
 
 def _stage_for_role(role: str) -> str:

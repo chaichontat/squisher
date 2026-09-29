@@ -100,6 +100,19 @@ def _stage_scale_zyx(record: dict[str, Any]) -> np.ndarray:
     return _vector_zyx(record, "scale_um")
 
 
+def _flipped_axes_zyx(record: dict[str, Any]) -> np.ndarray:
+    scale = record.get("scale_um")
+    return np.asarray([isinstance(scale, dict) and float(scale[axis]) < 0 for axis in DIMENSIONS])
+
+
+def _oriented_origin_zyx(record: dict[str, Any]) -> np.ndarray:
+    """Fused-fixed windows index sources in oriented order: voxel zero is the low physical bound."""
+    scale = _stage_scale_zyx(record)
+    if np.all(scale > 0):
+        return _stage_translation_zyx(record)
+    return _stage_translation_zyx(record) + np.minimum(scale, 0.0) * _shape_zyx_from_record(record)
+
+
 def _records_by_tile(path: Path) -> dict[str, dict[str, Any]]:
     payload = _read_json(path)
     records = payload.get("tiles")
@@ -483,23 +496,33 @@ def _fused_fixed_overlapping_window_zyx(
     return start, start + np.asarray(window_shape_zyx, dtype=np.int64)
 
 
-def _fused_fixed_registered_affine_um(row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+def _fused_fixed_registered_affine_um(
+    row: dict[str, Any], *, moving_scale_zyx: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Compose a selected crop-local affine into the fused physical stage frame."""
     fixed_start = np.asarray(row["fixed_start_zyx"], dtype=np.float64)
     shape = np.asarray(row["moving_shape_zyx"], dtype=np.float64)
     fixed_scale = np.asarray(row["fused_scale_zyx"], dtype=np.float64)
     fixed_translation = np.asarray(row["fused_translation_zyx"], dtype=np.float64)
+    moving_scale = np.asarray(moving_scale_zyx, dtype=np.float64)
     matrix = np.asarray(row["selected_local_matrix_zyx"], dtype=np.float64)
     translation = np.asarray(row["selected_local_translation_zyx"], dtype=np.float64)
     if matrix.shape != (3, 3) or translation.shape != (3,):
         raise ValueError(f"{row.get('moving_tile')!r} selected local affine has invalid shape")
-    if np.any(fixed_scale == 0):
-        raise ValueError(f"{row.get('moving_tile')!r} fused scale contains zero")
+    if (
+        fixed_scale.shape != (3,)
+        or moving_scale.shape != (3,)
+        or not np.all(np.isfinite(fixed_scale))
+        or not np.all(np.isfinite(moving_scale))
+        or np.any(fixed_scale == 0)
+        or np.any(moving_scale == 0)
+    ):
+        raise ValueError(f"{row.get('moving_tile')!r} has invalid fused or moving scale")
 
     center = (shape - 1.0) / 2.0
     fixed_origin = fixed_translation + fixed_start * fixed_scale
     scale_matrix = np.diag(fixed_scale)
-    physical_linear = scale_matrix @ matrix @ np.diag(1.0 / fixed_scale)
+    physical_linear = scale_matrix @ matrix @ np.diag(1.0 / moving_scale)
     affine = np.eye(4, dtype=np.float64)
     affine[:3, :3] = physical_linear
     affine[:3, 3] = (
@@ -527,17 +550,14 @@ def _fused_fixed_registration_from_summary(
             continue
         moving_tile = str(row["moving_tile"])
         moving_record = moving_by_tile[moving_tile]
-        raw_scale = _vector_zyx(moving_record, "scale_um")
-        fixed_scale = np.asarray(row["fused_scale_zyx"], dtype=np.float64)
-        if not np.allclose(raw_scale, fixed_scale, rtol=0.0, atol=1e-9):
-            raise ValueError(
-                f"{window_json} moving scale {raw_scale.tolist()} does not match "
-                f"fused scale {fixed_scale.tolist()}"
-            )
-        affine, fixed_origin = _fused_fixed_registered_affine_um(row)
+        # Materialized chunks are written in oriented order, so they carry positive spacing.
+        moving_spacing = np.abs(_vector_zyx(moving_record, "scale_um"))
+        affine, fixed_origin = _fused_fixed_registered_affine_um(
+            row, moving_scale_zyx=moving_spacing
+        )
         core_start = np.asarray(row["moving_start_l0_zyx"], dtype=np.int64)
         core_stop = np.asarray(row["moving_stop_l0_zyx"], dtype=np.int64)
-        source_origin = _stage_translation_zyx(moving_record) + core_start * raw_scale
+        source_origin = _oriented_origin_zyx(moving_record) + core_start * moving_spacing
         quadrant_value = row.get("quadrant")
         if quadrant_value is None:
             quadrant_value = compact["quadrant"]
@@ -553,14 +573,14 @@ def _fused_fixed_registration_from_summary(
                 "transform_source": row.get("selected_attempt"),
                 "shape": ((core_stop - core_start) // level_factor_zyx).tolist(),
                 "axes": "ZYX",
-                "spacing_um": _dict_zyx(np.abs(raw_scale * level_factor_zyx)),
+                "spacing_um": _dict_zyx(moving_spacing * level_factor_zyx),
                 "channels": ["0"],
                 "tracks": [],
                 "source_view": moving_record.get("source_view", moving_record.get("side")),
                 "source_origin_um": _dict_zyx(source_origin),
                 "fixed_origin_um": _dict_zyx(fixed_origin),
                 "stage_translation_um": _dict_zyx(fixed_origin),
-                "stage_scale_um": _dict_zyx(raw_scale * level_factor_zyx),
+                "stage_scale_um": _dict_zyx(moving_spacing * level_factor_zyx),
                 "registered_affine": {
                     "dims": AFFINE_DIMS,
                     "coords": AFFINE_COORDS,
@@ -621,15 +641,24 @@ def _materialize_downsampled_channel_crop_ome_zarr(
     if axes == "CZYX" and not 0 <= source_channel < int(source.shape[0]):
         raise ValueError(f"source channel {source_channel} is outside CZYX shape {source.shape}")
 
-    if np.any(start_zyx % source_factors) or np.any(stop_zyx % source_factors):
-        raise ValueError(
-            f"crop bounds {start_zyx.tolist()}:{stop_zyx.tolist()} are not aligned to "
-            f"source pyramid factors {source_factors.tolist()}"
-        )
-    source_start = np.asarray(start_zyx, dtype=np.int64) // source_factors
-    source_stop = np.asarray(stop_zyx, dtype=np.int64) // source_factors
     spatial_indices = tuple(axes.index(axis.upper()) for axis in DIMENSIONS)
     source_shape_zyx = np.asarray(source.shape, dtype=np.int64)[list(spatial_indices)]
+    # Crop bounds are oriented: a negatively scaled axis reads its mirrored raw range, reversed.
+    flipped = _flipped_axes_zyx(source_record)
+    raw_start = np.asarray(start_zyx, dtype=np.int64)
+    raw_stop = np.asarray(stop_zyx, dtype=np.int64)
+    if np.any(flipped):
+        level0, _level0_axes = _ome_level0_array_and_axes(source_path)
+        level0_shape_zyx = np.asarray(level0.shape, dtype=np.int64)[list(spatial_indices)]
+        raw_start = np.where(flipped, level0_shape_zyx - np.asarray(stop_zyx), raw_start)
+        raw_stop = np.where(flipped, level0_shape_zyx - np.asarray(start_zyx), raw_stop)
+    if np.any(raw_start % source_factors) or np.any(raw_stop % source_factors):
+        raise ValueError(
+            f"crop bounds {raw_start.tolist()}:{raw_stop.tolist()} are not aligned to "
+            f"source pyramid factors {source_factors.tolist()}"
+        )
+    source_start = raw_start // source_factors
+    source_stop = raw_stop // source_factors
     if np.any(source_start < 0) or np.any(source_stop > source_shape_zyx):
         raise ValueError(
             f"crop {start_zyx.tolist()}:{stop_zyx.tolist()} is outside source shape "
@@ -693,8 +722,12 @@ def _materialize_downsampled_channel_crop_ome_zarr(
     dtype = np.dtype(source.dtype)
     for output_z0 in range(0, output_shape[0], chunks[0]):
         output_z1 = min(output_z0 + chunks[0], output_shape[0])
-        source_z0 = int(source_start[0]) + output_z0 * int(remaining_factors[0])
-        source_z1 = int(source_start[0]) + output_z1 * int(remaining_factors[0])
+        if flipped[0]:
+            source_z0 = int(source_stop[0]) - output_z1 * int(remaining_factors[0])
+            source_z1 = int(source_stop[0]) - output_z0 * int(remaining_factors[0])
+        else:
+            source_z0 = int(source_start[0]) + output_z0 * int(remaining_factors[0])
+            source_z1 = int(source_start[0]) + output_z1 * int(remaining_factors[0])
         spatial_selection = (
             slice(source_z0, source_z1),
             slice(int(source_start[1]), int(source_stop[1])),
@@ -711,6 +744,8 @@ def _materialize_downsampled_channel_crop_ome_zarr(
                 x_slice=slice(int(source_start[2]), int(source_stop[2])),
                 dtype=dtype,
             )
+        if np.any(flipped):
+            source_block = np.flip(source_block, axis=tuple(int(axis) for axis in np.flatnonzero(flipped)))
         if np.all(remaining_factors == 1):
             materialized = source_block
         else:
@@ -808,10 +843,14 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
     spatial_indices = tuple(axes.index(axis) for axis in "ZYX")
     source_shape_zyx = np.asarray(source.shape, dtype=np.int64)[list(spatial_indices)]
 
-    active: list[tuple[dict[str, Any], Any, Any]] = []
+    active: list[tuple[dict[str, Any], Any, Any, np.ndarray, np.ndarray, np.ndarray]] = []
     for task in tasks:
         start = np.asarray(task["start_zyx"], dtype=np.int64)
         stop = np.asarray(task["stop_zyx"], dtype=np.int64)
+        # Crop bounds are oriented: a negatively scaled axis reads its mirrored raw range, reversed.
+        flipped = _flipped_axes_zyx(task["source_record"])
+        raw_start = np.where(flipped, source_shape_zyx - stop, start)
+        raw_stop = np.where(flipped, source_shape_zyx - start, stop)
         shape = tuple(int(value) for value in stop - start)
         if np.any(stop <= start):
             raise ValueError(f"invalid native crop {start.tolist()}:{stop.tolist()}")
@@ -881,20 +920,15 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
                 None if residual_correction is None else residual_correction.fingerprint
             ),
         }
-        active.append((task, root, output))
+        active.append((task, root, output, raw_start, raw_stop, flipped))
 
     z_axis = axes.index("Z")
     source_z_chunk = int(source.chunks[z_axis])
-    first_z = min(int(np.asarray(task["start_zyx"])[0]) for task, _, _ in active)
-    last_z = max(int(np.asarray(task["stop_zyx"])[0]) for task, _, _ in active)
+    first_z = min(int(item[3][0]) for item in active)
+    last_z = max(int(item[4][0]) for item in active)
     for source_z0 in range((first_z // source_z_chunk) * source_z_chunk, last_z, source_z_chunk):
         source_z1 = min(source_z0 + source_z_chunk, int(source.shape[z_axis]))
-        intersecting = [
-            item
-            for item in active
-            if int(np.asarray(item[0]["start_zyx"])[0]) < source_z1
-            and int(np.asarray(item[0]["stop_zyx"])[0]) > source_z0
-        ]
+        intersecting = [item for item in active if int(item[3][0]) < source_z1 and int(item[4][0]) > source_z0]
         if not intersecting:
             continue
         spatial_selection = (slice(source_z0, source_z1), slice(None), slice(None))
@@ -909,32 +943,35 @@ def _materialize_native_source_group(tasks: list[dict[str, Any]]) -> list[list[i
                 x_slice=slice(0, int(source_shape_zyx[2])),
                 dtype=np.dtype(source.dtype),
             )
-        for task, _root, output in intersecting:
-            start = np.asarray(task["start_zyx"], dtype=np.int64)
-            stop = np.asarray(task["stop_zyx"], dtype=np.int64)
-            copy_z0 = max(source_z0, int(start[0]))
-            copy_z1 = min(source_z1, int(stop[0]))
+        for _task, _root, output, raw_start, raw_stop, flipped in intersecting:
+            copy_z0 = max(source_z0, int(raw_start[0]))
+            copy_z1 = min(source_z1, int(raw_stop[0]))
             materialized = slab[
                 copy_z0 - source_z0 : copy_z1 - source_z0,
-                int(start[1]) : int(stop[1]),
-                int(start[2]) : int(stop[2]),
+                int(raw_start[1]) : int(raw_stop[1]),
+                int(raw_start[2]) : int(raw_stop[2]),
             ]
+            if np.any(flipped):
+                materialized = np.flip(materialized, axis=tuple(int(axis) for axis in np.flatnonzero(flipped)))
+            if flipped[0]:
+                output_z0, output_z1 = int(raw_stop[0]) - copy_z1, int(raw_stop[0]) - copy_z0
+            else:
+                output_z0, output_z1 = copy_z0 - int(raw_start[0]), copy_z1 - int(raw_start[0])
             dtype = np.dtype(output.dtype)
             if np.issubdtype(dtype, np.integer):
                 info = np.iinfo(dtype)
                 materialized = np.clip(materialized, info.min, info.max)
-            output[
-                copy_z0 - int(start[0]) : copy_z1 - int(start[0]),
-                :,
-                :,
-            ] = materialized.astype(dtype, copy=False)
+            output[output_z0:output_z1, :, :] = materialized.astype(dtype, copy=False)
 
     shapes: list[list[int]] = []
-    for task, root, output in active:
+    for task, root, output, _raw_start, _raw_stop, _flipped in active:
         root.attrs["squisher_complete"] = True
         _write_materialization_completion(Path(task["output_path"]))
         shapes.append(list(output.shape))
     return shapes
+
+
+DEFAULT_FUSED_FIXED_LEVEL_FACTOR_ZYX = (1, 1, 1)
 
 
 def export_fused_fixed_overlapping_materialized_chunks(
@@ -949,7 +986,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
     source_channel: int = 0,
     core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
     window_shape_zyx: tuple[int, int, int] = (528, 528, 528),
-    level_factor_zyx: tuple[int, int, int] = (4, 4, 4),
+    level_factor_zyx: tuple[int, int, int] = DEFAULT_FUSED_FIXED_LEVEL_FACTOR_ZYX,
     output_codec: Literal["zstd", "jpegxr"],
     zstd_level: int = 3,
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
@@ -1035,15 +1072,15 @@ def export_fused_fixed_overlapping_materialized_chunks(
                 f"{window_json} recorded shape {recorded_shape.tolist()} matches neither core "
                 f"{core_shape.tolist()} nor overlap window {window_shape.tolist()}"
             )
-        raw_scale = _vector_zyx(moving_record, "scale_um")
+        moving_spacing = np.abs(_vector_zyx(moving_record, "scale_um"))
         stage_scale = _stage_scale_zyx(record)
-        expected_stage_scale = raw_scale * level_factor.astype(np.float64)
+        expected_stage_scale = moving_spacing * level_factor.astype(np.float64)
         if not np.allclose(stage_scale, expected_stage_scale, rtol=0.0, atol=1e-9):
             raise ValueError(
                 f"tile {record.get('tile')!r} stage scale {stage_scale.tolist()} does not match "
-                f"source scale times level factor {expected_stage_scale.tolist()}"
+                f"oriented source spacing times level factor {expected_stage_scale.tolist()}"
             )
-        stage_translation = _stage_translation_zyx(record) + raw_scale * (overlap_start - core_start)
+        stage_translation = _stage_translation_zyx(record) + moving_spacing * (overlap_start - core_start)
         source_path = Path(str(moving_record["path"]))
         if not source_path.is_absolute():
             source_path = moving_position_input.parent / source_path
@@ -1548,3 +1585,61 @@ def export_tile_quadrant_materialized_chunks(
         "registration": registration_path.resolve(),
         "summary": summary_path.resolve(),
     }
+
+
+MATERIALIZED_OUTPUT_NAMES = {
+    "position": "fused_fixed_materialized_chunks.positions.json",
+    "registration": "fused_fixed_materialized_chunks.registration.json",
+    "summary": "fused_fixed_materialized_chunks.summary.json",
+}
+
+
+def join_materialized_sides(*, side_output_dirs: list[Path], output_dir: Path) -> dict[str, Path]:
+    """Join complete per-dataset materializations on one fixed grid into a single fusion input."""
+    if len(side_output_dirs) < 2:
+        raise ValueError("join at least two materialized side outputs")
+    if output_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite joined materialization output: {output_dir}")
+    sides = []
+    for side_dir in side_output_dirs:
+        payloads = {key: _read_json(side_dir / name) for key, name in MATERIALIZED_OUTPUT_NAMES.items()}
+        if payloads["summary"].get("status") != "complete":
+            raise ValueError(f"{side_dir} materialization is not complete")
+        sides.append((side_dir.resolve(), payloads))
+    reference = sides[0][1]
+    for side_dir, payloads in sides[1:]:
+        for key, payload_key in (
+            ("fixed_fused", "registration"),
+            ("materialization_grid", "registration"),
+            ("source_channel", "summary"),
+            ("output_codec", "summary"),
+        ):
+            if payloads[payload_key].get(key) != reference[payload_key].get(key):
+                raise ValueError(f"{side_dir} {key} differs from {sides[0][0]}")
+    registration_tiles = [tile for _side_dir, payloads in sides for tile in payloads["registration"]["tiles"]]
+    position_tiles = [tile for _side_dir, payloads in sides for tile in payloads["position"]["tiles"]]
+    names = [str(tile["tile"]) for tile in registration_tiles]
+    if len(set(names)) != len(names) or names != [str(tile["tile"]) for tile in position_tiles]:
+        raise ValueError("joined materialized sides contain duplicate or mismatched tile names")
+    joined_sides = [str(side_dir) for side_dir, _payloads in sides]
+    output_dir.mkdir(parents=True)
+    outputs = {key: output_dir / name for key, name in MATERIALIZED_OUTPUT_NAMES.items()}
+    _write_json(
+        outputs["position"],
+        reference["position"] | {"joined_sides": joined_sides, "tiles": position_tiles},
+    )
+    _write_json(
+        outputs["registration"],
+        reference["registration"]
+        | {"input_dir": str(output_dir.resolve()), "joined_sides": joined_sides, "tiles": registration_tiles},
+    )
+    _write_json(
+        outputs["summary"],
+        reference["summary"]
+        | {
+            "joined_sides": joined_sides,
+            "side_summaries": [payloads["summary"] for _side_dir, payloads in sides],
+            "tile_count": len(registration_tiles),
+        },
+    )
+    return {key: path.resolve() for key, path in outputs.items()}

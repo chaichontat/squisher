@@ -5,6 +5,7 @@ import math
 from typing import Any, Sequence
 
 import numpy as np
+from squisher.gpu_retry import cuda_oom_retry
 
 
 PHASE_CORRELATION_UPSAMPLE_FACTOR = 10
@@ -556,6 +557,7 @@ def normalized_cross_correlation_gpu_arrays(
     return float((cp.sum(fixed_values * moving_values) / denominator).get())
 
 
+@cuda_oom_retry("boundary-patch evaluation")
 def evaluate_boundary_patch_gpu(
     fixed_patch: Any,
     moving_patch: Any,

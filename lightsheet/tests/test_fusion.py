@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
@@ -88,13 +89,16 @@ def test_fusion_resume_accepts_changed_mtime_when_hashed_content_matches(tmp_pat
     }
     legacy.write_fusion_resume_plan(workspace, recorded)
 
-    assert legacy.find_latest_fusion_temp_workspace(
-        channel_output,
-        expected_plan={
-            "position_input": {"path": "/positions.json", "sha256": "same"},
-            "source": {"path": "/source.tif", "size": 10, "mtime_ns": 1},
-        },
-    ) == workspace
+    assert (
+        legacy.find_latest_fusion_temp_workspace(
+            channel_output,
+            expected_plan={
+                "position_input": {"path": "/positions.json", "sha256": "same"},
+                "source": {"path": "/source.tif", "size": 10, "mtime_ns": 1},
+            },
+        )
+        == workspace
+    )
     assert not legacy.fusion_resume_plans_match(
         recorded,
         {
@@ -121,10 +125,13 @@ def test_fusion_resume_prefers_matching_workspace_with_more_completed_blocks(tmp
     (legacy.fusion_output_from_temp_root(newer_empty, channel_output) / "0").mkdir(parents=True)
     legacy.write_fusion_resume_plan(newer_empty, {"plan": "matching"})
 
-    assert legacy.find_latest_fusion_temp_workspace(
-        channel_output,
-        expected_plan={"plan": "matching"},
-    ) == progressed
+    assert (
+        legacy.find_latest_fusion_temp_workspace(
+            channel_output,
+            expected_plan={"plan": "matching"},
+        )
+        == progressed
+    )
 
 
 def test_crop_preferences_accept_legacy_mtime_when_hashed_content_matches(
@@ -269,9 +276,11 @@ def test_fuse_uses_backend_supported_defaults(monkeypatch) -> None:
     assert args[args.index("--fusion-level") + 1] == "0"
     assert args[args.index("--batch-size") + 1] == "auto"
     assert args[args.index("--source-cache-max-gib") + 1] == "64.0"
+    assert args[args.index("--pipeline-staging-max-gib") + 1] == "8.0"
     assert args[args.index("--jpegxr-level") + 1] == "0.7"
     assert args[args.index("--output-codec") + 1] == "jpegxr"
-    assert "--per-chunk-cupy-cleanup" not in args
+    assert "--per-chunk-cupy-cleanup" in args
+    assert "--retain-cupy-pool" not in args
     assert "--resume-fusion" not in args
 
     fuse_tiles(
@@ -307,6 +316,28 @@ def test_fuse_passes_resume_fusion(monkeypatch) -> None:
     assert "--resume-fusion" in captured["args"]
 
 
+def test_fuse_passes_registered_view_correction(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+    correction = Path("/run/registered-view-correction.json")
+
+    fuse_tiles(
+        input_dir=Path("/run"),
+        position_input=Path("/run/positions.json"),
+        registration_input=Path("/run/registration.json"),
+        output=Path("/run/fused.ome.zarr"),
+        registered_view_correction=correction,
+    )
+
+    args = captured["args"]
+    assert args[args.index("--registered-view-correction") + 1] == str(correction)
+
+
 def test_fuse_defaults_downsampled_materialization_to_zstd(monkeypatch, tmp_path) -> None:
     captured = {}
     position = tmp_path / "positions.json"
@@ -329,9 +360,7 @@ def test_fuse_defaults_downsampled_materialization_to_zstd(monkeypatch, tmp_path
     assert args[args.index("--output-codec") + 1] == "zstd"
 
 
-def test_fuse_allows_downsampled_input_on_matching_level0_template(
-    monkeypatch, tmp_path
-) -> None:
+def test_fuse_allows_downsampled_input_on_matching_level0_template(monkeypatch, tmp_path) -> None:
     captured = {}
     position = tmp_path / "positions.json"
     position.write_text(json.dumps({"materialization_grid": {"level_factor_zyx": [4, 4, 4]}, "tiles": []}))
@@ -448,13 +477,12 @@ def test_fuse_normalizes_canonical_output_dir(monkeypatch) -> None:
     assert args[args.index("--output") + 1] == "/run/final/fused.ome.zarr"
 
 
-def test_fuse_passes_source_cache_budget(monkeypatch) -> None:
+def test_fuse_passes_source_and_gpu_memory_budgets(monkeypatch) -> None:
     captured = {}
 
     def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
         captured["script_name"] = script_name
         captured["args"] = args
-        captured["dry_run"] = dry_run
         return "ok"
 
     monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
@@ -465,11 +493,34 @@ def test_fuse_passes_source_cache_budget(monkeypatch) -> None:
         registration_input=Path("/run/registration.json"),
         output=Path("/run/fused.ome.zarr"),
         source_cache_max_gib=12.5,
+        fusion_gpu_memory_max_gib=18.0,
     )
 
     assert captured["script_name"] == "stitch_20x_tl_multiview.py"
     args = captured["args"]
     assert args[args.index("--source-cache-max-gib") + 1] == "12.5"
+    assert args[args.index("--fusion-gpu-memory-max-gib") + 1] == "18.0"
+
+
+def test_fuse_can_retain_cupy_pool(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(script_name: str, args: list[str], *, dry_run: bool = False) -> str:
+        captured["args"] = args
+        return script_name
+
+    monkeypatch.setattr("squisher_lightsheet.fusion.run_legacy_script", fake_run)
+
+    fuse_tiles(
+        input_dir=Path("/run"),
+        position_input=Path("/run/positions.json"),
+        registration_input=Path("/run/registration.json"),
+        output=Path("/run/fused.ome.zarr"),
+        per_chunk_cupy_cleanup=False,
+    )
+
+    assert "--retain-cupy-pool" in captured["args"]
+    assert "--per-chunk-cupy-cleanup" not in captured["args"]
 
 
 def test_fuse_passes_fusion_level(monkeypatch) -> None:
@@ -566,6 +617,41 @@ def test_fuse_passes_output_grid_template(monkeypatch) -> None:
     assert args[args.index("--output-grid-template-level") + 1] == "2"
     assert args[args.index("--output-codec") + 1] == "zstd"
     assert args[args.index("--zstd-level") + 1] == "5"
+
+
+def test_output_grid_template_owns_spacing_when_source_spacing_differs(tmp_path: Path) -> None:
+    import zarr
+
+    template = tmp_path / "reference.ome.zarr"
+    group = zarr.open_group(template, mode="w")
+    group.create_array("0", shape=(3, 5, 7), chunks=(3, 5, 7), dtype="uint16")
+    group.attrs["ome"] = {
+        "multiscales": [
+            {
+                "axes": [{"name": dim, "type": "space", "unit": "micrometer"} for dim in "zyx"],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.807, 0.3069942, 0.3069942]},
+                            {"type": "translation", "translation": [-40.0, -7.0, -5.0]},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    properties = legacy.output_stack_properties_from_ome_zarr_template(
+        template,
+        {"z": 1.807, "y": 0.3068036, "x": 0.3068036},
+    )
+
+    assert properties == {
+        "origin": {"z": -40.0, "y": -7.0, "x": -5.0},
+        "spacing": {"z": 1.807, "y": 0.3069942, "x": 0.3069942},
+        "shape": {"z": 3, "y": 5, "x": 7},
+    }
 
 
 def test_fuse_passes_source_view_flatfield_dirs(monkeypatch, tmp_path) -> None:
@@ -733,6 +819,8 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
 
     assert args.flatfield_dir is None
     assert args.source_cache_max_gib == legacy.DEFAULT_SOURCE_CACHE_MAX_GIB
+    assert args.fusion_gpu_memory_max_gib == 0.0
+    assert args.per_chunk_cupy_cleanup is True
     assert args.batch_size == "auto"
     assert args.output_chunksize == (12, 960, 960)
     assert args.fusion_weight_mode == "crop-sharpness-seam"
@@ -746,6 +834,16 @@ def test_legacy_fusion_flatfield_is_opt_in(monkeypatch, tmp_path) -> None:
     args = legacy.parse_args()
 
     assert args.flatfield_dir == flatfield_dir
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["stitch", str(input_dir), "--retain-cupy-pool"],
+    )
+
+    args = legacy.parse_args()
+
+    assert args.per_chunk_cupy_cleanup is False
 
 
 def test_legacy_fusion_accepts_hidden_intensity_threshold(monkeypatch, tmp_path) -> None:
@@ -1822,13 +1920,14 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
             dtype="uint16",
             zarr_format=2,
         )
+        original_fuse_block = fusion_core._fuse_block_zarr_backed
         calls = []
 
-        def fake_fuse_block(chunk_params_block, **kwargs):
+        def recording_fuse_block(chunk_params_block, **kwargs):
             entry = np.asarray(chunk_params_block, dtype=object).item()
             shape = tuple(int(entry["output_bb"]["shape"][dim]) for dim in ("z", "y", "x"))
             calls.append((entry["block_key"], len(entry["views"]), shape))
-            return np.full(shape, len(entry["views"]), dtype=np.uint16)
+            return original_fuse_block(chunk_params_block, **kwargs)
 
         class FakeDevice:
             def __init__(self, _device: int):
@@ -1854,7 +1953,6 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
         )
         monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
         monkeypatch.setattr(misc_utils, "clear_cupy_memory", lambda: None)
-        monkeypatch.setattr(fusion_core, "_fuse_block_zarr_backed", fake_fuse_block)
         payload = {
             "output_zarr_url": str(output_path),
             "output_stack_properties": output_stack_properties,
@@ -1876,10 +1974,72 @@ def test_reflected_fusion_routes_mixed_views_through_candidate_worker(monkeypatc
         }
         for block_id in sorted(candidate_map):
             legacy.run_mvs_fuse_chunk_loky_worker_once(block_id, payload, device=0)
+        baseline = output_array[:]
+        output_array[:] = 0
 
-        assert len(calls) == len(candidate_map)
+        prepared_view_counts = []
+        consumed_view_counts = []
+
+        class FakeReadSession:
+            def prepare(self, entry, _sim_coord_dict):
+                prepared_view_counts.append(len(entry["views"]))
+                return {"reads": [], "nbytes": 0, "view_count": len(entry["views"])}
+
+            def consume(self, reads):
+                consumed_view_counts.append(reads["view_count"])
+                return nullcontext()
+
+            def take(self, _info, _overlap_bb, _sim_coord_dict):
+                return None
+
+        monkeypatch.setattr(legacy, "_ACTIVE_DIRECT_SOURCE_READ_SESSION", FakeReadSession())
+        monkeypatch.setattr(fusion_core, "_fuse_block_zarr_backed", recording_fuse_block)
+        monkeypatch.setattr(
+            legacy,
+            "estimate_mvs_fusion_gpu_bytes",
+            lambda entry: int(np.prod([entry["output_bb"]["shape"][dim] for dim in ("z", "y", "x")])),
+        )
+        payload["fusion_gpu_memory_max_bytes"] = 12
+        for block_id in sorted(candidate_map):
+            legacy.run_mvs_fuse_chunk_loky_worker_once(block_id, payload, device=0)
+
+        assert len(calls) > len(candidate_map)
+        assert prepared_view_counts == [views for _block, views, _shape in calls]
+        assert consumed_view_counts == prepared_view_counts
+        assert all(np.prod(shape) <= 12 for _block, _views, shape in calls)
         assert any(shape != (3, 2, 4) for _block, _views, shape in calls)
-        assert np.count_nonzero(output_array[:]) > 0
+        np.testing.assert_array_equal(output_array[:], baseline)
+
+        for index, sim in enumerate(sims):
+            sim.attrs["fusion_source_index"] = index
+        payload["fuse_kwargs"]["fusion_func_kwargs"] = {
+            "pair_preferences": [[0, 1], [-1, 0]],
+            "source_views": ["L", "R"],
+            "registered_view_correction": "/run/correction.json",
+        }
+        registered_plan = legacy.plan_mvs_fuse_chunk(sorted(candidate_map)[0], payload)
+        root_source_indices = [
+            int(view["tile_info"]["fusion_source_index"])
+            for view in registered_plan["block_entry"]["views"]
+        ]
+        for item in registered_plan["subblocks"]:
+            kwargs = item["block_fusion_kwargs"]
+            source_indices = [
+                int(view["tile_info"]["fusion_source_index"])
+                for view in item["block_entry"]["views"]
+            ]
+            assert kwargs["source_indices"] == source_indices
+            assert source_indices == root_source_indices
+            assert kwargs["source_views"] == [["L", "R"][index] for index in source_indices]
+            assert kwargs["output_origin_zyx_um"] == tuple(
+                item["block_entry"]["output_bb_overlap"]["origin"][dim]
+                for dim in ("z", "y", "x")
+            )
+
+        monkeypatch.setattr(legacy, "estimate_mvs_fusion_gpu_bytes", lambda _entry: 100)
+        payload["fusion_gpu_memory_max_bytes"] = 1
+        with pytest.raises(ValueError, match="cannot fit the smallest x/y sub-block"):
+            legacy.plan_mvs_fuse_chunk(sorted(candidate_map)[0], payload)
     finally:
         legacy.close_stores(stores)
 
