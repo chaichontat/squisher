@@ -248,8 +248,27 @@ def surface_projection_domain(
     surface: SurfaceMesh,
     *,
     name: Literal["full", "ventricular-wall"],
+    ventricular_face_mask: Path | None = None,
 ) -> SurfaceProjectionDomain:
-    """Derive a projection domain, preserving reviewed repair provenance."""
+    """Derive a projection domain from reviewed faces or an automatic wall rule."""
+    if ventricular_face_mask is not None:
+        if name != "full":
+            raise ValueError("cannot combine a reviewed face mask with automatic wall trimming")
+        with np.load(ventricular_face_mask, allow_pickle=False) as artifact:
+            if artifact.files != ["ventricular_faces"]:
+                raise ValueError("reviewed face mask must contain only ventricular_faces")
+            face_mask = artifact["ventricular_faces"]
+        if face_mask.dtype != bool or face_mask.shape != (len(surface.faces),) or not face_mask.any():
+            raise ValueError("reviewed mask must be a nonempty Boolean selection with one entry per face")
+        vertex_mask = np.zeros(len(surface.vertices_world_xyz_um), dtype=bool)
+        vertex_mask[surface.faces[face_mask].ravel()] = True
+        return SurfaceProjectionDomain(
+            name="reviewed-ventricular-faces",
+            vertex_mask=vertex_mask,
+            face_mask=face_mask,
+            digest=_mask_digest(vertex_mask),
+            rule="explicit ventricular_faces; vertices incident to retained faces",
+        )
     if name == "full":
         vertex_mask = np.ones(len(surface.vertices_world_xyz_um), dtype=bool)
         face_mask = np.ones(len(surface.faces), dtype=bool)
@@ -295,10 +314,15 @@ def surface_projection_domain(
         )
         rule = "parent wall support plus Z-interpolated parent Y bounds for appended vertices"
     else:
-        vertex_mask, _ = ventricular_wall_support(
-            surface.vertices_intrinsic_xyz_um, cavity_x_sign=_cavity_x_sign(surface)
-        )
-        rule = "intrinsic per-Z wall between cavity-X turnarounds"
+        intrinsic_cavity = surface.geometry.direction.T @ surface.cavity_direction_world_xyz
+        if np.allclose(intrinsic_cavity, [0.0, 1.0, 0.0], atol=1e-10, rtol=1e-10):
+            vertex_mask, _ = ventricular_wall_support(surface.vertices_intrinsic_xyz_um[:, [1, 2, 0]])
+            rule = "intrinsic per-X wall between cavity-Y turnarounds"
+        else:
+            vertex_mask, _ = ventricular_wall_support(
+                surface.vertices_intrinsic_xyz_um, cavity_x_sign=_cavity_x_sign(surface)
+            )
+            rule = "intrinsic per-Z wall between cavity-X turnarounds"
 
     face_mask = np.all(vertex_mask[surface.faces], axis=1)
     if not np.any(face_mask):

@@ -62,6 +62,25 @@ the largest-component selection, avoiding a blunt global Z cutoff when appendage
 attach through implausibly long triangles. Use `--main-sheet-min-z-index` only
 when a reviewed global lower Z cutoff is still needed.
 
+For a cavity-facing sheet along intrinsic `+Y`, pass `--cavity-axis y` with the
+same X split. Both halves use positive-Y zero crossings of the unsplit signed
+distance field; the split bounds their charts. The working and source physical
+coordinates are preserved. This mode rejects `--keep-main-sheet`, whose bridge
+rule is specific to the X-facing sheets. For surface profiles,
+`--projection-domain ventricular-wall` retains the sheet between the cavity-Y
+turnarounds along Z in each intrinsic X section. It uses the same turnaround
+selection as the cavity-X workflow with permuted intrinsic axes. World
+coordinates and the stored full surface remain unchanged. `--projection-domain
+full` includes the rounded returns at the sheet edges.
+
+`--closed-shell` also writes `shell.npz` in each half: marching cubes of the same
+smoothed, cubic-resampled signed distance, clipped at the split plane and capped
+(PyVista `clip_closed_surface`). It stores `vertices_xyz_um`, `faces` and the
+Boolean `split_cap_faces`. Each shell must be one closed, outward-wound manifold;
+wall vertices on the split plane must lie on it within 0.01 µm, and with
+`--cavity-axis y` the wall must reach the split. The option requires a mask with
+no occupied voxels on the array faces.
+
 Project an aligned intensity volume through the first tissue interval along each
 surface's negative oriented normal and max-reduce it onto the bilateral UV charts:
 
@@ -102,6 +121,15 @@ lightsheet eomes-boundaries \
   --surface /path/to/vz-surface/surface.npz \
   --output-dir /path/to/eomes-boundaries
 ```
+
+For a reviewed ventricular region, pass `--ventricular-face-mask /path/to/ventricular_side.npz`.
+The NPZ must contain only `ventricular_faces`, a nonempty Boolean selection with
+one entry per supplied surface face. This selection controls closest-triangle
+projection and geodesic neighborhoods; it cannot be combined with
+`--projection-domain ventricular-wall`. Profile rows retain the complete source
+mesh vertex ordering. The artifact records the exact face/vertex domains and
+mask provenance; vertices without measured support retain zero counts and NaN
+intensities.
 
 The profile defaults reproduce the prod2 sampling contract: OME-Zarr level 2,
 stride `2,4,4`, 20 µm geodesic neighborhoods, and 4.8 µm depth centers below the

@@ -9,8 +9,10 @@ from typing import Literal
 import igl
 import numpy as np
 import numpy.typing as npt
+import pyvista as pv
 from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, map_coordinates, zoom
 import SimpleITK as sitk
+from skimage.measure import marching_cubes
 
 from squisher_lightsheet.artifact_io import atomic_output_directory, sha256_file
 from squisher_lightsheet.surface_geometry import (
@@ -337,6 +339,63 @@ def _binary_ray_counts(mask: npt.ArrayLike) -> npt.NDArray[np.int64]:
         np.diff(np.pad(values.astype(np.int8), ((0, 0), (0, 0), (1, 1))), axis=2) == 1,
         axis=2,
     )
+
+
+def _closed_half_shells(
+    sampled: FloatArray,
+    index_scale: FloatArray,
+    geometry: ImageGeometry,
+    split_x_index: int,
+    walls_world: dict[str, FloatArray],
+) -> dict[str, tuple[FloatArray, IntArray, npt.NDArray[np.bool_], dict[str, object]]]:
+    """Clip the zero isosurface of the sampled field into closed, capped halves that meet each wall rim."""
+    boundary_zyx, boundary_faces, _, _ = marching_cubes(
+        sampled, level=0.0, spacing=tuple(geometry.spacing_xyz_um[::-1] * index_scale), allow_degenerate=False
+    )
+    if geometry.determinant < 0:
+        boundary_faces = boundary_faces[:, ::-1]
+    boundary = pv.PolyData(
+        geometry.intrinsic_to_world(boundary_zyx[:, ::-1]),
+        np.column_stack((np.full(len(boundary_faces), 3), boundary_faces)),
+    )
+    split_x_um = (split_x_index - 0.5) * geometry.spacing_xyz_um[0]
+    split_origin = geometry.intrinsic_to_world(np.asarray([[split_x_um, 0.0, 0.0]]))[0]
+    shells = {}
+    for half, side in (("low-x", -1.0), ("high-x", 1.0)):
+        clipped = boundary.clip_closed_surface(normal=side * geometry.direction[:, 0], origin=split_origin).clean()
+        vertices = np.asarray(clipped.points, dtype=np.float64)
+        faces = clipped.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        edges = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        _, edge_uses = np.unique(edges, axis=0, return_counts=True)
+        component_count, _ = igl.facet_components(faces)
+        if np.any(edge_uses != 2) or component_count != 1:
+            raise ValueError(f"{half} shell must be one closed manifold component")
+        triangles = vertices[faces]
+        normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+        if np.einsum("ij,ij->", triangles[:, 0], normals) <= 0:
+            raise ValueError(f"{half} shell must have outward winding")
+        split_cap = np.all(
+            np.isclose(geometry.world_to_intrinsic(vertices)[:, 0][faces], split_x_um, rtol=0, atol=1e-6), axis=1
+        )
+        wall = walls_world[half]
+        rim = wall[np.isclose(geometry.world_to_intrinsic(wall)[:, 0], split_x_um, rtol=0, atol=1e-7)]
+        rim_error = np.empty(0)
+        if len(rim):
+            _, closest = clipped.find_closest_cell(rim, return_closest_point=True)
+            rim_error = np.linalg.norm(rim - closest, axis=1)
+            if rim_error.max() >= 0.01:
+                raise ValueError(f"{half} surface rim and closed shell disagree by {rim_error.max():.6f} um")
+        shells[half] = (vertices, faces, split_cap, {
+            "topology": {
+                "vertices": len(vertices),
+                "faces": len(faces),
+                "euler_characteristic": len(vertices) - len(edge_uses) + len(faces),
+            },
+            "split_cap_faces": int(split_cap.sum()),
+            "split_rim_vertices": len(rim),
+            "split_rim_max_error_um": float(rim_error.max()) if len(rim) else None,
+        })
+    return shells
 
 
 def _stride_mask(
@@ -729,12 +788,18 @@ def build_bilateral_ventricular_uv_surfaces(
     mask_path: Path,
     output_dir: Path,
     split_x_index: int,
+    cavity_axis: Literal["x", "y"] = "x",
     smoothing_um: float = DEFAULT_SMOOTHING_UM,
     keep_main_sheet: bool = False,
     main_sheet_min_z_index: int | None = None,
     max_face_edge_um: float | None = None,
+    closed_shell: bool = False,
 ) -> Path:
-    """Build medial UV surfaces for two hemispheres separated along array X."""
+    """Build cavity-facing UV surfaces for hemispheres separated along array X."""
+    if cavity_axis not in ("x", "y"):
+        raise ValueError("cavity_axis must be x or y")
+    if cavity_axis == "y" and keep_main_sheet:
+        raise ValueError("keep_main_sheet requires cavity_axis=x")
     mask_path = Path(mask_path)
     output_dir = Path(output_dir)
     if not np.isfinite(smoothing_um) or smoothing_um < 0:
@@ -754,6 +819,8 @@ def build_bilateral_ventricular_uv_surfaces(
         raise ValueError("main_sheet_min_z_index requires keep_main_sheet=True")
     if max_face_edge_um is not None and (not np.isfinite(max_face_edge_um) or max_face_edge_um <= 0):
         raise ValueError("max_face_edge_um must be finite and positive")
+    if closed_shell and any(face.any() for face in (mask[0], mask[-1], mask[:, 0], mask[:, -1], mask[:, :, 0], mask[:, :, -1])):
+        raise ValueError("closed_shell requires a mask with no occupied voxels on the array faces")
 
     geometry = ImageGeometry.from_sitk(image)
     spacing_zyx_um = geometry.spacing_xyz_um[::-1]
@@ -795,17 +862,36 @@ def build_bilateral_ventricular_uv_surfaces(
     else:
         hemisphere_by_half = {"low-x": "undetermined", "high-x": "undetermined"}
     for half in ("low-x", "high-x"):
-        vertices_intrinsic, faces, diagnostics = medial_x_graph(
-            sampled,
-            index_scale,
-            spacing_zyx_um,
-            np.zeros(3),
-            split_x_index=split_x_index,
-            half=half,
-            excluded_rays=excluded_rays,
-        )
+        if cavity_axis == "x":
+            vertices_intrinsic, faces, diagnostics = medial_x_graph(
+                sampled,
+                index_scale,
+                spacing_zyx_um,
+                np.zeros(3),
+                split_x_index=split_x_index,
+                half=half,
+                excluded_rays=excluded_rays,
+            )
+            cavity_direction_world = geometry.direction[:, 0] * (1 if half == "low-x" else -1)
+        else:
+            cut = int(round((split_x_index - 0.5) / index_scale[2]))
+            start, stop = (0, cut + 1) if half == "low-x" else (cut, sampled.shape[2])
+            ray_origin = np.array([0.0, start * index_scale[2] * spacing_zyx_um[2], 0.0])
+            vertices_yxz, faces, ray_diagnostics = positive_x_graph(
+                sampled.transpose(0, 2, 1)[:, start:stop, :],
+                index_scale[[0, 2, 1]],
+                spacing_zyx_um[[0, 2, 1]],
+                ray_origin,
+            )
+            vertices_intrinsic = vertices_yxz[:, [1, 0, 2]]
+            cavity_direction_world = geometry.direction[:, 1]
+            diagnostics = {
+                **ray_diagnostics,
+                "candidate_refined_rays": ray_diagnostics["nonempty_refined_rays"],
+                "retained_refined_rays": ray_diagnostics["nonempty_refined_rays"],
+                "excluded_refined_rays": 0,
+            }
         vertices_world = geometry.intrinsic_to_world(vertices_intrinsic)
-        cavity_direction_world = geometry.direction[:, 0] * (1 if half == "low-x" else -1)
         faces = _orient_faces(vertices_world, faces, cavity_direction_world)
         faces, edge_diagnostics = _exclude_long_edge_faces(vertices_world, faces, max_face_edge_um)
         retained_world, faces, retained_vertex_index, component_diagnostics = _keep_largest_face_component(
@@ -828,11 +914,20 @@ def build_bilateral_ventricular_uv_surfaces(
         halves[half] = {
             "anatomical_hemisphere_lps": hemisphere_by_half[half],
             "medial_face": "+X" if half == "low-x" else "-X",
+            "cavity_face": "+Y" if cavity_axis == "y" else ("+X" if half == "low-x" else "-X"),
             **diagnostics,
             **edge_diagnostics,
             **component_diagnostics,
             "topology": topology,
         }
+
+    shells = _closed_half_shells(
+        sampled, index_scale, geometry, split_x_index, {half: arrays[0] for half, arrays in half_arrays.items()}
+    ) if closed_shell else {}
+    for half, (_, _, _, shell_record) in shells.items():
+        if cavity_axis == "y" and not shell_record["split_rim_vertices"]:
+            raise ValueError(f"{half} surface does not reach the hemisphere split")
+        halves[half]["shell"] = shell_record
 
     with atomic_output_directory(output_dir) as stage:
         for half, (
@@ -853,6 +948,11 @@ def build_bilateral_ventricular_uv_surfaces(
                 geometry,
                 cavity_direction,
             )
+        for half, (shell_vertices, shell_faces, split_cap, _) in shells.items():
+            np.savez_compressed(
+                stage / half / "shell.npz", vertices_xyz_um=shell_vertices, faces=shell_faces, split_cap_faces=split_cap
+            )
+            halves[half]["outputs"]["shell.npz"] = sha256_file(stage / half / "shell.npz")
         metadata = {
             "artifact_type": "squisher_lightsheet.bilateral_ventricular_uv_surfaces.v1",
             "mask": str(mask_path.resolve()),
@@ -864,9 +964,14 @@ def build_bilateral_ventricular_uv_surfaces(
             "split_plane_world_xyz_um": geometry.intrinsic_to_world(
                 np.asarray([(split_x_index - 0.5) * geometry.spacing_xyz_um[0], 0.0, 0.0])
             ).tolist(),
-            "cut_cap_policy": "exclude refined ZY rays neighboring original rays occupied on both sides of the split",
+            "cavity_axis": cavity_axis,
+            "cut_cap_policy": (
+                "exclude refined ZY rays neighboring original rays occupied on both sides of the split"
+                if cavity_axis == "x" else
+                "positive-Y crossings use the unsplit signed distance; X split bounds each chart"
+            ),
             "original_cut_crossing_rays": int(np.count_nonzero(cut_crossing)),
-            "excluded_cut_cap_refined_rays": int(np.count_nonzero(cut_cap_excluded)),
+            "excluded_cut_cap_refined_rays": int(np.count_nonzero(cut_cap_excluded)) if cavity_axis == "x" else 0,
             **main_sheet_diagnostics,
             "signed_distance_smoothing_um": smoothing_um,
             "mask_shape_zyx": list(mask.shape),
@@ -877,6 +982,11 @@ def build_bilateral_ventricular_uv_surfaces(
             "surface_chart": "Tutte embedding with convex length-spaced boundary and uniform positive weights",
             "uv_units": "dimensionless",
             "uv_orientation": "geometric, anchored in intrinsic XYZ; no anatomical orientation",
+            "closed_shell": (
+                "marching cubes of the same smoothed, cubic-resampled signed distance at level 0; "
+                "planar clip and cap at the split plane (PyVista clip_closed_surface); "
+                "split_cap_faces flags the artificial cap"
+            ) if closed_shell else None,
             "halves": halves,
         }
         (stage / "bilateral.json").write_text(json.dumps(metadata, indent=2) + "\n")

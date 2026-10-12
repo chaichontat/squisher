@@ -10,6 +10,9 @@ import pytest
 from scipy import sparse
 import SimpleITK as sitk
 import zarr
+from typer.testing import CliRunner
+
+from squisher_lightsheet.cli import app
 
 from squisher_lightsheet.surface_geometry import SurfaceProjector
 from squisher_lightsheet.surface_profiles import (
@@ -240,3 +243,69 @@ def test_build_surface_profiles_defaults_to_level_two_and_requires_uint16(tmp_pa
             output_dir=tmp_path / "profiles",
             level=0,
         )
+
+
+def test_cli_profiles_uses_reviewed_faces_for_projection_and_neighborhoods(tmp_path: Path) -> None:
+    source = tmp_path / "source.ome.zarr"
+    _write_source(source)
+    mask = np.zeros((3, 3, 5), dtype=np.uint8)
+    mask[:, :, :2] = 1
+    image = sitk.GetImageFromArray(mask)
+    image.SetSpacing((0.001, 0.001, 0.001))
+    mask_path = tmp_path / "mask.nrrd"
+    sitk.WriteImage(image, mask_path)
+    surface, chart = _write_surface(tmp_path / "surface")
+    reviewed = tmp_path / "reviewed.npz"
+    np.savez_compressed(reviewed, ventricular_faces=np.array([True, False]))
+    output = tmp_path / "profiles"
+
+    result = CliRunner().invoke(app, [
+        "eomes-profiles", "--surface", str(surface), "--chart", str(chart),
+        "--mask", str(mask_path), "--source-zarr", str(source), "--output-dir", str(output),
+        "--level", "0", "--stride-zyx", "1,1,1", "--radius-um", "10",
+        "--max-depth-um", "3", "--depth-step-um", "1",
+        "--ventricular-face-mask", str(reviewed),
+    ])
+    assert result.exit_code == 0, result.output
+    with np.load(output / "profiles.npz") as profiles:
+        np.testing.assert_array_equal(profiles["vertex_index"], [0, 1, 2, 3])
+        np.testing.assert_array_equal(profiles["projection_domain_vertices"], [True, True, True, False])
+        # Three strict-interior YZ sites, with two tissue voxels at each site.
+        np.testing.assert_array_equal(profiles["valid_count"][:3].sum(axis=1), [6, 6, 6])
+        assert not profiles["valid_count"][3].any()
+        assert np.isnan(profiles["intensity"][3]).all()
+        np.testing.assert_allclose(profiles["intensity"][:3, 1:3], [[1, 0]] * 3)
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["projection_domain"]["name"] == "reviewed-ventricular-faces"
+    assert metadata["projection_domain"]["faces"] == 1
+    assert metadata["projection_domain"]["face_mask"] == str(reviewed.resolve())
+    assert metadata["projection_domain"]["face_mask_sha256"] == _sha256(reviewed)
+
+
+@pytest.mark.parametrize("values", [
+    np.array([1, 0]), np.array([[True, False]]), np.array([True]), np.array([False, False]),
+])
+def test_reviewed_face_domain_rejects_invalid_masks(tmp_path: Path, values: np.ndarray) -> None:
+    from squisher_lightsheet.surface_geometry import load_surface, surface_projection_domain
+
+    surface_path, _ = _write_surface(tmp_path / "surface")
+    mask_path = tmp_path / "reviewed.npz"
+    np.savez_compressed(mask_path, ventricular_faces=values)
+    with pytest.raises(ValueError, match="nonempty Boolean.*face"):
+        surface_projection_domain(surface_path, load_surface(surface_path), name="full",
+                                  ventricular_face_mask=mask_path)
+
+
+def test_reviewed_face_domain_rejects_ambiguous_sources(tmp_path: Path) -> None:
+    from squisher_lightsheet.surface_geometry import load_surface, surface_projection_domain
+
+    surface_path, _ = _write_surface(tmp_path / "surface")
+    surface = load_surface(surface_path)
+    mask_path = tmp_path / "reviewed.npz"
+    np.savez_compressed(mask_path, ventricular_faces=np.array([True, False]))
+    with pytest.raises(ValueError, match="cannot combine"):
+        surface_projection_domain(surface_path, surface, name="ventricular-wall",
+                                  ventricular_face_mask=mask_path)
+    np.savez_compressed(mask_path, wrong_key=np.array([True, False]))
+    with pytest.raises(ValueError, match="ventricular_faces"):
+        surface_projection_domain(surface_path, surface, name="full", ventricular_face_mask=mask_path)

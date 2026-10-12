@@ -339,6 +339,7 @@ def _extract_profiles(
         "valid_volume_um3": (count.astype(np.float64) * sample_volume_um3).astype(np.float32),
         "vertex_index": np.arange(len(vertices_xyz_um), dtype=np.int64),
         "projection_domain_vertices": projection_vertex_mask,
+        "projection_domain_faces": projection_face_mask,
     }
     counters["neighborhood_links"] = int(neighborhood.nnz)
     counters["nonempty_bins"] = int(np.count_nonzero(count))
@@ -361,6 +362,7 @@ def build_surface_profiles(
     max_depth_um: float = 280.8,
     depth_step_um: float = 4.8,
     projection_domain: Literal["full", "ventricular-wall"] = "full",
+    ventricular_face_mask: Path | None = None,
     projection_chunk_size: int = 250_000,
     geodesic_batch_size: int = 256,
 ) -> Path:
@@ -396,7 +398,9 @@ def build_surface_profiles(
     mask_coefficients, mask_geometry = _mask_sampler(mask_path)
     surface = load_surface(surface_path)
     vertices, faces = surface.vertices_world_xyz_um, surface.faces
-    domain = surface_projection_domain(surface_path, surface, name=projection_domain)
+    domain = surface_projection_domain(
+        surface_path, surface, name=projection_domain, ventricular_face_mask=ventricular_face_mask
+    )
     with np.load(chart_path) as chart:
         uv = np.asarray(chart["vertex_uv"], dtype=np.float64)
         if "mesh_sha256" in chart.files and str(chart["mesh_sha256"]) != sha256_file(surface_path):
@@ -474,5 +478,10 @@ def build_surface_profiles(
             "counters": counters,
             "output_sha256": sha256_file(profile_path),
         }
+        if ventricular_face_mask is not None:
+            metadata["projection_domain"].update({
+                "face_mask": str(Path(ventricular_face_mask).resolve()),
+                "face_mask_sha256": sha256_file(ventricular_face_mask),
+            })
         (stage / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     return (output_dir / "metadata.json").resolve()

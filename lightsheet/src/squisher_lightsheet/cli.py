@@ -294,6 +294,10 @@ def bilateral_uv_surface(
     mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
     split_x_index: Annotated[int, typer.Option("--split-x-index", min=1)],
+    cavity_axis: Annotated[
+        Literal["x", "y"],
+        typer.Option("--cavity-axis", help="Cavity-facing axis: medial +/-X, or +Y in both halves."),
+    ] = "x",
     smoothing_um: Annotated[float, typer.Option("--smoothing-um", min=0)] = DEFAULT_SMOOTHING_UM,
     keep_main_sheet: Annotated[
         bool,
@@ -318,17 +322,26 @@ def bilateral_uv_surface(
             help="Drop discontinuity-spanning faces before retaining the largest component.",
         ),
     ] = None,
+    closed_shell: Annotated[
+        bool,
+        typer.Option(
+            "--closed-shell",
+            help="Also write each half's closed, capped marching-cubes shell (shell.npz).",
+        ),
+    ] = False,
 ) -> None:
-    """Build separate medial UV charts for X-separated cerebral hemispheres."""
+    """Build cavity-facing UV charts for X-separated cerebral hemispheres."""
     typer.echo(
         build_bilateral_ventricular_uv_surfaces(
             mask_path=mask,
             output_dir=output_dir,
             split_x_index=split_x_index,
+            cavity_axis=cavity_axis,
             smoothing_um=smoothing_um,
             keep_main_sheet=keep_main_sheet,
             main_sheet_min_z_index=main_sheet_min_z_index,
             max_face_edge_um=max_face_edge_um,
+            closed_shell=closed_shell,
         )
     )
 
@@ -378,6 +391,11 @@ def eomes_profiles(
     projection_domain: Annotated[
         Literal["full", "ventricular-wall"], typer.Option("--projection-domain")
     ] = "full",
+    ventricular_face_mask: Annotated[
+        Path | None,
+        typer.Option("--ventricular-face-mask", exists=True, dir_okay=False, readable=True,
+                     help="NPZ containing Boolean ventricular_faces aligned to the supplied surface."),
+    ] = None,
 ) -> None:
     """Bin 561 intensity by exact closest-surface distance and mesh neighborhood."""
     typer.echo(
@@ -395,6 +413,7 @@ def eomes_profiles(
             max_depth_um=max_depth_um,
             depth_step_um=depth_step_um,
             projection_domain=projection_domain,
+            ventricular_face_mask=ventricular_face_mask,
         )
     )
 
