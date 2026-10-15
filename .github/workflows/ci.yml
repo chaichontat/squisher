@@ -30,7 +30,7 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Lint
-        run: uv run ruff check --output-format=concise squisher/src squisher/tests lightsheet/src lightsheet/tests
+        run: uv run ruff check --output-format=concise squisher/src squisher/tests lightsheet/src lightsheet/tests segment/squisher_segment segment/tests
 
       - name: Test squisher
         run: uv run --package squisher pytest -q squisher/tests
@@ -39,6 +39,11 @@ jobs:
         env:
           _TYPER_FORCE_DISABLE_TERMINAL: "1"
         run: uv run --package squisher-lightsheet pytest -q lightsheet/tests
+
+      - name: Test segmentation CPU contracts
+        env:
+          _TYPER_FORCE_DISABLE_TERMINAL: "1"
+        run: uv run --package squisher-segment pytest -q -m "not gpu" segment/tests
 
   build-windows-exe:
     runs-on: windows-latest

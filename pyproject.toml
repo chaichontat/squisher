@@ -6,3 +6,12 @@ markers = ["gpu: requires a CUDA-capable GPU"]
 
 [tool.uv]
 override-dependencies = ["scipy>=1.16.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
