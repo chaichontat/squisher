@@ -54,12 +54,27 @@ and output provenance record the gain-file identity. Resume rejects outputs made
 with a different manifest. Registration and fusion do not apply these gains
 again: they consume the already corrected deconvolved tiles.
 
-### Z-dependent post-BaSiC fields
+### Z-dependent fit-residual fields
 
-Profiles produced by `lightsheet post-basic --z-degree 1` contain a smooth
+Profiles produced by `lightsheet fit-residual --z-degree 1` contain a smooth
 residual field in normalized original raw Z/Y/X coordinates alongside the
 original 2D BaSiC arrays. Pass these pickles through the existing `--basic`
 arguments to both `sample-scale` and `run`. The GPU engine evaluates the field
 using the slab's original raw Z start and the full source Z count, then applies
 it after BaSiC correction and before tile gains and deconvolution. Changing the
 profile requires fresh scaling samples, as with any BaSiC change.
+
+
+### Metadata from mosaic top-up acquisitions
+
+A converted input folder may contain tiles from a mosaic and later single-tile
+acquisitions. Deconvolution retains all exact CZI XML records in
+`metadata.json`: one common record uses `czi_shared_metadata_xml`; multiple
+compatible records use `czi_metadata_groups`, with `metadata_group_index` on
+each tile position and a null shared record. Grouped inputs must agree in OME
+pixel geometry and CZI imaging settings, including channel order, tracks,
+exposure, illumination and calibration. Acquisition identity, time, stage
+placement, mosaic grid and display settings may differ; Airyscan transforms
+are ignored for comparison only when their corresponding mode is `Off`.
+Original XML is retained without modification. Incompatible imaging settings
+or missing metadata fail before processing.

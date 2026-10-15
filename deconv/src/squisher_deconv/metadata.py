@@ -56,13 +56,20 @@ def read_source_metadata(path: Path) -> SourceMetadata:
 
 
 def czi_dataset_metadata_payload(sources: Sequence[Path], outputs: Sequence[Path]) -> dict[str, Any]:
-    """Collect the CZI metadata shared by all inputs and each tile's OME position."""
+    """Retain exact CZI acquisition metadata and each tile's OME position.
+
+    A folder may contain a mosaic and later top-up acquisitions. Multiple XML
+    groups must agree in imaging settings; provenance and acquisition positions
+    may differ. A single group retains the original shared-metadata contract.
+    """
     if len(sources) != len(outputs):
         raise ValueError(
             f"Expected one output per source, got {len(sources)} sources and {len(outputs)} outputs."
         )
 
-    shared_metadata_xml: str | None = None
+    metadata_groups: list[str] = []
+    group_indices: list[int | None] = []
+    pixel_attributes: list[dict[str, str] | None] = []
     positions: list[dict[str, Any]] = []
     missing_shared_metadata: list[str] = []
     for source, output in zip(sources, outputs, strict=True):
@@ -72,6 +79,8 @@ def czi_dataset_metadata_payload(sources: Sequence[Path], outputs: Sequence[Path
         if ome_xml is None:
             missing_shared_metadata.append(str(source))
             positions.append({"path": str(output), "source": str(source)})
+            group_indices.append(None)
+            pixel_attributes.append(None)
             continue
         try:
             ome = ElementTree.fromstring(ome_xml)
@@ -80,17 +89,25 @@ def czi_dataset_metadata_payload(sources: Sequence[Path], outputs: Sequence[Path
 
         current_shared = _czi_shared_metadata_xml(ome, source=source)
         if current_shared is not None:
-            if shared_metadata_xml is None:
-                shared_metadata_xml = current_shared
-            elif current_shared != shared_metadata_xml:
-                raise ValueError(
-                    f"{source} contains different shared CZI metadata from the first input tile."
-                )
+            if current_shared not in metadata_groups:
+                if metadata_groups and _czi_imaging_settings(current_shared) != _czi_imaging_settings(
+                    metadata_groups[0]
+                ):
+                    raise ValueError(
+                        f"{source} contains different shared CZI metadata imaging settings from the first input tile."
+                    )
+                metadata_groups.append(current_shared)
+            group_indices.append(metadata_groups.index(current_shared))
         else:
             missing_shared_metadata.append(str(source))
+            group_indices.append(None)
+        pixels = next((element for element in ome.iter() if _local_name(element.tag) == "Pixels"), None)
+        pixel_attributes.append(
+            None if pixels is None else {key: value for key, value in pixels.attrib.items() if key != "ID"}
+        )
         positions.append(_ome_position_record(ome, source=source, output=Path(output)))
 
-    if shared_metadata_xml is not None:
+    if metadata_groups:
         if missing_shared_metadata:
             raise ValueError(
                 f"Input tile(s) are missing the shared CZI metadata present on other tiles: {missing_shared_metadata}"
@@ -98,7 +115,67 @@ def czi_dataset_metadata_payload(sources: Sequence[Path], outputs: Sequence[Path
         missing = [record["source"] for record in positions if "tile_index" not in record]
         if missing:
             raise ValueError(f"CZI input tile(s) are missing tile metadata: {missing}")
-    return {"czi_shared_metadata_xml": shared_metadata_xml, "positions": positions}
+    if len(metadata_groups) > 1:
+        reference_pixels = pixel_attributes[0]
+        for source, pixels in zip(sources, pixel_attributes, strict=True):
+            if pixels is None or pixels != reference_pixels:
+                raise ValueError(f"{source} differs in OME pixel size or spacing from {sources[0]}")
+        for position, group_index in zip(positions, group_indices, strict=True):
+            position["metadata_group_index"] = group_index
+        return {
+            "czi_shared_metadata_xml": None,
+            "czi_metadata_groups": metadata_groups,
+            "positions": positions,
+        }
+    return {
+        "czi_shared_metadata_xml": metadata_groups[0] if metadata_groups else None,
+        "positions": positions,
+    }
+
+
+def _czi_imaging_settings(xml: str) -> str:
+    """Compare imaging settings without acquisition identity, placement or display.
+
+    Exact source XML is retained separately. Inactive Airyscan transforms are
+    undefined in SPIM exports; ignore them only when the corresponding mode is Off.
+    All other settings, attributes, channel order and calibration remain strict.
+    """
+    root = ElementTree.fromstring(xml)
+    image = "./Metadata/Information/Image"
+    acquisition = "./Metadata/Experiment/ExperimentBlocks/AcquisitionBlock"
+    variable_paths = [
+        "./Metadata/Information/Document",
+        "./Metadata/DisplaySetting",
+        f"{image}/SizeM",
+        f"{image}/Dimensions/S/Scenes/Scene/Positions",
+        f"{image}/Dimensions/T/StartTime",
+        f"{acquisition}/AcquisitionModeSetup/OffsetZ",
+        f"{acquisition}/AcquisitionModeSetup/ReferenceZ",
+    ]
+    tile_group = f"{acquisition}/TilesSetup/PositionGroups/PositionGroup"
+    variable_paths.extend(
+        f"{tile_group}/{name}"
+        for name in ("TileAcquisitionMode", "TilesX", "TilesY", "TileAcquisitionOverlap")
+    )
+    for path in variable_paths:
+        parent_path, name = path.rsplit("/", 1)
+        for parent in root.findall(parent_path):
+            for child in parent.findall(name):
+                parent.remove(child)
+    channels = root.findall(f"{image}/Dimensions/Channels/Channel")
+    if not channels:
+        raise ValueError("Cannot combine different shared CZI metadata without channel imaging settings")
+    for settings in root.findall(f"{image}/Dimensions/Channels/Channel/AiryscanSettings"):
+        if settings.findtext("Mode") == "Off":
+            for axis in ("XX", "XY", "YX", "YY"):
+                for child in settings.findall(f"Transformation{axis}"):
+                    settings.remove(child)
+    for detector in root.findall(f"{acquisition}/MultiTrackSetup/TrackSetup/Detectors/Detector"):
+        if detector.findtext("AiryScanMode") == "Off":
+            for axis in ("XX", "XY", "YX", "YY"):
+                for child in detector.findall(f"AiryScanTransformation{axis}"):
+                    detector.remove(child)
+    return ElementTree.canonicalize(ElementTree.tostring(root, encoding="unicode"), strip_text=True)
 
 
 def _czi_shared_metadata_xml(ome: ElementTree.Element, *, source: Path) -> str | None:

@@ -104,6 +104,73 @@ def test_czi_dataset_metadata_payload_rejects_mismatched_shared_metadata(tmp_pat
         czi_dataset_metadata_payload(sources, [tmp_path / "a", tmp_path / "b"])
 
 
+def _write_czi_group_tile(
+    path: Path,
+    index: int,
+    *,
+    exposure: str = "20",
+    mode: str = "Off",
+    spacing: str = "0.3",
+    channel: str = "571",
+    shared: bool = True,
+) -> None:
+    xml = f"""<ImageDocument><Metadata><Information>
+      <Document><Name>acquisition-{index}</Name></Document>
+      <Image><Dimensions><Channels><Channel Id="channel0"><EmissionWavelength>{channel}</EmissionWavelength>
+        <ExposureTime>{exposure}</ExposureTime><AiryscanSettings><Mode>{mode}</Mode>
+        <TransformationXX>{index}</TransformationXX></AiryscanSettings></Channel></Channels></Dimensions></Image>
+      </Information></Metadata></ImageDocument>"""
+    annotation = (
+        (
+            f'<XMLAnnotation Namespace="squisher/czi/shared-metadata"><Value>'
+            f'<CZISharedMetadata xmlns="">{xml}</CZISharedMetadata></Value></XMLAnnotation>'
+        )
+        if shared
+        else ""
+    )
+    ome = f"""<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+      <Image><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="2" SizeY="2"
+        SizeZ="1" SizeC="1" SizeT="1" PhysicalSizeX="{spacing}" PhysicalSizeXUnit="&#181;m">
+        <Plane PositionX="{index * 100}" PositionY="0"/></Pixels></Image>
+      <StructuredAnnotations><MapAnnotation><Value><M K="squisher.output_tile_index">{index}</M>
+        <M K="czi.mosaic_index">0</M></Value></MapAnnotation>{annotation}</StructuredAnnotations></OME>"""
+    tifffile.imwrite(path, np.zeros((1, 2, 2), dtype=np.uint16), description=ome, metadata=None)
+
+
+def test_czi_dataset_retains_compatible_acquisition_metadata_groups(tmp_path) -> None:
+    sources = [tmp_path / f"tile-{i}.ome.tif" for i in range(2)]
+    for i, path in enumerate(sources):
+        _write_czi_group_tile(path, i)
+    payload = czi_dataset_metadata_payload(sources, sources)
+    assert payload["czi_shared_metadata_xml"] is None
+    assert len(payload["czi_metadata_groups"]) == 2
+    assert "acquisition-0" in payload["czi_metadata_groups"][0]
+    assert "acquisition-1" in payload["czi_metadata_groups"][1]
+    assert [p["metadata_group_index"] for p in payload["positions"]] == [0, 1]
+    assert [p["tile_index"] for p in payload["positions"]] == [0, 1]
+    assert [p["mosaic_index"] for p in payload["positions"]] == [0, 0]
+    assert [p["x"] for p in payload["positions"]] == [0.0, 100.0]
+
+
+@pytest.mark.parametrize(
+    "changed", [{"exposure": "40"}, {"channel": "648"}, {"spacing": "0.4"}, {"mode": "On"}, {"shared": False}]
+)
+def test_czi_dataset_rejects_incompatible_acquisition_groups(tmp_path, changed) -> None:
+    sources = [tmp_path / f"tile-{i}.ome.tif" for i in range(2)]
+    _write_czi_group_tile(sources[0], 0)
+    _write_czi_group_tile(sources[1], 1, **changed)
+    with pytest.raises(ValueError):
+        czi_dataset_metadata_payload(sources, sources)
+
+
+def test_czi_dataset_compares_active_airyscan_transforms(tmp_path) -> None:
+    sources = [tmp_path / f"tile-{i}.ome.tif" for i in range(2)]
+    for i, path in enumerate(sources):
+        _write_czi_group_tile(path, i, mode="On")
+    with pytest.raises(ValueError, match="different shared CZI metadata imaging settings"):
+        czi_dataset_metadata_payload(sources, sources)
+
+
 def test_ome_zarr_provenance_serialization_failure_removes_partial_output(tmp_path) -> None:
     source = _source(tmp_path, channels=1, z_count=1, height=2, width=2)
     output = tmp_path / "out.ome.zarr"
