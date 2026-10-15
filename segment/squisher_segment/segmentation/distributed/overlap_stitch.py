@@ -130,11 +130,13 @@ def initialize_overlap_evidence(
     *,
     run_key: str,
     resume: bool,
+    recover_empty: bool = False,
 ) -> None:
     """Create or validate the three pair-centric evidence arrays."""
     payload = {"schema": EVIDENCE_SCHEMA, "run_key": run_key, "rows": rows}
     metadata_path = directory / "metadata.json"
-    if resume:
+    recovering = resume and not metadata_path.is_file() and recover_empty
+    if resume and not recovering:
         if not metadata_path.is_file():
             raise RuntimeError(f"Cannot resume: overlap evidence metadata is missing at {metadata_path}.")
         saved = json.loads(metadata_path.read_text())
@@ -147,34 +149,60 @@ def initialize_overlap_evidence(
             if not axis_path.exists():
                 raise RuntimeError(f"Cannot resume: overlap evidence axis {axis} is missing.")
             array = zarr.open_array(axis_path, mode="r")
-            spatial_shape = tuple(
-                max(row["valid_shape"][dim] for row in axis_rows) for dim in range(3)
-            )
+            spatial_shape = tuple(max(row["valid_shape"][dim] for row in axis_rows) for dim in range(3))
             if array.shape != (len(axis_rows), 2, *spatial_shape):
                 raise RuntimeError(f"Cannot resume: overlap evidence axis {axis} shape changed.")
             if dict(array.attrs) != {"schema": EVIDENCE_SCHEMA, "run_key": run_key}:
-                raise RuntimeError(
-                    f"Cannot resume: overlap evidence axis {axis} identity changed."
-                )
+                raise RuntimeError(f"Cannot resume: overlap evidence axis {axis} identity changed.")
         return
 
-    if directory.exists():
+    if directory.exists() and not recovering:
         raise RuntimeError(f"Fresh overlap-IoU run found stale evidence at {directory}.")
-    directory.mkdir(parents=True)
+    if recovering:
+        expected_paths = {f"axis-{axis}.zarr" for axis, axis_rows in enumerate(rows) if axis_rows}
+        if directory.exists() and any(child.name not in expected_paths for child in directory.iterdir()):
+            raise RuntimeError(
+                "Cannot reconstruct overlap evidence: unexpected artifacts or block markers exist."
+            )
+        # Validate every existing array before changing any metadata. A blank
+        # array may lack attrs if initialization stopped directly after create.
+        for axis, axis_rows in enumerate(rows):
+            axis_path = directory / f"axis-{axis}.zarr"
+            if not axis_rows or not axis_path.exists():
+                continue
+            array = zarr.open_array(axis_path, mode="r")
+            spatial_shape = tuple(max(row["valid_shape"][dim] for row in axis_rows) for dim in range(3))
+            if (
+                array.shape != (len(axis_rows), 2, *spatial_shape)
+                or array.dtype != np.dtype(np.uint32)
+                or array.chunks != (1, 1, *_spatial_chunks(spatial_shape))
+                or array.nchunks_initialized != 0
+                or (
+                    dict(array.attrs) and dict(array.attrs) != {"schema": EVIDENCE_SCHEMA, "run_key": run_key}
+                )
+            ):
+                raise RuntimeError(
+                    f"Cannot reconstruct overlap evidence: axis {axis} is not blank or its identity changed."
+                )
+    directory.mkdir(parents=True, exist_ok=recovering)
     codecs = _evidence_codecs()
     for axis, axis_rows in enumerate(rows):
         if not axis_rows:
             continue
         spatial_shape = tuple(max(row["valid_shape"][dim] for row in axis_rows) for dim in range(3))
-        array = zarr.create_array(
-            directory / f"axis-{axis}.zarr",
-            shape=(len(axis_rows), 2, *spatial_shape),
-            chunks=(1, 1, *_spatial_chunks(spatial_shape)),
-            dtype=np.uint32,
-            serializer=codecs[0],
-            compressors=tuple(codecs[1:]),
-            config={"write_empty_chunks": False},
-        )
+        axis_path = directory / f"axis-{axis}.zarr"
+        if recovering and axis_path.exists():
+            array = zarr.open_array(axis_path, mode="r+")
+        else:
+            array = zarr.create_array(
+                axis_path,
+                shape=(len(axis_rows), 2, *spatial_shape),
+                chunks=(1, 1, *_spatial_chunks(spatial_shape)),
+                dtype=np.uint32,
+                serializer=codecs[0],
+                compressors=tuple(codecs[1:]),
+                config={"write_empty_chunks": False},
+            )
         array.attrs.update(schema=EVIDENCE_SCHEMA, run_key=run_key)
     atomic_write_text(metadata_path, json.dumps(payload, indent=2))
 

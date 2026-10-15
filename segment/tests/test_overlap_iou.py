@@ -521,3 +521,90 @@ def test_process_blocks_stitch_overlap_3d(tmp_path, monkeypatch, axis: int) -> N
     expected = np.zeros(spatial_shape, dtype=np.uint32)
     expected[object_box] = 1
     np.testing.assert_array_equal(output[:], expected)
+
+
+def test_overlap_initialization_interruption_recovers_empty_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    rows = [[{"valid_shape": [2, 2, 2]}], [], []]
+    original = overlap_stitch.atomic_write_text
+
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise OSError("initialization interrupted")
+
+    monkeypatch.setattr(overlap_stitch, "atomic_write_text", interrupted)
+    with pytest.raises(OSError, match="initialization interrupted"):
+        overlap_stitch.initialize_overlap_evidence(evidence_dir, rows, run_key="run", resume=False)
+    monkeypatch.setattr(overlap_stitch, "atomic_write_text", original)
+    # The published run config sends the real caller through resume=True.
+    overlap_stitch.initialize_overlap_evidence(
+        evidence_dir, rows, run_key="run", resume=True, recover_empty=True
+    )
+
+
+@pytest.mark.parametrize("stage", ["create", "attrs", "ready"])
+def test_overlap_initialization_fault_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    rows = [[{"valid_shape": [2, 2, 2]}], [], []]
+    original_create = overlap_stitch.zarr.create_array
+    original_write = overlap_stitch.atomic_write_text
+
+    def interrupted_create(*args: object, **kwargs: object) -> zarr.Array:
+        if stage == "create":
+            raise OSError("initialization interrupted")
+        original_create(*args, **kwargs)
+        raise OSError("initialization interrupted")
+
+    def interrupted_write(*args: object, **kwargs: object) -> None:
+        original_write(*args, **kwargs)
+        raise OSError("initialization interrupted")
+
+    monkeypatch.setattr(
+        overlap_stitch.zarr, "create_array", original_create if stage == "ready" else interrupted_create
+    )
+    monkeypatch.setattr(
+        overlap_stitch, "atomic_write_text", interrupted_write if stage == "ready" else original_write
+    )
+    with pytest.raises(OSError, match="initialization interrupted"):
+        overlap_stitch.initialize_overlap_evidence(evidence_dir, rows, run_key="run", resume=False)
+    monkeypatch.setattr(overlap_stitch.zarr, "create_array", original_create)
+    monkeypatch.setattr(overlap_stitch, "atomic_write_text", original_write)
+    overlap_stitch.initialize_overlap_evidence(
+        evidence_dir, rows, run_key="run", resume=True, recover_empty=True
+    )
+    overlap_stitch.initialize_overlap_evidence(evidence_dir, rows, run_key="run", resume=True)
+
+
+@pytest.mark.parametrize("persisted", ["data", "marker", "identity"])
+def test_overlap_empty_reconstruction_rejects_computed_or_mismatched_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persisted: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    rows = [[{"valid_shape": [2, 2, 2]}], [], []]
+    original = overlap_stitch.atomic_write_text
+
+    def interrupted(*args: object, **kwargs: object) -> None:
+        raise OSError("initialization interrupted")
+
+    monkeypatch.setattr(overlap_stitch, "atomic_write_text", interrupted)
+    with pytest.raises(OSError):
+        overlap_stitch.initialize_overlap_evidence(evidence_dir, rows, run_key="run", resume=False)
+    monkeypatch.setattr(overlap_stitch, "atomic_write_text", original)
+    array = zarr.open_array(evidence_dir / "axis-0.zarr", mode="r+")
+    if persisted == "data":
+        array[0] = 1
+    elif persisted == "identity":
+        array.attrs["run_key"] = "other"
+    else:
+        overlap_stitch.write_block_marker(evidence_dir, (0, 0, 0), "run")
+    with pytest.raises(RuntimeError, match="Cannot reconstruct"):
+        overlap_stitch.initialize_overlap_evidence(
+            evidence_dir, rows, run_key="run", resume=True, recover_empty=True
+        )
+    assert not (evidence_dir / "metadata.json").exists()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from squisher_segment.segment.extract import run_extract
@@ -18,9 +18,9 @@ def train(
     path: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Training-data root.")],
     name: Annotated[str, typer.Argument(help="Model config stem under PATH/models.")],
     packed: Annotated[
-        bool,
+        bool | None,
         typer.Option("--packed/--no-packed", help="Enable packed-stripe training."),
-    ] = False,
+    ] = None,
     skip_trt: Annotated[
         bool,
         typer.Option("--skip-trt", help="Skip TensorRT engine generation after training."),
@@ -44,13 +44,35 @@ def train(
     )
     train_config = train_config.model_copy(
         update={
-            "packed": packed,
+            "packed": train_config.packed if packed is None else packed,
             "skip_trt": train_config.skip_trt or skip_trt,
         }
     )
 
     updated = run_train(name, path, train_config)
     (models_path / f"{name}.trained.json").write_text(updated.model_dump_json(indent=2))
+
+
+@app.command("build-trt")
+def build_trt(
+    model_path: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, readable=True, help="Trained Cellpose checkpoint.")
+    ],
+    backend: Annotated[
+        Literal["sam", "unet"], typer.Option(help="Checkpoint backend.")
+    ] = "sam",
+) -> None:
+    """Build a verified device plan using the distributed 256-pixel profile."""
+    import torch
+    from squisher_segment.segment.train import build_trt_engine
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required to build a TensorRT plan but was not detected.")
+    plan = build_trt_engine(
+        model_path=model_path, device=torch.device("cuda"), backend=backend,
+        bsize=256, batch_size=1,
+    )
+    typer.echo(plan)
 
 
 @app.command("n4")

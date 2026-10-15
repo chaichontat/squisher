@@ -14,58 +14,26 @@ from __future__ import annotations
 import functools
 import getpass
 import os
-import pathlib
 import subprocess
-from pathlib import Path
 from typing import Any
 from collections.abc import Callable
 
 import dask
 import distributed
-import yaml
 from dask.distributed import Client
 
 DEFAULT_WORKER_MEMORY = "64GB"
 DEFAULT_CONFIG_FILENAME = "distributed_cellpose_dask_config.yaml"
 
 
-# ----------------------- config stuff ----------------------------------------#
-def _config_path(config_name: str) -> str:
-    return str(pathlib.Path.home()) + "/.config/dask/" + config_name
-
-
-def _modify_dask_config(
-    config: dict[str, Any],
-    config_name: str = DEFAULT_CONFIG_FILENAME,
-) -> None:
-    # Default: significantly quiet Dask/distributed logging so worker/scheduler
-    # noise does not obscure application-level exceptions. Users can override
-    # these levels by providing their own "logging" section in ``config``.
-    logging_defaults: dict[str, Any] = {
-        "logging": {
-            "distributed": "error",
-            "distributed.scheduler": "error",
-            # Hide worker chatter entirely (including warnings) by raising
-            # its threshold to CRITICAL.
-            "distributed.worker": "critical",
-            "distributed.nanny": "error",
-            "distributed.worker_state_machine": "critical",
-        }
-    }
-    merged_config: dict[str, Any] = {**logging_defaults, **config}
-    dask.config.set(merged_config)
-    cfg_path = Path(_config_path(config_name))
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cfg_path, "w") as f:
-        yaml.dump(dask.config.config, f, default_flow_style=False)
-
-
-def _remove_config_file(
-    config_name: str = DEFAULT_CONFIG_FILENAME,
-) -> None:
-    config_path = _config_path(config_name)
-    if os.path.exists(config_path):
-        os.remove(config_path)
+# Construction is synchronous; restore the caller's configuration before returning.
+# Nanny snapshots this configuration and passes it to its owned worker process.
+CLUSTER_CONFIG = {
+    "distributed.comm.timeouts.connect": "60s",
+    "distributed.comm.timeouts.tcp": "120s",
+    "distributed.scheduler.worker-ttl": "10m",
+    "distributed.admin.tick.limit": "10m",
+}
 
 
 def _auto_device_tokens() -> list[str]:
@@ -133,10 +101,6 @@ def _start_speccluster(
     from distributed import Scheduler
     from distributed.deploy.spec import SpecCluster
 
-    # Ensure dask config (including logging defaults) is written so that
-    # scheduler and worker processes inherit the quieter logging setup.
-    _modify_dask_config({}, DEFAULT_CONFIG_FILENAME)
-
     devices = _visible_devices()
     if not devices:
         raise RuntimeError("No GPUs detected; cannot start GPU SpecCluster")
@@ -147,9 +111,9 @@ def _start_speccluster(
         workers_per_device=workers_per_device,
         threads_per_worker=int(threads_per_worker),
     )
-    cluster = SpecCluster(workers=spec, scheduler={"cls": Scheduler, "options": {}})
-    client = Client(cluster)
-    return client, cluster, getattr(cluster, "dashboard_link", None)
+    with dask.config.set(CLUSTER_CONFIG):
+        cluster = SpecCluster(workers=spec, scheduler={"cls": Scheduler, "options": {}})
+        return _connect_cluster(cluster)
 
 
 def _start_localcuda(*, n_workers: int | None, threads_per_worker: int) -> tuple[Client, Any, str | None]:
@@ -158,12 +122,22 @@ def _start_localcuda(*, n_workers: int | None, threads_per_worker: int) -> tuple
     except Exception as e:  # pragma: no cover - env dependent
         raise RuntimeError("dask-cuda is required for LocalCUDACluster but is not installed") from e
 
-    cluster = LocalCUDACluster(
-        n_workers=n_workers,
-        threads_per_worker=threads_per_worker,
-        memory_limit=DEFAULT_WORKER_MEMORY,
-    )
-    client = Client(cluster)
+    with dask.config.set(CLUSTER_CONFIG):
+        cluster = LocalCUDACluster(
+            n_workers=n_workers,
+            threads_per_worker=threads_per_worker,
+            memory_limit=DEFAULT_WORKER_MEMORY,
+            silence_logs=False,
+        )
+        return _connect_cluster(cluster)
+
+
+def _connect_cluster(cluster: Any) -> tuple[Client, Any, str | None]:
+    try:
+        client = Client(cluster, set_as_default=False)
+    except BaseException:
+        cluster.close(timeout=30)
+        raise
     return client, cluster, getattr(cluster, "dashboard_link", None)
 
 
@@ -223,46 +197,24 @@ class myGPUCluster:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        import logging
-
-        # Suppress noisy shutdown logs from distributed
-        for name in [
-            "distributed",
-            "distributed.scheduler",
-            "distributed.worker",
-            "distributed.nanny",
-            "distributed.batched",
-            "distributed.core",
-        ]:
-            logging.getLogger(name).setLevel(logging.CRITICAL)
-
         try:
             if self._client is not None:
-                try:
-                    self._client.close(timeout=30)
-                except TimeoutError as close_exc:
-                    logging.getLogger(__name__).warning(
-                        f"Timed out while closing Dask client (cluster shutdown); ignoring: {close_exc!r}"
-                    )
-            if self._cluster is not None:
-                try:
-                    self._cluster.close(timeout=30)
-                except TimeoutError as close_exc:
-                    logging.getLogger(__name__).warning(
-                        f"Timed out while closing Dask cluster (cluster shutdown); ignoring: {close_exc!r}"
-                    )
+                self._client.close(timeout=30)
         finally:
-            # Clean up transient dask config used for logging control.
-            _remove_config_file(DEFAULT_CONFIG_FILENAME)
-            self._client = None
-            self._cluster = None
+            try:
+                if self._cluster is not None:
+                    self._cluster.close(timeout=30)
+            finally:
+                self._client = None
+                self._cluster = None
+                self.client = None
 
 
 # ----------------------- CPU LocalCluster ------------------------------------#
 class myLocalCluster(distributed.LocalCluster):
     """
-    This is a thin wrapper extending dask.distributed.LocalCluster to set
-    configs before the cluster or workers are initialized.
+    This wrapper scopes configuration to cluster construction. Process workers
+    inherit it through Nanny; the caller's Dask configuration is restored.
 
     For a list of full arguments (how to specify your worker resources) see:
     https://distributed.dask.org/en/latest/api.html#distributed.LocalCluster
@@ -291,37 +243,27 @@ class myLocalCluster(distributed.LocalCluster):
         persist_config: bool = False,
         **kwargs: Any,
     ) -> None:
-        # config
-        self.config_name = config_name
-        self.persist_config = persist_config
-        scratch_dir = f"{os.getcwd()}/"
-        scratch_dir += f".{getpass.getuser()}_distributed_cellpose/"
-        config_defaults = {"temporary-directory": scratch_dir}
-        if config is None:
-            config = {}
-        config = {**config_defaults, **config}
-        _modify_dask_config(config, config_name)
-
-        # construct
-        if "host" not in kwargs:
-            kwargs["host"] = ""
-        super().__init__(**kwargs)
-        self.client = distributed.Client(self)
-
-        # set environment variables for workers (threading)
-        environment_vars = {
-            "MKL_NUM_THREADS": str(2 * ncpus),
-            "NUM_MKL_THREADS": str(2 * ncpus),
-            "OPENBLAS_NUM_THREADS": str(2 * ncpus),
-            "OPENMP_NUM_THREADS": str(2 * ncpus),
-            "OMP_NUM_THREADS": str(2 * ncpus),
+        if persist_config:
+            raise ValueError("persist_config is unsupported; cluster configuration is scoped to startup")
+        effective_config = {
+            **CLUSTER_CONFIG,
+            "temporary-directory": f"{os.getcwd()}/.{getpass.getuser()}_distributed_cellpose/",
+            **(config or {}),
         }
-
-        def set_environment_vars():
-            for k, v in environment_vars.items():
-                os.environ[k] = v
-
-        self.client.run(set_environment_vars)
+        kwargs.setdefault("host", "")
+        kwargs.setdefault("silence_logs", False)
+        if kwargs.get("processes", True):
+            environment_vars = {
+                name: str(2 * ncpus)
+                for name in (
+                    "MKL_NUM_THREADS", "NUM_MKL_THREADS", "OPENBLAS_NUM_THREADS",
+                    "OPENMP_NUM_THREADS", "OMP_NUM_THREADS",
+                )
+            }
+            kwargs["env"] = {**environment_vars, **kwargs.get("env", {})}
+        with dask.config.set(effective_config):
+            super().__init__(**kwargs)
+            self.client, _, _ = _connect_cluster(self)
 
         print("Cluster dashboard link: ", self.dashboard_link)
 
@@ -329,23 +271,10 @@ class myLocalCluster(distributed.LocalCluster):
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if not self.persist_config:
-            _remove_config_file(self.config_name)
-        import logging
-
         try:
             self.client.close(timeout=30)
-        except TimeoutError as close_exc:
-            logging.getLogger(__name__).warning(
-                f"Timed out while closing Dask client (cluster shutdown); ignoring: {close_exc!r}"
-            )
-
-        try:
+        finally:
             super().__exit__(exc_type, exc_value, traceback)
-        except TimeoutError as close_exc:
-            logging.getLogger(__name__).warning(
-                f"Timed out while closing Dask LocalCluster (cluster shutdown); ignoring: {close_exc!r}"
-            )
 
 
 # ----------------------- decorator -------------------------------------------#

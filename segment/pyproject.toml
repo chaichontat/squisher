@@ -31,6 +31,7 @@ dependencies = [
     "tifffile",
     "typer>=0.15",
     "torch",
+    "torchvision",
     "zarr>=3.1",
     "pyyaml",
 ]
@@ -40,6 +41,12 @@ squisher = { workspace = true }
 
 [project.scripts]
 squisher-segment = "squisher_segment.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.15",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["squisher_segment"]

@@ -29,7 +29,8 @@ from squisher_segment.segment.model_artifacts import (
     configured_model_paths,
     file_sha256,
     plan_path_for_device,
-    runtime_source_sha256,
+    runtime_implementation_identity,
+    validate_trt_plan,
 )
 
 
@@ -77,6 +78,9 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
                 f"TensorRT plan required for {model_role}. Expected plan at {plan_candidate} "
                 f"for CUDA device '{device_name}'."
             )
+        validate_trt_plan(
+            model_path, device_name, batch_size=resolved_kwargs.get("batch_size", 1)
+        )
         _get_worker_logger().info(
             "Using %s TensorRT plan %s for CUDA device '%s'",
             model_role,
@@ -121,13 +125,14 @@ def _validate_worker_plan(
                 f"Worker device '{device_name}' selected unrecorded {model_role} "
                 f"TensorRT plan {plan_path}."
             )
+        validate_trt_plan(model_path, device_name, batch_size=model_kwargs.get("batch_size", 1))
 
 
-def _validate_worker_sources(expected: dict[str, str]) -> None:
-    actual = runtime_source_sha256()
+def _validate_worker_implementation(expected: dict[str, str]) -> None:
+    actual = runtime_implementation_identity()
     if actual != expected:
         changed = sorted(name for name in set(actual) | set(expected) if actual.get(name) != expected.get(name))
-        raise RuntimeError(f"Worker inference source differs from run identity: {changed}")
+        raise RuntimeError(f"Worker inference implementation differs from run identity: {changed}")
 
 
 def get_cached_model(model_kwargs: dict[str, Any]):
@@ -173,18 +178,18 @@ class CellposeModelPlugin(WorkerPlugin):
         model_kwargs: dict[str, Any],
         artifact_key: str,
         trt_plans: list[dict[str, Any]],
-        source_sha256: dict[str, str],
+        implementation_identity: dict[str, str],
     ):
         self.model_kwargs = model_kwargs
         self.artifact_key = artifact_key
         self.trt_plans = trt_plans
-        self.source_sha256 = source_sha256
+        self.implementation_identity = implementation_identity
 
     def setup(self, worker):
         """Initialize model when worker starts. Stores on worker.cellpose_model."""
         wlog = _get_worker_logger()
         _validate_worker_plan(self.model_kwargs, self.trt_plans)
-        _validate_worker_sources(self.source_sha256)
+        _validate_worker_implementation(self.implementation_identity)
         if (
             hasattr(worker, "cellpose_model")
             and getattr(worker, "cellpose_model_kwargs", None) == self.model_kwargs

@@ -24,6 +24,7 @@ checkout. Use `squisher-segment COMMAND --help` for command-specific options.
 squisher-segment extract INPUT
 squisher-segment n4 INPUT_OME_ZARR
 squisher-segment train TRAINING_ROOT MODEL_NAME
+squisher-segment build-trt MODEL_PATH
 squisher-segment segment run INPUT_ZARR
 squisher-segment segment stitch TEMP_DIR OUTPUT_ZARR
 squisher-segment postproc run INPUT_ZARR
@@ -34,6 +35,8 @@ squisher-segment regionprops LABELS_ZARR
 - `n4` corrects one channel-separated Lightsheet OME-Zarr and rebuilds its pyramid.
 - `train` reads `TRAINING_ROOT/models/MODEL_NAME.json`, trains the model, and
   writes `MODEL_NAME.trained.json` beside the input configuration.
+- `build-trt` builds a device-specific inference plan for an existing checkpoint
+  without retraining it.
 - `segment run` performs distributed Cellpose inference. Add `--cellpose-only`
   to retain the unstitched output for a separate stitching step.
 - `segment stitch` converts a Cellpose temporary directory into the final Zarr
@@ -91,6 +94,10 @@ describe the same integer mean-downsampling transitions.
 `squisher_segment.registered_ome_input.v1` manifest. A manifest names completed,
 channel-separated ZYX OME-Zarrs and a shared `source_roi_zyx`; workers stack only
 the requested crop, avoiding a full intermediate multichannel volume.
+Every source must explicitly declare spatial axis types, units, and a physical
+scale. Composed scale and origin must match across channels; missing geometry or
+different grids are rejected. Label outputs retain the physical grid adjusted
+for the ROI and any subsequent crop, plus projection provenance when applicable.
 
 Use `--max-project-2d` to max-project the selected Z range lazily and run
 Cellpose in 2D. The label output retains a singleton Z axis so the existing
@@ -151,7 +158,7 @@ The matching reference model configuration is:
 | `--stagger-seconds 0` | With measured-safe worker counts, staggering adds idle time without reducing the later synchronized dynamics peak. |
 | Resume each block independently | A block owns a disjoint trimmed core and persists its overlap sidecar before checkpointing. Every checkpointed planned block is retained after interruption; remaining blocks are fungible and submitted together. |
 | Derive temporary ID bits from the block grid | A fixed 16-bit local field failed at 75,414 labels. The 1,620-block reference grid needs 11 block bits and leaves 21 local bits. Encoding, decoding, and sparse stitching share this split; final labels remain dense `uint32`. |
-| Bind state to inputs, models, plans, source, and evaluation | Mixing incompatible blocks can corrupt a segmentation. Resume fails closed; override a source fingerprint only after proving block results are unchanged. |
+| Bind state to inputs, models, plans, implementation revision, and evaluation | Mixing incompatible blocks can corrupt a segmentation. Resume fails closed when these identities differ. |
 | `--no-cellpose-only` | Run stitching after inference. Use `--cellpose-only` only when a separately managed stitch step is intentional. |
 
 ### Stitching modes
@@ -193,6 +200,13 @@ Re-profile `follow_flows` foreground counts and peak device memory before
 increasing concurrency. Changing input contents, channel order, models, plans,
 normalization, foreground policy, or evaluation settings invalidates resume
 state. Input stores must remain immutable while temporary state is reusable.
+Run identity schema 7 replaces source-file fingerprints with an explicit
+segmentation algorithm revision and the installed Cellpose version. Earlier run
+identities are rejected; use a separate run directory rather than mixing old
+and new blocks. Maintainers must increment `SEGMENTATION_ALGORITHM_REVISION`
+when inference semantics change incompatibly. Interrupted overlap initialization
+can be reconstructed only before any label data, evidence, or block checkpoint
+has been published.
 
 ### Iterative training loop
 
@@ -238,12 +252,16 @@ chunk boundaries without loading the full label volume. The output columns are
 `intensity_NAME_min`, `intensity_NAME_mean`, and `intensity_NAME_max` for each
 source. The representative plane maximizes area; ties prefer the plane nearest
 the Z centroid and then the lower Z index.
+OME sources with a Squisher completion marker must be complete. When both labels
+and intensities declare physical geometry, axes, units, scale, and origin must
+agree. Raw arrays and legacy sources without physical metadata retain the
+caller's responsibility to supply coordinate-matched inputs.
 
 Incomplete runs retain atomic partial Parquet files in a hidden sibling
 directory and resume only when the label path, shape, chunks, dtype, artifact
 key, metadata hash, and `--offset-zyx` match. When supplied, the intensity path,
-resolved array path, shape, chunks, dtype, artifact key, and metadata hash must
-also match. At most `--workers` decoded label and intensity chunks and worker
+resolved array path, shape, chunks, dtype, artifact key, array attributes, and
+OME root provenance must also match. At most `--workers` decoded label and intensity chunks and worker
 results are active concurrently. Resume assumes source chunks remain immutable;
 it does not hash the complete volumes. Successful runs atomically publish the
 output and remove their partial directory.
@@ -268,6 +286,9 @@ configuration is:
 
 `backend` accepts `sam` or `unet`. When `base_model` is `null`, training uses
 `cpsam` for the SAM backend and `cyto3` for the UNet backend.
+SAM training preserves all supplied channels in order and accepts one to three;
+select channels explicitly before training if a source has more. UNet passes
+the supplied channels to Cellpose's configured channel-selection mechanism.
 
 `training_paths` and the optional `test_folder` are resolved relative to
 `TRAINING_ROOT`. They may name files or directories, but they cannot contain
@@ -279,20 +300,32 @@ Configuration is strict: unknown keys are errors. The supported `fishtools2`
 fields `name`, `bsize`, `SGD`, and `optimizer` are accepted. The `bsize` and
 `SGD` values are passed to Cellpose; `optimizer: "adamw"` selects AdamW by
 disabling SGD. TensorRT plans retain the 256-pixel input profile required by
-distributed inference. Use the `--packed` and `--skip-trt` command options to
-override those two runtime modes.
+distributed inference. `--packed` and `--no-packed` explicitly override the
+configuration; omission preserves it. `--skip-trt` skips plan generation.
 
 Unless TensorRT generation is skipped, training creates an ONNX model and a
 device-specific TensorRT plan named
 `MODEL_NAME-SANITIZED_CUDA_DEVICE_NAME.plan`. Inference selects the plan for the
 current CUDA device, so a plan built for one GPU model should not be reused on
 another GPU model.
+Each plan also requires its `.plan.json` sidecar, binding the checkpoint, plan
+contents, build profile, device name, and runtime versions. Retraining invalidates
+previous derivatives even with `--skip-trt`. Unverified, stale, or incompatible
+plans fail preflight. Rebuild an existing checkpoint's plan in the intended CUDA
+environment with `squisher-segment build-trt MODEL_PATH`; the command uses the
+256-pixel, batch-size-one distributed inference profile. It defaults to SAM;
+use `--backend unet` for an explicit UNet build.
 
 ## Development checks
 
 From the repository root with `multi` active:
 
 ```bash
-python -m pytest -q segment/tests
+pytest -q -m "not gpu" segment/tests
 ruff check --no-cache segment/squisher_segment segment/tests
 ```
+
+CI runs these CPU contracts and lint checks. On a CUDA-capable development
+machine, run `pytest -q -m gpu segment/tests` separately; CPU success does not
+establish GPU numerical correctness. Cluster startup scopes Dask configuration
+to its owned runtime and does not create or delete a user-global Dask YAML file.

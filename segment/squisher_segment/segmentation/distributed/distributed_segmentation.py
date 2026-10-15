@@ -18,7 +18,6 @@ from typing import Any
 
 import cellpose.io
 import cupy as cp
-import dask
 import dask_jobqueue
 import distributed
 import imagecodecs
@@ -34,6 +33,7 @@ from squisher_segment.segment.extract_core import (
     _selector_indices,
 )
 from squisher.jpegxr_zarr import register_jpegxr_codec
+from squisher.ome_geometry import ome_spatial_grid
 from squisher_segment.segmentation.distributed.cache_utils import (
     NumpyEncoder,
     atomic_write_text,
@@ -46,7 +46,8 @@ from squisher_segment.segment.model_artifacts import (
     configured_model_paths,
     file_sha256,
     plan_path_for_device,
-    runtime_source_sha256,
+    runtime_implementation_identity,
+    validate_trt_plan,
 )
 from squisher_segment.segmentation.distributed.gpu_cluster import cluster, myLocalCluster
 from squisher_segment.segmentation.distributed.merge_utils import (
@@ -67,17 +68,6 @@ from squisher_segment.segmentation.distributed.merge_utils import (
 from squisher_segment.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from squisher_segment.segmentation.distributed.tiling import solve_internal_zyx_for_tiles
 from squisher_segment.segmentation.distributed import overlap_stitch
-
-# Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
-# during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
-dask.config.set(
-    {
-        "distributed.comm.timeouts.connect": "60s",
-        "distributed.comm.timeouts.tcp": "120s",
-        "distributed.scheduler.worker-ttl": "10m",
-        "distributed.admin.tick.limit": "10m",
-    }
-)
 
 # IMPORTANT: No Rich logging at module level - RichHandler uses ContextVar which
 # cannot be pickled. This causes "cannot pickle '_contextvars.ContextVar'" errors
@@ -374,6 +364,8 @@ def _load_intermediate_state(temp_dir: Path) -> tuple[list, list, list, list[tup
 def _trt_plan_identity(
     model_paths: dict[str, Path],
     device_names: set[str],
+    *,
+    batch_size: int = 1,
 ) -> list[dict[str, Any]]:
     plans = []
     for model_role, model_path in model_paths.items():
@@ -384,6 +376,7 @@ def _trt_plan_identity(
                     f"TensorRT plan required for {model_role}. Expected plan at {plan_path} "
                     f"for CUDA device '{device_name}'."
                 )
+            metadata = validate_trt_plan(model_path, device_name, batch_size=batch_size)
             plan_stat = plan_path.stat()
             plans.append(
                 {
@@ -393,6 +386,7 @@ def _trt_plan_identity(
                     "sha256": file_sha256(plan_path),
                     "size": plan_stat.st_size,
                     "mtime_ns": plan_stat.st_mtime_ns,
+                    "metadata": metadata,
                 }
             )
     return plans
@@ -443,7 +437,7 @@ def _runtime_artifact_identity(
     *,
     max_devices: int | None = None,
 ) -> dict[str, Any]:
-    """Bind resume state to the plans and source code that execute inference."""
+    """Bind resume state to the plans and implementation revision that execute inference."""
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
@@ -461,8 +455,9 @@ def _runtime_artifact_identity(
         "trt_plans": _trt_plan_identity(
             configured_model_paths(model_kwargs),
             {torch.cuda.get_device_name(index) for index in range(device_count)},
+            batch_size=model_kwargs.get("batch_size", 1),
         ),
-        "source_sha256": runtime_source_sha256(),
+        "implementation_identity": runtime_implementation_identity(),
         "input_provenance": input_provenance,
     }
 
@@ -516,7 +511,7 @@ def _mask_identity(mask: NDArray[Any] | None) -> dict[str, Any] | None:
 
 
 def _validate_runtime_artifacts(runtime_artifacts: dict[str, Any]) -> None:
-    required_nonempty = ("trt_plans", "source_sha256", "input_provenance")
+    required_nonempty = ("trt_plans", "implementation_identity", "input_provenance")
     missing = [name for name in required_nonempty if not runtime_artifacts.get(name)]
     if missing:
         raise ValueError(f"runtime_artifacts is missing required non-empty fields: {missing}")
@@ -541,11 +536,11 @@ def _validate_runtime_artifacts(runtime_artifacts: dict[str, Any]) -> None:
     plan_keys = [(plan["model_role"], plan["device_name"]) for plan in runtime_artifacts["trt_plans"]]
     if len(plan_keys) != len(set(plan_keys)):
         raise ValueError("runtime_artifacts contains duplicate model-role/device plans.")
-    if not isinstance(runtime_artifacts["source_sha256"], dict) or not all(
+    if not isinstance(runtime_artifacts["implementation_identity"], dict) or not all(
         isinstance(name, str) and isinstance(digest, str) and digest
-        for name, digest in runtime_artifacts["source_sha256"].items()
+        for name, digest in runtime_artifacts["implementation_identity"].items()
     ):
-        raise ValueError("runtime_artifacts source_sha256 must be a mapping.")
+        raise ValueError("runtime_artifacts implementation_identity must be a mapping.")
     if not all(
         isinstance(item, dict) and {"path", "sha256"} <= item.keys()
         for item in runtime_artifacts["input_provenance"]
@@ -566,9 +561,9 @@ def _validate_run_identity_structure(run_identity: dict[str, Any]) -> dict[str, 
         "stitching",
     }
     missing = sorted(required - run_identity.keys())
-    if run_identity.get("schema_version") != 6 or missing:
+    if run_identity.get("schema_version") != 7 or missing:
         raise ValueError(
-            f"run_identity must be a complete schema-6 artifact-bound identity; missing {missing}."
+            f"run_identity must be a complete schema-7 artifact-bound identity; missing {missing}."
         )
     if not isinstance(run_identity["input"], dict) or not run_identity["input"]:
         raise ValueError("run_identity input must be a non-empty mapping.")
@@ -687,7 +682,7 @@ def _build_run_identity(
     )
     return _normalize_for_comparison(
         {
-            "schema_version": 6,
+            "schema_version": 7,
             "input": input_identity,
             "channel_indices": list(channel_indices),
             "model_sha256": {
@@ -1078,6 +1073,7 @@ class RegisteredOMEZarrInput:
     roi_zyx: tuple[tuple[int, int], ...]
     source_chunks: tuple[int, int, int]
     dtype_name: str
+    spatial_grid: dict[str, Any]
 
     @property
     def shape(self) -> tuple[int, int, int, int]:
@@ -1098,7 +1094,11 @@ class RegisteredOMEZarrInput:
 
     @property
     def attrs(self) -> dict[str, Any]:
-        return {"key": list(self.channel_names), "_ARRAY_DIMENSIONS": ["z", "y", "x", "c"]}
+        return {
+            "key": list(self.channel_names),
+            "_ARRAY_DIMENSIONS": ["z", "y", "x", "c"],
+            "squisher_spatial_grid": self.spatial_grid,
+        }
 
     def __getitem__(self, key: object) -> NDArray[Any]:
         selectors = _normalize_array_key(key, self.ndim)
@@ -1149,7 +1149,19 @@ class CroppedZYXCInput:
 
     @property
     def attrs(self) -> dict[str, Any]:
-        return dict(self.source.attrs)
+        attrs = dict(self.source.attrs)
+        grid = attrs.get("squisher_spatial_grid")
+        if grid is not None:
+            attrs["squisher_spatial_grid"] = {
+                **grid,
+                "translation": [
+                    origin + step * start
+                    for origin, step, start in zip(
+                        grid["translation"], grid["scale"], self.start_zyx, strict=True
+                    )
+                ],
+            }
+        return attrs
 
     def _map_selection(self, selection: object) -> tuple[object, ...]:
         selectors = _normalize_array_key(selection, self.ndim)
@@ -1194,7 +1206,14 @@ class MaxProjectedZYXCInput:
 
     @property
     def attrs(self) -> dict[str, Any]:
-        return dict(self.source.attrs)
+        attrs = dict(self.source.attrs)
+        attrs["squisher_projection"] = {
+            "method": "max",
+            "axis": "z",
+            "source_shape": list(self.source.shape[:3]),
+            "source_grid": attrs.get("squisher_spatial_grid"),
+        }
+        return attrs
 
     def get_orthogonal_selection(self, selection: object) -> NDArray[Any]:
         selectors = _normalize_array_key(selection, self.ndim)
@@ -1325,6 +1344,7 @@ def _open_registered_ome_input(
     source_arrays: list[zarr.Array] = []
     provenance = [_provenance_record(manifest_path)]
     source_identities = []
+    source_grids = []
     for channel, source_record in zip(channels, sources, strict=True):
         if not isinstance(channel, str) or not isinstance(source_record, dict):
             raise ValueError(f"Registered input manifest {manifest_path} has an invalid source record.")
@@ -1342,6 +1362,17 @@ def _open_registered_ome_input(
         if source_record.get("root_metadata_sha256") != root_record["sha256"]:
             raise ValueError(f"Source metadata changed since {manifest_path} was written: {source}")
         level_path, array = _ome_level_zero(root, source)
+        grid = ome_spatial_grid(dict(root.attrs), level_path)
+        if grid is None:
+            raise ValueError(f"Registered source {source} has no physical grid metadata.")
+        if source_grids and (
+            grid["axes"] != source_grids[0]["axes"]
+            or grid["units"] != source_grids[0]["units"]
+            or not np.allclose(grid["scale"], source_grids[0]["scale"], rtol=1e-9, atol=1e-9)
+            or not np.allclose(grid["translation"], source_grids[0]["translation"], rtol=1e-9, atol=1e-9)
+        ):
+            raise ValueError(f"Registered source {source} physical grid differs from the first channel.")
+        source_grids.append(grid)
         source_paths.append(str(source))
         dataset_paths.append(level_path)
         source_arrays.append(array)
@@ -1352,6 +1383,7 @@ def _open_registered_ome_input(
                 "path": str(source),
                 "dataset": level_path,
                 "root_metadata_sha256": root_record["sha256"],
+                "spatial_grid": grid,
                 "shape": list(array.shape),
                 "chunks": list(array.chunks),
                 "dtype": str(array.dtype),
@@ -1367,10 +1399,14 @@ def _open_registered_ome_input(
     source_shape = next(iter(shapes))
     if len(source_shape) != 3:
         raise ValueError(f"Registered OME-Zarr sources must be ZYX; got {source_shape}.")
-    try:
-        roi_zyx = tuple((int(bounds[0]), int(bounds[1])) for bounds in roi)
-    except (IndexError, TypeError, ValueError) as exc:
-        raise ValueError(f"Registered input manifest {manifest_path} has an invalid ROI.") from exc
+    if any(
+        not isinstance(bounds, list)
+        or len(bounds) != 2
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in bounds)
+        for bounds in roi
+    ):
+        raise ValueError(f"Registered input manifest {manifest_path} has an invalid integer ROI.")
+    roi_zyx = tuple((bounds[0], bounds[1]) for bounds in roi)
     if any(
         start < 0 or stop <= start or stop > size
         for (start, stop), size in zip(roi_zyx, source_shape, strict=True)
@@ -1389,6 +1425,15 @@ def _open_registered_ome_input(
         roi_zyx=roi_zyx,
         source_chunks=tuple(int(value) for value in source_arrays[0].chunks),
         dtype_name=str(source_arrays[0].dtype),
+        spatial_grid={
+            **source_grids[0],
+            "translation": [
+                origin + step * start
+                for origin, step, (start, _) in zip(
+                    source_grids[0]["translation"], source_grids[0]["scale"], roi_zyx, strict=True
+                )
+            ],
+        },
     )
     identity = {
         "kind": "registered-ome-zarr",
@@ -1628,7 +1673,7 @@ def _select_input_blocks(
     logger.info(f"Checking foreground blocks: 0/{total_tiles}")
     has_foreground: list[bool] = [True] * total_tiles
     future_to_index = {fut: i for i, fut in enumerate(check_futures)}
-    for fut in distributed.as_completed(check_futures):
+    for fut in distributed.as_completed(check_futures, loop=client.loop):
         i = future_to_index.get(fut)
         if i is None:
             raise RuntimeError("Foreground scan produced an unknown future.")
@@ -1914,6 +1959,7 @@ def _block_metadata_from_temp(
 
 def _wait_for_futures_collect_errors(
     *,
+    client: distributed.Client,
     futures: list[distributed.Future],
     future_labels: dict[distributed.Future, str],
     stage: str,
@@ -1921,7 +1967,7 @@ def _wait_for_futures_collect_errors(
     checkpoint_path: Path,
 ) -> list[tuple[distributed.Future, str]]:
     failures: list[tuple[distributed.Future, str]] = []
-    for fut in distributed.as_completed(futures):
+    for fut in distributed.as_completed(futures, loop=client.loop):
         label = future_labels.get(fut, getattr(fut, "key", "<unknown>"))
         try:
             result = fut.result()
@@ -1960,6 +2006,7 @@ def _wait_for_futures_retry_once(
 ) -> list[str]:
     """Retry failed tasks once after allowing replacement workers to start."""
     failures = _wait_for_futures_collect_errors(
+        client=client,
         futures=futures,
         future_labels=future_labels,
         stage=stage,
@@ -1977,6 +2024,7 @@ def _wait_for_futures_retry_once(
     time.sleep(SEGMENTATION_RETRY_DELAY_SECONDS)
     client.retry(retry_futures)
     retry_failures = _wait_for_futures_collect_errors(
+        client=client,
         futures=retry_futures,
         future_labels=future_labels,
         stage=f"{stage} retry",
@@ -2163,7 +2211,7 @@ def distributed_eval(
     trt_plans = runtime_artifacts.get("trt_plans")
     if not isinstance(trt_plans, list):
         raise ValueError("run_identity runtime_artifacts must include TensorRT plans.")
-    source_sha256 = runtime_artifacts["source_sha256"]
+    implementation_identity = runtime_artifacts["implementation_identity"]
 
     run_config_path = temporary_directory / "run_config.json"
     is_resume = run_config_path.exists()
@@ -2260,9 +2308,10 @@ def distributed_eval(
     if is_resume:
         if not temp_zarr_path.exists():
             raise RuntimeError(f"Cannot resume: temp_zarr missing at {temp_zarr_path}")
+        checkpointed_indices = load_checkpoint(checkpoint_path)
         completed_indices = _completed_blocks(
             final_block_indices,
-            load_checkpoint(checkpoint_path),
+            checkpointed_indices,
         )
         if stitch_mode == overlap_stitch.IOU_MODE:
             overlap_stitch.initialize_overlap_evidence(
@@ -2270,6 +2319,10 @@ def distributed_eval(
                 evidence_rows,
                 run_key=run_identity_key,
                 resume=True,
+                recover_empty=(
+                    not checkpointed_indices
+                    and zarr.open_array(temp_zarr_path, mode="r").nchunks_initialized == 0
+                ),
             )
             missing_sidecars = [
                 index
@@ -2352,7 +2405,7 @@ def distributed_eval(
             model_kwargs,
             artifact_key=_identity_digest(run_identity),
             trt_plans=trt_plans,
-            source_sha256=source_sha256,
+            implementation_identity=implementation_identity,
         )
         cluster.client.register_plugin(plugin)
 
@@ -2583,6 +2636,10 @@ def _stitch_precomputed(
     merged_boxes = merge_boxes_for_sparse_labels(boxes_list, box_ids_list, mapping)
     if _zarr_schema(staged_zarr) != _zarr_schema(temp_zarr):
         raise RuntimeError(f"Staged output {staged_path} schema does not match temporary segmentation.")
+    input_attrs = run_identity.get("input", {}).get("attrs", {})
+    for attr in ("squisher_spatial_grid", "squisher_projection"):
+        if attr in input_attrs:
+            staged_zarr.attrs[attr] = input_attrs[attr]
     staged_zarr.attrs["squisher_run_key"] = _identity_digest(run_identity)
     staged_zarr.attrs["squisher_output_schema"] = _zarr_schema(staged_zarr)
 

@@ -15,34 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from squisher_segment.segment.augment import PhotometricConfig, build_batch_augmenter
 from squisher_segment.segment.data_discovery import _compile_patterns, _discover_training_dirs, _matches_any
-from squisher_segment.segment.model_artifacts import plan_path_for_device
-
-
-def _cleanup_model_artifacts(model_path: Path) -> None:
-    """Remove stale TensorRT artifacts for a trained model.
-
-    Deletes device-specific `.plan` files first, followed by any ONNX files
-    derived from the same model name. This ensures we rebuild engines from a
-    clean slate after training.
-    """
-
-    model_dir = model_path.parent
-    base_name = model_path.name
-
-    plan_files = sorted(model_dir.glob(f"{base_name}-*.plan"))
-    onnx_files = sorted(model_dir.glob(f"{base_name}*.onnx"))
-
-    if plan_files or onnx_files:
-        logger.info(
-            f"Removing existing TensorRT artifacts for {base_name}: "
-            f"plans={[p.name for p in plan_files]}, onnx={[o.name for o in onnx_files]}"
-        )
-
-    for plan_file in plan_files:
-        plan_file.unlink(missing_ok=True)
-
-    for onnx_file in onnx_files:
-        onnx_file.unlink(missing_ok=True)
+from squisher_segment.segment.model_artifacts import (
+    file_sha256, invalidate_trt_plans, plan_path_for_device, write_trt_plan_metadata,
+)
 
 
 def _compute_model_md5(model_path: Path) -> str:
@@ -215,30 +190,28 @@ def _filter_images_by_patterns(
     )
 
 
-def _prepare_2d_training_images(images: Iterable[Any]) -> tuple[list[Any], int, int]:
-    """Return images with channel-first arrays normalized for Cellpose 2D training.
+def _prepare_2d_training_images(
+    images: Iterable[Any], *, backend: Literal["sam", "unet"] = "sam"
+) -> tuple[list[Any], int]:
+    """Preserve channel-first inputs; let UNet select its configured channels.
 
-    Cellpose expects channel-first data when `channel_axis=0`. We trim any extra
-    channels up front to avoid accidental use of higher indices that might exist
-    in the raw stacks. Singleton channel-first arrays are squeezed to 2D because
-    Cellpose expands `(1, Y, X)` to a 4D array in its 2D training path.
+    SAM accepts one to three channels, padding missing channels in Cellpose.
+    Singleton inputs are squeezed to avoid Cellpose's extra dimension.
     """
-
     prepared: list[Any] = []
-    trimmed = 0
     squeezed = 0
     for image in images:
-        if isinstance(image, np.ndarray) and image.ndim >= 3:
-            if image.shape[0] == 1:
-                prepared.append(image[0].copy())
-                squeezed += 1
-                continue
-            if image.shape[0] > 2:
-                prepared.append(image[:2].copy())
-                trimmed += 1
-                continue
-        prepared.append(image)
-    return prepared, trimmed, squeezed
+        if not isinstance(image, np.ndarray) or image.ndim not in (2, 3):
+            raise ValueError("2D training requires a YX or channel-first CYX array.")
+        n_channels = 1 if image.ndim == 2 else image.shape[0]
+        if n_channels < 1 or (backend == "sam" and n_channels > 3):
+            raise ValueError("SAM training requires 1 to 3 channels; select channels explicitly before training.")
+        if image.ndim == 3 and n_channels == 1:
+            prepared.append(image[0].copy())
+            squeezed += 1
+        else:
+            prepared.append(image)
+    return prepared, squeezed
 
 
 # models = sorted(
@@ -337,24 +310,25 @@ def build_trt_engine(
         f"Building TensorRT engine {plan_path.name} (batch_size={batch_size}, bsize={bsize}, device={device_name_raw}, vram={vram_mb} MB)"
     )
 
-    # Skip ONNX export if ONNX file exists and is newer than the model file
-    if onnx_path.exists() and onnx_path.stat().st_mtime > model_path.stat().st_mtime:
-        logger.info(f"Skipping ONNX export: {onnx_path.name} is up-to-date")
-    else:
-        trt_build.export_onnx(
-            str(model_path),
-            str(onnx_path),
-            batch_size=batch_size,
-            bsize=bsize,
-            opset=opset,
-            backend=backend,
-        )
+    checkpoint_sha256 = file_sha256(model_path)
+    invalidate_trt_plans(model_path, device_name=device_name_raw)
+    # Export from the current checkpoint and requested profile on every build.
+    trt_build.export_onnx(
+        str(model_path), str(onnx_path), batch_size=batch_size, bsize=bsize,
+        opset=opset, backend=backend,
+    )
     trt_build.build_engine(
         str(onnx_path),
         str(plan_path),
         batch_size=batch_size,
         bsize=bsize,
         vram=vram_mb,
+    )
+    if file_sha256(model_path) != checkpoint_sha256:
+        raise RuntimeError(f"Checkpoint changed during TensorRT build: {model_path}")
+    write_trt_plan_metadata(
+        model_path, device_name_raw, backend=backend, bsize=bsize,
+        batch_size=batch_size, opset=opset, vram_mb=vram_mb,
     )
     return plan_path
 
@@ -450,10 +424,10 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     )
 
     model_path = Path(model_path)
+    invalidate_trt_plans(model_path)
     if train_config.skip_trt:
         logger.info("Skipping TensorRT engine generation after training.")
     else:
-        _cleanup_model_artifacts(model_path)
         build_trt_engine(
             model_path=model_path,
             bsize=256,
@@ -546,13 +520,14 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
 
     logger.info(f"Filter summary: kept {kept_images}/{total_images} images; excluded {excluded_images}.")
 
-    limited_train_images, trimmed_train, squeezed_train = _prepare_2d_training_images(filtered_images)
+    prepared_train_images, squeezed_train = _prepare_2d_training_images(
+        filtered_images, backend=train_config.backend
+    )
 
     # Optional explicit test set discovery/loading using the same semantics as training
     final_test_images: list[Any] | None = None
     final_test_labels: list[Any] | None = None
     final_test_names: list[Any] | None = None
-    trimmed_test = 0
     squeezed_test = 0
 
     if train_config.test_folder is not None:
@@ -637,8 +612,8 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
         )
 
         if filtered_test_images:
-            final_test_images, trimmed_test, squeezed_test = _prepare_2d_training_images(
-                filtered_test_images
+            final_test_images, squeezed_test = _prepare_2d_training_images(
+                filtered_test_images, backend=train_config.backend
             )
             final_test_labels = filtered_test_labels
             final_test_names = filtered_test_names
@@ -652,21 +627,19 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
     else:
         # Fall back to whatever came back from the original loader (usually None)
         if test_images is not None:
-            final_test_images, trimmed_test, squeezed_test = _prepare_2d_training_images(test_images)
+            final_test_images, squeezed_test = _prepare_2d_training_images(
+                test_images, backend=train_config.backend
+            )
             final_test_labels = test_labels
             final_test_names = image_names_test
 
-    if trimmed_train or trimmed_test:
-        logger.info(
-            f"Restricted image channels to first two for {trimmed_train} training and {trimmed_test} test samples."
-        )
     if squeezed_train or squeezed_test:
         logger.info(
             f"Squeezed singleton channel axis for {squeezed_train} training and {squeezed_test} test samples."
         )
 
     filtered: tuple[list, ...] = (
-        limited_train_images,
+        prepared_train_images,
         filtered_labels,
         filtered_image_names if filtered_image_names is not None else None,
         final_test_images if final_test_images is not None else None,

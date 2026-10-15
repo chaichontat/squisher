@@ -11,7 +11,6 @@ import math
 import os
 import re
 import shutil
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +35,6 @@ QUANT_MIN_RANGE = 1e-6
 UNSHARP_HALO = 16
 MAX_FIELD_VOXELS = 64_000_000
 N4_FIELD_FILENAME = "n4-field.npy"
-EXPECTED_MULTI_PYTHON = Path("/home/chaichontat/miniforge3/envs/multi/bin/python")
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,16 +344,6 @@ def _ensure_gpu() -> None:
 
     if int(cp.cuda.runtime.getDeviceCount()) < 1:
         raise RuntimeError("N4 GPU processing requested but no CUDA device is available")
-
-
-def _validate_runtime() -> None:
-    interpreter = Path(sys.executable).resolve()
-    expected = EXPECTED_MULTI_PYTHON.resolve()
-    if interpreter != expected:
-        raise RuntimeError(
-            f"N4 OME-Zarr writes require the multi environment interpreter {expected}; found {interpreter}"
-        )
-    logger.info("N4 runtime interpreter: %s", interpreter)
 
 
 def _correct_gpu(block_zyx: np.ndarray, field_gpu: Any, *, unsharp: bool) -> tuple[Any, Any]:
@@ -964,7 +952,6 @@ def run_n4_ome_zarr(
         raise FileExistsError(f"Output already exists: {output}; use --overwrite to replace it")
     if initial_output_identity is not None:
         _validate_overwrite_target(output)
-    _validate_runtime()
     register_jpegxr_codec()
     source_root = zarr.open_group(source, mode="r")
     paths = _validate_source(source_root, source, config)

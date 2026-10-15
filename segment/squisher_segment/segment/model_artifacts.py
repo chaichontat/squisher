@@ -1,6 +1,10 @@
 import hashlib
+import json
+from importlib.metadata import PackageNotFoundError, version
+from tempfile import NamedTemporaryFile
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Mapping
 
@@ -38,33 +42,111 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def runtime_source_sha256() -> dict[str, str]:
-    """Fingerprint source modules that own distributed Cellpose inference."""
-    import cellpose.contrib.cellposetrt
-    import cellpose.contrib.pack_utils
-    import cellpose.contrib.packed_infer
-    import cellpose.core
-    import cellpose.dynamics
-    import cellpose.models
-    import cellpose.transforms
-    import cellpose.utils
+# Increment when inference semantics change incompatibly with existing run outputs.
+SEGMENTATION_ALGORITHM_REVISION = "2"
 
-    package_root = Path(__file__).parents[1]
-    distributed_root = package_root / "segmentation" / "distributed"
-    sources = {
-        "distributed_segmentation": distributed_root / "distributed_segmentation.py",
-        "model_cache": distributed_root / "model_cache.py",
-        "merge_utils": distributed_root / "merge_utils.py",
-        "overlap_stitch": distributed_root / "overlap_stitch.py",
-        "model_artifacts": Path(__file__),
-        "normalize": package_root / "segment" / "normalize.py",
-        "cellpose_core": Path(cellpose.core.__file__),
-        "cellpose_dynamics": Path(cellpose.dynamics.__file__),
-        "cellpose_models": Path(cellpose.models.__file__),
-        "cellpose_packed_infer": Path(cellpose.contrib.packed_infer.__file__),
-        "cellpose_pack_utils": Path(cellpose.contrib.pack_utils.__file__),
-        "cellpose_trt": Path(cellpose.contrib.cellposetrt.__file__),
-        "cellpose_transforms": Path(cellpose.transforms.__file__),
-        "cellpose_utils": Path(cellpose.utils.__file__),
+
+def runtime_implementation_identity() -> dict[str, str]:
+    """Identify maintained inference semantics and the installed Cellpose release."""
+    return {
+        "segmentation_algorithm_revision": SEGMENTATION_ALGORITHM_REVISION,
+        "cellpose_version": version("cellpose"),
     }
-    return {name: file_sha256(path.resolve()) for name, path in sources.items()}
+
+
+def plan_metadata_path(plan_path: Path) -> Path:
+    return plan_path.with_name(f"{plan_path.name}.json")
+
+
+def _build_runtime_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for package in ("cellpose", "torch", "tensorrt"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    import torch
+    versions["cuda"] = torch.version.cuda
+    return versions
+
+
+def _write_plan_metadata(plan_path: Path, metadata: Mapping[str, object]) -> None:
+    destination = plan_metadata_path(plan_path)
+    with NamedTemporaryFile(mode="w", dir=destination.parent, prefix=destination.name, delete=False) as stream:
+        json.dump(metadata, stream, sort_keys=True, indent=2)
+        temporary = Path(stream.name)
+    os.replace(temporary, destination)
+
+
+def invalidate_trt_plans(model_path: Path, *, device_name: str | None = None) -> None:
+    """Mark derivatives invalid without removing existing user artifacts."""
+    plans = (
+        [plan_path_for_device(model_path, device_name)]
+        if device_name is not None
+        else sorted(model_path.parent.glob(f"{model_path.name}-*.plan"))
+    )
+    for plan_path in plans:
+        _write_plan_metadata(plan_path, {"schema_version": 1, "status": "invalid"})
+
+
+def write_trt_plan_metadata(
+    model_path: Path,
+    device_name: str,
+    *,
+    backend: str,
+    bsize: int,
+    batch_size: int,
+    opset: int,
+    vram_mb: int,
+) -> dict[str, object]:
+    """Publish the generating checkpoint and profile after a successful build."""
+    plan_path = plan_path_for_device(model_path, device_name)
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "status": "ready",
+        "checkpoint_sha256": file_sha256(model_path),
+        "plan_sha256": file_sha256(plan_path),
+        "device_name": device_name,
+        "build": {"backend": backend, "bsize": bsize, "batch_size": batch_size,
+                  "opset": opset, "vram_mb": vram_mb, "dtype": "bfloat16"},
+        "runtime_versions": _build_runtime_versions(),
+    }
+    _write_plan_metadata(plan_path, metadata)
+    return metadata
+
+
+def validate_trt_plan(
+    model_path: Path,
+    device_name: str,
+    *,
+    backend: str = "sam",
+    bsize: int = 256,
+    batch_size: int = 1,
+) -> dict[str, object]:
+    """Fail closed for unbound, stale, corrupted, or incompatible derivatives."""
+    plan_path = plan_path_for_device(model_path, device_name)
+    sidecar = plan_metadata_path(plan_path)
+    rebuild_command = f"squisher-segment build-trt {shlex.quote(str(model_path))} --backend {shlex.quote(backend)}"
+    if not sidecar.is_file():
+        raise ValueError(f"TensorRT plan is unverified: {plan_path}; rebuild with `{rebuild_command}`.")
+    metadata = json.loads(sidecar.read_text())
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid TensorRT plan metadata: {sidecar}")
+    build = metadata.get("build")
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("status") != "ready"
+        or metadata.get("device_name") != device_name
+        or metadata.get("checkpoint_sha256") != file_sha256(model_path)
+        or metadata.get("plan_sha256") != file_sha256(plan_path)
+        or metadata.get("runtime_versions") != _build_runtime_versions()
+        or not isinstance(build, dict)
+        or build.get("backend") != backend
+        or build.get("bsize") != bsize
+        or build.get("batch_size") != batch_size
+        or build.get("dtype") != "bfloat16"
+        or not isinstance(build.get("opset"), int)
+        or not isinstance(build.get("vram_mb"), int)
+    ):
+        raise ValueError(f"TensorRT plan is stale or incompatible: {plan_path}; rebuild with `{rebuild_command}`.")
+    return metadata

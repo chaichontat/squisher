@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +19,7 @@ import zarr
 from loguru import logger
 from skimage.measure import regionprops_table
 from squisher.jpegxr_zarr import register_jpegxr_codec
+from squisher.ome_geometry import ome_spatial_grid
 
 
 class IntensityTransform(Protocol):
@@ -346,7 +348,7 @@ def _measure_source_chunk(
     intensity_image = None
     intensity_names = tuple(name for name, _ in intensity_sources)
     if intensity_sources:
-        intensity_arrays = [_open_image_array(Path(path))[0] for _, path in intensity_sources]
+        intensity_arrays = [_open_image_source(Path(path)).array for _, path in intensity_sources]
         intensity_image = np.empty(
             (*block.shape, len(intensity_arrays)),
             dtype=np.float32 if intensity_transform is not None else intensity_arrays[0].dtype,
@@ -395,7 +397,12 @@ def _write_parquet_atomic(frame: pl.DataFrame, path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _source_identity(labels_path: Path, labels: zarr.Array) -> dict[str, object]:
+def _source_identity(
+    labels_path: Path,
+    labels: zarr.Array,
+    *,
+    root_attrs: dict[str, object] | None = None,
+) -> dict[str, object]:
     metadata_path = labels_path / "zarr.json"
     if not metadata_path.is_file():
         metadata_path = labels_path / ".zarray"
@@ -410,17 +417,29 @@ def _source_identity(labels_path: Path, labels: zarr.Array) -> dict[str, object]
         "dtype": str(labels.dtype),
         "metadata_sha256": metadata_sha256,
         "artifact_key": labels.attrs.get("squisher_postproc_key") or labels.attrs.get("squisher_run_key"),
+        "array_attrs": dict(labels.attrs),
+        "root_attrs": root_attrs,
     }
 
 
-def _open_image_array(path: Path) -> tuple[zarr.Array, Path]:
+@dataclass(frozen=True)
+class _ImageSource:
+    array: zarr.Array
+    array_path: Path
+    root_attrs: dict[str, object] | None
+    grid: dict[str, object] | None
+
+
+def _open_image_source(path: Path) -> _ImageSource:
     """Open a direct Zarr array or the first dataset of an OME-Zarr group."""
     register_jpegxr_codec()
     node = zarr.open(path, mode="r")
     if isinstance(node, zarr.Array):
-        return node, path
+        return _ImageSource(node, path, None, node.attrs.get("squisher_spatial_grid"))
 
     attrs = node.attrs.asdict() if hasattr(node.attrs, "asdict") else dict(node.attrs)
+    if "squisher_complete" in attrs and attrs["squisher_complete"] is not True:
+        raise ValueError(f"Intensity OME-Zarr is incomplete: {path}")
     multiscales = attrs.get("multiscales")
     if multiscales is None and isinstance(attrs.get("ome"), dict):
         multiscales = attrs["ome"].get("multiscales")
@@ -435,7 +454,10 @@ def _open_image_array(path: Path) -> tuple[zarr.Array, Path]:
     array = node[level_path]
     if not isinstance(array, zarr.Array):
         raise ValueError(f"Intensity OME-Zarr level-0 dataset is not an array: {path / level_path}")
-    return array, path / level_path
+    grid = ome_spatial_grid(attrs, level_path)
+    if grid is not None and grid["axes"] != ["z", "y", "x"]:
+        raise ValueError(f"Intensity OME-Zarr requires ZYX spatial axes: {path}")
+    return _ImageSource(array, path / level_path, attrs, grid)
 
 
 def _prepare_partial_dir(
@@ -584,10 +606,12 @@ def measure_zarr(
     _validate_block(np.empty((0, 0, 0), dtype=labels.dtype), offset_zyx)
     intensity_paths = dict(intensity_paths or {})
     intensity_names = tuple(sorted(_validate_intensity_names(intensity_paths)))
-    intensity_sources: list[tuple[str, Path, Path, zarr.Array]] = []
+    label_grid = labels.attrs.get("squisher_spatial_grid")
+    intensity_sources: list[tuple[str, Path, _ImageSource]] = []
     for name in intensity_names:
         intensity_path = Path(intensity_paths[name])
-        intensity, intensity_array_path = _open_image_array(intensity_path)
+        source = _open_image_source(intensity_path)
+        intensity = source.array
         if intensity.ndim != 3 or not np.issubdtype(intensity.dtype, np.number):
             raise ValueError(
                 f"Expected intensity {name!r} to be a 3-D numeric Zarr, got "
@@ -598,12 +622,18 @@ def measure_zarr(
                 f"Intensity {name!r} and label Zarrs must have identical shapes, got "
                 f"intensity={intensity.shape}, labels={labels.shape}."
             )
-        if intensity_sources and intensity.dtype != intensity_sources[0][3].dtype:
+        if label_grid is not None and source.grid is not None:
+            if any(label_grid[key] != source.grid[key] for key in ("axes", "units")) or any(
+                not np.allclose(label_grid[key], source.grid[key], rtol=1e-9, atol=1e-9)
+                for key in ("scale", "translation")
+            ):
+                raise ValueError(f"Intensity {name!r} and labels have different physical grids")
+        if intensity_sources and intensity.dtype != intensity_sources[0][2].array.dtype:
             raise ValueError(
                 "All intensity Zarrs must have identical dtypes to avoid lossy stacking, got "
-                f"{intensity_sources[0][3].dtype} and {intensity.dtype}."
+                f"{intensity_sources[0][2].array.dtype} and {intensity.dtype}."
             )
-        intensity_sources.append((name, intensity_path, intensity_array_path, intensity))
+        intensity_sources.append((name, intensity_path, source))
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {output_path}")
 
@@ -615,11 +645,11 @@ def measure_zarr(
     if intensity_sources:
         identity["intensities"] = {
             name: {
-                **_source_identity(array_path, intensity),
+                **_source_identity(source.array_path, source.array, root_attrs=source.root_attrs),
                 "path": str(source_path.resolve()),
-                "array_path": str(array_path.resolve()),
+                "array_path": str(source.array_path.resolve()),
             }
-            for name, source_path, array_path, intensity in intensity_sources
+            for name, source_path, source in intensity_sources
         }
     if intensity_transform is not None:
         if not intensity_sources:
@@ -636,7 +666,7 @@ def measure_zarr(
     logger.info(f"Label chunks total={len(bounds)} pending={len(pending)} workers={workers}")
     _measure_pending_chunks(
         labels_path,
-        tuple((name, str(source_path)) for name, source_path, _, _ in intensity_sources),
+        tuple((name, str(source_path)) for name, source_path, _ in intensity_sources),
         pending,
         partial_dir,
         workers=workers,

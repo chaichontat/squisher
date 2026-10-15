@@ -287,8 +287,13 @@ def test_open_volume_accepts_registered_input_manifest(tmp_path: Path) -> None:
             "ome": {
                 "multiscales": [
                     {
-                        "axes": [{"name": axis} for axis in ("z", "y", "x")],
-                        "datasets": [{"path": "0"}],
+                        "axes": [
+                            {"name": axis, "type": "space", "unit": "micrometer"}
+                            for axis in ("z", "y", "x")
+                        ],
+                        "datasets": [{"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0, 1.0, 1.0]},
+                        ]}],
                     }
                 ]
             },

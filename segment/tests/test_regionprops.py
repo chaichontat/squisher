@@ -180,9 +180,7 @@ def test_measure_zarr_writes_global_props_and_cleans_partials(
     cells = pl.read_parquet(output)
     assert cells["label"].to_list() == [7, 9]
     np.testing.assert_allclose(
-        cells.filter(pl.col("label") == 7).select(
-            "centroid_z", "centroid_y", "centroid_x"
-        ).row(0),
+        cells.filter(pl.col("label") == 7).select("centroid_z", "centroid_y", "centroid_x").row(0),
         np.argwhere(volume == 7).mean(axis=0) + np.asarray((10, 20, 30)),
     )
     row = cells.filter(pl.col("label") == 7).row(0, named=True)
@@ -273,3 +271,132 @@ def test_regionprops_cli_writes_default_output(tmp_path: Path) -> None:
         "intensity_brdu_mean",
         "intensity_brdu_max",
     ).row(0) == (2.0, 5.0, 8.0, 2.0, 5.0, 8.0)
+
+
+def _ome_intensity(path: Path) -> zarr.Group:
+    root = zarr.create_group(path)
+    root.attrs.update(
+        {
+            "squisher_complete": True,
+            "multiscales": [
+                {
+                    "axes": [{"name": axis, "type": "space", "unit": "micrometer"} for axis in "zyx"],
+                    "datasets": [
+                        {
+                            "path": "0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [2.0, 1.0, 1.0]},
+                                {"type": "translation", "translation": [0.0, 0.0, 0.0]},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    root.create_array("0", shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint16)
+    return root
+
+
+def test_measure_zarr_rejects_incomplete_ome_source(tmp_path: Path) -> None:
+    labels_path = tmp_path / "labels.zarr"
+    zarr.create_array(labels_path, shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint32)
+    intensity_path = tmp_path / "intensity.ome.zarr"
+    root = _ome_intensity(intensity_path)
+    root.attrs["squisher_complete"] = False
+
+    with pytest.raises(ValueError, match="incomplete"):
+        regionprops.measure_zarr(
+            labels_path, tmp_path / "props.parquet", intensity_paths={"signal": intensity_path}, workers=1
+        )
+
+
+def test_measure_zarr_rejects_channel_axis_as_depth(tmp_path: Path) -> None:
+    labels_path = tmp_path / "labels.zarr"
+    zarr.create_array(labels_path, shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint32)
+    intensity_path = tmp_path / "intensity.ome.zarr"
+    root = _ome_intensity(intensity_path)
+    multiscales = root.attrs["multiscales"]
+    multiscales[0]["axes"][0] = {"name": "c", "type": "channel"}
+    root.attrs["multiscales"] = multiscales
+
+    with pytest.raises(ValueError, match="ZYX spatial axes"):
+        regionprops.measure_zarr(
+            labels_path,
+            tmp_path / "props.parquet",
+            intensity_paths={"signal": intensity_path},
+            workers=1,
+        )
+
+
+def test_measure_zarr_resume_rejects_changed_root_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels_path = tmp_path / "labels.zarr"
+    zarr.create_array(labels_path, shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint32)
+    intensity_path = tmp_path / "intensity.ome.zarr"
+    root = _ome_intensity(intensity_path)
+    root.attrs["squisher_n4"] = {"source": "first"}
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("measurement interrupted")
+
+    monkeypatch.setattr(regionprops, "_measure_pending_chunks", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        regionprops.measure_zarr(
+            labels_path, tmp_path / "props.parquet", intensity_paths={"signal": intensity_path}, workers=1
+        )
+    root.attrs["squisher_n4"] = {"source": "replacement"}
+    with pytest.raises(ValueError, match="different source"):
+        regionprops.measure_zarr(
+            labels_path, tmp_path / "props.parquet", intensity_paths={"signal": intensity_path}, workers=1
+        )
+
+
+@pytest.mark.parametrize("field", ["axes", "units", "scale", "translation"])
+def test_measure_zarr_rejects_mismatched_physical_grid(tmp_path: Path, field: str) -> None:
+    labels_path = tmp_path / "labels.zarr"
+    labels = zarr.create_array(labels_path, shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint32)
+    grid = {
+        "axes": ["z", "y", "x"],
+        "units": ["micrometer"] * 3,
+        "scale": [2.0, 1.0, 1.0],
+        "translation": [0.0, 0.0, 0.0],
+    }
+    replacements = {
+        "axes": ["x", "y", "z"],
+        "units": ["nanometer"] * 3,
+        "scale": [3.0, 1.0, 1.0],
+        "translation": [0.0, 0.0, 1000.0],
+    }
+    grid[field] = replacements[field]
+    labels.attrs["squisher_spatial_grid"] = grid
+    intensity_path = tmp_path / "intensity.ome.zarr"
+    _ome_intensity(intensity_path)
+
+    with pytest.raises(ValueError, match="different physical grids"):
+        regionprops.measure_zarr(
+            labels_path, tmp_path / "props.parquet", intensity_paths={"signal": intensity_path}, workers=1
+        )
+
+
+def test_measure_zarr_accepts_matching_physical_grid(tmp_path: Path) -> None:
+    labels_path = tmp_path / "labels.zarr"
+    labels = zarr.create_array(labels_path, shape=(2, 3, 3), chunks=(1, 3, 3), dtype=np.uint32)
+    labels[:] = 1
+    labels.attrs["squisher_spatial_grid"] = {
+        "axes": ["z", "y", "x"],
+        "units": ["micrometer"] * 3,
+        "scale": [2.0, 1.0, 1.0],
+        "translation": [0.0, 0.0, 0.0],
+    }
+    intensity_path = tmp_path / "intensity.ome.zarr"
+    root = _ome_intensity(intensity_path)
+    root["0"][:] = 17
+
+    regionprops.measure_zarr(
+        labels_path, tmp_path / "props.parquet", intensity_paths={"signal": intensity_path}, workers=1
+    )
+
+    assert pl.read_parquet(tmp_path / "props.parquet")["intensity_signal_mean"].to_list() == [17.0]

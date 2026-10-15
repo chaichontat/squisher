@@ -13,6 +13,7 @@ from dask.array.core import PerformanceWarning
 from typer.testing import CliRunner as TyperCliRunner
 
 from squisher_segment.cli import app
+from squisher_segment.segment.model_artifacts import write_trt_plan_metadata
 from squisher_segment.segmentation.distributed import cache_utils
 from squisher_segment.segmentation.distributed import distributed_segmentation as segmentation
 from squisher_segment.segmentation.distributed import gpu_cluster
@@ -38,7 +39,7 @@ def _runtime_artifacts(tag: str = "test") -> dict[str, object]:
                 "mtime_ns": 1,
             }
         ],
-        "source_sha256": {"pipeline": tag},
+        "implementation_identity": {"pipeline": tag},
         "input_provenance": [{"path": "/manifest.json", "sha256": tag}],
     }
 
@@ -55,7 +56,7 @@ def _input_identity(path: Path, array: zarr.Array) -> dict[str, object]:
 
 def _valid_run_identity(tag: str = "test") -> dict[str, object]:
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "input": {"path": f"/{tag}.zarr"},
         "channel_indices": [0],
         "model_sha256": {"xy": tag},
@@ -87,8 +88,13 @@ def _write_ome_channel(path: Path, data: np.ndarray) -> None:
             "ome": {
                 "multiscales": [
                     {
-                        "axes": [{"name": axis} for axis in ("z", "y", "x")],
-                        "datasets": [{"path": "0"}],
+                        "axes": [
+                            {"name": axis, "type": "space", "unit": "micrometer"}
+                            for axis in ("z", "y", "x")
+                        ],
+                        "datasets": [{"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [2, 1, 1]},
+                        ]}],
                     }
                 ]
             },
@@ -404,19 +410,6 @@ def test_normalization_block_is_bounded_by_cropped_input() -> None:
     assert segmentation._normalization_block_yx((2_470, 10_657, 7_871)) == (256, 1024)
 
 
-def test_normalization_settings_can_disable_unsharp() -> None:
-    settings = segmentation._normalization_settings(
-        block_yx=(256, 1024),
-        nonempty_rule={"channel": "561", "threshold": 1000},
-        unsharp=False,
-    )
-
-    assert settings["unsharp"] is False
-    assert settings["unsharp_backend"] is None
-    assert settings["unsharp_dimensionality"] is None
-    assert settings["unsharp_radius"] is None
-
-
 def test_cellpose_eval_uses_unit_anisotropy_and_masks_only() -> None:
     eval_kwargs = segmentation._build_cellpose_eval_kwargs(
         diameter=30,
@@ -583,6 +576,7 @@ def test_default_scan_caches_blocks_with_561_above_1000(
             return self.value
 
     class ImmediateClient:
+        loop = None
         thresholds: list[int] = []
         channel_indices: list[int] = []
 
@@ -622,7 +616,7 @@ def test_default_scan_caches_blocks_with_561_above_1000(
         return original_read(zarr_array, crop, channel_indices)
 
     monkeypatch.setattr(segmentation, "_read_input_crop", count_read)
-    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures, *, loop: futures)
     client = ImmediateClient()
     cache_path = tmp_path / "nonempty.json"
 
@@ -745,6 +739,7 @@ def test_nonempty_scan_fails_instead_of_scheduling_unknown_blocks(
             raise OSError("read failed")
 
     class FailingClient:
+        loop = None
         def map(self, *args: object, **kwargs: object) -> list[FailingFuture]:
             return [FailingFuture()]
 
@@ -754,7 +749,7 @@ def test_nonempty_scan_fails_instead_of_scheduling_unknown_blocks(
         chunks=(1, 1, 1, 3),
         dtype=np.uint16,
     )
-    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures, *, loop: futures)
 
     with pytest.raises(RuntimeError, match="Foreground scan failed for block 0"):
         segmentation._select_input_blocks(
@@ -803,7 +798,7 @@ def test_nonempty_rule_changes_run_and_cache_identity(tmp_path: Path) -> None:
         },
     )
 
-    assert threshold_1000["schema_version"] == threshold_999["schema_version"] == 6
+    assert threshold_1000["schema_version"] == threshold_999["schema_version"] == 7
     assert segmentation._identity_digest(threshold_1000) != segmentation._identity_digest(threshold_999)
     assert segmentation._nonempty_cache_key(threshold_1000) != segmentation._nonempty_cache_key(threshold_999)
 
@@ -1354,9 +1349,11 @@ def test_trt_plan_content_is_part_of_run_identity(tmp_path: Path) -> None:
     model_path.write_bytes(b"model")
     plan_path = segmentation.plan_path_for_device(model_path, "Test GPU")
     plan_path.write_bytes(b"plan-a")
+    write_trt_plan_metadata(model_path, "Test GPU", backend="sam", bsize=256, batch_size=1, opset=22, vram_mb=1024)
     artifacts_a = _runtime_artifacts("a")
     artifacts_a["trt_plans"] = segmentation._trt_plan_identity({"xy": model_path}, {"Test GPU"})
     plan_path.write_bytes(b"plan-b")
+    write_trt_plan_metadata(model_path, "Test GPU", backend="sam", bsize=256, batch_size=1, opset=22, vram_mb=1024)
     artifacts_b = _runtime_artifacts("a")
     artifacts_b["trt_plans"] = segmentation._trt_plan_identity({"xy": model_path}, {"Test GPU"})
     common = {
@@ -1390,6 +1387,7 @@ def test_ortho_checkpoint_and_plan_are_part_of_run_identity(tmp_path: Path) -> N
     ortho_model.write_bytes(b"ortho-a")
     for model_path in (xy_model, ortho_model):
         segmentation.plan_path_for_device(model_path, "Test GPU").write_bytes(b"plan-a")
+        write_trt_plan_metadata(model_path, "Test GPU", backend="sam", bsize=256, batch_size=1, opset=22, vram_mb=1024)
     model_kwargs = {
         "pretrained_model": str(xy_model),
         "pretrained_model_ortho": str(ortho_model),
@@ -1424,6 +1422,7 @@ def test_ortho_checkpoint_and_plan_are_part_of_run_identity(tmp_path: Path) -> N
 
     ortho_model.write_bytes(b"ortho-a")
     segmentation.plan_path_for_device(ortho_model, "Test GPU").write_bytes(b"plan-b")
+    write_trt_plan_metadata(ortho_model, "Test GPU", backend="sam", bsize=256, batch_size=1, opset=22, vram_mb=1024)
     artifacts_c = _runtime_artifacts("a")
     artifacts_c["trt_plans"] = segmentation._trt_plan_identity(
         {"xy": xy_model, "ortho": ortho_model}, {"Test GPU"}
@@ -1476,10 +1475,11 @@ def test_driver_checkpoints_only_successful_futures(
 
     success = ImmediateFuture({"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.25, "n_masks": 4})
     interrupted = ImmediateFuture(error=RuntimeError("worker stopped before completion"))
-    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures, *, loop: futures)
     checkpoint_path = tmp_path / "checkpoint.jsonl"
 
     failures = segmentation._wait_for_futures_collect_errors(
+        client=type("Client", (), {"loop": None})(),
         futures=[success, interrupted],
         future_labels={success: "success", interrupted: "interrupted"},
         stage="Segmentation",
@@ -1510,6 +1510,7 @@ def test_driver_waits_before_retrying_failed_block_once(
             pass
 
     class Client:
+        loop = None
         retried: list[object] = []
 
         def retry(self, futures: list[RetriableFuture]) -> None:
@@ -1520,7 +1521,7 @@ def test_driver_waits_before_retrying_failed_block_once(
     future = RetriableFuture()
     client = Client()
     sleeps: list[float] = []
-    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures, *, loop: futures)
     monkeypatch.setattr(segmentation.time, "sleep", sleeps.append)
     checkpoint_path = tmp_path / "checkpoint.jsonl"
 
@@ -1550,6 +1551,7 @@ def test_driver_does_not_retry_checkpoint_failure(
             return {"index": (0, 0, 0, 0), "worker": "gpu-0", "duration_s": 1.0, "n_masks": 2}
 
     class Client:
+        loop = None
         def retry(self, futures: list[SuccessfulFuture]) -> None:
             raise AssertionError("a driver-side checkpoint failure must not retry the task")
 
@@ -1559,8 +1561,8 @@ def test_driver_does_not_retry_checkpoint_failure(
     def fail_sleep(seconds: float) -> None:
         raise AssertionError("must not wait before a driver-side failure")
 
-    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures: futures)
     monkeypatch.setattr(segmentation, "append_checkpoint", fail_checkpoint)
+    monkeypatch.setattr(segmentation.distributed, "as_completed", lambda futures, *, loop: futures)
     monkeypatch.setattr(segmentation.time, "sleep", fail_sleep)
     future = SuccessfulFuture()
 
@@ -1931,7 +1933,7 @@ def test_run_stitch_rejects_stale_run_identity(tmp_path: Path) -> None:
         {"schema_version": 4, "run": "stale"},
     )
 
-    with pytest.raises(ValueError, match="schema-6 artifact-bound identity"):
+    with pytest.raises(ValueError, match="schema-7 artifact-bound identity"):
         segmentation._run_stitch(
             temp_dir,
             tmp_path / "output.zarr",
@@ -1974,7 +1976,7 @@ def test_distributed_eval_requires_artifact_bound_identity(tmp_path: Path) -> No
             channel_indices=(0,),
         )
 
-    with pytest.raises(ValueError, match="complete schema-6"):
+    with pytest.raises(ValueError, match="complete schema-7"):
         segmentation.distributed_eval.__wrapped__(
             input_zarr=input_zarr,
             blocksize=(2, 4, 4, 1),
@@ -2121,3 +2123,208 @@ def test_block_label_decode_rejects_mixed_block_tokens() -> None:
 
     with pytest.raises(ValueError, match="multiple block tokens"):
         merge_utils.decode_block_global_labels(mixed)
+
+
+@pytest.mark.parametrize("change", ["translation", "scale", "unit", "missing_scale", "transform"])
+def test_registered_sources_reject_different_or_unknown_physical_grid(tmp_path: Path, change: str) -> None:
+    sources = [tmp_path / "first.zarr", tmp_path / "second.zarr"]
+    for path in sources:
+        _write_ome_channel(path, np.zeros((2, 3, 4), dtype=np.uint16))
+        root = zarr.open_group(path, mode="r+")
+        ome = root.attrs["ome"]
+        image = ome["multiscales"][0]
+        image["axes"] = [{"name": axis, "type": "space", "unit": "micrometer"} for axis in "zyx"]
+        image["datasets"][0]["coordinateTransformations"] = [{"type": "scale", "scale": [2, 1, 1]}]
+        root.attrs["ome"] = ome
+    root = zarr.open_group(sources[1], mode="r+")
+    ome = root.attrs["ome"]
+    image = ome["multiscales"][0]
+    transformations = image["datasets"][0]["coordinateTransformations"]
+    if change == "translation":
+        transformations.append({"type": "translation", "translation": [0, 0, 1000]})
+    elif change == "scale":
+        transformations[0]["scale"][0] = 3
+    elif change == "unit":
+        image["axes"][2]["unit"] = "nanometer"
+    elif change == "missing_scale":
+        image["datasets"][0].pop("coordinateTransformations")
+    else:
+        transformations.append({"type": "affine", "affine": []})
+    root.attrs["ome"] = ome
+    manifest_path = tmp_path / "input.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "squisher_segment.registered_ome_input.v1",
+                "channels": ["405", "561"],
+                "sources": [
+                    {
+                        "channel": channel,
+                        "path": str(path),
+                        "root_metadata_sha256": segmentation.file_sha256(path / "zarr.json"),
+                    }
+                    for channel, path in zip(["405", "561"], sources, strict=True)
+                ],
+                "source_roi_zyx": [[0, 2], [0, 3], [0, 4]],
+                "shape": [2, 3, 4, 2],
+                "dtype": "uint16",
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="grid|scale|transform"):
+        segmentation._open_registered_ome_input(manifest_path)
+
+
+def test_registered_grid_composes_transforms_and_preserves_cropped_labels(tmp_path: Path) -> None:
+    sources = [tmp_path / "first.zarr", tmp_path / "second.zarr"]
+    for index, path in enumerate(sources):
+        _write_ome_channel(path, np.zeros((3, 5, 6), dtype=np.uint16))
+        root = zarr.open_group(path, mode="r+")
+        ome = root.attrs["ome"]
+        image = ome["multiscales"][0]
+        if index == 0:
+            image["datasets"][0]["coordinateTransformations"] += [
+                {"type": "translation", "translation": [10, 20, 30]}
+            ]
+        else:
+            image["datasets"][0]["coordinateTransformations"] = [
+                {"type": "scale", "scale": [1, 0.5, 0.5]},
+                {"type": "translation", "translation": [4, 9, 14]},
+            ]
+            image["coordinateTransformations"] = [
+                {"type": "scale", "scale": [2, 2, 2]},
+                {"type": "translation", "translation": [2, 2, 2]},
+            ]
+        root.attrs["ome"] = ome
+    manifest_path = tmp_path / "input.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "squisher_segment.registered_ome_input.v1",
+                "channels": ["405", "561"],
+                "sources": [
+                    {
+                        "channel": channel,
+                        "path": str(path),
+                        "root_metadata_sha256": segmentation.file_sha256(path / "zarr.json"),
+                    }
+                    for channel, path in zip(["405", "561"], sources, strict=True)
+                ],
+                "source_roi_zyx": [[1, 3], [1, 5], [2, 6]],
+                "shape": [2, 4, 4, 2],
+                "dtype": "uint16",
+            }
+        )
+    )
+    array, identity, _ = segmentation._open_registered_ome_input(manifest_path)
+    assert array.attrs["squisher_spatial_grid"]["translation"] == [12, 21, 32]
+    cropped, _ = segmentation._crop_zyxc_input(array, identity, start_zyx=(1, 1, 1), box_size_zyx=(1, 2, 2))
+    projected = segmentation.MaxProjectedZYXCInput(cropped)
+    grid = projected.attrs["squisher_spatial_grid"]
+    assert grid == {
+        "axes": ["z", "y", "x"],
+        "units": ["micrometer"] * 3,
+        "scale": [2, 1, 1],
+        "translation": [14, 22, 33],
+    }
+    assert projected.attrs["squisher_projection"]["source_shape"] == [1, 2, 2]
+    labels = zarr.create_array(
+        tmp_path / "temp.zarr", shape=projected.shape[:3], chunks=projected.chunks[:3], dtype=np.uint32
+    )
+    final, _ = segmentation._stitch_precomputed(
+        label_pairs=[],
+        boxes_list=[],
+        box_ids_list=[],
+        temp_zarr=labels,
+        temp_dir=tmp_path,
+        output_path=tmp_path / "labels.zarr",
+        run_identity={"input": {"attrs": projected.attrs}},
+        overwrite_output=False,
+        non_empty_indices=[],
+    )
+    assert final.attrs["squisher_spatial_grid"] == grid
+    assert final.attrs["squisher_projection"] == projected.attrs["squisher_projection"]
+
+
+@pytest.mark.parametrize("persisted", ["empty", "checkpoint", "labels"])
+def test_distributed_resume_reconstructs_only_uncomputed_overlap_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persisted: str,
+) -> None:
+    class SetupComplete(RuntimeError):
+        pass
+
+    class Client:
+        def wait_for_workers(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def run(self, *args: object, **kwargs: object) -> dict[str, object]:
+            return {}
+
+        def register_plugin(self, plugin: object) -> None:
+            raise SetupComplete
+
+    class Cluster:
+        client = Client()
+
+    input_zarr, _ = _write_input(tmp_path / "input.zarr")
+    input_zarr.attrs["key"] = ["405", "561", "638"]
+    model = tmp_path / "model"
+    model.write_bytes(b"model")
+    model_kwargs = {"pretrained_model": str(model)}
+    identity = segmentation._build_run_identity(
+        input_identity=_input_identity(tmp_path / "input.zarr", input_zarr),
+        channel_indices=(0,),
+        model_kwargs=model_kwargs,
+        eval_kwargs={"diameter": 1},
+        blocksize=(1, 4, 5, 1),
+        overlap=2,
+        preprocessing_steps=[],
+        nonempty_rule={"channel": "561", "channel_index": 1, "threshold": 1000, "min_fraction": 0.05},
+        mask=None,
+        runtime_artifacts=_runtime_artifacts(),
+        stitch_mode="overlap-iou",
+    )
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir()
+    temp = segmentation._initialize_temp_zarr(
+        path=temp_dir / "segmentation_unstitched.zarr",
+        shape=(2, 4, 5),
+        chunks=(1, 4, 5),
+        run_config_path=temp_dir / "run_config.json",
+        run_identity=identity,
+    )
+    if persisted == "checkpoint":
+        (temp_dir / "checkpoint.jsonl").write_text(json.dumps({"index": [0, 0, 0, 0]}) + "\n")
+    elif persisted == "labels":
+        temp[0] = 1
+    monkeypatch.setattr(segmentation, "_select_input_blocks", lambda **kwargs: [0, 1])
+    with pytest.raises(
+        SetupComplete if persisted == "empty" else RuntimeError,
+        match=None if persisted == "empty" else "metadata is missing",
+    ):
+        segmentation.distributed_eval.__wrapped__(
+            input_zarr=input_zarr,
+            blocksize=(1, 4, 5, 1),
+            write_path=tmp_path / "output.zarr",
+            model_kwargs=model_kwargs,
+            eval_kwargs={"diameter": 1},
+            cluster=Cluster(),
+            temporary_directory=temp_dir,
+            channel_indices=(0,),
+            run_identity=identity,
+        )
+    assert (temp_dir / "overlap-evidence" / "metadata.json").exists() == (persisted == "empty")
+
+
+@pytest.mark.parametrize("state", ["unverified", "stale"])
+def test_driver_rejects_unbound_or_stale_plan_before_run_identity(tmp_path: Path, state: str) -> None:
+    checkpoint = tmp_path / "model"
+    checkpoint.write_bytes(b"checkpoint")
+    segmentation.plan_path_for_device(checkpoint, "Test GPU").write_bytes(b"plan")
+    if state == "stale":
+        write_trt_plan_metadata(checkpoint, "Test GPU", backend="sam", bsize=256, batch_size=1, opset=22, vram_mb=1024)
+        checkpoint.write_bytes(b"retrained checkpoint")
+    with pytest.raises(ValueError, match=state):
+        segmentation._trt_plan_identity({"xy": checkpoint}, {"Test GPU"})
