@@ -14,6 +14,7 @@ dependencies = [
     "numpy>=2.4.6",
     "osqp>=1.1.0",
     "pillow>=12.0.0",
+    "pyarrow>=19",
     "pydantic>=2.13.0",
     "pyvista>=0.46",
     "rich>=15.0.0",
@@ -34,6 +35,8 @@ squisher-deconv = { workspace = true }
 [project.scripts]
 lightsheet = "squisher_lightsheet.cli:main"
 lightsheet-stitch = "squisher_lightsheet.stitch_cli:main"
+lightsheet-fused-fixed-sweep = "squisher_lightsheet._backends.fused_fixed_sweep:main"
+lightsheet-fused-fixed-contact-sheet = "squisher_lightsheet._backends.fused_fixed_contact_sheet:main"
 
 [build-system]
 requires = ["uv_build>=0.8.22,<0.9.0"]

@@ -261,3 +261,144 @@ def test_rechunk_ome_zarr_refuses_existing_output_without_overwrite(tmp_path: Pa
 
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         rechunk_ome_zarr(source=source, destination=destination)
+
+
+def _add_rechunk_sidecars(source: Path) -> None:
+    import hashlib
+
+    bundle = source / "provenance"
+    bundle.mkdir()
+    (bundle / "registration.json").write_text('{"registered": true}')
+    (bundle / "manifest.json").write_text(json.dumps({
+        "artifacts": [{"bundled_path": "provenance/registration.json"}],
+    }))
+    field = source / "n4-field.npy"
+    np.save(field, np.ones((2, 2, 2), dtype=np.float32))
+    root = zarr.open_group(str(source), mode="a")
+    root.attrs.update({
+        "squisher_fusion": {"manifest": "provenance/manifest.json"},
+        "squisher_n4": {"field_path": "n4-field.npy", "field_shape": [2, 2, 2],
+                        "field_sha256": hashlib.sha256(field.read_bytes()).hexdigest()},
+    })
+
+
+def test_rechunk_preserves_referenced_fusion_and_n4_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    _add_rechunk_sidecars(source)
+    destination = tmp_path / "out.zarr"
+    rechunk_ome_zarr(source=source, destination=destination, start_level=0)
+    for relative in ("provenance/manifest.json", "provenance/registration.json", "n4-field.npy"):
+        assert (destination / relative).read_bytes() == (source / relative).read_bytes()
+    assert zarr.open_group(str(destination), mode="r").attrs["squisher_complete"] is True
+
+
+@pytest.mark.parametrize("relative", ["provenance/manifest.json", "provenance/registration.json", "n4-field.npy"])
+def test_rechunk_rejects_missing_referenced_sidecar(tmp_path: Path, relative: str) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    _add_rechunk_sidecars(source)
+    (source / relative).unlink()
+    destination = tmp_path / "out.zarr"
+    with pytest.raises(FileNotFoundError, match="missing"):
+        rechunk_ome_zarr(source=source, destination=destination, start_level=0)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("kind", ["fusion", "n4"])
+def test_rechunk_rejects_rebasing_scientific_provenance(tmp_path: Path, kind: str) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    root = zarr.open_group(str(source), mode="a")
+    root.attrs[f"squisher_{kind}"] = {}
+    with pytest.raises(ValueError, match="requires start_level=0"):
+        rechunk_ome_zarr(source=source, destination=tmp_path / "out.zarr", start_level=1)
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "field_checksum", "field_shape", "escape", "symlink"])
+def test_rechunk_rejects_invalid_bundle(tmp_path: Path, invalid: str) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    _add_rechunk_sidecars(source)
+    root = zarr.open_group(str(source), mode="a")
+    if invalid == "unknown":
+        root.create_group("labels")
+    elif invalid in {"field_checksum", "field_shape"}:
+        attrs = root.attrs["squisher_n4"]
+        attrs["field_sha256" if invalid == "field_checksum" else "field_shape"] = "bad" if invalid == "field_checksum" else [1, 1, 1]
+        root.attrs["squisher_n4"] = attrs
+    elif invalid == "escape":
+        root.attrs["squisher_fusion"] = {"manifest": "../manifest.json"}
+    else:
+        (source / "provenance" / "external.json").symlink_to(tmp_path / "external.json")
+    with pytest.raises(ValueError):
+        rechunk_ome_zarr(source=source, destination=tmp_path / "out.zarr", start_level=0)
+    assert not (tmp_path / "out.zarr").exists()
+
+
+def test_rechunk_failed_replacement_preserves_completed_output(tmp_path: Path, monkeypatch) -> None:
+    from squisher_lightsheet import ome_zarr_rechunk
+
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    destination = tmp_path / "out.zarr"
+    original = _write_zarr_source(destination)
+    zarr.open_group(str(destination), mode="a").attrs["prior_output"] = True
+
+    def fail_copy(**kwargs):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(ome_zarr_rechunk, "_copy_chunks", fail_copy)
+    with pytest.raises(RuntimeError, match="copy failed"):
+        rechunk_ome_zarr(source=source, destination=destination, start_level=0, overwrite=True)
+    prior = zarr.open_group(str(destination), mode="r")
+    assert prior.attrs["squisher_complete"] is True
+    assert prior.attrs["prior_output"] is True
+    np.testing.assert_array_equal(prior["0"][:], original[0])
+    assert not list(tmp_path.glob(".out.zarr.tmp-*"))
+
+
+def test_rechunk_successfully_replaces_completed_output(tmp_path: Path) -> None:
+    source = tmp_path / "source.zarr"
+    expected = _write_zarr_source(source)
+    destination = tmp_path / "out.zarr"
+    _write_zarr_source(destination, levels=1)
+    rechunk_ome_zarr(source=source, destination=destination, start_level=0, overwrite=True)
+    root = zarr.open_group(str(destination), mode="r")
+    assert root.attrs["squisher_complete"] is True
+    assert len(root.attrs["ome"]["multiscales"][0]["datasets"]) == 4
+    np.testing.assert_array_equal(root["3"][:], expected[3])
+    assert not list(tmp_path.glob(".out.zarr.previous-*"))
+
+
+def test_rechunk_publication_failure_restores_prior_output(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    destination = tmp_path / "out.zarr"
+    expected = _write_zarr_source(destination, levels=1)
+    rename = Path.rename
+
+    def fail_install(path: Path, target: Path) -> Path:
+        if path.name.startswith(".out.zarr.tmp-"):
+            raise OSError("installation failed")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_install)
+    with pytest.raises(OSError, match="installation failed"):
+        rechunk_ome_zarr(source=source, destination=destination, start_level=0, overwrite=True)
+    root = zarr.open_group(str(destination), mode="r")
+    assert root.attrs["squisher_complete"] is True
+    np.testing.assert_array_equal(root["0"][:], expected[0])
+    assert not list(tmp_path.glob(".out.zarr.*"))
+
+
+def test_rechunk_validates_n4_recorded_fusion_sidecar_digest(tmp_path: Path) -> None:
+    source = tmp_path / "source.zarr"
+    _write_zarr_source(source)
+    _add_rechunk_sidecars(source)
+    root = zarr.open_group(str(source), mode="a")
+    n4 = root.attrs["squisher_n4"]
+    n4["source_sidecars_sha256"] = {"provenance/registration.json": "stale"}
+    root.attrs["squisher_n4"] = n4
+    with pytest.raises(ValueError, match="source sidecar checksum"):
+        rechunk_ome_zarr(source=source, destination=tmp_path / "out.zarr", start_level=0)

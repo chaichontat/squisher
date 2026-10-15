@@ -615,7 +615,7 @@ def main(
     stitch = load_stitch_module()
     position_payload = json.loads(args.position_input.read_text())
     side_lookup = side_by_tile(position_payload)
-    tiles = stitch.read_position_input_tiles(args.position_input.resolve())
+    tiles = stitch.read_position_input_tiles(args.position_input.resolve(), selected_channels=(args.channel,))
     params = stitch.load_registration_params(args.registration_input.resolve(), tiles)
     geometry = (
         build_full_affine_geometry(tiles, params, level=args.level, stitch=stitch)

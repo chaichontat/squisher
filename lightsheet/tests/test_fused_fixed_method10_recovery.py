@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import pickle
@@ -17,15 +16,6 @@ from squisher_lightsheet import fused_fixed_recovery
 
 def _load_recovery():
     return fused_fixed_recovery
-
-
-def _load_trial():
-    path = Path("/home/chaichontat/nvme/lightsheet/scripts/try_fused_fixed_method8.py")
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _recovery_row() -> dict[str, object]:
@@ -342,9 +332,25 @@ def test_final_linear_smoothing_predicts_only_transform_outliers() -> None:
     np.testing.assert_allclose(predictions[outlier_index], values[outlier_index], atol=1e-12)
 
 
-def test_selected_transform_update_keeps_all_representations_consistent() -> None:
+@pytest.mark.parametrize(
+    ("fixed_start", "moving_start", "shape"),
+    [
+        ([0, 0, 0], [0, 0, 0], [10, 10, 10]),
+        ([979, 8336, 4432], [960, 432, 432], [128, 528, 528]),
+        ([963, 8672, 4488], [960, 0, 432], [128, 528, 528]),
+    ],
+    ids=["zero-origins", "native-primary", "native-neighbor"],
+)
+def test_selected_transform_update_keeps_all_representations_consistent(
+    fixed_start, moving_start, shape,
+) -> None:
     recovery = _load_recovery()
-    row = _recovery_row()
+    row = _recovery_row() | {
+        "fixed_start_zyx": fixed_start,
+        "fixed_stop_zyx": (np.array(fixed_start) + shape).tolist(),
+        "moving_start_l0_zyx": moving_start,
+        "moving_stop_l0_zyx": (np.array(moving_start) + shape).tolist(),
+    }
     matrix = np.asarray([[1.0, 0.01, 0.0], [0.01, 1.0, -0.02], [0.0, -0.02, 1.0]])
     translation = np.asarray([1.0, -2.0, 3.0])
 
@@ -355,16 +361,22 @@ def test_selected_transform_update_keeps_all_representations_consistent() -> Non
         attempt="linear_interpolated_method10_outlier_replacement",
     )
 
-    expected_pull = recovery.output_to_input_from_model(matrix, translation, (10, 10, 10))
-    expected_global = recovery._global_forward_from_local(row, matrix, translation)
+    center = (np.array(shape) - 1) / 2
+    source_points = np.array(moving_start) + np.stack([np.zeros(3), center, np.array(shape) - 1])
+    fixed_points = (
+        (source_points - np.array(moving_start) - center) @ matrix.T
+        + center + translation + np.array(fixed_start)
+    )
+    pull = np.array(row["selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx"])
+    pull_offset = np.array(row["selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx"])
+    forward = np.array(row["selected_moving_l0_to_fixed_fused_l0_matrix_zyx"])
+    forward_offset = np.array(row["selected_moving_l0_to_fixed_fused_l0_offset_zyx"])
+    np.testing.assert_allclose(fixed_points @ pull.T + pull_offset, source_points, atol=1e-9)
+    np.testing.assert_allclose(source_points @ forward.T + forward_offset, fixed_points, atol=1e-9)
     np.testing.assert_allclose(row["selected_local_matrix_zyx"], matrix)
     np.testing.assert_allclose(row["selected_local_translation_zyx"], translation)
     np.testing.assert_allclose(row["local_matrix_zyx"], matrix)
     np.testing.assert_allclose(row["local_translation_zyx"], translation)
-    np.testing.assert_allclose(row["selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx"], expected_pull[0])
-    np.testing.assert_allclose(row["selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx"], expected_pull[1])
-    np.testing.assert_allclose(row["selected_moving_l0_to_fixed_fused_l0_matrix_zyx"], expected_global[0])
-    np.testing.assert_allclose(row["selected_moving_l0_to_fixed_fused_l0_offset_zyx"], expected_global[1])
     assert row["selected_corr_refined"] is None
     assert row["selected_gradient_component_ncc_mean"] is None
     assert row["selected_gradient_component_ncc_refined"] is None
@@ -408,7 +420,8 @@ def test_failed_refit_retains_accepted_original(tmp_path, rerun_payload, expecte
     assert recovered["outlier_recovery"]["retained_original_reason"] == expected_reason
 
 
-def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("attempt", ["native_method6_from_recovery_initializer", "local_3d_affine_refinement"])
+def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path, attempt: str) -> None:
     recovery = _load_recovery()
     original_path = tmp_path / "input" / "window.json"
     output_dir = tmp_path / "output"
@@ -418,7 +431,8 @@ def test_method6_recovery_accepts_its_native_recovery_attempt(tmp_path: Path) ->
         output_path,
         {
             **row,
-            "selected_attempt": "native_method6_from_recovery_initializer",
+            "selected_attempt": attempt,
+            "cache_config": {"native_method": "method6", "local_3d_refinement": True},
         },
     )
     task = {
@@ -572,9 +586,10 @@ def test_rerun_validation_uses_fixed_window_shape(tmp_path: Path) -> None:
     assert result["status"] == "accepted"
 
 
-def test_rerun_all_preserves_spatial_outlier_reason(tmp_path: Path, monkeypatch, capsys) -> None:
+@pytest.mark.parametrize("attempt", ["native_method6_from_phase_primed_initializer", "local_3d_affine_refinement"])
+def test_rerun_all_preserves_spatial_outlier_reason(tmp_path: Path, monkeypatch, capsys, attempt: str) -> None:
     recovery = _load_recovery()
-    cache = {"native_method": "method6"}
+    cache = {"native_method": "method6", "local_3d_refinement": True}
     paths = []
     for index, translation_x in enumerate((0.0, 1.0, 2.0, 100.0)):
         path = tmp_path / f"window{index}.json"
@@ -583,7 +598,7 @@ def test_rerun_all_preserves_spatial_outlier_reason(tmp_path: Path, monkeypatch,
             "moving_tile": "sample.001",
             "moving_start_l0_zyx": [index * 10, 0, 0],
             "moving_stop_l0_zyx": [index * 10 + 10, 10, 10],
-            "selected_attempt": "native_method6_from_phase_primed_initializer",
+            "selected_attempt": attempt,
             "selected_local_translation_zyx": [0.0, 0.0, translation_x],
             "cache_config": cache,
         }
@@ -1105,3 +1120,191 @@ def test_manual_initialization_fails_on_stale_or_unfittable_entries(tmp_path: Pa
             provenance_base=lambda _path, _row: {},
             source={},
         )
+
+
+def _seed_attempt(name: str, *, gradient: float, translation: list[float], scale: float = 1.0) -> dict:
+    return {
+        "name": name,
+        "status": "rejected",
+        "corr_refined": 0.4,
+        "gradient_component_ncc_mean": gradient,
+        "local_matrix_zyx": (np.eye(3) * scale).tolist(),
+        "local_translation_zyx": translation,
+    }
+
+
+def _seed_summary(tmp_path: Path, windows: dict[str, tuple[dict, list[dict]]]) -> Path:
+    """Complete-recovery summary over native-recovery window records, as recover-native and complete-recovery write them."""
+    native = tmp_path / "native-recovery"
+    (native / "window_json").mkdir(parents=True)
+    rows = []
+    for name, (row, attempts) in windows.items():
+        (native / "window_json" / name).write_text(
+            json.dumps({"moving_tile": "s.001.ome.zarr", "moving_start_l0_zyx": [0, 0, 0], "method8_attempts": attempts})
+        )
+        rows.append({"level0_json": str(tmp_path / "complete-recovery/window_json" / name), **row})
+    summary = tmp_path / "complete-recovery/fused_fixed_method8_summary.json"
+    summary.parent.mkdir()
+    summary.write_text(json.dumps({"input_summary": str(native / "fused_fixed_method8_summary.json"), "windows": rows}))
+    return summary
+
+
+def test_propose_manual_initializations_seeds_withheld_tissue_windows_from_their_best_supported_attempt(
+    tmp_path: Path,
+) -> None:
+    withheld = {"status": "rejected", "rejection_reason": "linear_mapping_outlier", "fixed_masked_fraction": 0.1}
+    summary = _seed_summary(
+        tmp_path,
+        {
+            "best.json": (
+                withheld,
+                [
+                    _seed_attempt("level2_initializer_phase_primed", gradient=0.12, translation=[1.0, -14.0, 5.0]),
+                    _seed_attempt("native_method6_from_recovery_initializer", gradient=0.17, translation=[1.0, -12.0, 4.0]),
+                    _seed_attempt("interpolated_method6_spatial_recovery", gradient=0.5, translation=[0.0, 0.0, 0.0]),
+                ],
+            ),
+            "drifted.json": (
+                withheld,
+                [_seed_attempt("native_method6_from_recovery_initializer", gradient=0.3, translation=[175.0, -9.0, -14.0])],
+            ),
+            "squashed.json": (
+                withheld,
+                [_seed_attempt("level2_initializer_phase_primed", gradient=0.3, translation=[1.0, 1.0, 1.0], scale=1.2)],
+            ),
+            "faint.json": (
+                withheld,
+                [_seed_attempt("level2_initializer_phase_primed", gradient=0.02, translation=[1.0, 1.0, 1.0])],
+            ),
+            "background.json": (
+                {**withheld, "fixed_masked_fraction": 0.9},
+                [_seed_attempt("level2_initializer_phase_primed", gradient=0.3, translation=[1.0, 1.0, 1.0])],
+            ),
+            "mask-rejected.json": (
+                {**withheld, "rejection_reason": "fixed_threshold_mask_too_masked"},
+                [_seed_attempt("level2_initializer_phase_primed", gradient=0.3, translation=[1.0, 1.0, 1.0])],
+            ),
+            "accepted.json": (
+                {**withheld, "status": "accepted", "rejection_reason": None},
+                [_seed_attempt("level2_initializer_phase_primed", gradient=0.3, translation=[1.0, 1.0, 1.0])],
+            ),
+        },
+    )
+    master = tmp_path / "manual-initializations.json"
+    previous_seed = _manual_entry(seed_origin="measured", local_translation_zyx=[9.0, 9.0, 9.0])
+    _write_manual(
+        master, {"curated.json": _manual_entry(), "accepted.json": previous_seed, "best.json": previous_seed}
+    )
+
+    entries = fused_fixed_recovery.propose_manual_initializations(
+        complete_summary=summary, master=master, channel="514"
+    )
+
+    # The seed that got accepted.json accepted stays; best.json is still withheld, so its seed is measured again.
+    assert set(entries) == {"best.json", "curated.json", "accepted.json"}
+    assert entries["accepted.json"] == previous_seed
+    assert entries["best.json"]["local_translation_zyx"] == [1.0, -12.0, 4.0]
+    assert entries["best.json"]["seed_origin"] == "measured"
+    assert entries["curated.json"]["seed_origin"] == "manual"
+    assert set(fused_fixed_recovery.load_manual_initializations(master, channel="514")) == set(entries)
+
+
+def _contradicted_window(tmp_path: Path, name: str, *, selected_candidate: str) -> None:
+    """Complete-recovery window record of an interpolated placement the residual check contradicted."""
+    path = tmp_path / "complete-recovery/window_json" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "outlier_recovery": {
+                    "interpolated_initializer_local_matrix_zyx": np.eye(3).tolist(),
+                    "interpolated_initializer_local_translation_zyx": [2.0, 10.0, -4.0],
+                },
+                "interpolated_fallback_promotion": {
+                    "selected_candidate": selected_candidate,
+                    "initializer_source": "interpolated",
+                    "residual": {
+                        "confident_plane_count": 2,
+                        "residual_yx_px": [-2.5, 1.0],
+                        "plane_spread_px": 0.5,
+                        "verdict": "contradicted",
+                    },
+                },
+            }
+        )
+    )
+
+
+def test_propose_manual_initializations_shifts_a_contradicted_interpolation_by_its_measured_residual(
+    tmp_path: Path,
+) -> None:
+    contradicted = {"status": "rejected", "rejection_reason": "spatial_fallback_contradicted_by_image", "fixed_masked_fraction": 0.1}
+    attempt = _seed_attempt("native_method6_from_recovery_initializer", gradient=0.3, translation=[1.0, 1.0, 1.0])
+    summary = _seed_summary(tmp_path, {"shifted.json": (contradicted, [attempt])})
+    _contradicted_window(tmp_path, "shifted.json", selected_candidate="interpolated")
+    master = tmp_path / "manual-initializations.json"
+
+    entries = fused_fixed_recovery.propose_manual_initializations(
+        complete_summary=summary, master=master, channel="514"
+    )
+
+    # Level-2 residual pixels are 4 level-0 pixels in YX; Z and the matrix are the interpolated placement's.
+    assert entries["shifted.json"]["local_translation_zyx"] == [2.0, 0.0, 0.0]
+    assert entries["shifted.json"]["local_matrix_zyx"] == np.eye(3).tolist()
+    assert entries["shifted.json"]["seed_origin"] == "measured"
+    # A shifted placement beyond the neighbourhood bound is not proposed.
+    assert "shifted.json" not in fused_fixed_recovery.propose_manual_initializations(
+        complete_summary=summary, master=tmp_path / "bounded.json", channel="514", maximum_translation_px=1.5
+    )
+
+    _contradicted_window(tmp_path, "shifted.json", selected_candidate="native_rerun")
+    with pytest.raises(ValueError, match="contradicted a native_rerun candidate"):
+        fused_fixed_recovery.propose_manual_initializations(
+            complete_summary=summary, master=master, channel="514"
+        )
+
+
+@pytest.mark.parametrize("scale", [1.01, 2.0])
+def test_contradicted_native_rerun_seed_uses_its_own_transform(tmp_path: Path, scale: float) -> None:
+    contradicted = {"status": "rejected", "rejection_reason": "spatial_fallback_contradicted_by_image",
+                    "fixed_masked_fraction": 0.1}
+    native = _seed_attempt("native_method6_from_recovery_initializer", gradient=0.2,
+                           translation=[1.0, 2.0, 3.0], scale=scale)
+    native["rejection_reason"] = "quality_gate_grad_ncc"
+    baseline = _seed_attempt("level2_initializer_only", gradient=0.1, translation=[2.0, 10.0, -4.0])
+    summary = _seed_summary(tmp_path, {"shifted.json": (contradicted, [native, baseline])})
+    _contradicted_window(tmp_path, "shifted.json", selected_candidate="native_rerun")
+    completed_path = tmp_path / "complete-recovery/window_json/shifted.json"
+    completed = json.loads(completed_path.read_text())
+    completed.update({"native_method": "method6", "method8_attempts": [native, baseline]})
+    completed["outlier_recovery"]["native_rerun_rejection_reason"] = "quality_gate_grad_ncc"
+    completed_path.write_text(json.dumps(completed))
+    master = tmp_path / "manual-initializations.json"
+    if scale == 2.0:
+        with pytest.raises(ValueError, match="implausible affine"):
+            fused_fixed_recovery.propose_manual_initializations(
+                complete_summary=summary, master=master, channel="514")
+        assert not master.exists()
+        return
+    entries = fused_fixed_recovery.propose_manual_initializations(
+        complete_summary=summary, master=master, channel="514")
+    assert entries["shifted.json"]["local_translation_zyx"] == [1.0, -8.0, 7.0]
+    assert entries["shifted.json"]["local_matrix_zyx"] == native["local_matrix_zyx"]
+    assert "native_rerun placement" in entries["shifted.json"]["evidence"]
+    assert "shifted.json" not in fused_fixed_recovery.propose_manual_initializations(
+        complete_summary=summary, master=tmp_path / "bounded.json", channel="514", maximum_translation_px=7.5)
+
+
+def test_native_worker_error_is_not_published_as_spatial_rejection(tmp_path: Path) -> None:
+    recovery = _load_recovery()
+    output_dir = tmp_path / "output"
+    original = tmp_path / "input/window.json"
+    output = output_dir / "window_json/window.json"
+    error = {"status": "error", "error": "KeyError: fixed_shape_zyx"}
+    recovery._write_json(output, error)
+    task = {"row": _recovery_row(), "original_path": original,
+            "transform": np.r_[np.eye(3).ravel(), [0., 0., 0.]],
+            "provenance": {"maximum_refit_displacement_px": 1.}}
+    with pytest.raises(RuntimeError, match="Native recovery worker failed.*fixed_shape_zyx"):
+        recovery._finalize_native_rerun(task, output_dir=output_dir, native_method="method6")
+    assert recovery._read_json(output) == error

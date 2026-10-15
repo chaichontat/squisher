@@ -308,6 +308,72 @@ def render_fused_middle_z_qc(
     return FusedMiddleZQCResult(tuple(outputs), contact_sheet)
 
 
+DEFAULT_FUSED_PREVIEW_LEVEL = 3
+FUSED_PREVIEW_DEPTH_FRACTIONS = (0.25, 0.5, 0.75)
+
+
+def render_fused_preview(
+    *, label: str, source: Path, output: Path, level: int = DEFAULT_FUSED_PREVIEW_LEVEL
+) -> Path:
+    """Render one complete fused volume as XY planes at 25/50/75% depth plus middle XZ and YZ, at physical aspect.
+
+    The display range is the 1st to 99.7th percentile of nonzero voxels at the rendered level.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import zarr
+
+    group = zarr.open_group(source, mode="r")
+    if group.attrs.get("squisher_complete") is not True:
+        raise ValueError(f"fused volume is not complete: {source}")
+    path = ngff.level_path(group, level=level, context=source)
+    array = group[path]
+    if list(ngff.axes(group, array).lower()) != ["z", "y", "x"]:
+        raise ValueError(f"fused volume must have ZYX axes: {source}")
+    _names, scale, origin, _has_scale, _has_origin = ngff.scale_translation(
+        group, dataset_index=ngff.dataset_paths(group).index(path)
+    )
+    scale = np.asarray(scale[-3:], dtype=np.float64)
+    origin = np.asarray(origin[-3:], dtype=np.float64)
+    volume = np.asarray(array)
+    nonzero = volume[volume > 0]
+    low, high = np.percentile(nonzero, [1.0, 99.7]) if nonzero.size else (0.0, 1.0)
+    nz, ny, nx = volume.shape
+    stop = origin + np.asarray(volume.shape) * scale
+    style = {"cmap": "gray", "vmin": low, "vmax": high, "interpolation": "nearest"}
+
+    figure = plt.figure(figsize=(18, 13), dpi=150)
+    grid = figure.add_gridspec(2, 3, height_ratios=[ny * scale[1], nz * scale[0]])
+    for column, fraction in enumerate(FUSED_PREVIEW_DEPTH_FRACTIONS):
+        z = int(round(fraction * (nz - 1)))
+        axis = figure.add_subplot(grid[0, column])
+        axis.imshow(volume[z], extent=(origin[2], stop[2], stop[1], origin[1]), **style)
+        axis.set_title(
+            f"XY at z = {origin[0] + z * scale[0]:.0f} um (level-{level} plane {z} of {nz})", fontsize=9
+        )
+        axis.set(xlabel="x (um)", ylabel="y (um)")
+    axis = figure.add_subplot(grid[1, 0:2])
+    axis.imshow(volume[:, ny // 2, :], extent=(origin[2], stop[2], stop[0], origin[0]), **style)
+    axis.set_title(f"XZ at y = {origin[1] + (ny // 2) * scale[1]:.0f} um", fontsize=9)
+    axis.set(xlabel="x (um)", ylabel="z (um)")
+    axis = figure.add_subplot(grid[1, 2])
+    axis.imshow(volume[:, :, nx // 2], extent=(origin[1], stop[1], stop[0], origin[0]), **style)
+    axis.set_title(f"YZ at x = {origin[2] + (nx // 2) * scale[2]:.0f} um", fontsize=9)
+    axis.set(xlabel="y (um)", ylabel="z (um)")
+    for axis in figure.axes:
+        axis.tick_params(labelsize=7)
+        axis.xaxis.label.set_size(8)
+        axis.yaxis.label.set_size(8)
+    figure.suptitle(f"{label}: {source} (level {level}, display {low:.0f}-{high:.0f})", fontsize=10)
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output)
+    plt.close(figure)
+    return output.resolve()
+
+
 def scale_positive_u8(image: np.ndarray, high_percentile: float = 99.7) -> np.ndarray:
     if high_percentile <= 0.0 or high_percentile > 100.0:
         raise ValueError(f"high_percentile must be in (0, 100], got {high_percentile}")

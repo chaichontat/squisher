@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
+import hashlib
+import json
 import math
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -79,9 +82,11 @@ def rechunk_ome_zarr(
                 f"dtype {source_arrays[0].dtype}"
             )
 
-    temporary = destination.with_name(f".{destination.name}.tmp")
-    _prepare_output(destination=destination, temporary=temporary, overwrite=overwrite)
+    sidecars = _source_sidecars(source, source_paths, source_attrs, start_level=start_level)
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing output path: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent))
 
     level_summaries: list[dict[str, Any]] = []
     try:
@@ -146,8 +151,13 @@ def rechunk_ome_zarr(
                     }
                 )
 
+        for relative in sidecars:
+            target = temporary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / relative, target)
+        _source_sidecars(temporary, [str(i) for i in range(len(selected_paths))], output_attrs, start_level=0)
         output_root.attrs["squisher_complete"] = True
-        temporary.rename(destination)
+        _publish_output(temporary, destination, overwrite=overwrite)
     except BaseException:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -195,17 +205,119 @@ def _validate_options(
         raise ValueError(f"codec_concurrency must be positive, got {codec_concurrency}")
 
 
-def _prepare_output(*, destination: Path, temporary: Path, overwrite: bool) -> None:
-    existing = [path for path in (destination, temporary) if path.exists()]
-    if existing and not overwrite:
-        raise FileExistsError(
-            f"Refusing to overwrite existing output path(s): {', '.join(str(path) for path in existing)}"
+def _publish_output(temporary: Path, destination: Path, *, overwrite: bool) -> None:
+    if not destination.exists():
+        temporary.rename(destination)
+        return
+    if not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing output path: {destination}")
+    # Keep the prior output until the fully validated replacement can be installed.
+    backup = Path(tempfile.mkdtemp(prefix=f".{destination.name}.previous-", dir=destination.parent))
+    prior = backup / destination.name
+    destination.rename(prior)
+    try:
+        temporary.rename(destination)
+    except BaseException:
+        prior.rename(destination)
+        backup.rmdir()
+        raise
+    if prior.is_dir():
+        shutil.rmtree(prior)
+    else:
+        prior.unlink()
+    backup.rmdir()
+
+
+def _relative_sidecar(value: object, *, context: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} must be a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"{context} must stay inside the OME-Zarr store")
+    return path
+
+
+def _source_sidecars(
+    source: Path, dataset_paths: list[str], attrs: dict[str, Any], *, start_level: int,
+) -> list[Path]:
+    """Validate supported referenced members using the N4 sidecar policy."""
+    dataset_roots = {Path(path).parts[0] for path in dataset_paths}
+    allowed_roots = {"zarr.json", ".zgroup", ".zattrs", ".zmetadata", *dataset_roots}
+    files: list[Path] = []
+    has_provenance = any(key in attrs for key in ("squisher_fusion", "squisher_n4"))
+    if has_provenance and (start_level != 0 or dataset_paths != [str(i) for i in range(len(dataset_paths))]):
+        raise ValueError(
+            "Fusion/N4 provenance requires start_level=0 and unchanged numeric dataset paths; "
+            "rebasing would invalidate recorded level-0 geometry and dataset references"
         )
-    for path in existing:
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+    fusion = attrs.get("squisher_fusion")
+    if "squisher_fusion" in attrs:
+        if not isinstance(fusion, dict):
+            raise ValueError("squisher_fusion must be an object")
+        relative = _relative_sidecar(fusion.get("manifest"), context="squisher_fusion.manifest")
+        bundle_root = relative.parts[0]
+        if bundle_root in allowed_roots:
+            raise ValueError("squisher_fusion.manifest overlaps an image dataset or store metadata")
+        bundle = source / bundle_root
+        if bundle.is_symlink():
+            raise ValueError(f"Fusion provenance bundle must not contain symlinks: {bundle}")
+        manifest_path = source / relative
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Fusion provenance manifest is missing: {manifest_path}")
+        for path in bundle.rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"Fusion provenance bundle must not contain symlinks: {path}")
+            if path.is_file():
+                files.append(path.relative_to(source))
+        manifest = json.loads(manifest_path.read_text())
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+            raise ValueError("Fusion provenance manifest must contain an artifacts list")
+        for artifact in manifest["artifacts"]:
+            if not isinstance(artifact, dict):
+                raise ValueError("Fusion provenance artifact must be an object")
+            artifact_path = _relative_sidecar(artifact.get("bundled_path"), context="fusion artifact.bundled_path")
+            if artifact_path.parts[0] != bundle_root or not (source / artifact_path).is_file():
+                raise FileNotFoundError(f"Fusion provenance artifact is missing: {source / artifact_path}")
+            payload = json.loads((source / artifact_path).read_text())
+            if not isinstance(payload, dict):
+                raise ValueError(f"Fusion provenance artifact must contain an object: {artifact_path}")
+        allowed_roots.add(bundle_root)
+    n4 = attrs.get("squisher_n4")
+    if "squisher_n4" in attrs:
+        if not isinstance(n4, dict):
+            raise ValueError("squisher_n4 must be an object")
+        relative = _relative_sidecar(n4.get("field_path"), context="squisher_n4.field_path")
+        if len(relative.parts) != 1 or relative.parts[0] in allowed_roots:
+            raise ValueError("squisher_n4.field_path must name a separate root sidecar file")
+        field_path = source / relative
+        if field_path.is_symlink():
+            raise ValueError(f"N4 field artifact must not be a symlink: {field_path}")
+        if not field_path.is_file():
+            raise FileNotFoundError(f"N4 field artifact is missing: {field_path}")
+        expected_digest = n4.get("field_sha256")
+        with field_path.open("rb") as handle:
+            actual_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        if not isinstance(expected_digest, str) or actual_digest != expected_digest:
+            raise ValueError(f"N4 field artifact checksum does not match: {field_path}")
+        field = np.load(field_path, mmap_mode="r", allow_pickle=False)
+        if list(field.shape) != n4.get("field_shape"):
+            raise ValueError(f"N4 field artifact shape does not match: {field_path}")
+        files.append(relative)
+        allowed_roots.add(relative.parts[0])
+        sidecar_digests = n4.get("source_sidecars_sha256", {})
+        if not isinstance(sidecar_digests, dict):
+            raise ValueError("squisher_n4.source_sidecars_sha256 must be an object")
+        for name, digest in sidecar_digests.items():
+            path = _relative_sidecar(name, context="squisher_n4.source_sidecars_sha256")
+            if path not in files:
+                raise ValueError(f"N4 references unsupported sidecar: {path}")
+            with (source / path).open("rb") as handle:
+                if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+                    raise ValueError(f"N4 source sidecar checksum does not match: {path}")
+    unsupported = sorted(path.name for path in source.iterdir() if path.name not in allowed_roots)
+    if unsupported:
+        raise ValueError(f"{source} contains unsupported auxiliary store nodes: {unsupported}")
+    return files
 
 
 def _dimension_names(root: Any, array: Any, *, source: Path, path: str) -> tuple[str, ...]:

@@ -124,9 +124,11 @@ def test_fused_fixed_registered_affine_maps_local_model_to_fixed_physical_space(
         np.testing.assert_allclose(actual[:3], expected)
 
 
+@pytest.mark.parametrize("source_channel", [0, 2])
 def test_export_fused_fixed_materializes_overlap_without_changing_registered_world_mapping(
     monkeypatch,
     tmp_path,
+    source_channel,
 ) -> None:
     source = tmp_path / "source.ome.zarr"
     source.mkdir()
@@ -139,7 +141,7 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
                         "tile": "tile.ome.tif",
                         "path": str(source),
                         "axes": "CZYX",
-                        "shape": [2, 1440, 1440, 1440],
+                        "shape": [3, 1440, 1440, 1440],
                         "scale_um": {"z": 0.6, "y": 0.3, "x": 0.2},
                     }
                 ]
@@ -189,7 +191,7 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
         assert path == correction_path
         assert moving_by_tile["tile.ome.tif"]["path"] == str(source)
         assert moving_position_input == moving_position
-        assert source_channel == 0
+        assert source_channel in (0, 2)
         return {str(source.resolve()): correction}
 
     def fake_materialize(**kwargs):
@@ -212,6 +214,8 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
         moving_position_input=moving_position,
         output_dir=tmp_path / "out",
         output_codec="zstd",
+        source_channel=source_channel,
+        output_channel_label="514",
         residual_correction=correction_path,
         level_factor_zyx=(4, 4, 4),
     )
@@ -224,6 +228,10 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
     assert position["units"] == "micrometer"
     registration = json.loads(outputs["registration"].read_text())
     record = registration["tiles"][0]
+    assert record["channels"] == ["514"]
+    assert position["tiles"][0]["channels"] == ["514"]
+    assert record["materialized_source_channel"] == source_channel
+    assert calls[0]["source_channel"] == source_channel
     assert record["shape"] == [132, 132, 132]
     assert record["materialized_source_start_zyx"] == [912, 912, 912]
     assert record["materialized_fixed_origin_um"] == record["stage_translation_um"]
@@ -241,6 +249,24 @@ def test_export_fused_fixed_materializes_overlap_without_changing_registered_wor
     assert position["residual_correction"] == expected_identity
     assert registration["residual_correction"] == expected_identity
     assert summary["residual_correction"] == expected_identity
+
+
+    # Relabeling metadata must reuse completed pixels, with source channel provenance intact.
+    monkeypatch.setattr(tile_quadrant_fusion, "_completed_materialization_shape", lambda task: [132, 132, 132])
+    resumed = export_fused_fixed_overlapping_materialized_chunks(
+        source_registration_input=registration_input,
+        moving_position_input=moving_position,
+        output_dir=tmp_path / "out",
+        output_codec="zstd",
+        source_channel=source_channel,
+        output_channel_label="514-reviewed",
+        residual_correction=correction_path,
+        level_factor_zyx=(4, 4, 4),
+        resume=True,
+    )
+    assert len(calls) == 1
+    assert json.loads(resumed["position"].read_text())["tiles"][0]["channels"] == ["514-reviewed"]
+    assert json.loads(resumed["summary"].read_text())["output_channel_label"] == "514-reviewed"
 
 
 def test_export_fused_fixed_uses_explicit_pixel_source_registration(monkeypatch, tmp_path) -> None:
@@ -1383,3 +1409,162 @@ def test_native_source_group_writes_oriented_windows_for_flipped_source(monkeypa
     np.testing.assert_array_equal(
         zarr.open_group(str(tmp_path / "window.ome.zarr"), mode="r")["0"][:], oriented[1:4, 0:6, 2:6]
     )
+
+@pytest.mark.parametrize("label", ["", " ", " 514", "514 "])
+def test_materialization_rejects_invalid_output_channel_labels(tmp_path, label):
+    with pytest.raises(ValueError, match="output_channel_label"):
+        export_fused_fixed_overlapping_materialized_chunks(
+            moving_position_input=tmp_path / "missing.json",
+            output_dir=tmp_path / "out",
+            output_codec="zstd",
+            output_channel_label=label,
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def _explicit_domain_inputs(tmp_path):
+    source = tmp_path / "source.ome.zarr"
+    data = np.arange(2 * 10 * 8 * 9, dtype=np.uint16).reshape(2, 10, 8, 9)
+    _source_ome_zarr(source, data, axes="CZYX", chunks=(1, 2, 8, 9))
+    position = tmp_path / "moving.positions.json"
+    position.write_text(json.dumps({"tiles": [{"tile": "source.ome.zarr", "path": str(source),
+        "shape": list(data.shape), "axes": "CZYX", "translation_um": dict(zip("zyx", [10, 20, 30], strict=True)),
+        "scale_um": dict(zip("zyx", [.6, .3, .2], strict=True))}]}))
+    matrix = np.array([[1., .08, 0], [0, 1., .04], [0, 0, 1.]])
+    translation = np.array([.7, -.3, .2])
+    rows, windows = [], []
+    for number,(start,stop,policy) in enumerate([
+        ([0, 1, 2], [3, 5, 7], "retained_published_mapping"),
+        ([5, 2, 3], [10, 8, 9], "validated_refinement"),
+    ]):
+        shape = np.array(stop)-start
+        fixed_start = np.array([20, 30, 40])
+        center = (shape-1)/2
+        pull = np.linalg.inv(matrix)
+        offset = np.array(start)-pull@(fixed_start+center+translation-matrix@center)
+        transform_path = tmp_path / f"transform{number}.json"
+        row = {"status": "accepted", "moving_tile": "source.ome.zarr", "quadrant": f"qy0_qx{number}",
+            "moving_start_l0_zyx": start, "moving_stop_l0_zyx": stop, "moving_shape_zyx": shape.tolist(),
+            "fixed_start_zyx": fixed_start.tolist(), "fused_scale_zyx": [.6, .3, .2],
+            "fused_translation_zyx": [-5., 7., 11.], "selected_attempt": "published_or_validated",
+            "selected_local_matrix_zyx": matrix.tolist(), "selected_local_translation_zyx": translation.tolist(),
+            "selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx": pull.tolist(),
+            "selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx": offset.tolist()}
+        transform_path.write_text(json.dumps(row))
+        row.update(artifact_type="lightsheet.fused_fixed_explicit_domain.v1", domain_policy=policy,
+                   parent_window_json=str(transform_path), transform_record_json=str(transform_path))
+        window = tmp_path / f"domain{number}.json"
+        window.write_text(json.dumps(row))
+        rows.append(row)
+        windows.append({"level0_json": str(window)})
+    summary = tmp_path / "explicit.summary.json"
+    summary.write_text(json.dumps({"artifact_type": "lightsheet.fused_fixed_explicit_domain_summary.v1", "windows": windows}))
+    return position, summary, data, rows
+
+
+def test_explicit_domains_materialize_mixed_shapes_pixels_world_mapping_and_resume(tmp_path):
+    import zarr
+
+    position, summary, data, rows = _explicit_domain_inputs(tmp_path)
+    kwargs = dict(source_summary_input=summary, moving_position_input=position, output_dir=tmp_path/"out",
+                  output_codec="zstd", source_channel=1, level_factor_zyx=(1, 1, 1), use_explicit_domains=True)
+    result = export_fused_fixed_overlapping_materialized_chunks(**kwargs)
+    output = json.loads(result["registration"].read_text())
+    assert json.loads(result["summary"].read_text())["status"] == "complete"
+    assert [r["shape"] for r in output["tiles"]] == [[3, 4, 5], [5, 6, 6]]
+    for row,record in zip(rows,output["tiles"],strict=True):
+        start,stop = np.array(row["moving_start_l0_zyx"]),np.array(row["moving_stop_l0_zyx"])
+        crop = zarr.open_group(record["path"],mode="r")["0"]
+        np.testing.assert_array_equal(crop[:],data[(1,*tuple(slice(a,b) for a,b in zip(start,stop,strict=True)))])
+        assert record["domain_policy"] == row["domain_policy"]
+        assert record["parent_window_json"] == row["parent_window_json"]
+        assert record["selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx"] == row["selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx"]
+        local = np.array([1., 2., 1.])
+        materialized_world = np.array([record["stage_translation_um"][a] for a in "zyx"])+local*np.array([.6, .3, .2])
+        registered_world = np.array(record["registered_affine"]["matrix"])@np.r_[materialized_world,1.]
+        pull = np.array(row["selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx"])
+        fixed_index = np.linalg.solve(pull,start+local-np.array(row["selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx"]))
+        np.testing.assert_allclose(registered_world[:3],np.array([-5., 7., 11.])+fixed_index*[.6, .3, .2],atol=1e-10)
+    export_fused_fixed_overlapping_materialized_chunks(**kwargs,resume=True)
+    payload = json.loads((tmp_path/"domain1.json").read_text())
+    payload["transform_record_json"] = payload["parent_window_json"] = str(tmp_path/"transform0.json")
+    (tmp_path/"domain1.json").write_text(json.dumps(payload))
+    with pytest.raises(ValueError,match="materialization plan differs"):
+        export_fused_fixed_overlapping_materialized_chunks(**kwargs,resume=True)
+
+
+@pytest.mark.parametrize("change,match",[
+    ({"artifact_type": "wrong"}, "explicit-domain record"),
+    ({"status": "rejected"}, "not accepted"),
+    ({"domain_policy": "refit_anything"}, "domain_policy"),
+    ({"parent_window_json": ""}, "parent_window_json"),
+    ({"moving_shape_zyx": [2, 4, 5]}, "shape does not match"),
+    ({"moving_start_l0_zyx": [-1, 1, 2], "moving_shape_zyx": [4, 4, 5]}, "outside source bounds"),
+    ({"moving_stop_l0_zyx": [11, 5, 7], "moving_shape_zyx": [11, 4, 5]}, "outside source bounds"),
+    ({"moving_start_l0_zyx": [0.5, 1, 2]}, "integer moving_start"),
+    ({"selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx": [float("nan"), 0, 0]}, "finite"),
+])
+def test_explicit_domains_reject_invalid_metadata_before_writes(tmp_path,change,match):
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    path = tmp_path/"domain0.json"
+    path.write_text(json.dumps(json.loads(path.read_text())|change))
+    with pytest.raises(ValueError,match=match):
+        export_fused_fixed_overlapping_materialized_chunks(source_summary_input=summary,moving_position_input=position,
+            output_dir=tmp_path/"out",output_codec="zstd",level_factor_zyx=(1, 1, 1),use_explicit_domains=True)
+    assert not (tmp_path/"out").exists()
+
+
+def test_explicit_domains_reject_wrong_summary_and_missing_optin(tmp_path):
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    kwargs = dict(source_summary_input=summary,moving_position_input=position,output_dir=tmp_path/"out",output_codec="zstd")
+    with pytest.raises(ValueError,match="supplied together"):
+        export_fused_fixed_overlapping_materialized_chunks(**kwargs)
+    summary.write_text(json.dumps({"windows": []}))
+    with pytest.raises(ValueError,match="supplied together"):
+        export_fused_fixed_overlapping_materialized_chunks(**kwargs,use_explicit_domains=True)
+    with pytest.raises(ValueError,match="requires source_summary_input"):
+        export_fused_fixed_overlapping_materialized_chunks(source_registration_input=summary,moving_position_input=position,
+            output_dir=tmp_path/"out",output_codec="zstd",use_explicit_domains=True)
+
+
+def test_explicit_domains_reject_downsample_incompatible_shape(tmp_path):
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    with pytest.raises(ValueError,match="divisible by level factors"):
+        export_fused_fixed_overlapping_materialized_chunks(source_summary_input=summary,moving_position_input=position,
+            output_dir=tmp_path/"out",output_codec="zstd",level_factor_zyx=(2, 2, 2),use_explicit_domains=True)
+
+
+
+def test_explicit_materializer_cli_requires_summary(tmp_path):
+    from typer.testing import CliRunner
+    from squisher_lightsheet.cli import app
+
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    result = CliRunner().invoke(app,["fused-fixed-materialize-overlap", "--moving-position", str(position),
+        "--source-registration", str(summary), "--output-dir", str(tmp_path/"out"), "--output-codec", "zstd",
+        "--use-explicit-domains"])
+    assert result.exit_code == 2
+    assert "requires --source-summary" in result.output
+    assert not (tmp_path/"out").exists()
+
+
+def test_explicit_domains_resume_rejects_changed_record_shape(tmp_path):
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    kwargs = dict(source_summary_input=summary,moving_position_input=position,output_dir=tmp_path/"out",
+                  output_codec="zstd",level_factor_zyx=(1,1,1),use_explicit_domains=True)
+    export_fused_fixed_overlapping_materialized_chunks(**kwargs)
+    path = tmp_path/"domain0.json"
+    row = json.loads(path.read_text())
+    row["moving_stop_l0_zyx"][0] = 2
+    row["moving_shape_zyx"][0] = 2
+    path.write_text(json.dumps(row))
+    with pytest.raises(ValueError,match="materialization plan differs"):
+        export_fused_fixed_overlapping_materialized_chunks(**kwargs,resume=True)
+
+
+def test_explicit_domains_reject_empty_manifest(tmp_path):
+    position,summary,_data,_rows = _explicit_domain_inputs(tmp_path)
+    summary.write_text(json.dumps({"artifact_type": "lightsheet.fused_fixed_explicit_domain_summary.v1", "windows": []}))
+    with pytest.raises(ValueError,match="nonempty windows"):
+        export_fused_fixed_overlapping_materialized_chunks(source_summary_input=summary,moving_position_input=position,
+            output_dir=tmp_path/"out",output_codec="zstd",use_explicit_domains=True)

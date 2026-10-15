@@ -970,6 +970,7 @@ def masked_structural_translation_gpu(
     highpass_sigma_zyx: tuple[float, float, float],
     exclusion_radius_zyx: tuple[int, int, int],
     overlap_ratio: float = 0.3,
+    subpixel: bool = False,
 ) -> StructuralTranslation:
     """Bounded masked-NCC translation search on in-mask high-passed structure.
 
@@ -1023,7 +1024,16 @@ def masked_structural_translation_gpu(
     excluded[
         tuple(slice(max(0, int(i - r)), int(i + r + 1)) for i, r in zip(peak_index, radius, strict=True))
     ] = -1.0
-    shift = -(peak_index - bounds)
+    shift = -(peak_index - bounds).astype(np.float64)
+    if subpixel and not np.any(np.abs(shift) == bounds):
+        for axis in range(3):
+            left_index, right_index = peak_index.copy(), peak_index.copy()
+            left_index[axis] -= 1
+            right_index[axis] += 1
+            left, right = float(window[tuple(left_index)]), float(window[tuple(right_index)])
+            curvature = left - 2.0 * peak + right
+            if curvature < 0:
+                shift[axis] -= 0.5 * (left - right) / curvature
     return StructuralTranslation(
         shift_zyx=(float(shift[0]), float(shift[1]), float(shift[2])),
         peak_ncc=peak,

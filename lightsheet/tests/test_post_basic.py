@@ -951,3 +951,26 @@ def test_spawned_z_validation_reports_worker_failure_with_plane_context() -> Non
             source_field_penalty=0.03,
             validation_workers=2,
         )
+
+
+def test_pair_metrics_preserve_opposing_spatial_errors() -> None:
+    from squisher_lightsheet.post_basic import _pair_metrics
+
+    # Each overlap is equally bright and dark at opposite edges, as in CR514.
+    residual = np.array([-0.3, -0.2, -0.1, 0.1, 0.2, 0.3, -0.4, 0.4])
+    pair = np.array([0, 0, 0, 0, 0, 0, 1, 1])
+    metric = _pair_metrics(residual, pair)
+    assert metric["pairs"] == 2
+    assert metric["median"] == pytest.approx(0.3)
+    assert metric["p90"] == pytest.approx(0.38)
+    assert metric["pixel_abs_median"] == pytest.approx(0.25)
+
+
+def test_pair_metrics_keep_constant_gain_errors_and_equal_pair_weight() -> None:
+    from squisher_lightsheet.post_basic import _pair_metrics
+
+    residual = np.array([-0.2] * 100 + [0.4] * 2)
+    pair = np.array([0] * 100 + [1] * 2)
+    metric = _pair_metrics(residual, pair)
+    assert metric["median"] == pytest.approx(0.3)
+    assert metric["p90"] == pytest.approx(0.38)

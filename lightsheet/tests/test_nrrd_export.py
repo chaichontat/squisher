@@ -171,3 +171,56 @@ def test_export_nrrd_cli_forwards_contract(tmp_path: Path, monkeypatch) -> None:
         "slab_planes": 12,
         "progress": cli_module._log_progress,
     }
+
+
+def test_export_nrrd_accepts_identity_normalization_at_anisotropic_spacing(tmp_path: Path) -> None:
+    source = tmp_path / "source.ome.zarr"
+    expected = _write_source(source)[1]
+    root = zarr.open_group(source, mode="r+")
+    ome = root.attrs["ome"]
+    scale = [14.456000000000003, 2.401979128496805, 2.40197912849726]
+    origin = [-14.69218596780324, -487.78844716126207, -1661.0594942518562]
+    ome["multiscales"][0]["datasets"][1]["coordinateTransformations"] = [
+        {"type": "scale", "scale": scale},
+        {"type": "translation", "translation": origin},
+    ]
+    root.attrs["ome"] = ome
+    output = tmp_path / "561.nrrd"
+
+    summary = export_nrrd(source=source, output=output, level=1, channel="561")
+
+    image = sitk.ReadImage(output)
+    np.testing.assert_array_equal(sitk.GetArrayFromImage(image), expected)
+    np.testing.assert_allclose(image.GetSpacing(), np.asarray(scale)[::-1] / 1000, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(image.GetOrigin(), np.asarray(origin)[::-1] / 1000, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(image.GetDirection()).reshape(3, 3), np.eye(3), rtol=0, atol=np.finfo(np.float64).eps
+    )
+    assert summary["all_voxels_equal"] is True
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [
+        (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+    ],
+    ids=["rotation", "reflection"],
+)
+def test_validate_nrrd_rejects_nonidentity_direction(tmp_path: Path, direction: tuple[float, ...]) -> None:
+    from squisher_lightsheet.nrrd_export import _validate_nrrd
+
+    path = tmp_path / "nonidentity.nrrd"
+    image = sitk.GetImageFromArray(np.zeros((2, 3, 4), dtype=np.uint16))
+    image.SetSpacing((0.003, 0.002, 0.001))
+    image.SetDirection(direction)
+    sitk.WriteImage(image, path)
+
+    with pytest.raises(ValueError, match="direction is not identity"):
+        _validate_nrrd(
+            path,
+            sitk=sitk,
+            expected_shape_zyx=(2, 3, 4),
+            expected_scale_zyx_um=np.array([1.0, 2.0, 3.0]),
+            expected_origin_zyx_um=np.zeros(3),
+        )

@@ -237,7 +237,9 @@ def _validate_nrrd(
         raise ValueError("NRRD spacing does not match the selected OME-Zarr level")
     if not np.allclose(reader.GetOrigin(), expected_origin_zyx_um[::-1] / 1000, rtol=0, atol=1e-12):
         raise ValueError("NRRD origin does not match the selected OME-Zarr level")
-    if not np.array_equal(np.asarray(reader.GetDirection()).reshape(3, 3), np.eye(3)):
+    if not np.allclose(
+        np.asarray(reader.GetDirection()).reshape(3, 3), np.eye(3), rtol=0, atol=np.finfo(np.float64).eps
+    ):
         raise ValueError("NRRD direction is not identity")
 
     digest = hashlib.sha256()

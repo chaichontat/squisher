@@ -31,8 +31,11 @@ decide whether a run is usable.
 - `lightsheet-stitch register` defaults to level-0 phase correlation followed
   by axis-prior shifted-crop phase recovery. Native Method8 is opt-in with
   `--method8`; it must not run in the default side-internal workflow.
-- `lightsheet-stitch register` accepts only a validated, human-reviewed tiled
-  `uint16` YX OME-TIFF and its explicit threshold. It generates and consumes a
+- Before `lightsheet-stitch register`, inspect the threshold-review render from
+  the exact processed inputs and record the selected threshold with that artifact.
+  The command accepts the input positions, tiles, and explicit numeric threshold;
+  it treats the threshold as the caller's attestation and does not validate a
+  review-render association. It generates and consumes a
   complete level-2 pair-by-Z-chunk screen before any level-0 crop read; it has
   no automatic-threshold, unmasked, caller-supplied-screen, or partial-pair mode.
   `--level 2` uses the reviewed phase workflow entirely at level 2.

@@ -7,7 +7,8 @@ import pytest
 from squisher_lightsheet import workflow
 
 
-def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("channel", [0, 1])
+def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_path, channel) -> None:
     monkeypatch.setattr(workflow, "run_lr_dumb_stitch_alignment", lambda **_kwargs: None)
     register_calls = []
     monkeypatch.setattr(
@@ -26,16 +27,18 @@ def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_
         left_dir=left,
         right_dir=right,
         output_prefix=tmp_path / "sample",
-        channel=0,
+        channel=channel,
         do_fuse=True,
         do_pyramid=True,
     )
 
     summary = json.loads(paths.summary_json.read_text())
     assert summary["outputs"]["fusion_base_output"].endswith("fused.ome.zarr")
-    assert summary["outputs"]["fusion_outputs"] == [str((paths.registration_dir / "fused.ch0.ome.zarr").resolve())]
+    assert summary["outputs"]["fusion_outputs"] == [
+        str((paths.registration_dir / f"fused.ch{channel}.ome.zarr").resolve())
+    ]
     assert summary["outputs"]["corrected_overlay"] == str(paths.corrected_overlay.resolve())
-    assert paths.corrected_overlay.name == "level2_phase_corrected_zyx_yellowOverlay_ch0.png"
+    assert paths.corrected_overlay.name == f"level2_phase_corrected_zyx_yellowOverlay_ch{channel}.png"
     assert "search_margin_px" in summary["parameters"]
     assert "phase_upsample_factor" in summary["parameters"]
     assert summary["parameters"]["rough_phase_level"] == 2
@@ -44,6 +47,7 @@ def test_run_tltr_summary_records_actual_fused_channel_outputs(monkeypatch, tmp_
     assert summary["parameters"]["rough_phase_z_sampling"] == "native_center_z_slab"
     assert summary["parameters"]["rough_phase_z_slab_planes"] == 8
     assert register_calls[0]["registration_pair_mode"] == "axis-aligned"
+    assert register_calls[0]["channels"] == [channel]
     assert {"position", "rough_phase", "registration", "qc", "fusion", "pyramid"} <= set(summary["commands"])
     assert summary["commands"]["pyramid"] == "fusion builds completed OME-Zarr pyramid"
 

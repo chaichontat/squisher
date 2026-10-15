@@ -133,3 +133,30 @@ def scale_translation(
                 has_translation = True
                 translation = [current + offset for current, offset in zip(translation, numeric, strict=True)]
     return list(names), scale, translation, has_scale, has_translation
+
+
+def require_same_multiscale_grid(store: Path, template: Path, *, tolerance_um: float = 1e-6) -> None:
+    """Fail unless ``store`` lies on ``template``'s grid: the same spatial axes, shapes, scales, and origins per level."""
+    import numpy as np
+    import zarr
+
+    groups = {path: zarr.open_group(str(path), mode="r") for path in (store, template)}
+    levels = {path: dataset_paths(group) for path, group in groups.items()}
+    if len(levels[store]) != len(levels[template]):
+        raise ValueError(f"{store} has {len(levels[store])} pyramid levels; {template} has {len(levels[template])}")
+    for index, (path, template_path) in enumerate(zip(levels[store], levels[template], strict=True)):
+        names, scale, origin, *_ = scale_translation(groups[store], dataset_index=index)
+        template_names, template_scale, template_origin, *_ = scale_translation(groups[template], dataset_index=index)
+        shape = tuple(groups[store][path].shape[-3:])
+        template_shape = tuple(groups[template][template_path].shape[-3:])
+        if (
+            names[-3:] != template_names[-3:]
+            or shape != template_shape
+            or not np.allclose(scale[-3:], template_scale[-3:], rtol=0.0, atol=tolerance_um)
+            or not np.allclose(origin[-3:], template_origin[-3:], rtol=0.0, atol=tolerance_um)
+        ):
+            raise ValueError(
+                f"{store} level {index} ({names[-3:]}, shape {shape}, scale {scale[-3:]}, origin {origin[-3:]}) is "
+                f"not on {template}'s grid ({template_names[-3:]}, {template_shape}, {template_scale[-3:]}, "
+                f"{template_origin[-3:]})"
+            )

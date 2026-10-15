@@ -15,12 +15,14 @@ from scipy.ndimage import label, map_coordinates
 from skimage.registration._masked_phase_cross_correlation import cross_correlate_masked
 import zarr
 
+from squisher.ome_geometry import ome_spatial_grid
 from squisher_lightsheet.artifact_io import read_json_object
 from squisher_lightsheet.fused_fixed import (
     LINEAR_MAPPING_RECOVERY_ATTEMPT,
     SPATIAL_RECOVERY_ATTEMPT,
 )
 from squisher_lightsheet.global_phase import masked_highpass
+from squisher_lightsheet.ngff import axes
 from squisher_lightsheet.qc import load_qc_font
 
 
@@ -44,6 +46,11 @@ RESIDUAL_MAX_SHIFT_PX = 16
 RESIDUAL_PEAK_EXCLUSION_PX = 3
 RESIDUAL_MIN_NCC = 0.20
 RESIDUAL_MIN_PEAK_MARGIN = 0.10
+# Aggregate residual: mean masked-NCC surface over evenly spaced planes spanning the central three
+# quarters of the window. In prod3 514, 148/150 residual-verified windows passed it with no shift
+# of 4 or more level-2 px, while it measured windows the three-plane check left unverified.
+AGGREGATE_RESIDUAL_PLANE_COUNT = 13
+AGGREGATE_RESIDUAL_MAX_SHIFT_PX = 40
 DEFAULT_INTERPOLATED_QC_COLUMNS = 14
 THUMBNAIL_SIZE = 184
 CELL_WIDTH = 220
@@ -79,10 +86,10 @@ def _stretch(values: np.ndarray) -> np.ndarray:
 
 def _validate_summary_geometry(summary: dict[str, Any], source: Path) -> None:
     shape = summary.get("window_shape_zyx")
-    if not isinstance(shape, list | tuple) or list(shape) != [WINDOW, WINDOW, WINDOW]:
+    if not isinstance(shape, list | tuple) or tuple(shape) not in ((WINDOW, WINDOW, WINDOW), (128, WINDOW, WINDOW)):
         raise ValueError(
             f"{source} uses unsupported window_shape_zyx {shape}; expected "
-            f"{[WINDOW, WINDOW, WINDOW]}"
+            f"{[WINDOW, WINDOW, WINDOW]} or {[128, WINDOW, WINDOW]}"
         )
 
 
@@ -92,10 +99,14 @@ def plane_support_bounds(
     translation: np.ndarray,
     fixed_z_l0: int,
     canvas_shape: tuple[int, int],
+    *,
+    window_shape_zyx: tuple[int, int, int] = (WINDOW, WINDOW, WINDOW),
 ) -> tuple[int, int, int, int] | None:
-    center = (WINDOW - 1.0) / 2.0
+    shape = np.asarray(window_shape_zyx, dtype=np.float64)
+    center = (shape - 1.0) / 2.0
+    corners = CUBE_CORNERS / (WINDOW - 1.0) * (shape - 1.0)
     transformed = (
-        (matrix @ (CUBE_CORNERS - center).T).T
+        (matrix @ (corners - center).T).T
         + center
         + translation
         + fixed_start
@@ -135,6 +146,37 @@ def _selected_transform(row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _sampling_array(root: zarr.Group, path: Path, *, moving: bool) -> zarr.Array:
+    """Validate the native-index mapping used by recovery image sampling."""
+    if "0" not in root or str(LEVEL) not in root:
+        raise ValueError(f"{path}: recovery sampling requires native and level-{LEVEL} arrays")
+    metadata = dict(root.attrs)
+    native_grid = ome_spatial_grid(metadata, "0")
+    sampled_grid = ome_spatial_grid(metadata, str(LEVEL))
+    if native_grid is None or sampled_grid is None:
+        raise ValueError(f"{path}: recovery sampling requires explicit physical metadata")
+    native, sampled = root["0"], root[str(LEVEL)]
+    expected_axes = "CZYX" if moving else "ZYX"
+    if axes(root, native) != expected_axes or axes(root, sampled) != expected_axes:
+        raise ValueError(f"{path}: recovery sampling requires {expected_axes} arrays")
+    if native_grid["units"] != ["micrometer"] * 3 or sampled_grid["units"] != native_grid["units"]:
+        raise ValueError(f"{path}: recovery sampling requires spatial units in micrometers")
+    native_scale = np.asarray(native_grid["scale"], dtype=np.float64)
+    factors = (1, MOVING_XY_FACTOR, MOVING_XY_FACTOR) if moving else (FIXED_LEVEL_FACTOR,) * 3
+    index_offset = (
+        np.asarray(sampled_grid["translation"], dtype=np.float64)
+        - np.asarray(native_grid["translation"], dtype=np.float64)
+    ) / native_scale
+    if not np.allclose(
+        np.asarray(sampled_grid["scale"], dtype=np.float64) / native_scale,
+        factors, rtol=0, atol=1e-9,
+    ) or not np.allclose(index_offset, 0, rtol=0, atol=1e-9):
+        raise ValueError(f"{path}: recovery sampling requires factors {factors} and zero relative index offset")
+    if moving and sampled.shape[0] != native.shape[0]:
+        raise ValueError(f"{path}: recovery sampling channel count differs from the native source")
+    return sampled
+
+
 def _sample_moving_plane(
     *,
     row: dict[str, Any],
@@ -143,6 +185,7 @@ def _sample_moving_plane(
     fixed_z_l0: int,
     bounds: tuple[int, int, int, int],
     arrays: dict[str, zarr.Array],
+    window_shape_zyx: tuple[int, int, int] = (WINDOW, WINDOW, WINDOW),
 ) -> tuple[np.ndarray, np.ndarray]:
     fixed_start = np.asarray(row["fixed_start_zyx"], dtype=np.float64)
     y0, y1, x0, x1 = bounds
@@ -158,7 +201,8 @@ def _sample_moving_plane(
             xx - fixed_start[2],
         ]
     )
-    center = (WINDOW - 1.0) / 2.0
+    shape = np.asarray(window_shape_zyx, dtype=np.float64)
+    center = ((shape - 1.0) / 2.0)[:, None]
     moving_local = (
         np.linalg.inv(matrix)
         @ (fixed_local.reshape(3, -1) - center - translation[:, None])
@@ -169,8 +213,11 @@ def _sample_moving_plane(
     )[:, None]
     path = str(row["moving_path"])
     if path not in arrays:
-        arrays[path] = zarr.open_group(path, mode="r")[str(LEVEL)]
+        arrays[path] = _sampling_array(zarr.open_group(path, mode="r"), Path(path), moving=True)
     source = arrays[path]
+    channel = row.get("moving_channel")
+    if type(channel) is not int or not 0 <= channel < source.shape[0]:
+        raise ValueError(f"{path}: recovery sampling requires an explicit valid acquisition channel, got {channel!r}")
     coords = np.vstack(
         [
             moving_global[0],
@@ -179,7 +226,7 @@ def _sample_moving_plane(
         ]
     )
     valid = np.all(moving_local >= 0.0, axis=0) & np.all(
-        moving_local <= WINDOW - 1.0, axis=0
+        moving_local <= (shape - 1.0)[:, None], axis=0
     )
     valid &= np.all(coords >= 0.0, axis=0) & np.all(
         coords <= np.asarray(source.shape[-3:], dtype=np.float64)[:, None] - 1.0,
@@ -196,7 +243,7 @@ def _sample_moving_plane(
         )
         block = np.asarray(
             source[
-                int(row.get("moving_channel", 0)),
+                channel,
                 lo[0] : hi[0],
                 lo[1] : hi[1],
                 lo[2] : hi[2],
@@ -231,6 +278,13 @@ class PlaneShift:
         )
 
 
+def residual_corrected_transform(transform: np.ndarray, residual_yx: Sequence[float]) -> np.ndarray:
+    """Apply a level-2 in-plane residual shift to a window transform's level-0 fixed-space translation."""
+    corrected = np.asarray(transform, dtype=np.float64).copy()
+    corrected[10:12] += MOVING_XY_FACTOR * np.asarray(residual_yx, dtype=np.float64)
+    return corrected
+
+
 class WindowImageScorer:
     """Compare window transforms against the fixed volume on shared level-2 planes.
 
@@ -242,16 +296,19 @@ class WindowImageScorer:
     ``log1p``); the tissue mask stays on raw fixed intensity.
     """
 
-    def __init__(self, fixed_fused: Path, fixed_threshold: float, intensity_transform: str) -> None:
+    def __init__(self, fixed_fused: Path, fixed_threshold: float, intensity_transform: str,
+                 *, window_shape_zyx: tuple[int, int, int] = (WINDOW, WINDOW, WINDOW)) -> None:
         if intensity_transform not in ("linear", "log1p"):
             raise ValueError(f"Unsupported fit intensity transform: {intensity_transform!r}")
-        self._fixed = zarr.open_group(str(fixed_fused), mode="r")[str(LEVEL)]
+        self._window_shape = window_shape_zyx
+        self._fixed = _sampling_array(zarr.open_group(fixed_fused, mode="r"), fixed_fused, moving=False)
         self._fixed_threshold = float(fixed_threshold)
         self._log1p = intensity_transform == "log1p"
         self._arrays: dict[str, zarr.Array] = {}
 
     def _planes(
-        self, row: dict[str, Any], transforms: Sequence[np.ndarray]
+        self, row: dict[str, Any], transforms: Sequence[np.ndarray],
+        offsets_l0: Sequence[float] | None = None,
     ) -> list[tuple[np.ndarray, list[np.ndarray], np.ndarray]]:
         fixed_start = np.asarray(row["fixed_start_zyx"], dtype=np.float64)
         candidates = [
@@ -259,11 +316,13 @@ class WindowImageScorer:
         ]
         center_z = (
             fixed_start[0]
-            + (WINDOW - 1.0) / 2.0
+            + (self._window_shape[0] - 1.0) / 2.0
             + float(np.mean([translation[0] for _matrix, translation in candidates]))
         )
         planes = []
-        for offset in IMAGE_SCORE_PLANE_OFFSETS_L0:
+        if offsets_l0 is None:
+            offsets_l0 = (-self._window_shape[0] // 4, 0, self._window_shape[0] // 4)
+        for offset in offsets_l0:
             fixed_z = int(np.rint((center_z + offset) / FIXED_LEVEL_FACTOR))
             if not 0 <= fixed_z < self._fixed.shape[-3]:
                 continue
@@ -273,7 +332,8 @@ class WindowImageScorer:
                 for matrix, translation in candidates
                 if (
                     bounds := plane_support_bounds(
-                        fixed_start, matrix, translation, fixed_z_l0, self._fixed.shape[-2:]
+                        fixed_start, matrix, translation, fixed_z_l0, self._fixed.shape[-2:],
+                        window_shape_zyx=self._window_shape,
                     )
                 )
                 is not None
@@ -295,6 +355,7 @@ class WindowImageScorer:
                     fixed_z_l0=fixed_z_l0,
                     bounds=(y0, y1, x0, x1),
                     arrays=self._arrays,
+                    window_shape_zyx=self._window_shape,
                 )
                 moving_patches.append(sampled)
                 mask &= valid
@@ -325,44 +386,63 @@ class WindowImageScorer:
 
     def residual_shifts(self, row: dict[str, Any], transform: np.ndarray) -> list[PlaneShift]:
         """Bounded masked-NCC search for residual in-plane misalignment of one transform."""
-        shifts = []
-        for fixed_patch, (moving_patch,), mask in self._planes(row, [transform]):
-            fixed_signal = masked_highpass(fixed_patch, mask, IMAGE_SCORE_HIGHPASS_SIGMA_PX)
-            moving_signal = masked_highpass(moving_patch, mask, IMAGE_SCORE_HIGHPASS_SIGMA_PX)
-            xcorr = cross_correlate_masked(
-                moving_signal, fixed_signal, mask, mask, mode="full", overlap_ratio=0.3
-            )
-            origin = np.asarray(mask.shape) - 1
-            bound = RESIDUAL_MAX_SHIFT_PX
-            window = np.nan_to_num(
-                xcorr[
-                    origin[0] - bound : origin[0] + bound + 1,
-                    origin[1] - bound : origin[1] + bound + 1,
-                ],
-                nan=-1.0,
-            )
-            peak_y, peak_x = np.unravel_index(int(np.argmax(window)), window.shape)
-            peak = float(window[peak_y, peak_x])
-            excluded = window.copy()
-            radius = RESIDUAL_PEAK_EXCLUSION_PX
-            excluded[
-                max(0, peak_y - radius) : peak_y + radius + 1,
-                max(0, peak_x - radius) : peak_x + radius + 1,
-            ] = -1.0
-            shift = (float(bound - peak_y), float(bound - peak_x))
-            shifts.append(
-                PlaneShift(
-                    shift_yx=shift,
-                    peak_ncc=peak,
-                    second_peak_ncc=float(np.max(excluded)),
-                    at_search_edge=bool(max(abs(shift[0]), abs(shift[1])) == bound),
-                )
-            )
-        return shifts
+        return [
+            _surface_peak(_residual_surface(fixed_patch, moving_patch, mask, RESIDUAL_MAX_SHIFT_PX))
+            for fixed_patch, (moving_patch,), mask in self._planes(row, [transform])
+        ]
+
+    def aggregate_residual_shift(self, row: dict[str, Any], transform: np.ndarray) -> PlaneShift | None:
+        """Residual shift at the peak of the mean masked-NCC surface over many window planes.
+
+        Averaging surfaces lets windows whose individual planes are too weakly textured
+        for a confident peak still measure a consistent in-plane misalignment. Returns
+        None when no plane is informative.
+        """
+        half_span = 3.0 * self._window_shape[0] / 8.0
+        offsets = np.linspace(-half_span, half_span, AGGREGATE_RESIDUAL_PLANE_COUNT)
+        bound = AGGREGATE_RESIDUAL_MAX_SHIFT_PX
+        surfaces = [
+            _residual_surface(fixed_patch, moving_patch, mask, bound)
+            for fixed_patch, (moving_patch,), mask in self._planes(row, [transform], offsets)
+            if min(mask.shape) > bound
+        ]
+        if not surfaces:
+            return None
+        return _surface_peak(np.mean(surfaces, axis=0))
+
+
+def _residual_surface(
+    fixed_patch: np.ndarray, moving_patch: np.ndarray, mask: np.ndarray, bound: int
+) -> np.ndarray:
+    """Masked NCC of the moving plane shifted by up to ``bound`` pixels, centred on zero shift."""
+    fixed_signal = masked_highpass(fixed_patch, mask, IMAGE_SCORE_HIGHPASS_SIGMA_PX)
+    moving_signal = masked_highpass(moving_patch, mask, IMAGE_SCORE_HIGHPASS_SIGMA_PX)
+    xcorr = cross_correlate_masked(moving_signal, fixed_signal, mask, mask, mode="full", overlap_ratio=0.3)
+    origin = np.asarray(mask.shape) - 1
+    return np.nan_to_num(
+        xcorr[origin[0] - bound : origin[0] + bound + 1, origin[1] - bound : origin[1] + bound + 1],
+        nan=-1.0,
+    )
+
+
+def _surface_peak(surface: np.ndarray) -> PlaneShift:
+    bound = surface.shape[0] // 2
+    peak_y, peak_x = np.unravel_index(int(np.argmax(surface)), surface.shape)
+    excluded = surface.copy()
+    radius = RESIDUAL_PEAK_EXCLUSION_PX
+    excluded[max(0, peak_y - radius) : peak_y + radius + 1, max(0, peak_x - radius) : peak_x + radius + 1] = -1.0
+    shift = (float(bound - peak_y), float(bound - peak_x))
+    return PlaneShift(
+        shift_yx=shift,
+        peak_ncc=float(surface[peak_y, peak_x]),
+        second_peak_ncc=float(np.max(excluded)),
+        at_search_edge=bool(max(abs(shift[0]), abs(shift[1])) == bound),
+    )
 
 
 def _render_plane(
-    rows: list[dict[str, Any]], fixed_z_l0: int, canvas_shape: tuple[int, int]
+    rows: list[dict[str, Any]], fixed_z_l0: int, canvas_shape: tuple[int, int],
+    window_shape_zyx: tuple[int, int, int] = (WINDOW, WINDOW, WINDOW),
 ) -> tuple[np.ndarray, np.ndarray, int]:
     canvas = np.zeros(canvas_shape, dtype=np.float32)
     coverage = np.zeros(canvas_shape, dtype=np.uint16)
@@ -376,6 +456,7 @@ def _render_plane(
             translation,
             fixed_z_l0,
             canvas_shape,
+            window_shape_zyx=window_shape_zyx,
         )
         if bounds is None:
             continue
@@ -387,6 +468,7 @@ def _render_plane(
             fixed_z_l0=fixed_z_l0,
             bounds=bounds,
             arrays=arrays,
+            window_shape_zyx=window_shape_zyx,
         )
         np.maximum(
             canvas[y0:y1, x0:x1], sampled, out=canvas[y0:y1, x0:x1]
@@ -432,16 +514,22 @@ def render_prefusion_qc(
     fixed_volume: Path,
     fixed_threshold: float,
     output_dir: Path,
+    fixed_z_index: int | None = None,
 ) -> Path:
-    """Render middle-plane dumb stitches and geometric tissue-hole maps."""
+    """Render dumb stitches and geometric tissue-hole maps on one fixed level-2 plane.
+
+    The plane defaults to the fixed volume's middle; name another when a dataset does not reach it.
+    """
     if not summaries:
         raise ValueError("at least one recovery summary is required")
     labels = [label_name for label_name, _path in summaries]
     if len(labels) != len(set(labels)):
         raise ValueError(f"summary labels must be unique: {labels}")
     fixed_group = zarr.open_group(fixed_volume, mode="r")
-    fixed = fixed_group[str(LEVEL)]
-    fixed_z = fixed.shape[-3] // 2
+    fixed = _sampling_array(fixed_group, fixed_volume, moving=False)
+    fixed_z = fixed.shape[-3] // 2 if fixed_z_index is None else int(fixed_z_index)
+    if not 0 <= fixed_z < fixed.shape[-3]:
+        raise ValueError(f"fixed plane {fixed_z} lies outside the {fixed.shape[-3]}-plane level-{LEVEL} volume")
     fixed_z_l0 = fixed_z * FIXED_LEVEL_FACTOR
     fixed_plane = np.asarray(fixed[fixed_z], dtype=np.float32)
     tissue = fixed_plane >= fixed_threshold
@@ -466,7 +554,8 @@ def render_prefusion_qc(
         ]
         started = time.perf_counter()
         canvas, coverage, contributors = _render_plane(
-            rows, fixed_z_l0, fixed_plane.shape
+            rows, fixed_z_l0, fixed_plane.shape,
+            window_shape_zyx=tuple(summary["window_shape_zyx"]),
         )
         combined_coverage += coverage
         combined_contributors += contributors
@@ -573,10 +662,11 @@ def _render_interpolated_window(
     row: dict[str, Any],
     fixed: zarr.Array,
     moving_arrays: dict[str, zarr.Array],
+    *, window_shape_zyx: tuple[int, int, int] = (WINDOW, WINDOW, WINDOW),
 ) -> tuple[Image.Image, int]:
     fixed_start = np.asarray(row["fixed_start_zyx"], dtype=np.float64)
     matrix, translation = _selected_transform(row)
-    center = (WINDOW - 1.0) / 2.0
+    center = (window_shape_zyx[0] - 1.0) / 2.0
     fixed_z = int(
         np.clip(
             np.rint(
@@ -588,7 +678,8 @@ def _render_interpolated_window(
     )
     fixed_z_l0 = fixed_z * FIXED_LEVEL_FACTOR
     bounds = plane_support_bounds(
-        fixed_start, matrix, translation, fixed_z_l0, fixed.shape[-2:]
+        fixed_start, matrix, translation, fixed_z_l0, fixed.shape[-2:],
+        window_shape_zyx=window_shape_zyx,
     )
     if bounds is None:
         raise ValueError(
@@ -603,6 +694,7 @@ def _render_interpolated_window(
         fixed_z_l0=fixed_z_l0,
         bounds=bounds,
         arrays=moving_arrays,
+        window_shape_zyx=window_shape_zyx,
     )
     fixed_patch = np.asarray(
         fixed[fixed_z, y0:y1, x0:x1], dtype=np.float32
@@ -679,7 +771,8 @@ def render_interpolated_window_qc(
             *row["moving_start_l0_zyx"],
         )
     )
-    fixed = zarr.open_group(summary["fixed_fused"], mode="r")[str(LEVEL)]
+    fixed_path = Path(summary["fixed_fused"])
+    fixed = _sampling_array(zarr.open_group(fixed_path, mode="r"), fixed_path, moving=False)
     moving_arrays: dict[str, zarr.Array] = {}
     row_count = (len(records) + columns - 1) // columns
     sheet = Image.new(
@@ -709,7 +802,8 @@ def render_interpolated_window_qc(
 
     for index, row in enumerate(records):
         thumbnail, fixed_z = _render_interpolated_window(
-            row, fixed, moving_arrays
+            row, fixed, moving_arrays,
+            window_shape_zyx=tuple(summary["window_shape_zyx"]),
         )
         column = index % columns
         sheet_row = index // columns

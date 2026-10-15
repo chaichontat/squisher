@@ -77,6 +77,26 @@ possible combined multiplier to at most one, preserving relative calibration
 while avoiding amplification when corrected values are written back to the
 source integer dtype.
 
+## Refining a demonstrated camera-edge mismatch
+
+`fit-residual-edges` freezes a reviewed schema-3 correction and fits four
+additional quadratic log-gain ramps at the low/high native Y and X edges.
+For distance `t` from an edge and explicitly supplied width `w`, each ramp is
+`max(1 - t/w, 0)²`. The additional field is exactly one with zero slope in the
+interior. It is constant across Z, evaluated in original full-camera
+coordinates, and applied with the baseline exactly once by the existing reader.
+Schema 4 records these four coefficients, the width, the unchanged baseline
+fields/gains, and one extra common scalar for amplification headroom.
+
+This constrained refinement addresses edge discrepancies without estimating
+unobserved interior curvature from narrow overlaps. The command evaluates
+held-out source pairs and every held-out depth, and renders all sampled native
+planes. Review the applied multiplier and transitions as well as boundaries;
+where independent same-channel imaging overlaps, compare held-out spatial
+blocks using a scale learned from unchanged interiors and frozen for both
+models. It does not establish an acquisition's physical illumination mechanism.
+See the command example in [README.md](README.md#fit-residual-calibration-after-deconvolution).
+
 ## How fitting works
 
 1. The command reads the accepted records from the registration and verifies

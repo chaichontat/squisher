@@ -29,7 +29,10 @@ from squisher_lightsheet.post_basic import (
     _boundary_metrics,
     _corrected_tiles,
     _fixed_grid,
+    _fit_field,
     _mosaic,
+    _pair_folds,
+    _pair_metrics,
     _plan_record,
     _pull_grid,
     _registration_records,
@@ -45,6 +48,46 @@ DEFAULT_Z_PERCENTILES = tuple(index * 2.5 for index in range(1, 40))
 
 
 @dataclass(frozen=True)
+class EdgeResidualField:
+    """Four camera-edge ramps with exact identity and zero slope in the interior."""
+
+    width_fraction: float
+    coefficient: np.ndarray
+
+    def __post_init__(self) -> None:
+        if (
+            not np.isfinite(self.width_fraction)
+            or not 0 < self.width_fraction < 0.5
+            or self.coefficient.shape != (4,)
+            or not np.all(np.isfinite(self.coefficient))
+        ):
+            raise ValueError("Residual edge field requires width in (0, 0.5) and four finite coefficients")
+
+    def basis(self, yx: np.ndarray) -> np.ndarray:
+        return np.column_stack(
+            [
+                np.maximum(1 - yx[:, axis] / self.width_fraction, 0) ** 2
+                if side == 0
+                else np.maximum(1 - (1 - yx[:, axis]) / self.width_fraction, 0) ** 2
+                for axis in (0, 1)
+                for side in (0, 1)
+            ]
+        )
+
+    def plane(self, shape_yx: tuple[int, int], *, y_slice: slice, x_slice: slice) -> np.ndarray:
+        yy, xx = np.meshgrid(
+            np.linspace(0, 1, shape_yx[0])[y_slice],
+            np.linspace(0, 1, shape_yx[1])[x_slice],
+            indexing="ij",
+        )
+        log_field = self.basis(np.column_stack([yy.ravel(), xx.ravel()])) @ self.coefficient
+        field = np.exp(log_field).reshape(yy.shape).astype(np.float32)
+        if not np.all(np.isfinite(field)) or np.any(field <= 0):
+            raise ValueError("Residual edge field is not positive and finite")
+        return field
+
+
+@dataclass(frozen=True)
 class ResidualCorrection:
     """Compact source correction evaluated only for requested original-coordinate slabs."""
 
@@ -52,9 +95,10 @@ class ResidualCorrection:
     shape_zyx: tuple[int, int, int]
     multiplier: float
     fingerprint: str
+    edge_field: EdgeResidualField | None = None
 
     def block(self, *, z_slice: slice, y_slice: slice, x_slice: slice) -> np.ndarray:
-        return (
+        field = (
             residual_block(
                 self.coefficient,
                 z_slice=z_slice,
@@ -64,6 +108,9 @@ class ResidualCorrection:
             )
             * self.multiplier
         )
+        if self.edge_field is not None:
+            field *= self.edge_field.plane(self.shape_zyx[1:], y_slice=y_slice, x_slice=x_slice)
+        return field
 
 
 def _source_identity(path: Path) -> str:
@@ -107,7 +154,9 @@ def _sample_tiles(
         materialized = record.get("materialized_source_start_zyx") is not None
         if materialized:
             if not allow_materialized:
-                raise ValueError("Residual fitting requires original deconvolved tiles, not materialized crops")
+                raise ValueError(
+                    "Residual fitting requires original deconvolved tiles, not materialized crops"
+                )
             if axes != ["z", "y", "x"] or axes_n != axes or channel != 0 or level != 0:
                 raise ValueError(
                     f"Cross-dataset matching requires level-0 single-channel ZYX materialized sources: {path}"
@@ -569,6 +618,185 @@ def fit_residual_correction(
         raise
 
 
+def fit_edge_residual_correction(
+    *,
+    registration: Path,
+    fixed_fused: Path,
+    base_correction: Path,
+    output_dir: Path,
+    width_fraction: float,
+    channel: int = 0,
+    source_level: int = 2,
+    stride: int = 4,
+    z_percentiles: Sequence[float] = DEFAULT_Z_PERCENTILES,
+    workers: int = 8,
+    seed: int = 0,
+    penalty: float = 0.003,
+) -> Path:
+    """Refine camera edges while freezing an accepted correction and its interior field."""
+    edge = EdgeResidualField(width_fraction, np.zeros(4))
+    if channel < 0 or source_level < 0 or stride < 1 or workers < 1:
+        raise ValueError("Invalid edge fitting channel, level, stride, or workers")
+    if not np.isfinite(penalty) or penalty <= 0:
+        raise ValueError("Edge fitting penalty must be positive and finite")
+    if len(z_percentiles) < 3 or any(not np.isfinite(p) or not 0 <= p <= 100 for p in z_percentiles):
+        raise ValueError("Edge fitting requires at least three finite Z percentiles in [0, 100]")
+    registration, fixed_fused, base_correction, output_dir = (
+        path.resolve() for path in (registration, fixed_fused, base_correction, output_dir)
+    )
+    if output_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite edge correction output: {output_dir}")
+    base_identity = _sha256(base_correction)
+    payload = json.loads(base_correction.read_text())
+    if payload.get("schema_version") != 3:
+        raise ValueError("Edge fitting requires a schema-3 base correction, without an existing edge field")
+    records = _registration_records(registration)
+    sources = [Path(record["path"]).resolve() for record in records]
+    shapes = [tuple(record["shape"][-3:]) for record in records]
+    corrections = load_residual_corrections(
+        base_correction, sources=sources, shapes_zyx=shapes, channel=channel
+    )
+    if payload["fit"]["registration_sha256"] != _sha256(registration):
+        raise ValueError("Edge fitting registration differs from the base correction registration")
+    source_index = {source: index for index, source in enumerate(sources)}
+    base = _fixed_grid(fixed_fused, fixed_z=None, stride=stride)
+    sampled_z = sorted(int(np.floor((base.shape[0] - 1) * p / 100)) for p in z_percentiles)
+    if len(set(sampled_z)) != len(sampled_z):
+        raise ValueError("Edge fitting Z percentiles must select distinct planes")
+    rows, planes = [], []
+    for z in sampled_z:
+        grid = replace(base, z=z)
+        tiles = _sample_tiles(records, grid, channel, source_level, workers)
+        # The existing owner evaluates the same original-coordinate cosine basis at sampled pixels.
+        tiles = _corrected_tiles(
+            tiles,
+            np.zeros_like(np.asarray(payload["coefficient"])).ravel(),
+            np.asarray([corrections[str(t.source)].multiplier for t in tiles]),
+            np.asarray([corrections[str(t.source)].coefficient.ravel() for t in tiles]),
+        )
+        before, owner = _mosaic(grid.output_shape, tiles)
+        positive = before[before > 0]
+        if positive.size < 2:
+            raise ValueError(f"Insufficient edge fitting source signal at fixed Z {z}")
+        cutoff = float(np.expm1(threshold_otsu(np.log1p(positive))))
+        plane_rows = _overlap_samples(tiles, cutoff)
+        if not plane_rows:
+            raise ValueError(f"No eligible source overlaps at fixed Z {z}")
+        for row in plane_rows:
+            row["first"] = source_index[tiles[int(row["first"])].source]
+            row["second"] = source_index[tiles[int(row["second"])].source]
+            row["z"] = z
+        rows.extend(plane_rows)
+        planes.append(_SampledPlane(grid, tiles, before, owner, cutoff, {}))
+        logger.info("Edge residual sampled Z {}: {} overlap pairs", z, len(plane_rows))
+    design = np.concatenate([edge.basis(row["ya"]) - edge.basis(row["yb"]) for row in rows])
+    target = np.concatenate([row["target"] for row in rows])
+    pair = np.concatenate([np.full(len(row["target"]), i, dtype=np.int64) for i, row in enumerate(rows)])
+    heldout = _pair_folds(rows, seed=seed)[pair] == 0
+    evaluation_coefficient = _fit_field(design[~heldout], target[~heldout], penalty)
+    evaluation = {
+        "heldout_before": _pair_metrics(-target[heldout] / np.log(2), pair[heldout]),
+        "heldout_after": _pair_metrics(
+            (design[heldout] @ evaluation_coefficient - target[heldout]) / np.log(2), pair[heldout]
+        ),
+        "evaluation_coefficient": evaluation_coefficient.tolist(),
+        "metric_statistic": "median absolute pixel error per source-pair plane",
+        "metric_unit": "absolute log2 fold-change",
+    }
+    depth_evaluation = []
+    pixel_z = np.asarray([row["z"] for row in rows])[pair]
+    for z in sampled_z:
+        test = pixel_z == z
+        coefficient = _fit_field(design[~test], target[~test], penalty)
+        depth_evaluation.append(
+            {
+                "z": z,
+                "before": _pair_metrics(-target[test] / np.log(2), pair[test]),
+                "after": _pair_metrics((design[test] @ coefficient - target[test]) / np.log(2), pair[test]),
+            }
+        )
+    edge = replace(edge, coefficient=_fit_field(design, target, penalty))
+    # Preserve the existing no-amplification headroom contract with one recorded common scalar.
+    upper = max(0.0, *edge.coefficient[:2]) + max(0.0, *edge.coefficient[2:])
+    global_scale_ratio = float(np.exp(-upper))
+    original_scale = payload["global_scale"]
+    payload.update(
+        {
+            "schema_version": 4,
+            "edge_field": {"width_fraction": width_fraction, "coefficient": edge.coefficient.tolist()},
+            "global_scale": original_scale * global_scale_ratio,
+            "edge_fit": {
+                "base_correction": {"path": str(base_correction), "sha256": base_identity},
+                "base_global_scale": original_scale,
+                "global_scale_ratio": global_scale_ratio,
+                "sampled_z": sampled_z,
+                "source_level": source_level,
+                "stride": stride,
+                "seed": seed,
+                "penalty": penalty,
+                "evaluation": evaluation,
+                "heldout_z": depth_evaluation,
+                "interior_policy": "exact identity incremental field outside camera edge width; common scalar for headroom",
+            },
+        }
+    )
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".fit-residual-edges-", dir=output_dir.parent))
+    (stage / "correction.json").write_text(json.dumps(payload, indent=2) + "\n")
+    qc_planes = []
+    for plane in planes:
+        corrected = [
+            replace(
+                tile,
+                data=tile.data
+                * np.exp((edge.basis(tile.yx.reshape(-1, 2)) @ edge.coefficient).reshape(tile.data.shape)),
+            )
+            for tile in plane.tiles
+        ]
+        after, owner = _mosaic(plane.grid.output_shape, corrected)
+        if not np.array_equal(plane.owner, owner):
+            raise RuntimeError("Edge residual QC owner map changed during correction")
+        plane_dir = stage / f"z{plane.grid.z}"
+        plane_dir.mkdir()
+        artifacts = _write_qc(
+            plane_dir,
+            root=stage,
+            channel=channel,
+            before=plane.before,
+            after=after,
+            spacing_yx=np.abs(base.scale[1:]) * stride,
+            labels=("Accepted native correction", "Edge refinement; common scalar omitted"),
+        )
+        qc_planes.append(
+            {
+                "z": plane.grid.z,
+                "artifacts": artifacts,
+                "boundaries": _boundary_metrics(plane.before, after, owner, plane.cutoff),
+            }
+        )
+    manifest = {
+        "artifact_type": "squisher_lightsheet.residual_edge_calibration.v1",
+        "status": "complete",
+        "correction": _artifact(stage / "correction.json", stage),
+        "fixed_fused": str(fixed_fused),
+        "registration": str(registration),
+        "channel": channel,
+        "edge_fit": payload["edge_fit"],
+        "edge_field": payload["edge_field"],
+        "planes": qc_planes,
+    }
+    if (
+        _sha256(base_correction) != base_identity
+        or _sha256(registration) != payload["fit"]["registration_sha256"]
+    ):
+        raise RuntimeError("Edge fitting base correction or registration changed during the run")
+    load_residual_corrections(stage / "correction.json", sources=sources, shapes_zyx=shapes, channel=channel)
+    (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    stage.replace(output_dir)
+    logger.info("Edge residual correction output complete: {}", output_dir)
+    return output_dir / "manifest.json"
+
+
 def load_residual_corrections(
     path: Path,
     *,
@@ -580,7 +808,7 @@ def load_residual_corrections(
     payload = json.loads(path.read_text())
     if (
         not isinstance(payload, dict)
-        or payload.get("schema_version") != 3
+        or payload.get("schema_version") not in (3, 4)
         or payload.get("kind") != "squisher.residual-correction"
     ):
         raise ValueError(f"Invalid residual correction schema: {path}")
@@ -590,6 +818,16 @@ def load_residual_corrections(
         or payload.get("basis") != "cosine-xy2-z-scaled"
     ):
         raise ValueError(f"Residual correction channel or coordinate mismatch: {path}")
+    edge_field = None
+    if payload["schema_version"] == 4:
+        edge = payload.get("edge_field")
+        if not isinstance(edge, dict) or not isinstance(edge.get("width_fraction"), (float, int)):
+            raise ValueError("Residual edge field requires an explicit width and coefficients")
+        edge_field = EdgeResidualField(
+            float(edge["width_fraction"]), np.asarray(edge.get("coefficient"), dtype=np.float64)
+        )
+    elif "edge_field" in payload:
+        raise ValueError("Residual edge field requires schema version 4")
     coefficient = validate_coefficients(payload["coefficient"])
     scale = payload["global_scale"]
     if type(scale) not in (int, float) or not np.isfinite(scale) or scale <= 0:
@@ -636,6 +874,8 @@ def load_residual_corrections(
             "gain": row["gain"],
             "global_scale": scale,
         }
+        if edge_field is not None:
+            model_identity["edge_field"] = payload["edge_field"]
         fingerprint = hashlib.sha256(
             json.dumps(model_identity, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:16]
@@ -644,5 +884,6 @@ def load_residual_corrections(
             shape_zyx=shape,
             multiplier=float(row["gain"] * scale),
             fingerprint=fingerprint,
+            edge_field=edge_field,
         )
     return result

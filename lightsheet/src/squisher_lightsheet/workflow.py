@@ -184,6 +184,7 @@ def run_tltr_workflow(
         position_input=paths.phase_position,
         registration_output=paths.registration_json,
         level=level,
+        channels=[channel],
         registration_pair_mode=registration_pair_mode,
         registration_pair_file=registration_pair_file,
         robust_boundary_qc_dir=paths.robust_boundary_qc_dir,

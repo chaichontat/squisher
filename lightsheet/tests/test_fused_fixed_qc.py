@@ -11,6 +11,24 @@ import zarr
 from squisher_lightsheet import fused_fixed_qc as qc
 
 
+def _declare_sampling_grid(path: Path, *, moving: bool = False) -> None:
+    root = zarr.open_group(path, mode="r+")
+    sampled = root["2"]
+    dimensions = ("c", "z", "y", "x") if moving else ("z", "y", "x")
+    factors = (1, 1, 4, 4) if moving else (4, 4, 4)
+    native_shape = tuple(size * factor for size, factor in zip(sampled.shape, factors, strict=True))
+    root.create_array("0", shape=native_shape, chunks=(1,) * len(native_shape),
+                      dtype=sampled.dtype, dimension_names=dimensions)
+    root.attrs["ome"] = {"version": "0.5", "multiscales": [{
+        "axes": [{"name": axis, "type": "channel"} if axis == "c" else
+                 {"name": axis, "type": "space", "unit": "micrometer"} for axis in dimensions],
+        "datasets": [{"path": name, "coordinateTransformations": [
+            {"type": "scale", "scale": scale},
+            {"type": "translation", "translation": [0.0] * len(dimensions)},
+        ]} for name, scale in (("0", [1.0] * len(dimensions)), ("2", list(factors)))],
+    }]}
+
+
 def test_plane_support_bounds_preserves_fixed_528_geometry() -> None:
     bounds = qc.plane_support_bounds(
         np.zeros(3),
@@ -85,10 +103,12 @@ def test_interpolated_qc_selects_attempts_for_native_method(
             }
         )
     )
-    monkeypatch.setattr(qc.zarr, "open_group", lambda *_args, **_kwargs: {"2": object()})
+    fixed_path = tmp_path / "fixed.ome.zarr"
+    zarr.open_group(fixed_path, mode="w").create_array("2", shape=(4, 8, 8), dtype="uint16")
+    _declare_sampling_grid(fixed_path)
     rendered = []
 
-    def render(row, _fixed, _moving_arrays):
+    def render(row, _fixed, _moving_arrays, *, window_shape_zyx):
         rendered.append(row["selected_attempt"])
         return Image.new("RGB", (184, 184)), 0
 
@@ -133,6 +153,7 @@ def test_prefusion_qc_writes_hole_metrics(tmp_path: Path, monkeypatch) -> None:
     root = zarr.open_group(fixed_volume, mode="w")
     fixed = root.create_array("2", shape=(3, 6, 8), chunks=(1, 6, 8), dtype="uint16")
     fixed[:] = 100
+    _declare_sampling_grid(fixed_volume)
     summary = tmp_path / "summary.json"
     summary.write_text(
         json.dumps(
@@ -146,7 +167,7 @@ def test_prefusion_qc_writes_hole_metrics(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         qc,
         "_render_plane",
-        lambda _rows, _z, shape: (
+        lambda _rows, _z, shape, *, window_shape_zyx: (
             np.ones(shape, dtype=np.float32),
             np.ones(shape, dtype=np.uint16),
             0,
@@ -172,6 +193,7 @@ def test_prefusion_qc_reports_union_coverage(tmp_path: Path, monkeypatch) -> Non
     root = zarr.open_group(fixed_volume, mode="w")
     fixed = root.create_array("2", shape=(3, 6, 8), chunks=(1, 6, 8), dtype="uint16")
     fixed[:] = 100
+    _declare_sampling_grid(fixed_volume)
     summaries = []
     for label_name in ("514-L", "514-R"):
         summary = tmp_path / f"{label_name}.json"
@@ -195,7 +217,7 @@ def test_prefusion_qc_reports_union_coverage(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(
         qc,
         "_render_plane",
-        lambda _rows, _z, shape: (
+        lambda _rows, _z, shape, *, window_shape_zyx: (
             np.ones(shape, dtype=np.float32),
             next(coverage_iterator),
             1,
@@ -232,6 +254,8 @@ def test_window_image_scorer_ranks_aligned_transform_above_shifted(tmp_path: Pat
         "2", shape=(1, qc.WINDOW, size, size), chunks=(1, 32, size, size), dtype="uint16"
     )
     moving[:] = np.broadcast_to(texture, moving.shape)
+    _declare_sampling_grid(tmp_path / "fixed.zarr")
+    _declare_sampling_grid(tmp_path / "moving.zarr", moving=True)
     row = {
         "fixed_start_zyx": [0, 0, 0],
         "moving_start_l0_zyx": [0, 0, 0],
@@ -260,6 +284,8 @@ def test_window_image_scorer_returns_none_without_fixed_tissue(tmp_path: Path) -
         "2", shape=(1, qc.WINDOW, size, size), chunks=(1, 32, size, size), dtype="uint16"
     )
     moving[:] = 1000
+    _declare_sampling_grid(tmp_path / "fixed.zarr")
+    _declare_sampling_grid(tmp_path / "moving.zarr", moving=True)
     row = {
         "fixed_start_zyx": [0, 0, 0],
         "moving_start_l0_zyx": [0, 0, 0],
@@ -288,6 +314,8 @@ def test_window_image_scorer_residual_shift_recovers_known_offset(tmp_path: Path
         "2", shape=(1, qc.WINDOW, size, size), chunks=(1, 32, size, size), dtype="uint16"
     )
     moving[:] = np.broadcast_to(texture, moving.shape)
+    _declare_sampling_grid(tmp_path / "fixed.zarr")
+    _declare_sampling_grid(tmp_path / "moving.zarr", moving=True)
     row = {
         "fixed_start_zyx": [0, 0, 0],
         "moving_start_l0_zyx": [0, 0, 0],
@@ -305,6 +333,11 @@ def test_window_image_scorer_residual_shift_recovers_known_offset(tmp_path: Path
     assert {shift.shift_yx for shift in shifts} == {(0.0, -5.0)}
     assert len(aligned) == len(displaced) == 3
     assert all(a > d for a, d in zip(aligned, displaced, strict=True))
+    aggregate = scorer.aggregate_residual_shift(row, shifted)
+    assert aggregate is not None and aggregate.confident and aggregate.shift_yx == (0.0, -5.0)
+    corrected = qc.residual_corrected_transform(shifted, shifts[0].shift_yx)
+    assert corrected.tolist() == np.concatenate([np.eye(3).ravel(), np.zeros(3)]).tolist()
+    assert {shift.shift_yx for shift in scorer.residual_shifts(row, corrected)} == {(0.0, 0.0)}
 
 
 def test_window_image_scorer_scores_in_the_fit_intensity_space(tmp_path: Path) -> None:
@@ -322,6 +355,8 @@ def test_window_image_scorer_scores_in_the_fit_intensity_space(tmp_path: Path) -
     )
     # Linear in log space, strongly nonlinear in raw intensity.
     moving[:] = np.broadcast_to(np.expm1(1.35 * np.log1p(fixed_values.astype("uint16"))).astype("uint16"), moving.shape)
+    _declare_sampling_grid(tmp_path / "fixed.zarr")
+    _declare_sampling_grid(tmp_path / "moving.zarr", moving=True)
     row = {
         "fixed_start_zyx": [0, 0, 0],
         "moving_start_l0_zyx": [0, 0, 0],
@@ -337,3 +372,99 @@ def test_window_image_scorer_scores_in_the_fit_intensity_space(tmp_path: Path) -
     assert all(log > linear + 0.003 for log, linear in zip(log_scores, linear_scores, strict=True))
     with pytest.raises(ValueError, match="intensity transform"):
         qc.WindowImageScorer(tmp_path / "fixed.zarr", 400.0, "identity")
+
+
+def _single_summary_volume(tmp_path: Path) -> tuple[Path, Path]:
+    fixed_volume = tmp_path / "fixed.ome.zarr"
+    root = zarr.open_group(fixed_volume, mode="w")
+    fixed = root.create_array("2", shape=(5, 6, 8), chunks=(1, 6, 8), dtype="uint16")
+    fixed[:] = 100
+    _declare_sampling_grid(fixed_volume)
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps({"window_shape_zyx": [528, 528, 528], "fixed_fused": str(fixed_volume), "windows": []})
+    )
+    return fixed_volume, summary
+
+
+def test_prefusion_qc_samples_the_requested_fixed_plane(tmp_path: Path, monkeypatch) -> None:
+    fixed_volume, summary = _single_summary_volume(tmp_path)
+    sampled = []
+
+    def fake_render_plane(_rows, z, shape, *, window_shape_zyx):
+        sampled.append(z)
+        return np.ones(shape, dtype=np.float32), np.ones(shape, dtype=np.uint16), 0
+
+    monkeypatch.setattr(qc, "_render_plane", fake_render_plane)
+
+    output = qc.render_prefusion_qc(
+        summaries=[("405-R", summary)],
+        fixed_volume=fixed_volume,
+        fixed_threshold=50,
+        output_dir=tmp_path / "qc",
+        fixed_z_index=1,
+    )
+
+    report = json.loads((output.parent / "prefusion-hole-review.json").read_text())
+    assert report["fixed_z_index"] == 1
+    assert sampled == [1 * qc.FIXED_LEVEL_FACTOR]
+
+
+def test_prefusion_qc_rejects_a_fixed_plane_outside_the_volume(tmp_path: Path) -> None:
+    fixed_volume, summary = _single_summary_volume(tmp_path)
+
+    with pytest.raises(ValueError, match="outside the 5-plane"):
+        qc.render_prefusion_qc(
+            summaries=[("405-R", summary)],
+            fixed_volume=fixed_volume,
+            fixed_threshold=50,
+            output_dir=tmp_path / "qc",
+            fixed_z_index=5,
+        )
+
+
+def test_short_window_support_does_not_extend_axial_domain() -> None:
+    assert qc.plane_support_bounds(
+        np.zeros(3), np.eye(3), np.zeros(3), 64, (200, 200),
+        window_shape_zyx=(128, 528, 528),
+    ) == (0, 132, 0, 132)
+    assert qc.plane_support_bounds(
+        np.zeros(3), np.eye(3), np.zeros(3), 128, (200, 200),
+        window_shape_zyx=(128, 528, 528),
+    ) is None
+    shear = np.eye(3)
+    shear[1, 0] = 0.2
+    assert qc.plane_support_bounds(
+        np.zeros(3), shear, np.zeros(3), 64, (200, 200),
+        window_shape_zyx=(128, 528, 528),
+    ) == (0, 132, 0, 132)
+
+
+def test_short_window_image_scorer_and_thumbnail_use_actual_axial_center(tmp_path: Path) -> None:
+    from scipy.ndimage import gaussian_filter
+
+    size = 132
+    texture = gaussian_filter(np.random.default_rng(94).normal(size=(size, size)), 1.5)
+    texture = (1000 + 4000 * (texture - texture.min()) / np.ptp(texture)).astype('uint16')
+    fixed_root = zarr.open_group(tmp_path / 'fixed.zarr', mode='w')
+    fixed = fixed_root.create_array('2', shape=(32, size, size), chunks=(8, size, size), dtype='uint16')
+    fixed[:] = np.broadcast_to(texture, fixed.shape)
+    moving_root = zarr.open_group(tmp_path / 'moving.zarr', mode='w')
+    moving = moving_root.create_array('2', shape=(1, 128, size, size), chunks=(1, 32, size, size), dtype='uint16')
+    moving[:] = np.broadcast_to(texture, moving.shape)
+    _declare_sampling_grid(tmp_path / "fixed.zarr")
+    _declare_sampling_grid(tmp_path / "moving.zarr", moving=True)
+    row = dict(fixed_start_zyx=[0, 0, 0], moving_start_l0_zyx=[0, 0, 0],
+               moving_path=str(tmp_path / 'moving.zarr'), moving_channel=0,
+               moving_tile='test', selected_local_matrix_zyx=np.eye(3).tolist(),
+               selected_local_translation_zyx=[0, 0, 0])
+    transform = np.concatenate([np.eye(3).ravel(), np.zeros(3)])
+    scorer = qc.WindowImageScorer(tmp_path / 'fixed.zarr', 400, 'linear', window_shape_zyx=(128, 528, 528))
+    assert scorer.plane_scores(row, [transform])[0] == pytest.approx([1, 1, 1], abs=1e-3)
+    image, plane = qc._render_interpolated_window(row, fixed, {}, window_shape_zyx=(128, 528, 528))
+    assert plane == 16
+    assert image.size == (qc.THUMBNAIL_SIZE, qc.THUMBNAIL_SIZE)
+
+
+def test_summary_accepts_short_window_geometry(tmp_path: Path) -> None:
+    qc._validate_summary_geometry({'window_shape_zyx': [128, 528, 528]}, tmp_path / 'summary.json')

@@ -4,7 +4,6 @@ import json
 import shutil
 from pathlib import Path
 import subprocess
-import sys
 from typing import Annotated, Literal
 
 import typer
@@ -30,6 +29,13 @@ from squisher_lightsheet.channel_subtraction import (
     subtract_channel_tiles,
     subtract_paired_channel_tiles,
 )
+from squisher_lightsheet.acquisition_offset import (
+    DEFAULT_COARSE_LEVEL as DEFAULT_ACQUISITION_OFFSET_COARSE_LEVEL,
+    DEFAULT_FINE_LEVEL as DEFAULT_ACQUISITION_OFFSET_FINE_LEVEL,
+    DEFAULT_TILE_COUNT as DEFAULT_ACQUISITION_OFFSET_TILE_COUNT,
+    DEFAULT_VALIDATION_TILE_COUNT as DEFAULT_ACQUISITION_OFFSET_VALIDATION_TILE_COUNT,
+    run_acquisition_offset,
+)
 from squisher_lightsheet.candidate_grid import render_candidate_grid
 from squisher_lightsheet.channel_affine import (
     apply_channel_affine_registration,
@@ -54,6 +60,7 @@ from squisher_lightsheet.fused_subtraction import (
     fit_fused_subtraction,
     subtract_fused_volumes,
 )
+from squisher_lightsheet._backends import backend_executable
 from squisher_lightsheet.fused_fixed import (
     DEFAULT_STARTING_AFFINE_MATRIX_ZYX,
     DEFAULT_SWEEP_RUNNER,
@@ -64,8 +71,13 @@ from squisher_lightsheet.fused_fixed_recovery import (
     DEFAULT_MAXIMUM_OUTLIER_PX as DEFAULT_NATIVE_RECOVERY_MAXIMUM_OUTLIER_PX,
     DEFAULT_MAXIMUM_REFIT_DISPLACEMENT_PX,
     DEFAULT_NATIVE_DEVICE_SPEC,
+    DEFAULT_SEED_MAXIMUM_MASKED_FRACTION,
+    DEFAULT_SEED_MAXIMUM_TRANSLATION_PX,
+    DEFAULT_SEED_MINIMUM_GRADIENT_NCC,
+    propose_manual_initializations,
     recover_native,
 )
+from squisher_lightsheet.fused_fixed_diagnostics import write_overlap_disagreement
 from squisher_lightsheet.fused_fixed_qc import (
     DEFAULT_INTERPOLATED_QC_COLUMNS,
     render_interpolated_window_qc,
@@ -125,6 +137,8 @@ from squisher_lightsheet.registered_grid_anchors import (
 )
 from squisher_lightsheet.qc import (
     DEFAULT_FUSED_MIDDLE_Z_LEVEL,
+    DEFAULT_FUSED_PREVIEW_LEVEL,
+    render_fused_preview,
     render_live_fusion_preview,
     render_fused_middle_z_qc,
     render_fused_xyz_overlay_qc,
@@ -155,6 +169,10 @@ from squisher_lightsheet.uv_surface import (
     build_ventricular_uv_surface,
 )
 from squisher_lightsheet.workflow import DEFAULT_LEVEL, DEFAULT_OVERLAP_FRACTION, run_tltr_workflow
+from squisher_lightsheet.hcr_manifest import draft_manifest as draft_hcr_manifest
+from squisher_lightsheet.hcr_manifest import parse_acquisition as parse_hcr_acquisition
+from squisher_lightsheet.hcr_manifest import verify_manifest as verify_hcr_manifest
+from squisher_lightsheet.hcr_manifest import write_manifest as write_hcr_manifest
 from squisher_lightsheet.zeiss_positions import plot_xy_positions
 from squisher_lightsheet.zeiss_tile_positions import create_zeiss_tile_position_file
 
@@ -163,14 +181,74 @@ app = typer.Typer(no_args_is_help=True)
 align_405_to_488_app = typer.Typer(no_args_is_help=True)
 cross_register_app = typer.Typer(no_args_is_help=True)
 cross_register_method8_app = typer.Typer(no_args_is_help=True)
+hcr_manifest_app = typer.Typer(no_args_is_help=True)
 app.add_typer(align_405_to_488_app, name="align-405-to-488")
 app.add_typer(cross_register_app, name="cross-register")
 app.add_typer(cross_register_method8_app, name="cross-register-method8")
+app.add_typer(hcr_manifest_app, name="hcr-manifest")
 
-FUSED_FIXED_CONTACT_SHEET_SCRIPT = Path(
-    "/home/chaichontat/nvme/lightsheet/scripts/render_fused_fixed_method8_contact_sheets.py"
-)
 
+@hcr_manifest_app.command("draft")
+def hcr_manifest_draft(
+    dataset: Annotated[str, typer.Option("--dataset")],
+    layout: Annotated[str, typer.Option("--layout", help="CL/CR or TL/TR; the first side is fixed.")],
+    acquisition: Annotated[
+        list[str],
+        typer.Option("--acquisition", help="SIDE=DIRECTORY of one acquisition's OME-TIFF tiles; repeat per acquisition."),
+    ],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+) -> None:
+    """Draft an unapproved HCR acquisition manifest, labelling channels from embedded CZI emission wavelengths."""
+    try:
+        acquisitions = [parse_hcr_acquisition(value) for value in acquisition]
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--acquisition") from exc
+    write_hcr_manifest(output, draft_hcr_manifest(dataset=dataset, layout=layout, acquisitions=acquisitions))
+    typer.echo(json.dumps({"manifest": str(output)}, indent=2))
+
+
+@app.command("clcr-placement")
+def clcr_placement(
+    left_position: Annotated[Path, typer.Option("--left-position", exists=True, dir_okay=False)],
+    right_position: Annotated[Path, typer.Option("--right-position", exists=True, dir_okay=False)],
+    alignment_manifest: Annotated[
+        Path, typer.Option("--alignment-manifest", exists=True, dir_okay=False, help="align-registered-lr manifest.json.")
+    ],
+    phasecorr: Annotated[
+        Path, typer.Option("--phasecorr", exists=True, dir_okay=False, help="align-registered-lr phase.json.")
+    ],
+    method8_summary: Annotated[Path, typer.Option("--method8-summary", exists=True, dir_okay=False)],
+    deconv_root: Annotated[
+        Path, typer.Option("--deconv-root", exists=True, file_okay=False, help="Both sides' deconvolved tiles.")
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    qc_channel: Annotated[int, typer.Option("--qc-channel", min=0)] = 0,
+    qc_level: Annotated[int, typer.Option("--qc-level", min=0)] = 2,
+) -> None:
+    """Publish the accepted CL/CR placement as fusion positions, an identity registration, and a z-median overlay."""
+    from squisher_lightsheet.clcr_placement import publish_clcr_placement
+
+    outputs = publish_clcr_placement(
+        left_position=left_position,
+        right_position=right_position,
+        alignment_manifest=alignment_manifest,
+        phasecorr=phasecorr,
+        method8_summary=method8_summary,
+        deconv_root=deconv_root,
+        output_dir=output_dir,
+        qc_channel=qc_channel,
+        qc_level=qc_level,
+    )
+    typer.echo(json.dumps(outputs, indent=2))
+
+
+@hcr_manifest_app.command("verify")
+def hcr_manifest_verify(
+    manifest: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Re-read every listed acquisition and fail if any tile, channel label, or position differs."""
+    verify_hcr_manifest(json.loads(manifest.read_text()))
+    typer.echo(json.dumps({"manifest": str(manifest), "verified": True}, indent=2))
 
 @app.callback()
 def lightsheet() -> None:
@@ -220,6 +298,27 @@ def edu_workflow(
         typer.echo(str(gate))
         raise typer.Exit(3) from gate
     typer.echo(completion)
+
+
+@app.command("hcr-workflow")
+def hcr_workflow(
+    manifest: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="Approved `lightsheet hcr-manifest` file."),
+    ],
+    output_root: Annotated[Path | None, typer.Option("--output-root", file_okay=False)] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Run or resume WORKFLOW_HCR.md for the dataset an approved acquisition manifest describes."""
+    from squisher_lightsheet.hcr_workflow import run_hcr_workflow
+    from squisher_lightsheet.workflow_runner import ReviewRequired
+
+    try:
+        progress = run_hcr_workflow(manifest, output_root=output_root, dry_run=dry_run)
+    except ReviewRequired as gate:
+        typer.echo(str(gate))
+        raise typer.Exit(3) from gate
+    typer.echo(progress)
 
 
 def _parse_source_view_flatfield_dir(value: str) -> tuple[str, Path]:
@@ -484,6 +583,22 @@ def eomes_boundary_qc(
     )
 
 
+@app.command("eomes-layers")
+def eomes_layers(
+    coordinates_dir: Annotated[Path, typer.Option("--coordinates-dir", exists=True, file_okay=False)],
+    surface: Annotated[Path, typer.Option("--surface", exists=True, dir_okay=False)],
+    boundaries: Annotated[Path, typer.Option("--boundaries", exists=True, dir_okay=False)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+) -> None:
+    """Assign VZ, SVZ, and CP from reviewed Eomes boundaries and saved projections."""
+    from squisher_lightsheet.surface_layers import assign_surface_layers
+
+    typer.echo(assign_surface_layers(
+        coordinates_dir=coordinates_dir, surface_path=surface,
+        boundaries_path=boundaries, output_dir=output_dir,
+    ))
+
+
 @app.command("fit-planar-tilt")
 def fit_planar_tilt(
     mask: Annotated[Path, typer.Option("--mask", exists=True, dir_okay=False, readable=True)],
@@ -601,6 +716,62 @@ def fit_residual(
     )
     typer.echo(manifest_path)
     typer.echo(f"QC figures: {manifest_path.parent / 'qc'}")
+
+
+@app.command("fit-residual-edges")
+def fit_residual_edges(
+    fixed_fused: Annotated[
+        Path, typer.Option("--fixed-fused", exists=True, file_okay=False, readable=True)
+    ],
+    registration: Annotated[
+        Path, typer.Option("--registration", exists=True, dir_okay=False, readable=True)
+    ],
+    base_correction: Annotated[
+        Path,
+        typer.Option("--base-correction", exists=True, dir_okay=False, readable=True),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    width_fraction: Annotated[
+        float,
+        typer.Option(
+            "--edge-width-fraction",
+            help="Fraction of native camera Y/X size; interior field is frozen.",
+        ),
+    ],
+    channel: Annotated[int, typer.Option("--channel", min=0)] = 0,
+    source_level: Annotated[int, typer.Option("--source-level", min=0)] = 2,
+    stride: Annotated[int, typer.Option("--stride", min=1)] = 4,
+    z_percentile: Annotated[
+        list[float] | None, typer.Option("--z-percentile", min=0, max=100)
+    ] = None,
+    workers: Annotated[int, typer.Option("--workers", min=1)] = 8,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
+    penalty: Annotated[float, typer.Option("--penalty")] = 0.003,
+) -> None:
+    """Refine native camera edges while preserving an accepted interior correction."""
+    from squisher_lightsheet.residual_correction import (
+        DEFAULT_Z_PERCENTILES,
+        fit_edge_residual_correction,
+    )
+
+    typer.echo(
+        fit_edge_residual_correction(
+            registration=registration,
+            fixed_fused=fixed_fused,
+            base_correction=base_correction,
+            output_dir=output_dir,
+            width_fraction=width_fraction,
+            channel=channel,
+            source_level=source_level,
+            stride=stride,
+            z_percentiles=DEFAULT_Z_PERCENTILES
+            if z_percentile is None
+            else z_percentile,
+            workers=workers,
+            seed=seed,
+            penalty=penalty,
+        )
+    )
 
 
 @app.command("cross-dataset-match")
@@ -881,14 +1052,9 @@ def fused_fixed_contact_sheet(
     ] = "phase-correlation",
 ) -> None:
     """Render completed fused-fixed windows, including an incomplete active run."""
-    if not FUSED_FIXED_CONTACT_SHEET_SCRIPT.is_file():
-        raise FileNotFoundError(
-            f"Missing fused-fixed contact-sheet renderer: {FUSED_FIXED_CONTACT_SHEET_SCRIPT}"
-        )
     resolved_output = (output_dir or run_dir / "contact_sheets").resolve()
     command = [
-        str(renderer_python or sys.executable),
-        str(FUSED_FIXED_CONTACT_SHEET_SCRIPT),
+        str(backend_executable("lightsheet-fused-fixed-contact-sheet", python=renderer_python)),
         "--run-dir",
         str(run_dir.resolve()),
         "--output-dir",
@@ -961,7 +1127,12 @@ def fused_fixed_materialize_overlap(
         Path | None,
         typer.Option("--source-summary", exists=True, dir_okay=False, readable=True),
     ] = None,
+    use_explicit_domains: Annotated[bool, typer.Option("--use-explicit-domains", help="Materialize exact domains from an explicit-domain summary; do not expand crops.")] = False,
     source_channel: Annotated[int, typer.Option("--source-channel", min=0)] = 0,
+    output_channel_label: Annotated[
+        str | None,
+        typer.Option("--output-channel-label", help="Semantic label of the single output channel; source index remains provenance."),
+    ] = None,
     core_shape_zyx: Annotated[str, typer.Option("--core-shape-zyx")] = "480,480,480",
     window_shape_zyx: Annotated[str, typer.Option("--window-shape-zyx")] = "528,528,528",
     level_factor_zyx: Annotated[str, typer.Option("--level-factor-zyx")] = ",".join(
@@ -977,6 +1148,8 @@ def fused_fixed_materialize_overlap(
     """Rematerialize fused-fixed cores with cross-registration-style overlap."""
     if (source_registration is None) == (source_summary is None):
         raise typer.BadParameter("pass exactly one of --source-registration or --source-summary")
+    if use_explicit_domains and source_summary is None:
+        raise typer.BadParameter("--use-explicit-domains requires --source-summary")
     if resume and overwrite:
         raise typer.BadParameter("--resume and --overwrite are mutually exclusive")
     if not resume:
@@ -986,12 +1159,14 @@ def fused_fixed_materialize_overlap(
     outputs = export_fused_fixed_overlapping_materialized_chunks(
         source_registration_input=source_registration,
         source_summary_input=source_summary,
+        use_explicit_domains=use_explicit_domains,
         moving_position_input=moving_position,
         moving_source_input=moving_source_registration,
         moving_source_dir=moving_source_dir,
         residual_correction=residual_correction,
         output_dir=output_dir,
         source_channel=source_channel,
+        output_channel_label=output_channel_label,
         core_shape_zyx=parse_shape_zyx(core_shape_zyx),
         window_shape_zyx=parse_shape_zyx(window_shape_zyx),
         level_factor_zyx=parse_shape_zyx(level_factor_zyx),
@@ -1024,6 +1199,13 @@ def _parse_optional_float(text: str) -> float | None:
     if text.strip().lower() in {"none", "off", "disabled"}:
         return None
     return float(text)
+
+
+def _parse_grid_bounds_zyx(text: str) -> tuple[int, int, int, int, int, int]:
+    parts = text.split(",")
+    if len(parts) != 6:
+        raise typer.BadParameter("output grid bounds require z0,y0,x0,z1,y1,x1")
+    return tuple(int(part) for part in parts)
 
 
 def _parse_int_zyx(text: str, option_name: str = "value") -> tuple[int, int, int]:
@@ -1352,6 +1534,15 @@ def cross_register_method6(
         Path | None,
         typer.Option("--window-filter-json", exists=True, dir_okay=False, readable=True),
     ] = None,
+    parent_window_dir: Annotated[
+        Path | None, typer.Option("--parent-window-dir", exists=True, file_okay=False, readable=True,
+            help="Initialize smaller domains from their accepted parent global maps."),
+    ] = None,
+    split_parent_windows: Annotated[bool, typer.Option("--split-parent-windows", help="Subdivide accepted parents axially while preserving their XY bounds.")] = False,
+    parent_reference_fused: Annotated[
+        Path | None, typer.Option("--parent-reference-fused", exists=True, file_okay=False, readable=True,
+                                 help="Recorded parent reference; requires an identical completed physical pyramid grid."),
+    ] = None,
     core_shape_zyx: Annotated[str, typer.Option("--core-shape-zyx")] = "480,480,480",
     window_shape_zyx: Annotated[str, typer.Option("--window-shape-zyx")] = "528,528,528",
     fit_downsample_zyx: Annotated[str, typer.Option("--fit-downsample-zyx")] = "1,1,1",
@@ -1361,6 +1552,8 @@ def cross_register_method6(
     ] = DEFAULT_CROSS_REGISTER_METHOD8_LIB_DIR,
     ftol: Annotated[float, typer.Option("--ftol", min=0.0)] = 1e-4,
     max_iterations: Annotated[int, typer.Option("--max-iterations", min=1)] = 300,
+    local_3d_refinement: Annotated[bool, typer.Option("--local-3d-refinement", help="Require spatially balanced local 3D refinement and internal consistency checks.")] = False,
+    local_affine_estimator: Annotated[Literal["least-squares", "restrained"], typer.Option("--local-affine-estimator", help="Select the recorded local estimator; restrained uses a fixed physical strain prior and robust fitting.")] = "least-squares",
     phase_upsample_factor: Annotated[int, typer.Option("--phase-upsample-factor", min=1)] = 10,
     min_corr: Annotated[float, typer.Option("--min-corr")] = 0.15,
     min_grad_ncc: Annotated[float, typer.Option("--min-grad-ncc")] = 0.24,
@@ -1397,6 +1590,12 @@ def cross_register_method6(
     overwrite: Annotated[bool, typer.Option("--overwrite/--no-overwrite")] = False,
 ) -> None:
     """Fit fused-fixed Method 6, then write one canonical channel registration."""
+    if split_parent_windows and parent_window_dir is None:
+        raise typer.BadParameter("--split-parent-windows requires --parent-window-dir")
+    if parent_reference_fused is not None and parent_window_dir is None:
+        raise typer.BadParameter("--parent-reference-fused requires --parent-window-dir")
+    if local_affine_estimator != "least-squares" and not local_3d_refinement:
+        raise typer.BadParameter("--local-affine-estimator restrained requires --local-3d-refinement")
     if output_registration.exists() and not overwrite:
         raise typer.BadParameter(
             f"output registration already exists at {output_registration}; pass --overwrite to replace it"
@@ -1423,12 +1622,17 @@ def cross_register_method6(
         target_label=target_label,
         sweep_runner=sweep_runner,
         window_filter_json=window_filter_json,
+        parent_window_dir=parent_window_dir,
+        parent_reference_fused=parent_reference_fused,
+        split_parent_windows=split_parent_windows,
         core_shape_zyx=parse_shape_zyx(core_shape_zyx),
         window_shape_zyx=parse_shape_zyx(window_shape_zyx),
         fit_downsample_zyx=parse_shape_zyx(fit_downsample_zyx),
         native_lib_dir=native_lib_dir,
         ftol=ftol,
         max_iterations=max_iterations,
+        local_3d_refinement=local_3d_refinement,
+        local_affine_estimator=local_affine_estimator,
         phase_upsample_factor=phase_upsample_factor,
         min_corr=min_corr,
         min_grad_ncc=min_grad_ncc,
@@ -1449,6 +1653,18 @@ def cross_register_method6(
             indent=2,
         )
     )
+
+
+@cross_register_app.command("assemble-bounded-domains")
+def cross_register_assemble_bounded_domains(
+    plan: Annotated[Path, typer.Option("--plan", exists=True, dir_okay=False, readable=True)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+) -> None:
+    """Assemble explicit bounded corrections and retained published mappings."""
+    from squisher_lightsheet.fused_fixed_domains import assemble_bounded_domains
+
+    summary = assemble_bounded_domains(plan_path=plan, output_dir=output_dir)
+    typer.echo(summary)
 
 
 @cross_register_app.command("recover-native")
@@ -1557,6 +1773,15 @@ def cross_register_complete_recovery(
     replacement_image_ncc_margin: Annotated[
         float, typer.Option("--replacement-image-ncc-margin", min=0.0)
     ] = DEFAULT_COMPLETE_RECOVERY_SETTINGS.replacement_image_ncc_margin,
+    maximum_unverified_rerun_departure_px: Annotated[
+        float,
+        typer.Option(
+            "--maximum-unverified-rerun-departure-px",
+            min=0.0,
+            help="Largest level-0 translation departure from the interpolated placement for a native rerun "
+            "that the residual check does not verify.",
+        ),
+    ] = DEFAULT_COMPLETE_RECOVERY_SETTINGS.maximum_unverified_rerun_departure_px,
 ) -> None:
     """Publish the fixed four-stage recovery policy from a native checkpoint."""
     summary = complete_recovery(
@@ -1572,6 +1797,7 @@ def cross_register_complete_recovery(
             maximum_linear_median_residual_um=maximum_linear_median_residual_um,
             maximum_outlier_px=maximum_outlier_px,
             replacement_image_ncc_margin=replacement_image_ncc_margin,
+            maximum_unverified_rerun_departure_px=maximum_unverified_rerun_departure_px,
         ),
     )
     typer.echo(json.dumps({"summary": str(summary)}, indent=2))
@@ -1585,6 +1811,14 @@ def cross_register_prefusion_qc(
     ],
     fixed_threshold: Annotated[float, typer.Option("--fixed-threshold", min=0.0)],
     output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    fixed_z_index: Annotated[
+        int | None,
+        typer.Option(
+            "--fixed-z-index",
+            min=0,
+            help="Level-2 fixed plane to sample. Default: the middle plane, which a one-sided dataset may not reach.",
+        ),
+    ] = None,
 ) -> None:
     """Render pre-fusion dumb stitches and geometric tissue-hole maps."""
     output = render_prefusion_qc(
@@ -1592,6 +1826,7 @@ def cross_register_prefusion_qc(
         fixed_volume=fixed_volume,
         fixed_threshold=fixed_threshold,
         output_dir=output_dir,
+        fixed_z_index=fixed_z_index,
     )
     typer.echo(json.dumps({"contact_sheet": str(output)}, indent=2))
 
@@ -1615,6 +1850,144 @@ def cross_register_interpolated_window_qc(
         columns=columns,
     )
     typer.echo(json.dumps({"contact_sheet": str(result)}, indent=2))
+
+
+@cross_register_app.command("overlap-disagreement")
+def cross_register_overlap_disagreement(
+    summary: Annotated[Path, typer.Option("--summary", exists=True, dir_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option("--output", dir_okay=False)],
+) -> None:
+    """Report accepted affine disagreement on shared native source domains."""
+    typer.echo(json.dumps({"report": str(write_overlap_disagreement(summary, output))}, indent=2))
+
+
+@cross_register_app.command("propose-seeds")
+def cross_register_propose_seeds(
+    summary: Annotated[
+        Path,
+        typer.Option(
+            "--summary", exists=True, dir_okay=False, readable=True, help="complete-recovery summary."
+        ),
+    ],
+    manual_initializations: Annotated[
+        Path,
+        typer.Option(
+            "--manual-initializations",
+            dir_okay=False,
+            help="Dataset master file of curated window initializations (created if absent).",
+        ),
+    ],
+    channel: Annotated[str, typer.Option("--manual-initializations-channel")],
+    maximum_masked_fraction: Annotated[
+        float, typer.Option("--maximum-masked-fraction", min=0.0, max=1.0)
+    ] = DEFAULT_SEED_MAXIMUM_MASKED_FRACTION,
+    maximum_translation_px: Annotated[
+        float, typer.Option("--maximum-translation-px", min=0.0)
+    ] = DEFAULT_SEED_MAXIMUM_TRANSLATION_PX,
+    minimum_gradient_ncc: Annotated[
+        float, typer.Option("--minimum-gradient-ncc")
+    ] = DEFAULT_SEED_MINIMUM_GRADIENT_NCC,
+) -> None:
+    """Seed withheld tissue windows from their best image-supported native-recovery attempt."""
+    entries = propose_manual_initializations(
+        complete_summary=summary,
+        master=manual_initializations,
+        channel=channel,
+        maximum_masked_fraction=maximum_masked_fraction,
+        maximum_translation_px=maximum_translation_px,
+        minimum_gradient_ncc=minimum_gradient_ncc,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "channel": channel,
+                "measured": sorted(name for name, entry in entries.items() if entry["seed_origin"] == "measured"),
+                "manual": sorted(name for name, entry in entries.items() if entry["seed_origin"] == "manual"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cross_register_app.command("acquisition-offset")
+def cross_register_acquisition_offset(
+    moving_position: Annotated[
+        Path,
+        typer.Option(
+            "--moving-position",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Separately acquired series, placed in the combined frame without its depth offset.",
+        ),
+    ],
+    reference_position: Annotated[
+        Path,
+        typer.Option(
+            "--reference-position",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Reference acquisition on the same stage lattice, in the combined frame.",
+        ),
+    ],
+    moving_tile_dir: Annotated[Path, typer.Option("--moving-tile-dir", exists=True, file_okay=False)],
+    reference_tile_dir: Annotated[Path, typer.Option("--reference-tile-dir", exists=True, file_okay=False)],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    output_position: Annotated[Path, typer.Option("--output-position", dir_okay=False)],
+    reference_channel: Annotated[int, typer.Option("--reference-channel", min=0)],
+    moving_channel: Annotated[int, typer.Option("--moving-channel", min=0)] = 0,
+    tiles: Annotated[
+        list[str] | None,
+        typer.Option("--tile", help="Tile number to measure (repeatable). Default: the most central tiles."),
+    ] = None,
+    tile_count: Annotated[
+        int, typer.Option("--tile-count", min=1)
+    ] = DEFAULT_ACQUISITION_OFFSET_TILE_COUNT,
+    validation_tile_count: Annotated[
+        int,
+        typer.Option(
+            "--validation-tile-count",
+            min=1,
+            help="Tiles held out of the median and spread away from the measured ones, to validate the shift.",
+        ),
+    ] = DEFAULT_ACQUISITION_OFFSET_VALIDATION_TILE_COUNT,
+    coarse_level: Annotated[
+        int, typer.Option("--coarse-level", min=0)
+    ] = DEFAULT_ACQUISITION_OFFSET_COARSE_LEVEL,
+    fine_level: Annotated[int, typer.Option("--fine-level", min=0)] = DEFAULT_ACQUISITION_OFFSET_FINE_LEVEL,
+) -> None:
+    """Measure a separate acquisition's per-tile depth and XY offset and shift its positions by the median."""
+    summary = run_acquisition_offset(
+        moving_position=moving_position,
+        reference_position=reference_position,
+        moving_tile_dir=moving_tile_dir,
+        reference_tile_dir=reference_tile_dir,
+        output_dir=output_dir,
+        output_position=output_position,
+        moving_channel=moving_channel,
+        reference_channel=reference_channel,
+        tiles=tiles,
+        tile_count=tile_count,
+        validation_tile_count=validation_tile_count,
+        coarse_level=coarse_level,
+        fine_level=fine_level,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "median_correction_zyx_um": summary["median_correction_zyx_um"],
+                "correction_mad_zyx_um": summary["correction_mad_zyx_um"],
+                "validation_passed": summary["validation"]["passed"],
+                "output_position": str(output_position),
+            },
+            indent=2,
+        )
+    )
+    if not summary["validation"]["passed"]:
+        failed = [check for check in summary["validation"]["checks"] if not check["passed"]]
+        typer.echo(f"Shifted positions fail held-out tile-pair validation: {json.dumps(failed)}", err=True)
+        raise typer.Exit(1)
 
 
 @cross_register_method8_app.command("coarse")
@@ -1859,6 +2232,20 @@ def fused_middle_z_qc(
     )
 
 
+@app.command("fused-preview")
+def fused_preview(
+    volumes: Annotated[list[str], typer.Option("--volume", help="Complete fused volume as LABEL=PATH.")],
+    output_dir: Annotated[Path, typer.Option("--output-dir", file_okay=False)],
+    level: Annotated[int, typer.Option("--level", min=0)] = DEFAULT_FUSED_PREVIEW_LEVEL,
+) -> None:
+    """Render LABEL.png per fused volume: XY at 25/50/75% depth plus middle XZ and YZ, at physical aspect."""
+    outputs = [
+        render_fused_preview(label=label, source=source, output=output_dir / f"{label}.png", level=level)
+        for label, source in _parse_labeled_paths(volumes, option="--volume", kind="directory")
+    ]
+    typer.echo(json.dumps({"previews": [str(path) for path in outputs]}, indent=2))
+
+
 @app.command("threshold-review")
 def threshold_review(
     fixed_fused: Annotated[
@@ -2097,14 +2484,17 @@ def single_position(
     input_dir: Annotated[Path, typer.Option("--input-dir", exists=True, file_okay=False, readable=True)],
     output: Annotated[Path, typer.Option("--output")],
     side: Annotated[str, typer.Option("--side")],
+    position_overrides: Annotated[Path | None, typer.Option("--position-overrides", exists=True, dir_okay=False)] = None,
     plot_title: Annotated[str, typer.Option("--plot-title")] = "metadata tile positions",
 ) -> None:
+    override_options = {} if position_overrides is None else {"position_overrides": position_overrides}
     create_single_position_file(
         input_dir=input_dir,
         output=output,
         side=side,
         plot_title=plot_title,
         progress=typer.echo,
+        **override_options,
     )
     typer.echo(output.resolve())
 
@@ -2502,6 +2892,10 @@ def fuse(
             help="OME-Zarr whose scale-0 grid is reused.",
         ),
     ] = None,
+    output_grid_bounds_zyx: Annotated[
+        str | None,
+        typer.Option("--output-grid-bounds-zyx", help="Native template ROI as z0,y0,x0,z1,y1,x1."),
+    ] = None,
     output_grid_template_level: Annotated[
         int,
         typer.Option(
@@ -2546,6 +2940,7 @@ def fuse(
         output_chunksize_zyx=_parse_int_zyx(output_chunksize_zyx, "--output-chunksize-zyx"),
         output_grid_template=output_grid_template,
         output_grid_template_level=output_grid_template_level,
+        output_grid_bounds_zyx=None if output_grid_bounds_zyx is None else _parse_grid_bounds_zyx(output_grid_bounds_zyx),
         output_codec=output_codec,
         zstd_level=zstd_level,
         jpegxr_level=jpegxr_level,

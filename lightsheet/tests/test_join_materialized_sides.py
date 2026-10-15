@@ -10,7 +10,15 @@ from squisher_lightsheet.tile_quadrant_fusion import join_materialized_sides
 GRID = {"core_shape_zyx": [480, 480, 480], "window_shape_zyx": [528, 528, 528], "level_factor_zyx": [1, 1, 1]}
 
 
-def _side(root: Path, name: str, tiles: list[str], *, fixed_fused: str = "/fused/561.ome.zarr", status: str = "complete") -> Path:
+def _side(
+    root: Path,
+    name: str,
+    tiles: list[str],
+    *,
+    fixed_fused: str = "/fused/561.ome.zarr",
+    status: str = "complete",
+    source_channel: int = 2,
+) -> Path:
     output = root / name
     (output / "materialized_tiles").mkdir(parents=True)
     records = []
@@ -18,7 +26,7 @@ def _side(root: Path, name: str, tiles: list[str], *, fixed_fused: str = "/fused
         path = output / "materialized_tiles" / tile
         path.mkdir()
         records.append({"tile": tile, "path": str(path), "source_view": name})
-    common = {"fixed_fused": fixed_fused, "materialization_grid": GRID, "source_channel": 2}
+    common = {"fixed_fused": fixed_fused, "materialization_grid": GRID, "source_channel": source_channel}
     (output / "fused_fixed_materialized_chunks.positions.json").write_text(
         json.dumps(
             {
@@ -43,7 +51,7 @@ def _side(root: Path, name: str, tiles: list[str], *, fixed_fused: str = "/fused
             {
                 "artifact_type": "squisher_lightsheet.fused_fixed_overlapping_materialization_summary.v1",
                 "status": status,
-                "source_channel": 2,
+                "source_channel": source_channel,
                 "output_codec": "jpegxr",
                 "materialization_grid": GRID,
                 "tile_count": len(tiles),
@@ -90,3 +98,15 @@ def test_join_materialized_sides_rejects_incomplete_side(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="complete"):
         join_materialized_sides(side_output_dirs=[left, right], output_dir=tmp_path / "joined")
+
+
+def test_join_materialized_sides_records_each_side_s_source_channel(tmp_path: Path) -> None:
+    # 229Ptprz1: 514 is channel 2 of the CL multichannel acquisition and channel 0 of the separate CR acquisition.
+    left = _side(tmp_path, "CL", ["cl.a.ome.zarr"], source_channel=2)
+    right = _side(tmp_path, "CR", ["cr.a.ome.zarr"], source_channel=0)
+
+    outputs = join_materialized_sides(side_output_dirs=[left, right], output_dir=tmp_path / "joined")
+
+    summary = json.loads(outputs["summary"].read_text())
+    assert "source_channel" not in summary
+    assert summary["source_channels"] == {str(left.resolve()): 2, str(right.resolve()): 0}

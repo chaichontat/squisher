@@ -229,6 +229,33 @@ lightsheet fit-residual \
   --seed 20260907
 ```
 
+For a demonstrated intensity mismatch confined to camera edges, refine an
+accepted correction with `fit-residual-edges`. It fits four quadratic log-gain
+ramps (low/high Y and X), constant across Z, and freezes the existing shared
+field, source fields, and gains. Each added ramp is exactly zero with zero slope
+outside the explicitly selected native edge width. This avoids extrapolating a
+narrow overlap measurement into tile centers.
+
+```bash
+lightsheet fit-residual-edges \
+  --fixed-fused /path/to/native-grid.ome.zarr \
+  --registration /path/to/native-registration.json \
+  --base-correction /path/to/accepted-fit/correction.json \
+  --output-dir /path/to/edge-refinement \
+  --edge-width-fraction 0.06
+```
+
+Select the width from measured native overlap profiles; `0.06` is an example,
+not a default. The command requires an unchanged schema-3 base and its exact
+native registration/source set. It samples 39 depths by default, evaluates
+held-out pairs and each held-out depth, and writes a native comparison at every
+depth. Its schema-4 correction combines the baseline and edge field for one
+application by the existing fusion/materialization reader. A recorded common
+scalar preserves amplification headroom; QC omits that scalar so darkening
+cannot masquerade as seam improvement. Accept only after reviewing the native
+boundaries, transition regions, and independent same-channel coverage where
+available, using one scale learned from unchanged interiors and held fixed.
+
 By default, the fit samples 39 planes at 2.5-percentile increments. To select a
 smaller explicit set, add repeated `--z-percentile` options:
 
@@ -406,9 +433,19 @@ lightsheet rechunk-ome-zarr SOURCE.ome.zarr PREVIEW.ome.zarr \
   --codec-concurrency 4
 ```
 
-The command writes through `.PREVIEW.ome.zarr.tmp`, sets
-`squisher_complete=true` only after every selected level is copied, and refuses
-existing output unless `--overwrite` is passed.
+The command writes through a unique `.PREVIEW.ome.zarr.tmp-*` directory, sets
+`squisher_complete=true` only after every selected level and referenced sidecar
+is validated, and refuses existing output unless `--overwrite` is passed.
+Replacement retains the previous output while copying and restores it if
+installation fails; concurrent writers and crash-atomic replacement are not
+supported.
+
+Fusion and N4 outputs require `--start-level 0` and unchanged numeric dataset
+paths, because their provenance describes the original level-0 grid. Their
+referenced fusion bundles and N4 fields are copied and validated. Missing or
+unsupported auxiliary members are rejected instead of publishing dangling
+metadata. Level rebasing remains available for OME-Zarrs without those
+grid-dependent provenance attributes.
 
 ## Export an OME-Zarr level as NRRD
 
@@ -840,10 +877,25 @@ Recorded Image_10/Image_14 seam-refinement artifacts:
 
 ## Cross-Channel Fused-Fixed Registration
 
+The sweep, per-window fit, and contact-sheet implementations are included in
+`squisher-lightsheet`. Reinstall the package after updating an existing editable
+checkout to create `lightsheet-fused-fixed-sweep` and
+`lightsheet-fused-fixed-contact-sheet`; the public `lightsheet` commands invoke
+these executables from the active Python environment. An explicit
+`--sweep-runner` still selects a custom script by its exact path. Native CUDA
+operations continue to require the configured microImageLib shared library.
+
 The current workflow registers a tiled moving channel to an existing fused
 fixed-channel OME-Zarr. The fixed mosaic defines the target coordinate frame.
 Local registration estimates an affine for each moving-tile window; fusion
 applies those affines without resampling the materialized crop bytes first.
+
+EDU stage markers bind their upstream file, source-volume, and registration
+identities. Changes at the same paths reject reuse, including completed
+materialized fusions whose intermediate tiles have been cleaned up. Older
+markers without those input identities are not adopted automatically; preserve
+the historical run and use a separate output root. Completed pixel data alone
+does not prove that a stage matches the current inputs.
 
 Use this order:
 
@@ -863,15 +915,15 @@ Use this order:
    A tile without enough local support may use only registration-graph-adjacent
    good tiles.
 4. Apply the physical linear-field filter. Reject windows and whole tiles with
-   insufficient support or no field consensus. Later stages must not restore
-   these rows.
+   insufficient support or no field consensus. Complete recovery can reaccept
+   a mapping outlier through its shared-plane image comparison.
 5. Fit the retained field again and replace only robust affine outliers. Keep
    every other accepted measured matrix and translation exactly as fitted.
 6. Materialize accepted windows from the corrected summary with overlap. The
-   standard geometry uses `480,480,480` level-0 source cores,
-   `528,528,528` level-0 source windows, a 480-voxel step, and `4,4,4`
-   reduction. Regular outputs have shape `132,132,132` and overlap their
-   neighbors by 12 materialized pixels; tail-aligned windows may overlap more.
+   standard geometry uses `480,480,480` native source cores and
+   `528,528,528` source windows, with a 480-voxel step. Materialization defaults
+   to native sampling (`1,1,1`). Explicit `4,4,4` previews have shape
+   `132,132,132` and 12-pixel regular overlaps; tail-aligned windows may overlap more.
 7. Fuse the materialized windows on the fixed mosaic's selected pyramid grid,
    then validate the OME-Zarr completion marker, multiscales, shapes, chunks,
    codecs, and an overlay-free intensity QC image.
@@ -929,6 +981,15 @@ keeps the worker on that UUID, while an unmasked `--workers 2 --devices 0,1`
 selects physical GPUs 0 and 1. A local index outside the inherited mask fails
 before GPU work starts. `recover-native --devices` follows the same mapping
 because its reruns use this sweep runner.
+
+With `--parent-window-dir` and `--split-parent-windows`, Method6 subdivides
+accepted parent domains and rebases each selected parent affine into its child
+crop. The parent matrix and translation are preserved as the fit initializer.
+Parents recorded against another fusion may be reused with the explicit
+`--parent-reference-fused ORIGINAL_FUSION` option only when both completed
+references have identical spatial units and physical grids at every pyramid
+level. Parent records retain their original reference; the new run records both
+references in its cache and summary provenance.
 
 Apply an accepted physical channel calibration to another acquisition without
 rerunning the estimator:
@@ -1030,6 +1091,10 @@ stage origin, and retains its selected affine in `registered_affine`.
 The commands below recover and finalize an existing fused-fixed Method 6
 summary; coarse placement and the initial sweep are prerequisites. Native
 recovery uses the method and intensity transform recorded by that summary.
+Accepted local 3D affine refinements are native fits when the window records
+the matching native method and enabled local 3D refinement setting. These fits
+can seed spatial recovery and linear mapping recovery, and accepted local 3D
+recovery reruns retain their image validation.
 Accepted fits seed recovery only when their leave-one-out transform differs
 from the remaining fits by no more than the configured corner-displacement
 tolerance. Outliers become recovery targets and cannot seed their own tile or
@@ -1059,14 +1124,26 @@ lightsheet cross-register complete-recovery \
 
 `complete-recovery` accepts completed native Method 6 or Method 10 Mattes recovery checkpoints.
 It applies the physical linear filter, retained-affine-outlier replacement,
-validated spatial fallback promotion, and linear-mapping recovery in that fixed
+spatial fallback promotion, and linear-mapping recovery in that fixed
 order. A fitted transform is replaced by a linear-field prediction only when
 zero-shift high-passed NCC against the fixed volume, on shared level-2 planes,
-favors the prediction by `--replacement-image-ncc-margin`. Spatial promotion
-keeps a native rerun rejected by the correlation or gradient-NCC gate when its
-gradient NCC beats the interpolated initializer's by
-`--native-rerun-grad-ncc-margin`, or when it failed only correlation while
-meeting the gradient-NCC minimum. Intermediate stage outputs remain temporary.
+favors the prediction by `--replacement-image-ncc-margin` on every informative
+plane. Mapping recovery retains and reaccepts the original fitted outlier when
+the prediction loses that comparison. Spatial promotion starts from the
+supported, plausible interpolated initializer. A native rerun rejected only by
+the correlation or gradient-NCC gate can replace it when the same image
+comparison favors the rerun. Unless its YX residual check verifies it, that
+rerun must stay within `--maximum-unverified-rerun-departure-px` of the
+initializer, measured by native corner displacement. When the median of the
+confident planes puts the selected candidate beyond the aligned bound, even if
+the planes disagree, the window's recorded
+original fit, then its parent-window initializer, then the selection shifted by
+the measured level-2 residual replace it if the residual check verifies them;
+otherwise the window stays rejected. When none of the three planes yields a
+confident peak, the mean masked-NCC surface over 13 planes spanning the central
+three quarters of the window measures the residual instead and can verify those
+candidates. An unverified candidate can remain accepted. Each window records the transform origin, recovery decision and
+residual verdict separately. Intermediate stage outputs remain temporary.
 The command atomically
 publishes the final windows, stage reports, and an identity manifest; repeated
 use succeeds only when the input content, settings, and complete output hashes
@@ -1087,7 +1164,26 @@ lightsheet cross-register interpolated-window-qc \
   --moving-label 514 \
   --fixed-label 561 \
   --output /path/to/prefusion-qc/interpolated-514.png
+
+lightsheet cross-register overlap-disagreement \
+  --summary "$COMPLETE_DIR/fused_fixed_method8_summary.json" \
+  --output /path/to/prefusion-qc/overlap-disagreement.json
 ```
+
+Recovery scoring and both prefusion renderers require recorded micrometer
+geometry at native level 0 and level 2. Fixed arrays are ZYX with level factors
+`4,4,4`; moving arrays are CZYX with factors `1,4,4` and an explicit acquisition
+channel. Within each store, both levels must have the same physical index
+origin. Fixed and moving stores may have different spacings and world origins.
+Unsupported sampling geometry raises an error before image scoring.
+
+The overlap report compares accepted maps from the same resolved source path
+and acquisition channel. It evaluates eight voxel-center corners and the center
+of each shared native source domain, converting signed source orientation and
+selected global maps to fixed physical coordinates. It reports displacement
+vectors and magnitudes in micrometers without reading image pixels or changing
+acceptance. Shared-plane residual verification measures YX alignment; native
+axial images or identified 3D correspondences provide axial evidence.
 
 After fusion, render same-grid middle-Z PNGs and a combined contact sheet:
 
@@ -1103,6 +1199,16 @@ lightsheet fused-middle-z-qc \
 
 ### Overlapping Materialization, Fusion, and QC
 
+For depth-dependent placement, accepted 528-cube parents can initialize short
+`128,528,528` windows with `80,480,480` cores. The selected parent map is rebased
+into each child's moving and fixed crop frames. At 0.6 micrometers per Z voxel,
+these windows span 76.8 micrometers, advance 48 micrometers and overlap by
+28.8 micrometers. Native Method6 fitting and the enabled local 3D refinement
+estimate a separate affine for each window. The local refinement fits a full
+affine to confident structural patch correspondences by least squares. Recovery
+models translation versus window position and averages rotation and stretch by
+polar decomposition; it does not interpolate all affine coefficients.
+
 Pass the filtered, outlier-replaced summary through `--source-summary`; it
 contains the final accepted rows and selected transforms. A manifest generated
 before those stages contains stale acceptance and affine data.
@@ -1110,6 +1216,21 @@ before those stages contains stale acceptance and affine data.
 The materializer defaults to native level 0 (`--level-factor-zyx 1,1,1`). Set
 `--level-factor-zyx 4,4,4` explicitly when producing a downsampled level-2
 review artifact, as in the preview example below.
+
+All index vectors use ZYX order. With crop center `c = (shape - 1) / 2`, the
+forward map is `f = A(m - c) + c + t`. Its inverse pull is `m = P f + b`, with
+`P = inverse(A)` and `b = c - P(c + t)`. Materialization copies oriented source
+crop pixels and applies the named intensity correction once. It records physical
+affine placement using the fixed crop origin and both native voxel spacings.
+The informational source-origin field supplies provenance, not another
+translation. Fusion resamples the placed crops onto the fixed grid. Source reads
+enclose fractional crop bounds on the native voxel grid and retain the actual
+first selected voxel's physical origin, including cached reads.
+
+Full overlapping windows and content-preibisch-coarse blending suppress intensity
+seams. Blending does not force adjacent affine maps to agree geometrically; use
+the overlap report and native XY/XZ images to inspect map disagreement and
+broadened or doubled nuclei.
 
 ```bash
 MOVING_POSITIONS=/path/to/moving.positions.json

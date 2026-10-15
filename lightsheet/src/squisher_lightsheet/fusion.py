@@ -127,6 +127,7 @@ def fuse_tiles(
     output_chunksize_zyx: tuple[int, int, int] = DEFAULT_OUTPUT_CHUNKSIZE_ZYX,
     output_grid_template: Path | None = None,
     output_grid_template_level: int = 0,
+    output_grid_bounds_zyx: tuple[int, int, int, int, int, int] | None = None,
     output_codec: OutputCodec = "auto",
     zstd_level: int = 3,
     jpegxr_level: float = DEFAULT_JPEGXR_LEVEL,
@@ -138,6 +139,8 @@ def fuse_tiles(
 ) -> str:
     if residual_correction is not None and flatfield_dirs_by_source_view:
         raise ValueError("Residual correction requires already-corrected inputs; do not also apply BaSiC")
+    if output_grid_bounds_zyx is not None and output_grid_template is None:
+        raise ValueError("output grid bounds require an output grid template")
     output = canonical_fusion_base_output(output)
     batch_size = parse_fusion_batch_size(batch_size)
     resolved_output_codec = resolve_fusion_output_codec(
@@ -179,6 +182,8 @@ def fuse_tiles(
     if output_grid_template is not None:
         args.extend(["--output-grid-template", str(output_grid_template)])
         args.extend(["--output-grid-template-level", str(output_grid_template_level)])
+    if output_grid_bounds_zyx is not None:
+        args.extend(["--output-grid-bounds-zyx", *(str(value) for value in output_grid_bounds_zyx)])
     if flatfield_dirs_by_source_view is not None:
         validate_source_view_flatfields(flatfield_dirs_by_source_view)
         for view, flatfield_dir in flatfield_dirs_by_source_view.items():

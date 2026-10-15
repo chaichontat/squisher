@@ -16,7 +16,6 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 from typing import Callable, Sequence
 
 import numpy as np
@@ -24,10 +23,12 @@ import numpy as np
 from squisher_lightsheet._legacy.stitch_20x_tl_multiview import (
     TileMetadata,
     parse_ome_metadata,
+    file_resume_identity,
+    source_tile_resume_identity,
 )
+from squisher_lightsheet.artifact_io import registration_input_fingerprint
 
 
-EXPECTED_PYTHON = Path("/home/chaichontat/miniforge3/envs/multi/bin/python")
 DEFAULT_PSF_571 = Path(
     "/home/chaichontat/nvme/lightsheet/20260606/"
     "psf_Image_57_571nm_zstrict/radial_symmetric_reskewed_rawscale_zcenter2_xy9_sumnorm.tif"
@@ -37,12 +38,9 @@ DEFAULT_PSF_638 = Path(
     "psf_Image_57_648nm_std/radial_symmetric_reskewed_rawscale_zcenter2_xy9_sumnorm.tif"
 )
 DEFAULT_638_REFERENCE = Path(
-    "/working/eduseg/20260808-prod2/234-3-514561638/"
-    "reg-638-to-561/registration.json"
+    "/working/eduseg/20260808-prod2/234-3-514561638/reg-638-to-561/registration.json"
 )
-DEFAULT_638_REFERENCE_SHA256 = (
-    "ee7820a860b1d247f8116d86fe98206cbcf19ee93957b35e88706179e1b5e4f3"
-)
+DEFAULT_638_REFERENCE_SHA256 = "ee7820a860b1d247f8116d86fe98206cbcf19ee93957b35e88706179e1b5e4f3"
 STARTING_MATRIX_514 = (
     "0.9999090828,-0.0083501824,-0.0029757332,"
     "0.0141554887,0.9999284579,-0.0096124636,"
@@ -160,9 +158,7 @@ def _atomic_json(path: Path, payload: object) -> None:
 
 def _ome_tiffs(directory: Path) -> tuple[Path, ...]:
     paths = tuple(sorted((*directory.glob("*.ome.tif"), *directory.glob("*.ome.tiff"))))
-    partials = tuple(sorted(directory.glob(".*.ome.tif.*"))) + tuple(
-        sorted(directory.glob(".*.ome.tiff.*"))
-    )
+    partials = tuple(sorted(directory.glob(".*.ome.tif.*"))) + tuple(sorted(directory.glob(".*.ome.tiff.*")))
     if partials:
         raise ValueError(f"Input transfer is incomplete; partial OME-TIFFs remain in {directory}")
     return paths
@@ -238,7 +234,9 @@ def discover_inputs(source: Path) -> EduInputs:
     dapi_dir, dapi_tiffs, _ = dapi[0]
     track_channels = {channel for track in multi_metadata.tracks for channel in track.channels}
     if track_channels != {0, 1, 2}:
-        raise ValueError(f"Three-channel track metadata does not cover channels 0,1,2: {multi_metadata.tracks}")
+        raise ValueError(
+            f"Three-channel track metadata does not cover channels 0,1,2: {multi_metadata.tracks}"
+        )
     return EduInputs(
         multi_dir=multi_dir,
         dapi_dir=dapi_dir,
@@ -263,14 +261,6 @@ def _gpu_uuids() -> tuple[str, ...]:
     return tuple(uuid for _memory, uuid in sorted(rows, reverse=True))
 
 
-def _require_multi_environment() -> None:
-    if Path(sys.executable).resolve() != EXPECTED_PYTHON.resolve():
-        raise RuntimeError(
-            f"EDU workflow must run in the multi environment: expected {EXPECTED_PYTHON}, "
-            f"got {sys.executable}"
-        )
-
-
 def _require_complete_fusion(path: Path) -> None:
     metadata = json.loads((path / "zarr.json").read_text())
     if metadata.get("attributes", {}).get("squisher_complete") is not True:
@@ -285,6 +275,23 @@ def _require_complete_deconvolution(path: Path, expected_count: int) -> None:
         metadata = json.loads((store / "zarr.json").read_text())
         if metadata.get("attributes", {}).get("squisher_complete") is not True:
             raise ValueError(f"Incomplete deconvolved store: {store}")
+
+
+def _tile_inputs(directory: Path) -> object:
+    if not directory.is_dir() or not any(directory.glob("*.ome.zarr")):
+        raise ValueError(f"No source OME-Zarr tiles in {directory}")
+    return [
+        source_tile_resume_identity(path, require_completion=True)
+        for path in sorted(directory.glob("*.ome.zarr"))
+    ]
+
+
+def _recovery_inputs(summary: Path) -> object:
+    payload = json.loads(summary.read_text())
+    return {
+        "summary": file_resume_identity(summary),
+        "windows": [file_resume_identity(Path(window["level0_json"])) for window in payload["windows"]],
+    }
 
 
 class StageRunner:
@@ -305,14 +312,20 @@ class StageRunner:
         required: Sequence[Path],
         env: dict[str, str] | None = None,
         validate: Callable[[], None] | None = None,
+        input_identity: Callable[[], object] | None = None,
     ) -> None:
         command = [str(value) for value in argv]
         identity = _json_sha256({"command": command, "environment": env or {}})
         marker = self._marker(name)
+        inputs = input_identity() if input_identity is not None else None
         if marker.is_file():
             payload = json.loads(marker.read_text())
             if payload.get("identity") != identity:
                 raise ValueError(f"Stage {name} command changed; refusing to reuse {marker}")
+            if input_identity is not None and payload.get("inputs") != inputs:
+                raise ValueError(
+                    f"Stage {name} inputs changed or were not recorded; refusing to reuse {marker}"
+                )
             if all(path.exists() for path in required):
                 if validate is not None:
                     validate()
@@ -354,6 +367,7 @@ class StageRunner:
                 "name": name,
                 "identity": identity,
                 "command": command,
+                "inputs": inputs,
                 "required_outputs": [str(path.resolve()) for path in required],
                 "completed_at": datetime.now().astimezone().isoformat(),
             },
@@ -438,10 +452,7 @@ def _write_metadata_grid(registration: Path, tile_dir: Path, output: Path) -> No
             "ome": {
                 "multiscales": [
                     {
-                        "axes": [
-                            {"name": axis, "type": "space", "unit": "micrometer"}
-                            for axis in "zyx"
-                        ],
+                        "axes": [{"name": axis, "type": "space", "unit": "micrometer"} for axis in "zyx"],
                         "datasets": [
                             {
                                 "coordinateTransformations": [
@@ -542,8 +553,7 @@ def _reference_638_matrix(path: Path) -> str:
     payload = json.loads(path.read_text())
     contract = payload.get("transform_contract", {})
     if (
-        payload.get("artifact_type")
-        != "squisher_lightsheet.global_channel_affine_registration.v1"
+        payload.get("artifact_type") != "squisher_lightsheet.global_channel_affine_registration.v1"
         or contract.get("source_space") != "638_stage_um"
         or contract.get("target_space") != "561_registered_um"
     ):
@@ -564,8 +574,8 @@ def _common_pyramid_level(*directories: Path) -> int:
         if source is None:
             raise ValueError(f"No OME-Zarr tiles in {directory}")
         metadata = json.loads((source / "zarr.json").read_text())
-        datasets = metadata.get("attributes", {}).get("ome", {}).get("multiscales", [{}])[0].get(
-            "datasets", []
+        datasets = (
+            metadata.get("attributes", {}).get("ome", {}).get("multiscales", [{}])[0].get("datasets", [])
         )
         maxima.append(len(datasets) - 1)
     return min(maxima)
@@ -609,6 +619,9 @@ def _preprocess(
             "128",
         ],
         required=profiles,
+        input_identity=lambda: [
+            source_tile_resume_identity(path, require_completion=False) for path in tiffs
+        ],
         env=primary_gpu_env,
     )
     common: list[str | Path] = ["--channels", str(channels)]
@@ -630,6 +643,11 @@ def _preprocess(
             "100",
         ],
         required=[scale / "scaling.json"],
+        input_identity=lambda: {
+            "tiffs": [source_tile_resume_identity(path, require_completion=False) for path in tiffs],
+            "profiles": [file_resume_identity(path) for path in profiles],
+            "psfs": [file_resume_identity(path) for path in psfs],
+        },
         env=all_gpu_env,
     )
     runner.command(
@@ -652,6 +670,12 @@ def _preprocess(
         required=[deconv],
         env=all_gpu_env,
         validate=lambda: _require_complete_deconvolution(deconv, len(tiffs)),
+        input_identity=lambda: {
+            "tiffs": [source_tile_resume_identity(path, require_completion=False) for path in tiffs],
+            "profiles": [file_resume_identity(path) for path in profiles],
+            "psfs": [file_resume_identity(path) for path in psfs],
+            "scaling": file_resume_identity(scale / "scaling.json"),
+        },
     )
 
 
@@ -667,6 +691,7 @@ def _fuse_source(
     correction: Path | None,
     primary_gpu_env: dict[str, str],
     gpu_memory_max_gib: str | None = None,
+    input_identity: Callable[[], object] | None = None,
 ) -> None:
     argv: list[str | Path] = [
         "lightsheet",
@@ -710,7 +735,116 @@ def _fuse_source(
         required=[paths.fused(label) / "zarr.json"],
         env=primary_gpu_env,
         validate=lambda: _require_complete_fusion(paths.fused(label)),
+        input_identity=input_identity
+        or (
+            lambda: {
+                "tiles": _tile_inputs(source_dir),
+                "position": file_resume_identity(position),
+                "registration": file_resume_identity(registration),
+                "correction": file_resume_identity(correction),
+                "grid": source_tile_resume_identity(
+                    paths.grid("561") if label == "561" else paths.fused("561"),
+                    require_completion=label != "561",
+                ),
+            }
+        ),
     )
+
+
+def _run_materialized_fusion(
+    runner: StageRunner,
+    paths: EduPaths,
+    *,
+    label: str,
+    channel: int,
+    summary: Path,
+    primary_gpu_env: dict[str, str],
+) -> None:
+    materialized = paths.multi / f"materialized-{label}"
+    materialize_command = [
+        "lightsheet",
+        "fused-fixed-materialize-overlap",
+        "--moving-position",
+        paths.registered_positions(label),
+        "--moving-source-registration",
+        paths.registration(label),
+        "--moving-source-dir",
+        paths.deconv(label),
+        "--source-summary",
+        summary,
+        "--output-dir",
+        materialized,
+        "--source-channel",
+        str(channel),
+        "--residual-correction",
+        paths.residual(label) / "correction.json",
+        "--core-shape-zyx",
+        "480,480,480",
+        "--window-shape-zyx",
+        "528,528,528",
+        "--level-factor-zyx",
+        "1,1,1",
+        "--output-codec",
+        "zstd",
+        "--zstd-level",
+        "3",
+        "--workers",
+        "4",
+        "--resume",
+    ]
+
+    def input_identity() -> object:
+        # Bind durable sources because successful materialized tiles are removed.
+        return {
+            "sources": {
+                "moving": registration_input_fingerprint(
+                    paths.registered_positions(label), paths.deconv(label)
+                ),
+                "registration": file_resume_identity(paths.registration(label)),
+                "recovery": _recovery_inputs(summary),
+                "correction": file_resume_identity(paths.residual(label) / "correction.json"),
+                "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+            },
+            "materialization_command": [str(value) for value in materialize_command],
+        }
+
+    try:
+        _require_complete_fusion(paths.fused(label))
+    except (FileNotFoundError, ValueError):
+        runner.command(
+            f"materialize-{label}",
+            materialize_command,
+            required=[
+                materialized / "materialized_tiles",
+                materialized / "fused_fixed_materialized_chunks.positions.json",
+                materialized / "fused_fixed_materialized_chunks.registration.json",
+                materialized / "fused_fixed_materialized_chunks.summary.json",
+            ],
+            env=primary_gpu_env,
+            input_identity=input_identity,
+        )
+    else:
+        if not runner._marker(f"fuse-{label}").is_file():
+            raise ValueError(
+                f"Complete fuse-{label} has no recorded input identity; cannot safely reuse {paths.fused(label)}"
+            )
+    _fuse_source(
+        runner,
+        paths,
+        label=label,
+        source_dir=materialized / "materialized_tiles",
+        position=materialized / "fused_fixed_materialized_chunks.positions.json",
+        registration=materialized / "fused_fixed_materialized_chunks.registration.json",
+        channel=0,
+        correction=None,
+        primary_gpu_env=primary_gpu_env,
+        gpu_memory_max_gib=MATERIALIZED_FUSION_GPU_MEMORY_MAX_GIB,
+        input_identity=input_identity,
+    )
+    if materialized.exists() and not runner.dry_run:
+        _require_complete_fusion(paths.fused(label))
+        shutil.rmtree(materialized)
+        print(f"[edu] removed successful intermediate {materialized}", flush=True)
 
 
 def _run_cross_channel_recovery(
@@ -765,6 +899,10 @@ def _run_cross_channel_recovery(
             "8",
         ],
         required=[rough / "global-phase.positions.json", rough / "global-phase.summary.json"],
+        input_identity=lambda: {
+            "fixed": registration_input_fingerprint(paths.registered_positions("561"), paths.deconv("561")),
+            "moving": registration_input_fingerprint(paths.registered_positions(label), paths.deconv(label)),
+        },
         env=primary_gpu_env,
     )
     runner.command(
@@ -808,6 +946,14 @@ def _run_cross_channel_recovery(
             "--resume",
         ],
         required=[method6 / "fused_fixed_method8_summary.json"],
+        input_identity=lambda: {
+            "moving": registration_input_fingerprint(
+                rough / "global-phase.positions.json", paths.deconv(label)
+            ),
+            "registration": file_resume_identity(paths.registration(label)),
+            "fixed_position": file_resume_identity(paths.registered_positions("561")),
+            "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+        },
         env=primary_gpu_env,
     )
     runner.command(
@@ -828,6 +974,15 @@ def _run_cross_channel_recovery(
             *_manual_initialization_args(paths, label),
         ],
         required=[native / "fused_fixed_method8_summary.json"],
+        input_identity=lambda: {
+            "method6": _recovery_inputs(method6 / "fused_fixed_method8_summary.json"),
+            "moving": registration_input_fingerprint(paths.registered_positions(label), paths.deconv(label)),
+            "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+            "adjacency": file_resume_identity(
+                paths.registration_dir(label) / "registration.measurements.json"
+            ),
+            "manual": file_resume_identity(paths.manual_initializations),
+        },
         env=primary_gpu_env,
     )
     runner.command(
@@ -842,8 +997,90 @@ def _run_cross_channel_recovery(
             complete,
         ],
         required=[complete / "fused_fixed_method8_summary.json", complete / "manifest.json"],
+        input_identity=lambda: {
+            "native": _recovery_inputs(native / "fused_fixed_method8_summary.json"),
+            "moving": registration_input_fingerprint(paths.registered_positions(label), paths.deconv(label)),
+            "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+        },
     )
     return complete / "fused_fixed_method8_summary.json"
+
+
+def _run_cellpose_runtime(
+    runner: StageRunner,
+    runtime_report: Path,
+    *,
+    primary_gpu_env: dict[str, str],
+) -> None:
+    def runtime_identity(*, build_missing: bool) -> dict[str, object]:
+        previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = primary_gpu_env["CUDA_VISIBLE_DEVICES"]
+        try:
+            import numba
+            import torch
+
+            from squisher_segment.segment.model_artifacts import plan_path_for_device, validate_trt_plan
+
+            device = torch.device("cuda:0")
+            device_name = torch.cuda.get_device_name(device)
+            plan = plan_path_for_device(DEFAULT_CELLPOSE_MODEL, device_name)
+            if not plan.is_file() and build_missing:
+                from squisher_segment.segment.train import build_trt_engine
+
+                build_trt_engine(
+                    model_path=DEFAULT_CELLPOSE_MODEL,
+                    bsize=256,
+                    device=device,
+                    batch_size=1,
+                    backend="sam",
+                )
+            metadata = validate_trt_plan(
+                DEFAULT_CELLPOSE_MODEL,
+                device_name,
+                backend="sam",
+                bsize=256,
+                batch_size=1,
+            )
+            if build_missing:
+                from squisher_segment.segmentation.distributed import distributed_postproc
+
+                del distributed_postproc
+            return {
+                "artifact_type": "squisher_lightsheet.edu_cellpose_runtime.v2",
+                "gpu_uuid": primary_gpu_env["CUDA_VISIBLE_DEVICES"],
+                "device_name": device_name,
+                "model": str(DEFAULT_CELLPOSE_MODEL.resolve()),
+                "model_sha256": metadata["checkpoint_sha256"],
+                "plan": str(plan.resolve()),
+                "plan_sha256": metadata["plan_sha256"],
+                "plan_metadata": metadata,
+                "numba_version": numba.__version__,
+            }
+        finally:
+            if previous is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = previous
+
+    def prepare_runtime() -> None:
+        _atomic_json(runtime_report, runtime_identity(build_missing=True))
+
+    def validate_runtime() -> None:
+        expected = runtime_identity(build_missing=False)
+        if json.loads(runtime_report.read_text()) != expected:
+            raise ValueError(f"Cellpose runtime identity is no longer valid: {runtime_report}")
+
+    runner.action(
+        "cellpose-runtime",
+        {
+            "model": str(DEFAULT_CELLPOSE_MODEL.resolve()),
+            "model_sha256": _sha256(DEFAULT_CELLPOSE_MODEL),
+            "gpu_uuid": primary_gpu_env["CUDA_VISIBLE_DEVICES"],
+        },
+        prepare_runtime,
+        required=[runtime_report],
+        validate=validate_runtime,
+    )
 
 
 def _run_segmentation(
@@ -855,9 +1092,7 @@ def _run_segmentation(
 ) -> Path:
     import zarr
 
-    shape = tuple(
-        int(value) for value in zarr.open_group(paths.fused("561"), mode="r")["0"].shape
-    )
+    shape = tuple(int(value) for value in zarr.open_group(paths.fused("561"), mode="r")["0"].shape)
     if shape[1] < 2048 or shape[2] < 2048:
         raise ValueError(f"Reference fusion is smaller than the 2048x2048 Cellpose subset: {shape}")
     roi = [[0, shape[0]]]
@@ -893,73 +1128,7 @@ def _run_segmentation(
     }
 
     runtime_report = cellpose / "runtime-plan.json"
-
-    def prepare_runtime() -> None:
-        previous = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = primary_gpu_env["CUDA_VISIBLE_DEVICES"]
-        try:
-            import numba
-            import torch
-
-            from squisher_segment.segment.model_artifacts import plan_path_for_device
-            from squisher_segment.segment.train import build_trt_engine
-            from squisher_segment.segmentation.distributed import distributed_postproc
-
-            del distributed_postproc
-            device = torch.device("cuda:0")
-            device_name = torch.cuda.get_device_name(device)
-            plan = plan_path_for_device(DEFAULT_CELLPOSE_MODEL, device_name)
-            if not plan.is_file() or plan.stat().st_mtime_ns <= DEFAULT_CELLPOSE_MODEL.stat().st_mtime_ns:
-                plan = build_trt_engine(
-                    model_path=DEFAULT_CELLPOSE_MODEL,
-                    bsize=256,
-                    device=device,
-                    batch_size=1,
-                    backend="sam",
-                )
-            if not plan.is_file() or plan.stat().st_mtime_ns <= DEFAULT_CELLPOSE_MODEL.stat().st_mtime_ns:
-                raise RuntimeError(f"TensorRT plan is missing or stale after build: {plan}")
-            _atomic_json(
-                runtime_report,
-                {
-                    "artifact_type": "squisher_lightsheet.edu_cellpose_runtime.v1",
-                    "gpu_uuid": primary_gpu_env["CUDA_VISIBLE_DEVICES"],
-                    "device_name": device_name,
-                    "model": str(DEFAULT_CELLPOSE_MODEL.resolve()),
-                    "model_sha256": _sha256(DEFAULT_CELLPOSE_MODEL),
-                    "plan": str(plan.resolve()),
-                    "plan_sha256": _sha256(plan),
-                    "numba_version": numba.__version__,
-                },
-            )
-        finally:
-            if previous is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = previous
-
-    model_stat = DEFAULT_CELLPOSE_MODEL.stat()
-
-    def validate_runtime() -> None:
-        payload = json.loads(runtime_report.read_text())
-        if (
-            payload.get("gpu_uuid") != primary_gpu_env["CUDA_VISIBLE_DEVICES"]
-            or not Path(payload["plan"]).is_file()
-        ):
-            raise ValueError(f"Cellpose runtime identity is no longer valid: {runtime_report}")
-
-    runner.action(
-        "cellpose-runtime",
-        {
-            "model": str(DEFAULT_CELLPOSE_MODEL.resolve()),
-            "model_size": model_stat.st_size,
-            "model_mtime_ns": model_stat.st_mtime_ns,
-            "gpu_uuid": primary_gpu_env["CUDA_VISIBLE_DEVICES"],
-        },
-        prepare_runtime,
-        required=[runtime_report],
-        validate=validate_runtime,
-    )
+    _run_cellpose_runtime(runner, runtime_report, primary_gpu_env=primary_gpu_env)
 
     def write_inputs() -> None:
         _atomic_json(source_manifest, source_payload)
@@ -999,6 +1168,12 @@ def _run_segmentation(
             "0",
         ],
         required=[cellpose / "output_segmentation-sam.done", cellpose / "output_segmentation-sam.zarr"],
+        input_identity=lambda: {
+            "sources": file_resume_identity(source_manifest),
+            "config": file_resume_identity(config),
+            "runtime": file_resume_identity(runtime_report),
+            "fusions": fusion_identity,
+        },
         env=primary_gpu_env,
     )
     runner.command(
@@ -1020,6 +1195,10 @@ def _run_segmentation(
             "1",
         ],
         required=[cellpose / "postproc.zarr"],
+        input_identity=lambda: {
+            "segmentation": file_resume_identity(cellpose / "output_segmentation-sam.zarr/zarr.json"),
+            "completion": file_resume_identity(cellpose / "output_segmentation-sam.done"),
+        },
         env=primary_gpu_env,
     )
     expected_label_shape = tuple(source_payload["shape"][:3])
@@ -1058,23 +1237,27 @@ def _run_segmentation(
             argv += ["--dz", "1"]
         else:
             argv += ["--anisotropy", "1", "--ortho-depth", "512"]
-        runner.command(f"cellpose-export-{mode}", argv, required=[output])
+        runner.command(
+            f"cellpose-export-{mode}",
+            argv,
+            required=[output],
+            input_identity=lambda: {
+                "sources": file_resume_identity(source_manifest),
+                "labels": file_resume_identity(cellpose / "postproc.zarr/zarr.json"),
+                "fusions": fusion_identity,
+            },
+        )
     export_marker = cellpose / "export.complete.json"
 
     def validate_exports() -> None:
         counts = {}
         for directory in (cellpose / "extract-z512-full", cellpose / "extract-o512-full"):
-            images = sorted(
-                path for path in directory.glob("*.tif") if not path.name.endswith("_masks.tif")
-            )
+            images = sorted(path for path in directory.glob("*.tif") if not path.name.endswith("_masks.tif"))
             masks = {path for path in directory.glob("*_masks.tif")}
-            expected_masks = {
-                image.with_name(f"{image.stem}_masks.tif") for image in images
-            }
+            expected_masks = {image.with_name(f"{image.stem}_masks.tif") for image in images}
             if len(images) != 50 or masks != expected_masks:
                 raise ValueError(
-                    f"Incomplete paired export in {directory}: "
-                    f"images={len(images)}, masks={len(masks)}"
+                    f"Incomplete paired export in {directory}: images={len(images)}, masks={len(masks)}"
                 )
             counts[directory.name] = len(images)
         if export_marker.is_file():
@@ -1112,13 +1295,9 @@ def run_edu_workflow(
     allow_disconnected_405: bool = False,
 ) -> Path:
     """Run or resume WORKFLOW_EDU.md from one representative OME-TIFF."""
-    _require_multi_environment()
-
     inputs = discover_inputs(source)
     if output_root is None:
-        prefix = os.path.commonprefix((inputs.multi_dir.name, inputs.dapi_dir.name)).rstrip(
-            "-_. "
-        )
+        prefix = os.path.commonprefix((inputs.multi_dir.name, inputs.dapi_dir.name)).rstrip("-_. ")
         output_root = inputs.multi_dir.parent / f"{prefix or inputs.multi_dir.name}-edu-workflow"
     root = output_root.expanduser().resolve()
     paths = EduPaths(root=root, multi=root / "multi", dapi=root / "405")
@@ -1187,6 +1366,7 @@ def run_edu_workflow(
                 "--write-tiff",
             ],
             required=[review / f"{label}_omeMetadata_noBlend_noLines_manifest.json"],
+            input_identity=lambda: _tile_inputs(paths.deconv(label)),
         )
     thresholds = _gate_numbers(
         root / "native-thresholds.json",
@@ -1208,25 +1388,29 @@ def run_edu_workflow(
                 "L",
             ],
             required=[paths.positions(acquisition)],
+            input_identity=lambda: [
+                source_tile_resume_identity(path, require_completion=False)
+                for path in (inputs.dapi_tiffs if acquisition == "405" else inputs.multi_tiffs)
+            ],
         )
     for label, channel in (("561", 0), ("514", 2), ("405", 0)):
         register_command = [
-                "lightsheet-stitch",
-                "register",
-                "--position-json",
-                paths.positions(label),
-                "--zarr-dir",
-                paths.deconv(label),
-                "--output-dir",
-                paths.registration_dir(label),
-                "--threshold",
-                str(thresholds[label]),
-                "--channel",
-                str(channel),
-                "--device",
-                "0",
-                "--z-chunks",
-                "6",
+            "lightsheet-stitch",
+            "register",
+            "--position-json",
+            paths.positions(label),
+            "--zarr-dir",
+            paths.deconv(label),
+            "--output-dir",
+            paths.registration_dir(label),
+            "--threshold",
+            str(thresholds[label]),
+            "--channel",
+            str(channel),
+            "--device",
+            "0",
+            "--z-chunks",
+            "6",
         ]
         if label == "561" and allow_disconnected_561:
             register_command.append("--allow-disconnected")
@@ -1238,6 +1422,9 @@ def run_edu_workflow(
             f"register-{label}",
             register_command,
             required=[paths.registration(label), paths.registered_positions(label)],
+            input_identity=lambda: registration_input_fingerprint(
+                paths.positions(label), paths.deconv(label)
+            ),
             env=primary_gpu_env,
         )
 
@@ -1285,6 +1472,11 @@ def run_edu_workflow(
                 "20260907",
             ],
             required=[residual / "correction.json", residual / "manifest.json"],
+            input_identity=lambda: {
+                "registration": file_resume_identity(registration),
+                "tiles": _tile_inputs(paths.deconv(label)),
+                "grid": source_tile_resume_identity(grid, require_completion=False),
+            },
         )
 
     _fuse_source(
@@ -1312,6 +1504,7 @@ def run_edu_workflow(
             "2",
         ],
         required=[threshold_review],
+        input_identity=lambda: source_tile_resume_identity(paths.fused("561"), require_completion=True),
     )
     fused_threshold = _gate_numbers(
         root / "fused-561-threshold.json",
@@ -1361,6 +1554,11 @@ def run_edu_workflow(
             "--resume",
         ],
         required=[refit_638 / "registration.json", refit_638 / "fused_fixed_method8_summary.json"],
+        input_identity=lambda: {
+            "moving": registration_input_fingerprint(paths.registered_positions("561"), paths.deconv("561")),
+            "registration": file_resume_identity(paths.registration("561")),
+            "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+        },
         env=primary_gpu_env,
     )
     _fuse_source(
@@ -1424,6 +1622,10 @@ def run_edu_workflow(
             prefusion_qc,
         ],
         required=[prefusion_qc],
+        input_identity=lambda: {
+            "recoveries": {label: _recovery_inputs(summary) for label, summary in recoveries.items()},
+            "fixed_fused": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+        },
     )
     for label in ("514", "405"):
         runner.command(
@@ -1444,6 +1646,7 @@ def run_edu_workflow(
                 prefusion_qc / f"interpolated-{label}.png",
             ],
             required=[prefusion_qc / f"interpolated-{label}.png"],
+            input_identity=lambda: _recovery_inputs(recoveries[label]),
         )
     _gate_approval(
         root / "prefusion-approval.json",
@@ -1452,69 +1655,14 @@ def run_edu_workflow(
     )
 
     for label, channel in (("514", 2), ("405", 0)):
-        materialized = paths.multi / f"materialized-{label}"
-        try:
-            _require_complete_fusion(paths.fused(label))
-        except (FileNotFoundError, ValueError):
-            runner.command(
-                f"materialize-{label}",
-                [
-                    "lightsheet",
-                    "fused-fixed-materialize-overlap",
-                    "--moving-position",
-                    paths.registered_positions(label),
-                    "--moving-source-registration",
-                    paths.registration(label),
-                    "--moving-source-dir",
-                    paths.deconv(label),
-                    "--source-summary",
-                    recoveries[label],
-                    "--output-dir",
-                    materialized,
-                    "--source-channel",
-                    str(channel),
-                    "--residual-correction",
-                    paths.residual(label) / "correction.json",
-                    "--core-shape-zyx",
-                    "480,480,480",
-                    "--window-shape-zyx",
-                    "528,528,528",
-                    "--level-factor-zyx",
-                    "1,1,1",
-                    "--output-codec",
-                    "zstd",
-                    "--zstd-level",
-                    "3",
-                    "--workers",
-                    "4",
-                    "--resume",
-                ],
-                required=[
-                    materialized / "materialized_tiles",
-                    materialized / "fused_fixed_materialized_chunks.positions.json",
-                    materialized / "fused_fixed_materialized_chunks.registration.json",
-                    materialized / "fused_fixed_materialized_chunks.summary.json",
-                ],
-                env=primary_gpu_env,
-            )
-            _fuse_source(
-                runner,
-                paths,
-                label=label,
-                source_dir=materialized / "materialized_tiles",
-                position=materialized / "fused_fixed_materialized_chunks.positions.json",
-                registration=materialized / "fused_fixed_materialized_chunks.registration.json",
-                channel=0,
-                correction=None,
-                primary_gpu_env=primary_gpu_env,
-                gpu_memory_max_gib=MATERIALIZED_FUSION_GPU_MEMORY_MAX_GIB,
-            )
-        else:
-            print(f"[edu] reuse complete fuse-{label}", flush=True)
-        if materialized.exists() and not dry_run:
-            _require_complete_fusion(paths.fused(label))
-            shutil.rmtree(materialized)
-            print(f"[edu] removed successful intermediate {materialized}", flush=True)
+        _run_materialized_fusion(
+            runner,
+            paths,
+            label=label,
+            channel=channel,
+            summary=recoveries[label],
+            primary_gpu_env=primary_gpu_env,
+        )
 
     final_qc = paths.multi / "qc-final"
     middle_args: list[str | Path] = ["lightsheet", "fused-middle-z-qc"]
@@ -1534,6 +1682,10 @@ def run_edu_workflow(
         "final-middle-z-qc",
         middle_args,
         required=[final_qc / "combined-middle-z.png"],
+        input_identity=lambda: {
+            label: source_tile_resume_identity(paths.fused(label), require_completion=True)
+            for label in ("561", "638", "514", "405")
+        },
     )
     for label in ("638", "514", "405"):
         overlay = final_qc / f"561-vs-{label}"
@@ -1556,11 +1708,13 @@ def run_edu_workflow(
                 "512",
             ],
             required=[overlay],
+            input_identity=lambda: {
+                "fixed": source_tile_resume_identity(paths.fused("561"), require_completion=True),
+                "moving": source_tile_resume_identity(paths.fused(label), require_completion=True),
+            },
         )
 
-    fusion_identity = {
-        label: _sha256(paths.fused(label) / "zarr.json") for label in ("405", "561", "638")
-    }
+    fusion_identity = {label: _sha256(paths.fused(label) / "zarr.json") for label in ("405", "561", "638")}
     _gate_approval(
         root / "segmentation-approval.json",
         fusion_identity,

@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,7 +22,7 @@ from squisher_lightsheet.artifact_io import read_json_object
 from squisher_lightsheet.fused_fixed import SUMMARY_NAME
 
 
-PRODUCER_VERSION = "squisher-lightsheet.complete-recovery.4"
+PRODUCER_VERSION = "squisher-lightsheet.complete-recovery.8"
 POLICY_ORDER = (
     "physical_linear_filter",
     "retained_affine_outlier_smoothing",
@@ -35,6 +36,9 @@ NATIVE_RERUN_QUALITY_GATE_REASONS = frozenset(("quality_gate_grad_ncc", "quality
 INTERPOLATED_BASELINE_ATTEMPT = "level2_initializer_only"
 CONTRADICTED_INTERPOLATION_REASON = "spatial_fallback_contradicted_by_image"
 COMPLETE_NATIVE_METHODS = frozenset(("method6", "method10-mattes"))
+# Provisional: on 230Tnc 405, residual-verified rerun promotions displaced window corners up to 57 level-0 px from
+# the interpolated placement, and the four unverified reruns beyond 60 px included misplacements of 70 to 364 px.
+DEFAULT_MAXIMUM_UNVERIFIED_RERUN_DEPARTURE_PX = 60.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,12 @@ class CompleteRecoverySettings:
     )
     maximum_outlier_px: float = recovery.DEFAULT_MAXIMUM_OUTLIER_PX
     replacement_image_ncc_margin: float = recovery.DEFAULT_REPLACEMENT_IMAGE_NCC_MARGIN
+    maximum_unverified_rerun_departure_px: float = DEFAULT_MAXIMUM_UNVERIFIED_RERUN_DEPARTURE_PX
+
+    def __post_init__(self) -> None:
+        bound = self.maximum_unverified_rerun_departure_px
+        if not math.isfinite(bound) or bound < 0.0:
+            raise ValueError(f"maximum_unverified_rerun_departure_px must be finite and non-negative, got {bound}")
 
 
 DEFAULT_COMPLETE_RECOVERY_SETTINGS = CompleteRecoverySettings()
@@ -174,17 +184,88 @@ def _quality_gate_rejected_native_rerun(
             f"Expected one native rerun and one {INTERPOLATED_BASELINE_ATTEMPT} attempt "
             f"for {row.get('moving_tile')}"
         )
-    if native[0]["rejection_reason"] != reason:
+    candidate = native[0]
+    cache = row.get("cache_config", {})
+    if cache.get("native_method") == native_method and cache.get("local_3d_refinement") is True:
+        refined = [attempt for attempt in attempts if attempt["name"] == "local_3d_affine_refinement"]
+        if len(refined) != 1:
+            raise ValueError(f"Expected one final local refinement attempt for {row.get('moving_tile')}")
+        candidate = refined[0]
+        gradient_mean = row["outlier_recovery"]["native_rerun_gradient_component_ncc_mean"]
+    else:
+        gradient_mean = candidate.get("gradient_component_ncc_mean")
+    if candidate["rejection_reason"] != reason:
         raise ValueError(f"Native rerun rejection mismatch for {row.get('moving_tile')}")
     if not np.allclose(_attempt_transform(baseline[0]), interpolated, atol=1e-4):
         raise ValueError(
             f"{INTERPOLATED_BASELINE_ATTEMPT} does not match the interpolated initializer "
             f"for {row.get('moving_tile')}"
         )
-    transform = _attempt_transform(native[0])
+    transform = _attempt_transform(candidate)
     if not recovery._affine_is_plausible(transform):
         raise ValueError(f"Quality-gate rejection with implausible affine for {row.get('moving_tile')}")
-    return {"attempt": native[0], "transform": transform}
+    return {"attempt": candidate, "transform": transform, "gradient_component_ncc_mean": gradient_mean}
+
+
+def _recorded_transform(matrix: Any, translation: Any, *, label: str, row: dict[str, Any]) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    translation = np.asarray(translation, dtype=np.float64)
+    if matrix.shape != (3, 3) or translation.shape != (3,):
+        raise ValueError(f"Invalid recorded {label} transform for {row.get('moving_tile')}")
+    return np.concatenate([matrix.ravel(), translation])
+
+
+def _residual_measures_misalignment(residual: dict[str, Any]) -> bool:
+    """Whether the median of the confident planes puts the residual beyond the aligned bound.
+
+    Planes that disagree beyond the spread bound still count, since a depth-varying
+    offset spreads them; every replacement candidate must pass the residual check.
+    """
+    return (
+        residual["residual_yx_px"] is not None
+        and float(np.linalg.norm(residual["residual_yx_px"])) > recovery.RESIDUAL_ALIGNED_MAX_PX
+    )
+
+
+def _recorded_fit_candidates(row: dict[str, Any]) -> list[tuple[str, np.ndarray]]:
+    """Plausible transforms the window's original fit recorded, in preference order.
+
+    The original fit's own rejected transform comes first, then the accepted
+    parent-window transform it was initialized from. A fit rejected before it
+    started, such as for a too-masked fixed crop, recorded neither.
+    """
+    provenance = row.get("outlier_recovery") or {}
+    candidates = []
+    if provenance.get("original_selected_local_matrix_zyx") is not None:
+        candidates.append((
+            "original_fit",
+            _recorded_transform(
+                provenance["original_selected_local_matrix_zyx"],
+                provenance["original_selected_local_translation_zyx"],
+                label="original fit",
+                row=row,
+            ),
+        ))
+    source = provenance.get("source_window_json")
+    if source is not None:
+        original = read_json_object(Path(source))
+        if (
+            "initial_matrix_zyx" in original
+            and (original.get("initializer_conversion") or {}).get("source") == "accepted_parent_window"
+        ):
+            frame = ("moving_tile", "fixed_start_zyx", "moving_start_l0_zyx", "moving_shape_zyx")
+            if any(original[key] != row[key] for key in frame):
+                raise ValueError(f"{source} does not share the window frame of {row['moving_tile']}")
+            candidates.append((
+                "parent_initializer",
+                _recorded_transform(
+                    original["initial_matrix_zyx"],
+                    original["initial_translation_zyx"],
+                    label="parent initializer",
+                    row=row,
+                ),
+            ))
+    return [(name, transform) for name, transform in candidates if recovery._affine_is_plausible(transform)]
 
 
 def _promote_spatial_fallback(
@@ -193,14 +274,25 @@ def _promote_spatial_fallback(
     native_method: str,
     scorer: Any,
     image_ncc_margin: float,
+    maximum_unverified_rerun_departure_px: float,
 ) -> dict[str, Any]:
     """Promote the image-favored candidate unless the image contradicts it.
 
     The interpolated initializer is the default. A quality-gate-rejected native
-    rerun replaces it only when every informative plane favors the rerun. The
-    selected transform is then checked for confident residual misalignment; a
-    contradicted window stays rejected instead of being published misaligned.
+    rerun replaces it only when every informative plane favors the rerun, and,
+    unless the residual check verifies the rerun, only when its translation stays
+    within ``maximum_unverified_rerun_departure_px`` level-0 pixels of the
+    interpolated placement. When the median of the confident planes puts that
+    selection beyond the aligned bound, the window's recorded original fit, then
+    its parent-window initializer, then the selection shifted by the measured
+    residual are checked, and the first one the residual check verifies replaces
+    it. When no plane is confident, the aggregate residual over many window planes
+    stands in for that measurement, and a candidate it verifies also qualifies.
+    Otherwise a selection with confident residual misalignment stays rejected
+    instead of being published misaligned.
     """
+    from squisher_lightsheet.fused_fixed_qc import residual_corrected_transform
+
     provenance = row.get("outlier_recovery") or {}
     matrix = np.asarray(
         provenance.get("interpolated_initializer_local_matrix_zyx"), dtype=np.float64
@@ -240,30 +332,105 @@ def _promote_spatial_fallback(
         }
     selected = rerun["transform"] if rerun is not None and select_rerun else interpolated
     residual = recovery.residual_verdict(scorer.residual_shifts(row, selected))
+    rerun_departure = None
+    withheld_rerun_residual = None
+    if rerun is not None and select_rerun:
+        shape = np.asarray(row["fixed_stop_zyx"], dtype=np.float64) - np.asarray(
+            row["fixed_start_zyx"], dtype=np.float64
+        )
+        rerun_departure = recovery._corner_displacement_px(rerun["transform"], interpolated, shape)
+        if (
+            residual["verdict"] != "verified"
+            and rerun_departure > maximum_unverified_rerun_departure_px
+        ):
+            select_rerun = False
+            withheld_rerun_residual = residual
+            selected = interpolated
+            residual = recovery.residual_verdict(scorer.residual_shifts(row, selected))
+    recorded = None
+    recorded_checks = []
+    replaced_residual = None
+    aggregate = None
+    misalignment = residual["residual_yx_px"] if _residual_measures_misalignment(residual) else None
+    if misalignment is None and residual["confident_plane_count"] == 0:
+        aggregate = recovery.aggregate_residual_verdict(scorer.aggregate_residual_shift(row, selected))
+        if aggregate["verdict"] == "contradicted":
+            misalignment = aggregate["residual_yx_px"]
+    if misalignment is not None:
+        corrected = residual_corrected_transform(selected, misalignment)
+        candidates = [
+            *_recorded_fit_candidates(row),
+            (f"residual_corrected_{'native_rerun' if select_rerun else 'interpolated'}", corrected),
+        ]
+        for name, transform in candidates:
+            verdict = recovery.residual_verdict(scorer.residual_shifts(row, transform))
+            if aggregate is not None and verdict["verdict"] != "verified":
+                verdict = {
+                    **verdict,
+                    "aggregate": recovery.aggregate_residual_verdict(
+                        scorer.aggregate_residual_shift(row, transform)
+                    ),
+                }
+                if verdict["aggregate"]["verdict"] == "verified":
+                    verdict["verdict"] = "verified"
+            recorded_checks.append({"candidate": name, "residual": verdict})
+            if verdict["verdict"] == "verified":
+                recorded = (name, transform)
+                replaced_residual = residual
+                residual = verdict
+                break
+    if recorded is not None:
+        selected_candidate = recorded[0]
+    else:
+        selected_candidate = "native_rerun" if select_rerun else "interpolated"
     promotion = {
-        "artifact_type": "lightsheet.interpolated_spatial_fallback_promotion.v2",
+        "artifact_type": "lightsheet.interpolated_spatial_fallback_promotion.v7",
         "policy": (
             "promote the interpolated initializer, or the quality-gate-rejected native "
-            "rerun when every informative plane favors it, unless confident residual "
-            "misalignment contradicts the selected transform"
+            "rerun when every informative plane favors it and either the residual check "
+            "verifies it or its corner displacement from the interpolated initializer "
+            "stays within the unverified-rerun bound; when the median of the confident "
+            "planes puts that selection beyond the aligned bound, promote the first of the "
+            "recorded original fit, the parent initializer, and the selection shifted by "
+            "the measured residual that the residual check verifies; when no plane is "
+            "confident, the aggregate multi-plane residual measures and verifies instead; "
+            "otherwise withhold the selection when confident residual misalignment "
+            "contradicts it"
         ),
         "previous_status": row["status"],
         "previous_rejection_reason": row["rejection_reason"],
         "native_rerun_rejection_reason": provenance.get("native_rerun_rejection_reason"),
         "source_good_window_count": len(source_windows),
         "initializer_source": initializer_source,
-        "selected_candidate": "native_rerun" if select_rerun else "interpolated",
+        "selected_candidate": selected_candidate,
+        "recorded_fit_checks": recorded_checks,
+        "replaced_selection_residual": replaced_residual,
         "candidate_comparison": comparison,
+        "native_rerun_corner_departure_px": rerun_departure,
+        "maximum_unverified_rerun_departure_px": maximum_unverified_rerun_departure_px,
+        "native_rerun_withheld_for_departure": withheld_rerun_residual is not None,
+        "withheld_native_rerun_residual": withheld_rerun_residual,
         "residual": residual,
+        "aggregate_residual": aggregate,
     }
     promoted = deepcopy(row)
-    if residual["verdict"] == "contradicted":
+    if residual["verdict"] == "contradicted" or (
+        recorded is None and aggregate is not None and aggregate["verdict"] == "contradicted"
+    ):
         promoted.update(
             {"status": "rejected", "rejection_reason": CONTRADICTED_INTERPOLATION_REASON}
         )
         promoted["interpolated_fallback_promotion"] = {**promotion, "selected_attempt": None}
         return promoted
-    if select_rerun:
+    if recorded is not None:
+        attempt = f"residual_verified_{recorded[0]}"
+        recovery._set_selected_transform(
+            promoted,
+            matrix=recorded[1][:9].reshape(3, 3),
+            translation=recorded[1][9:],
+            attempt=attempt,
+        )
+    elif select_rerun:
         assert rerun is not None
         attempt = str(rerun["attempt"]["name"])
         recovery._set_selected_transform(
@@ -275,9 +442,7 @@ def _promote_spatial_fallback(
         promoted.update(
             {
                 "selected_corr_refined": rerun["attempt"].get("corr_refined"),
-                "selected_gradient_component_ncc_mean": rerun["attempt"].get(
-                    "gradient_component_ncc_mean"
-                ),
+                "selected_gradient_component_ncc_mean": rerun["gradient_component_ncc_mean"],
                 "selected_gradient_component_ncc_refined": rerun["attempt"].get(
                     "gradient_component_ncc_refined"
                 ),
@@ -373,7 +538,11 @@ def _write_completion_stage(
 
 
 def _promote_spatial_fallbacks(
-    summary_path: Path, output_dir: Path, *, image_ncc_margin: float
+    summary_path: Path,
+    output_dir: Path,
+    *,
+    image_ncc_margin: float,
+    maximum_unverified_rerun_departure_px: float,
 ) -> Path:
     summary_path = summary_path.resolve()
     summary = read_json_object(summary_path)
@@ -388,6 +557,7 @@ def _promote_spatial_fallbacks(
     promoted_count = 0
     candidates: Counter[str] = Counter()
     contradicted_count = 0
+    withheld_count = 0
     native_reasons: Counter[str] = Counter()
     support_counts: list[int] = []
     for compact in summary["windows"]:
@@ -404,6 +574,7 @@ def _promote_spatial_fallbacks(
                 native_method=native_method,
                 scorer=scorer,
                 image_ncc_margin=image_ncc_margin,
+                maximum_unverified_rerun_departure_px=maximum_unverified_rerun_departure_px,
             )
             promotion = row["interpolated_fallback_promotion"]
             if row["status"] == "accepted":
@@ -412,6 +583,7 @@ def _promote_spatial_fallbacks(
             else:
                 contradicted_count += 1
             native_reasons[str(promotion["native_rerun_rejection_reason"])] += 1
+            withheld_count += int(promotion["native_rerun_withheld_for_departure"])
             support_counts.append(int(promotion["source_good_window_count"]))
         output_path = window_dir / source_path.name
         _write_json(output_path, row)
@@ -426,6 +598,8 @@ def _promote_spatial_fallbacks(
         "selected_candidates": dict(sorted(candidates.items())),
         "contradicted_by_image_count": contradicted_count,
         "replacement_image_ncc_margin": image_ncc_margin,
+        "maximum_unverified_rerun_departure_px": maximum_unverified_rerun_departure_px,
+        "native_rerun_withheld_for_departure_count": withheld_count,
         "native_rejection_reasons": dict(sorted(native_reasons.items())),
         "minimum_source_good_window_count": min(support_counts, default=None),
         "maximum_source_good_window_count": max(support_counts, default=None),
@@ -488,6 +662,7 @@ def _is_native_source(row: dict[str, Any], native_method: str) -> bool:
     attempt = str(row.get("selected_attempt", ""))
     return row.get("status") == "accepted" and (
         attempt.startswith(recovery._native_attempt_prefix(native_method))
+        or recovery._is_local_3d_native_fit(row, native_method)
         or attempt.startswith("level2_initializer_")
     )
 
@@ -659,6 +834,7 @@ def _run_policy_stages(
         smooth_summary,
         promote_dir,
         image_ncc_margin=settings.replacement_image_ncc_margin,
+        maximum_unverified_rerun_departure_px=settings.maximum_unverified_rerun_departure_px,
     )
 
     linear_dir = workspace / "04-linear-recovery"

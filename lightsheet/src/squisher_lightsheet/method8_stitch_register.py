@@ -4,7 +4,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from functools import lru_cache
 from typing import Any, Literal
@@ -69,6 +69,7 @@ class TileInfo:
     shape_zyx: np.ndarray
     channel: int
     level: int = 0
+    reviewed_neighbors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,47 @@ def _load_tiles(position_json: Path, zarr_dir: Path, *, channel: int = 0, level:
             channel=int(channel),
             level=level,
         )
+    additional_pairs = payload.get("additional_registration_pairs", [])
+    if additional_pairs:
+        proof = payload.get("position_overrides")
+        if not isinstance(proof, dict) or not isinstance(proof.get("path"), str):
+            raise ValueError("Additional registration pairs require reviewed position overrides")
+        review_path = Path(proof["path"])
+        if not review_path.is_file() or sha256_file(review_path) != proof.get("sha256"):
+            raise ValueError("Additional registration pair review identity no longer matches")
+        review = json.loads(review_path.read_text())
+        if (
+            review.get("approved") is not True
+            or review.get("additional_registration_pairs") != additional_pairs
+        ):
+            raise ValueError("Additional registration pairs were not approved in the position review")
+        if not isinstance(additional_pairs, list):
+            raise ValueError("Additional registration pairs must be a list of two tile names")
+        names = {str(record["tile"]): _tile_id(str(record["tile"])) for record in payload["tiles"]}
+        for pair in additional_pairs:
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or any(not isinstance(name, str) or name not in names for name in pair)
+                or pair[0] == pair[1]
+            ):
+                raise ValueError(f"Invalid reviewed registration pair: {pair}")
+            fixed_id, moving_id = sorted((names[pair[0]], names[pair[1]]), key=int)
+            fixed, moving = tiles[fixed_id], tiles[moving_id]
+            if not np.allclose(fixed.spacing_um_zyx, moving.spacing_um_zyx, rtol=0, atol=1e-9):
+                raise ValueError(f"Reviewed pair {pair} has incompatible spacing")
+            fixed_stop = fixed.start_um_zyx + fixed.shape_zyx * fixed.spacing_um_zyx
+            moving_stop = moving.start_um_zyx + moving.shape_zyx * moving.spacing_um_zyx
+            overlap = np.minimum(
+                np.maximum(fixed.start_um_zyx, fixed_stop), np.maximum(moving.start_um_zyx, moving_stop)
+            ) - np.maximum(
+                np.minimum(fixed.start_um_zyx, fixed_stop), np.minimum(moving.start_um_zyx, moving_stop)
+            )
+            if np.any(overlap <= 0):
+                raise ValueError(f"Reviewed registration pair {pair} does not overlap")
+            tiles[fixed_id] = replace(
+                fixed, reviewed_neighbors=tuple(sorted(set(fixed.reviewed_neighbors) | {moving_id}, key=int))
+            )
     return tiles
 
 
@@ -683,6 +725,11 @@ def _all_adjacent_pairs(tiles: dict[str, TileInfo]) -> list[str]:
                 continue
             sort_key = int(fixed.tile_id) * 1000 + int(moving.tile_id)
             pairs.append((sort_key, f"{fixed.tile_id}-{moving.tile_id}"))
+    for fixed in records:
+        for moving_id in fixed.reviewed_neighbors:
+            pair = f"{fixed.tile_id}-{moving_id}"
+            if not any(existing == pair for _key, existing in pairs):
+                pairs.append((int(fixed.tile_id) * 1000 + int(moving_id), pair))
     return [pair for _sort_key, pair in sorted(pairs)]
 
 
@@ -1097,9 +1144,7 @@ def measure_method8_zcoverage(
         for chunk_index, (z_start, z_stop) in enumerate(chunks):
             mode = "method8" if method8 else "phase"
             progress(f"{mode} pair={pair} chunk={chunk_index + 1}/{len(chunks)} z={z_start}:{z_stop}")
-            screen_sample = (
-                None if screen_decisions is None else screen_decisions[(pair, chunk_index)]
-            )
+            screen_sample = None if screen_decisions is None else screen_decisions[(pair, chunk_index)]
             if screen_sample is not None and (
                 screen_sample.get("z_start") != z_start or screen_sample.get("z_stop") != z_stop
             ):
@@ -1612,9 +1657,7 @@ def constraints_from_method8_summary(
         measurement_mode = representative.get("measurement_mode")
         source_label = f"level{summary.get('settings', {}).get('level', 0)}_{source}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
         if measurement_mode is not None:
-            source_label = (
-                f"level{summary.get('settings', {}).get('level', 0)}_{source}_{measurement_mode}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
-            )
+            source_label = f"level{summary.get('settings', {}).get('level', 0)}_{source}_{measurement_mode}_{threshold_slug}_phase_gated_median_n{len(edge_rows)}"
         constraints.append(
             BoundaryConstraint(
                 fixed=fixed_index,
@@ -1843,7 +1886,8 @@ def optimize_positions_from_method8_summary(
             "corrections": str(corrections_path.resolve()),
         },
     }
-    corrections_text = json.dumps(
+    corrections_text = (
+        json.dumps(
             {
                 "tile_names": tile_names,
                 "spacing_zyx_um": spacing.tolist(),
@@ -1851,7 +1895,9 @@ def optimize_positions_from_method8_summary(
                 "corrections_zyx_um": (corrections_array * spacing).tolist(),
             },
             indent=2,
-        ) + "\n"
+        )
+        + "\n"
+    )
     optimized_positions = json.loads(json.dumps(position_payload))
     for index, record in enumerate(optimized_positions["tiles"]):
         translation = _record_vector_zyx(record, "translation_um") + corrections_array[index] * spacing

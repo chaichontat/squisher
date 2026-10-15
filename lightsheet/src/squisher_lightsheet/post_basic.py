@@ -800,7 +800,8 @@ def _expanded_source_fields(
 
 
 def _pair_metrics(residual: np.ndarray, pair: np.ndarray) -> dict[str, float | int]:
-    jumps = [abs(float(np.median(residual[pair == index]))) for index in np.unique(pair)]
+    """Weight overlap pairs equally without cancelling opposite spatial errors."""
+    jumps = [float(np.median(np.abs(residual[pair == index]))) for index in np.unique(pair)]
     if not jumps:
         raise ValueError("Cannot compute seam metrics without overlap pairs")
     return {
@@ -883,6 +884,7 @@ def _fit_seams(
         "field_coordinate": "normalized-original-raw-zyx",
         "penalties": list(penalties),
         "metric_unit": "absolute log2 fold-change",
+        "metric_statistic": "median absolute pixel error per source-pair plane",
         "selected_penalty": selected[0],
         "coefficient": coefficient.tolist(),
         "heldout_before": _pair_metrics(-target[test] / np.log(2), pair[test]),

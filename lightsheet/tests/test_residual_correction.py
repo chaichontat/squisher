@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import xarray as xr
 import zarr
 from multiview_stitcher import spatial_image_utils as si_utils
 
@@ -233,7 +232,7 @@ def test_fusion_evaluates_only_requested_original_coordinate_block():
         )
 
 
-def test_fusion_read_hook_applies_depth_aware_block(monkeypatch):
+def test_fusion_read_hook_applies_depth_aware_block(monkeypatch, tmp_path):
     coefficient = np.zeros((2, 5))
     coefficient[0, 0] = 0.2
     coefficient[1, 2] = -0.4
@@ -243,8 +242,16 @@ def test_fusion_read_hook_applies_depth_aware_block(monkeypatch):
         multiplier=0.7,
         fingerprint="model-identity",
     )
-    sim = xr.DataArray(np.ones((2, 3, 4), dtype=np.float32), dims=("z", "y", "x"))
-    monkeypatch.setattr(si_utils, "deserialize_zarr_backed_sim", lambda *args, **kwargs: sim)
+    source = zarr.open_array(
+        tmp_path / "depth_aware_source.zarr", mode="w", shape=correction.shape_zyx,
+        chunks=(3, 4, 5), dtype="float32", dimension_names=("z", "y", "x"),
+    )
+    source[:] = 1.
+    sim = si_utils.get_sim_from_array(
+        source, dims=("z", "y", "x"), scale={"z": 2., "y": 3., "x": 4.},
+        translation={"z": 20., "y": 30., "x": 40.},
+    )
+    sim.attrs["source"] = "tile"
     fake_cupy = SimpleNamespace(
         asarray=np.asarray,
         asnumpy=np.asarray,
@@ -252,13 +259,8 @@ def test_fusion_read_hook_applies_depth_aware_block(monkeypatch):
         ndarray=np.ndarray,
     )
     monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    info = {
-        "origin": {"z": 0.0, "y": 0.0, "x": 0.0},
-        "spacing": {"z": 1.0, "y": 1.0, "x": 1.0},
-        "source": "tile",
-    }
     overlap = {
-        "origin": {"z": 2.0, "y": 3.0, "x": 4.0},
+        "origin": {"z": 24.0, "y": 39.0, "x": 56.0},
         "shape": {"z": 2, "y": 3, "x": 4},
     }
 
@@ -268,6 +270,7 @@ def test_fusion_read_hook_applies_depth_aware_block(monkeypatch):
         dataset_attr_keys=("source",),
         error_prefix="Residual correction",
     ):
+        info = si_utils.serialize_zarr_backed_sim(sim)
         actual = si_utils.deserialize_zarr_backed_sim(
             info,
             reconstruct_slice=True,
@@ -280,6 +283,7 @@ def test_fusion_read_hook_applies_depth_aware_block(monkeypatch):
         x_slice=slice(4, 8),
     )
     np.testing.assert_allclose(actual.data, expected)
+    np.testing.assert_allclose(si_utils.get_origin_from_sim(actual, asarray=True), [24., 39., 56.])
 
 
 def test_fusion_source_cache_reuses_canonical_raw_chunks_across_requests(monkeypatch, tmp_path):
@@ -570,9 +574,7 @@ def test_fusion_source_cache_uses_exact_read_when_chunk_exceeds_budget(monkeypat
 
 
 @pytest.mark.parametrize("edge_dim", ["z", "y", "x"])
-def test_fusion_source_cache_preserves_reader_behavior_for_upper_edge_halo(
-    monkeypatch, tmp_path, edge_dim
-):
+def test_fusion_source_cache_preserves_reader_behavior_for_upper_edge_halo(monkeypatch, tmp_path, edge_dim):
     source = zarr.open_array(
         tmp_path / "source.zarr",
         mode="w",
@@ -688,3 +690,83 @@ def test_fusion_passes_residual_correction_to_owner_and_rejects_basic(monkeypatc
     assert calls[0][calls[0].index("--residual-correction") + 1] == str(tmp_path / "correction.json")
     with pytest.raises(ValueError, match="do not also apply BaSiC"):
         fuse_tiles(**kwargs, flatfield_dirs_by_source_view={"CL": tmp_path})
+
+
+def test_edge_residual_preserves_interiors_and_uses_original_crop_coordinates(fitted_correction):
+    path, sources, _ = fitted_correction
+    original = load_residual_corrections(path, sources=sources, shapes_zyx=[(8, 64, 64)] * 9, channel=0)
+    payload = json.loads(path.read_text())
+    payload["schema_version"] = 4
+    payload["edge_field"] = {"width_fraction": 0.125, "coefficient": [0.2, 0.15, 0.1, 0.05]}
+    path.write_text(json.dumps(payload))
+    fields = load_residual_corrections(path, sources=sources, shapes_zyx=[(8, 64, 64)] * 9, channel=0)
+    field, before = fields[str(sources[0])], original[str(sources[0])]
+    full = field.block(z_slice=slice(0, 8), y_slice=slice(0, 64), x_slice=slice(0, 64))
+    baseline = before.block(z_slice=slice(0, 8), y_slice=slice(0, 64), x_slice=slice(0, 64))
+    np.testing.assert_array_equal(full[:, 8:56, 8:56], baseline[:, 8:56, 8:56])
+    np.testing.assert_allclose(full[:, 0, 32] / baseline[:, 0, 32], np.exp(0.2))
+    crop = field.block(z_slice=slice(3, 6), y_slice=slice(0, 12), x_slice=slice(20, 40))
+    np.testing.assert_array_equal(crop, full[3:6, :12, 20:40])
+    assert field.fingerprint != before.fingerprint
+
+
+@pytest.mark.parametrize(
+    "edge",
+    [
+        {"width_fraction": 0.5, "coefficient": [0.2, 0.15, 0.1, 0.05]},
+        {"width_fraction": 0.0, "coefficient": [0.2, 0.15, 0.1, 0.05]},
+        {"width_fraction": 0.125, "coefficient": [0.2, 0.15, 0.1]},
+        {"width_fraction": 0.125, "coefficient": [float("nan"), 0.15, 0.1, 0.05]},
+    ],
+)
+def test_edge_residual_rejects_invalid_model_at_loader(fitted_correction, edge):
+    path, sources, _ = fitted_correction
+    payload = json.loads(path.read_text())
+    payload["schema_version"] = 4
+    payload["edge_field"] = edge
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="edge field"):
+        load_residual_corrections(path, sources=sources, shapes_zyx=[(8, 64, 64)] * 9, channel=0)
+
+
+def test_edge_fit_recovers_camera_loss_without_refitting_base_interiors(fitted_correction):
+    from squisher_lightsheet.residual_correction import EdgeResidualField, fit_edge_residual_correction
+
+    path, sources, _ = fitted_correction
+    baseline = json.loads(path.read_text())
+    # This fixture's true acquisition gains and depth field are known; freeze their exact inverse.
+    baseline["coefficient"] = [[0.0] * 5, [0.0, 0.0, -0.6, 0.0, 0.0]]
+    baseline["global_scale"] = 0.5
+    for row, gain in zip(baseline["sources"], fitted_correction[2], strict=True):
+        row["gain"] = float(1 / gain)
+        row["coefficient"] = [[0.0] * 5, [0.0] * 5]
+    path.write_text(json.dumps(baseline))
+    camera_loss = EdgeResidualField(0.125, np.array([0.3, 0.2, 0.15, 0.1]))
+    attenuation = 1 / camera_loss.plane((64, 64), y_slice=slice(None), x_slice=slice(None))
+    for source in sources:
+        group = zarr.open_group(source, mode="r+")
+        group["0"][:] = np.asarray(group["0"][:]) * attenuation[None, None]
+    output = path.parent.parent / "edge-refinement"
+    fit_edge_residual_correction(
+        registration=path.parent.parent / "registration.json",
+        fixed_fused=path.parent.parent / "fixed.ome.zarr",
+        base_correction=path,
+        output_dir=output,
+        width_fraction=0.125,
+        source_level=0,
+        stride=1,
+        z_percentiles=(25, 50, 75),
+        workers=1,
+        penalty=0.00003,
+    )
+    candidate = json.loads((output / "correction.json").read_text())
+    np.testing.assert_array_equal(candidate["coefficient"], baseline["coefficient"])
+    assert candidate["sources"] == baseline["sources"]
+    evaluation = candidate["edge_fit"]["evaluation"]
+    assert evaluation["heldout_after"]["median"] < evaluation["heldout_before"]["median"]
+    np.testing.assert_allclose(candidate["edge_field"]["coefficient"], camera_loss.coefficient, atol=0.06)
+    assert (output / "z3/compare-ch0.png").is_file()
+    fields = load_residual_corrections(
+        output / "correction.json", sources=sources, shapes_zyx=[(8, 64, 64)] * 9, channel=0
+    )
+    assert all(field.edge_field is not None for field in fields.values())

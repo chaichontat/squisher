@@ -1811,6 +1811,7 @@ def test_fusion_negative_stage_scale_uses_zarr_backed_orientation_affine(tmp_pat
             interpolation_order=1,
             blending_widths=None,
             shrink_distance=0,
+            trim_overlap=True,
             backend=None,
         )
 
@@ -2183,3 +2184,46 @@ def test_fusion_resume_honors_deconvolution_completion(tmp_path: Path, complete)
     root.write_text(json.dumps({"attributes": {"squisher_complete": True, "revision": 2}}))
     changed = legacy.source_tile_resume_identity(source, require_completion=True)
     assert changed["root_metadata"]["sha256"] != identity["root_metadata"]["sha256"]
+
+
+@pytest.mark.parametrize("with_template,with_registration,register_only,accepted", [
+    (True, True, False, True),
+    (False, True, False, False),
+    (True, False, False, False),
+    (True, True, True, False),
+])
+def test_fixed_grid_registered_fusion_preserves_distinct_native_spacings(
+    tmp_path, monkeypatch, with_template, with_registration, register_only, accepted
+):
+    import sys
+
+    input_dir = tmp_path / "tiles"
+    input_dir.mkdir()
+    names = ["tl.ome.tif", "tr.ome.tif"]
+    for name in names:
+        (input_dir / name).touch()
+    payload = cached_metadata_payload(input_dir, names)
+    for dim in ("y", "x"):
+        payload["tiles"][1]["spacing_um"][dim] = .50031
+        payload["tiles"][1]["scale_um"][dim] = .50031
+    positions = tmp_path / "positions.json"
+    positions.write_text(json.dumps(payload))
+    calls = []
+    monkeypatch.setattr(legacy, "run_stitch_once", lambda *args, **kwargs: calls.append((args, kwargs)))
+    argv = ["stitch", str(input_dir), "--position-input", str(positions), "--channels", "0"]
+    if with_template:
+        argv += ["--output-grid-template", str(tmp_path / "canonical.ome.zarr")]
+    if with_registration:
+        argv += ["--registration-input", str(tmp_path / "registration.json")]
+    if register_only:
+        argv += ["--register-only"]
+    monkeypatch.setattr(sys, "argv", argv)
+    if accepted:
+        assert legacy.main() == 0
+        tiles = calls[0][1]["tiles"]
+        assert [tile.spacing["x"] for tile in tiles] == [.5, .50031]
+        assert [legacy.tile_sim_scale(tile)["x"] for tile in tiles] == [.5, .50031]
+    else:
+        with pytest.raises(ValueError, match="same y/x physical spacing"):
+            legacy.main()
+        assert not calls

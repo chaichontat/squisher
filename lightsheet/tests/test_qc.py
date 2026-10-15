@@ -130,6 +130,31 @@ def _write_complete_fused_store(
     }
 
 
+def test_fused_preview_cli_writes_one_png_per_complete_volume(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from squisher_lightsheet.cli import app
+
+    volume = tmp_path / "405.ome.zarr"
+    _write_complete_fused_store(volume, np.arange(6 * 8 * 10, dtype=np.uint16).reshape(6, 8, 10))
+
+    result = CliRunner().invoke(
+        app, ["fused-preview", "--volume", f"405={volume}", "--output-dir", str(tmp_path / "previews"), "--level", "0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Image.open(tmp_path / "previews/405.png").size[0] > 0
+
+
+def test_render_fused_preview_refuses_an_incomplete_volume(tmp_path) -> None:
+    volume = tmp_path / "partial.ome.zarr"
+    _write_complete_fused_store(volume, np.ones((6, 8, 10), dtype=np.uint16))
+    zarr.open_group(volume, mode="r+").attrs["squisher_complete"] = False
+
+    with pytest.raises(ValueError, match="not complete"):
+        qc.render_fused_preview(label="x", source=volume, output=tmp_path / "x.png", level=0)
+
+
 def test_render_fused_middle_z_qc_validates_grid_and_writes_pngs(tmp_path) -> None:
     fixed = tmp_path / "fixed.ome.zarr"
     moving = tmp_path / "moving.ome.zarr"

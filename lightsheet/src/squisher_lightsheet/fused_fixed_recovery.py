@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-import importlib
+import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -18,7 +19,6 @@ from scipy.spatial.transform import Rotation
 
 from squisher_lightsheet import ngff
 from squisher_lightsheet._legacy.rough_align_tltr_center_z_phase import tile_bounds_zyx_um
-from squisher_lightsheet.channel_affine import output_to_input_from_model
 from squisher_lightsheet.fused_fixed import DEFAULT_SWEEP_RUNNER, SUMMARY_NAME
 from squisher_lightsheet.tile_phase import tile_record_from_position_record
 
@@ -86,6 +86,15 @@ def _native_attempt_prefix(native_method: str) -> str:
     if native_method not in SUPPORTED_NATIVE_METHODS:
         raise ValueError(f"Unsupported native recovery method {native_method!r}")
     return f"native_{native_method.replace('-', '_')}_from_"
+
+
+def _is_local_3d_native_fit(row: dict[str, Any], native_method: str) -> bool:
+    cache = row.get("cache_config", {})
+    return (
+        row.get("selected_attempt") == "local_3d_affine_refinement"
+        and cache.get("native_method") == native_method
+        and cache.get("local_3d_refinement") is True
+    )
 
 
 def _native_recovery_attempt(native_method: str) -> str:
@@ -611,6 +620,7 @@ def window_image_scorer(summary: dict[str, Any]) -> Any:
         Path(summary["fixed_fused"]),
         float(summary["quality_settings"]["fixed_mask_threshold"]),
         str(summary["cache_config"]["fit_intensity_transform"]),
+        window_shape_zyx=tuple(summary["window_shape_zyx"]),
     )
 
 
@@ -657,6 +667,20 @@ def residual_verdict(plane_shifts: Sequence[Any]) -> dict[str, Any]:
     else:
         verdict = "unverified"
     return {**report, "verdict": verdict}
+
+
+def aggregate_residual_verdict(shift: Any | None) -> dict[str, Any]:
+    """Classify a transform from its aggregate multi-plane residual shift."""
+    if shift is None or not shift.confident:
+        return {"residual_yx_px": None, "verdict": "unverified"}
+    magnitude = float(np.linalg.norm(shift.shift_yx))
+    if magnitude <= RESIDUAL_ALIGNED_MAX_PX:
+        verdict = "verified"
+    elif magnitude > RESIDUAL_CONTRADICTED_MIN_PX:
+        verdict = "contradicted"
+    else:
+        verdict = "unverified"
+    return {"residual_yx_px": list(shift.shift_yx), "verdict": verdict}
 
 
 def smooth_final_linear_mapping(args: argparse.Namespace) -> Path:
@@ -892,6 +916,64 @@ def detect_outliers(
     return ~active, all_scores, float(maximum_px)
 
 
+def final_transform_departures(
+    rows: Sequence[tuple[Path, dict[str, Any]]], *, maximum_px: float = DEFAULT_MAXIMUM_OUTLIER_PX
+) -> dict[Path, dict[str, Any]]:
+    """Score each accepted window's final selected transform against the other accepted windows of its tile.
+
+    Read-only use of the recovery outlier rule (``detect_outliers``): the leave-one-out decomposed-affine prediction
+    and its maximum corner displacement in level-0 pixels, excluding the worst window above ``maximum_px`` until none
+    remains. A tile with fewer than three accepted windows has no field to compare against, and windows left when
+    exclusion exhausts a tile's support have too little; both report ``insufficient_support`` instead of a score.
+    """
+    by_tile: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for path, row in rows:
+        if row.get("status") == "accepted":
+            by_tile.setdefault(_tile_number(row["moving_tile"]), []).append((path, row))
+    results: dict[Path, dict[str, Any]] = {}
+    for _tile, items in sorted(by_tile.items()):
+        support = len(items) - 1
+        if len(items) < 3:
+            for path, _row in items:
+                results[path] = {
+                    "status": "insufficient_support",
+                    "support_count": support,
+                    "score_px": None,
+                    "threshold_px": float(maximum_px),
+                    "departs": None,
+                }
+            continue
+        shape = np.asarray(items[0][1]["fixed_stop_zyx"], dtype=np.int64) - np.asarray(
+            items[0][1]["fixed_start_zyx"], dtype=np.int64
+        )
+        outliers, scores, threshold = detect_outliers(
+            np.stack([_point(row) for _path, row in items]),
+            np.stack([_transform(row) for _path, row in items]),
+            shape,
+            maximum_px=maximum_px,
+        )
+        # Iterative exclusion stops below three windows; their last scores then compare against too little support.
+        exhausted = int(np.count_nonzero(~outliers)) < 3
+        for index, (path, _row) in enumerate(items):
+            if exhausted and not outliers[index]:
+                results[path] = {
+                    "status": "insufficient_support",
+                    "support_count": int(np.count_nonzero(~outliers)) - 1,
+                    "score_px": None,
+                    "threshold_px": threshold,
+                    "departs": None,
+                }
+                continue
+            results[path] = {
+                "status": "scored",
+                "support_count": support,
+                "score_px": float(scores[index]),
+                "threshold_px": threshold,
+                "departs": bool(outliers[index]),
+            }
+    return results
+
+
 def _load_tile_adjacency(path: Path) -> dict[str, set[str]]:
     pair_summaries = _read_json(path).get("pair_summaries")
     if not isinstance(pair_summaries, dict):
@@ -960,13 +1042,9 @@ def _set_selected_transform(
     translation: np.ndarray,
     attempt: str,
 ) -> None:
-    shape = np.asarray(row["fixed_stop_zyx"], dtype=np.int64) - np.asarray(
-        row["fixed_start_zyx"], dtype=np.int64
-    )
-    pull_matrix, pull_offset = output_to_input_from_model(
-        matrix, translation, tuple(int(value) for value in shape)
-    )
     global_matrix, global_offset = _global_forward_from_local(row, matrix, translation)
+    pull_matrix = np.linalg.inv(global_matrix)
+    pull_offset = -pull_matrix @ global_offset
     row.update(
         {
             "selected_attempt": attempt,
@@ -1152,6 +1230,143 @@ def _apply_manual_initializations(
         }
 
 
+SEED_ATTEMPTS = ("level2_initializer_phase_primed", "native_method6_from_recovery_initializer")
+DEFAULT_SEED_MAXIMUM_MASKED_FRACTION = 0.6
+DEFAULT_SEED_MAXIMUM_TRANSLATION_PX = 60.0
+DEFAULT_SEED_MINIMUM_GRADIENT_NCC = 0.10
+
+
+def propose_manual_initializations(
+    *,
+    complete_summary: Path,
+    master: Path,
+    channel: str,
+    maximum_masked_fraction: float = DEFAULT_SEED_MAXIMUM_MASKED_FRACTION,
+    maximum_translation_px: float = DEFAULT_SEED_MAXIMUM_TRANSLATION_PX,
+    minimum_gradient_ncc: float = DEFAULT_SEED_MINIMUM_GRADIENT_NCC,
+) -> dict[str, dict[str, Any]]:
+    """Write measured seeds for withheld tissue windows into one channel of the dataset master file.
+
+    Candidates are complete-recovery rows that are not accepted, not mask-rejected, and mostly tissue. A window whose
+    spatial placement the image contradicted is seeded with the selected interpolation or native rerun shifted
+    by the residual measured for that exact candidate. Every other seed is the window's best native-recovery attempt among the phase-primed
+    level-2 initializer and the native refit from the recovery initializer, by gradient NCC, skipping implausible
+    affines, translations beyond the neighbourhood, and attempts below the gradient NCC floor. Entries curated by
+    hand (seed_origin "manual") and seeds of windows now accepted are kept as they are.
+    """
+    from squisher_lightsheet.complete_recovery import (
+        CONTRADICTED_INTERPOLATION_REASON,
+        _quality_gate_rejected_native_rerun,
+    )
+    from squisher_lightsheet.fused_fixed_qc import MOVING_XY_FACTOR
+
+    summary = _read_json(complete_summary)
+    native_windows = Path(summary["input_summary"]).parent / "window_json"
+    payload = (
+        _read_json(master)
+        if master.is_file()
+        else {"artifact_type": MANUAL_INITIALIZATIONS_ARTIFACT, "channels": {}}
+    )
+    if payload.get("artifact_type") != MANUAL_INITIALIZATIONS_ARTIFACT:
+        raise ValueError(f"{master} is not a {MANUAL_INITIALIZATIONS_ARTIFACT} artifact")
+    existing = payload["channels"].get(channel, {})
+    accepted = {Path(row["level0_json"]).name for row in summary["windows"] if row["status"] == "accepted"}
+    entries = {
+        window: entry
+        for window, entry in existing.items()
+        if entry["seed_origin"] == "manual" or window in accepted
+    }
+    for row in summary["windows"]:
+        masked = row.get("fixed_masked_fraction")
+        if (
+            row["status"] == "accepted"
+            or row.get("rejection_reason") in MASK_REJECTION_REASONS
+            or masked is None
+            or masked >= maximum_masked_fraction
+        ):
+            continue
+        name = Path(row["level0_json"]).name
+        if name in entries:
+            continue
+        record = _read_json(native_windows / name)
+        if row.get("rejection_reason") == CONTRADICTED_INTERPOLATION_REASON:
+            completed = _read_json(Path(row["level0_json"]))
+            promotion = completed["interpolated_fallback_promotion"]
+            residual = promotion["residual"]
+            provenance = completed["outlier_recovery"]
+            matrix = np.asarray(provenance["interpolated_initializer_local_matrix_zyx"], dtype=np.float64)
+            translation = np.asarray(provenance["interpolated_initializer_local_translation_zyx"], dtype=np.float64)
+            placement_source = promotion["initializer_source"]
+            candidate = promotion["selected_candidate"]
+            if candidate == "native_rerun":
+                if "native_method" not in completed:
+                    raise ValueError(f"{row['level0_json']} contradicted a native_rerun candidate without method provenance")
+                rerun = _quality_gate_rejected_native_rerun(
+                    completed, native_method=completed["native_method"],
+                    interpolated=np.concatenate([matrix.ravel(), translation]),
+                )
+                if rerun is None:
+                    raise ValueError(f"{row['level0_json']} has no quality-gate-rejected native rerun for its residual")
+                matrix = rerun["transform"][:9].reshape(3, 3)
+                translation = rerun["transform"][9:].copy()
+                placement_source = candidate
+            elif candidate != "interpolated":
+                raise ValueError(f"{row['level0_json']} contradicted an unsupported {candidate} candidate")
+            # The scorer samples its fixed level-2 planes at MOVING_XY_FACTOR level-0 pixels per pixel.
+            translation[1:] += np.asarray(residual["residual_yx_px"], dtype=np.float64) * MOVING_XY_FACTOR
+            if float(np.max(np.abs(translation))) > maximum_translation_px:
+                continue
+            entries[name] = {
+                "moving_tile": record["moving_tile"],
+                "moving_start_l0_zyx": record["moving_start_l0_zyx"],
+                "local_matrix_zyx": matrix.tolist(),
+                "local_translation_zyx": translation.tolist(),
+                "seed_origin": "measured",
+                "evidence": (
+                    f"{row['level0_json']}: the image contradicted the {placement_source} placement "
+                    f"with a residual of {residual['residual_yx_px']} level-2 YX px on "
+                    f"{residual['confident_plane_count']} confident planes (spread {residual['plane_spread_px']:.2f} "
+                    "px); the seed is that placement shifted by the residual."
+                ),
+            }
+            continue
+        candidates = []
+        for attempt in record["method8_attempts"]:
+            if attempt["name"] not in SEED_ATTEMPTS or attempt.get("local_matrix_zyx") is None:
+                continue
+            translation = np.asarray(attempt["local_translation_zyx"], dtype=np.float64)
+            transform = np.concatenate(
+                [np.asarray(attempt["local_matrix_zyx"], dtype=np.float64).ravel(), translation]
+            )
+            gradient = attempt.get("gradient_component_ncc_mean")
+            if (
+                gradient is None
+                or gradient < minimum_gradient_ncc
+                or float(np.max(np.abs(translation))) > maximum_translation_px
+                or not _affine_is_plausible(transform)
+            ):
+                continue
+            candidates.append((float(gradient), attempt))
+        if not candidates:
+            continue
+        gradient, attempt = max(candidates, key=lambda item: item[0])
+        entries[name] = {
+            "moving_tile": record["moving_tile"],
+            "moving_start_l0_zyx": record["moving_start_l0_zyx"],
+            "local_matrix_zyx": attempt["local_matrix_zyx"],
+            "local_translation_zyx": attempt["local_translation_zyx"],
+            "seed_origin": "measured",
+            "evidence": (
+                f"{native_windows / name} attempt {attempt['name']}: gradient NCC {gradient:.3f}, corr "
+                f"{attempt.get('corr_refined')}, translation {attempt['local_translation_zyx']} l0 voxels; "
+                f"complete-recovery withheld the window ({row.get('rejection_reason')})."
+            ),
+        }
+    payload["channels"][channel] = entries
+    _write_json(master, payload)
+    return entries
+
+
 def _initializer_payload(
     row: dict[str, Any], transform: np.ndarray, provenance: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1169,12 +1384,24 @@ def _initializer_payload(
     }
 
 
-def _load_sweep_module(sweep_runner: Path = DEFAULT_SWEEP_RUNNER) -> Any:
+def _load_sweep_module(sweep_runner: Path = DEFAULT_SWEEP_RUNNER) -> ModuleType:
     sweep_runner = sweep_runner.resolve()
-    script_dir = str(sweep_runner.parent)
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    return importlib.import_module(sweep_runner.stem)
+    if sweep_runner == DEFAULT_SWEEP_RUNNER.resolve():
+        from squisher_lightsheet._backends import fused_fixed_sweep
+
+        return fused_fixed_sweep
+    module_name = "_squisher_custom_sweep_" + str(sweep_runner).encode().hex()
+    spec = importlib.util.spec_from_file_location(module_name, sweep_runner)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load sweep runner: {sweep_runner}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 def _persistent_sweep_args(
@@ -1251,6 +1478,8 @@ def _persistent_sweep_args(
         str(initializer_dir),
         "--resume" if resume else "--no-resume",
     ]
+    if cache.get("local_3d_refinement") is True:
+        arguments.extend(["--local-3d-refinement", "--local-affine-estimator", str(cache.get("local_affine_estimator", "least-squares"))])
     if bool(cache["mattes_fixed_shear"]):
         arguments.append("--mattes-fixed-shear")
     return sweep.build_parser().parse_args(arguments)
@@ -1362,6 +1591,8 @@ def _finalize_native_rerun(
             )
     else:
         rerun = _read_json(output_path)
+        if rerun.get("status") == "error":
+            raise RuntimeError(f"Native recovery worker failed for {output_path}: {rerun.get('error')}")
         if "selected_local_matrix_zyx" in rerun and "selected_local_translation_zyx" in rerun:
             rerun_transform = _transform(rerun)
         spatial_delta = (
@@ -1395,7 +1626,8 @@ def _finalize_native_rerun(
         )
         if (
             rerun.get("status") == "accepted"
-            and rerun.get("selected_attempt") == _native_recovery_attempt(native_method)
+            and (rerun.get("selected_attempt") == _native_recovery_attempt(native_method)
+                 or _is_local_3d_native_fit(rerun, native_method))
             and (not require_grad_ncc_improvement or grad_ncc_improved)
         ):
             result = rerun
@@ -1455,7 +1687,6 @@ def run(args: argparse.Namespace) -> Path | None:
     summary_path = Path(args.summary).resolve()
     summary = _read_json(summary_path)
     native_method = _native_method_from_summary(summary)
-    native_attempt_prefix = _native_attempt_prefix(native_method)
     tile_filter = (
         None
         if not args.tile_filter
@@ -1479,7 +1710,8 @@ def run(args: argparse.Namespace) -> Path | None:
             for path, row in items
             if row.get("status") == "accepted"
             and isinstance(row.get("selected_attempt"), str)
-            and row["selected_attempt"].startswith(native_attempt_prefix)
+            and (row["selected_attempt"].startswith(_native_attempt_prefix(native_method))
+                 or _is_local_3d_native_fit(row, native_method))
             and row["selected_attempt"] != _native_recovery_attempt(native_method)
             and "selected_local_matrix_zyx" in row
             and "selected_local_translation_zyx" in row

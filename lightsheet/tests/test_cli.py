@@ -1174,6 +1174,8 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
             str(output_dir),
             "--output-codec",
             "zstd",
+            "--output-channel-label",
+            "514",
             "--workers",
             "6",
             "--max-tiles",
@@ -1191,6 +1193,7 @@ def test_fused_fixed_materialize_overlap_forwards_grid_and_export_options(
     assert captured["core_shape_zyx"] == (480, 480, 480)
     assert captured["window_shape_zyx"] == (528, 528, 528)
     assert captured["level_factor_zyx"] == (1, 1, 1)
+    assert captured["output_channel_label"] == "514"
     assert captured["source_channel"] == 0
     assert captured["output_codec"] == "zstd"
     assert captured["jpegxr_level"] == 0.7
@@ -1295,6 +1298,8 @@ def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypa
     run_dir.mkdir()
     renderer_python = tmp_path / "python"
     renderer_python.touch()
+    renderer = tmp_path / "lightsheet-fused-fixed-contact-sheet"
+    renderer.touch()
     captured = {}
 
     def fake_run(command, **kwargs):
@@ -1302,7 +1307,6 @@ def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypa
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(cli_module, "FUSED_FIXED_CONTACT_SHEET_SCRIPT", Path(__file__))
 
     result = CliRunner().invoke(
         app,
@@ -1329,7 +1333,7 @@ def test_fused_fixed_contact_sheet_cli_accepts_incomplete_run(tmp_path, monkeypa
     assert captured["command"][captured["command"].index("--status") + 1] == "rejected"
     assert captured["command"][captured["command"].index("--rejection-reason") + 1] == "native_rerun_rejected"
     assert captured["command"][captured["command"].index("--tile-filter") + 1] == "018"
-    assert captured["command"][0] == str(renderer_python)
+    assert captured["command"][0] == str(renderer)
     assert captured["kwargs"] == {"check": True}
 
 

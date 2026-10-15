@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
+import json
+import pytest
 from pathlib import Path
 
 from squisher_lightsheet._legacy import create_lr_position_file as legacy
@@ -111,3 +113,61 @@ def test_overlap_fraction_only_changes_join_axis_for_x_join() -> None:
     right_25 = next(item for item in joined_25 if item.info.side == "R")
     assert right_10.translation_zyx[:2] == right_25.translation_zyx[:2]
     assert right_10.translation_zyx[2] != right_25.translation_zyx[2]
+
+
+def _position_override(tmp_path: Path):
+    source = tmp_path / "tile.025.ome.tif"
+    source.write_bytes(b"source")
+    other = tmp_path / "tile.000.ome.tif"
+    other.write_bytes(b"other")
+    tiles = [tile(source.name, "L", (0, 0, 0)), tile(other.name, "L", (0, 100, 100))]
+    from dataclasses import replace
+
+    tiles = [replace(tiles[0], path=source), replace(tiles[1], path=other)]
+    record = {
+        "source_identity": {"size_bytes": source.stat().st_size, "mtime_ns": source.stat().st_mtime_ns},
+        "original_translation_um_zyx": [0, 0, 0],
+        "translation_um_zyx": [0, 2396.87, -2.4],
+    }
+    payload = {
+        "artifact_type": "lightsheet.position_overrides.v1",
+        "approved": True,
+        "tiles": {source.name: record},
+    }
+    path = tmp_path / "overrides.json"
+    path.write_text(json.dumps(payload))
+    return tiles, path, payload
+
+
+def test_reviewed_position_overrides_move_only_named_tiles_and_preserve_sources(tmp_path):
+    from squisher_lightsheet.positions import _apply_position_overrides
+
+    tiles, path, _ = _position_override(tmp_path)
+    result = _apply_position_overrides(tiles, path)
+    assert result[0].translation_zyx == (0, 2396.87, -2.4)
+    assert result[0].spacing_zyx == tiles[0].spacing_zyx
+    assert result[1] == tiles[1]
+    assert tiles[0].path.read_bytes() == b"source"
+
+
+@pytest.mark.parametrize("change", ["unapproved", "stale", "unknown", "nonfinite", "original", "bool"])
+def test_position_overrides_reject_invalid_or_stale_review(tmp_path, change):
+    from squisher_lightsheet.positions import _apply_position_overrides
+
+    tiles, path, payload = _position_override(tmp_path)
+    record = next(iter(payload["tiles"].values()))
+    if change == "unapproved":
+        payload["approved"] = False
+    elif change == "stale":
+        record["source_identity"]["size_bytes"] += 1
+    elif change == "unknown":
+        payload["tiles"] = {"unknown.ome.tif": record}
+    elif change == "original":
+        record["original_translation_um_zyx"] = [0, 10, 0]
+    elif change == "bool":
+        record["translation_um_zyx"] = [True, 0, 0]
+    else:
+        record["translation_um_zyx"] = [float("nan"), 0, 0]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        _apply_position_overrides(tiles, path)

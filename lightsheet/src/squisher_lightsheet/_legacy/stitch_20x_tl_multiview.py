@@ -23,7 +23,6 @@ import os
 import shutil
 import tempfile
 import time
-import sys
 import threading
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, replace
@@ -41,6 +40,7 @@ from squisher.jpegxr_zarr import (
 )
 from squisher_lightsheet.parsing import parse_source_view_path_entry
 from squisher_lightsheet import ngff
+from squisher_lightsheet.mvs_backend import MVSBackend, fusion_zarr_module
 from squisher_lightsheet import pyramid as pyramid_core
 from squisher_lightsheet import qc as qc_core
 from squisher_lightsheet import seams as seam_core
@@ -78,7 +78,6 @@ MVS_GROUPWISE_RESOLUTION_METHOD = "global_optimization"
 MVS_GROUPWISE_TRANSFORM = "translation"
 MVS_POST_QUALITY_THRESHOLD = 0.25
 NATIVE_REG3D_LIB_DIR = Path("/home/chaichontat/microImageLib/bin/linux")
-NATIVE_REG3D_WRAPPER_DIR = Path("/home/chaichontat/nvme/lightsheet/231-Ptprz1")
 NATIVE_REG3D_RIGID_METHOD = 2
 NATIVE_REG3D_MAX_ITERATIONS = 300
 NATIVE_REG3D_FTOL = 1e-4
@@ -124,9 +123,9 @@ def cupy_cleanup_context(per_chunk_cleanup: bool):
     try:
         yield
     finally:
-        originals[0][2]()
         for module, name, original in originals:
             setattr(module, name, original)
+        originals[0][2]()
 
 
 @contextmanager
@@ -1141,6 +1140,8 @@ def validate_tiles_metadata(
     require_same_shape: bool,
     require_same_spacing: bool = True,
     require_same_yx_when_variable: bool = True,
+    require_same_yx_spacing: bool = True,
+    selected_channels: tuple[int, ...] | None = None,
 ) -> None:
     if not tiles:
         raise ValueError("Expected at least one tile")
@@ -1163,19 +1164,30 @@ def validate_tiles_metadata(
         c_yx_shapes = {(tile.shape[1], tile.shape[2], tile.shape[3]) for tile in tiles}
     else:
         c_yx_shapes = {(1, tile.shape[1], tile.shape[2]) for tile in tiles}
-    if not require_same_shape and require_same_yx_when_variable and len(c_yx_shapes) != 1:
+    if selected_channels is not None:
+        if not selected_channels:
+            raise ValueError("Expected at least one selected channel")
+        for tile in tiles:
+            for channel in selected_channels:
+                if channel < 0 or channel >= tile_channel_count(tile) or channel >= len(tile.channels):
+                    raise ValueError(f"{tile.path} is missing selected channel {channel}")
+        if len({tuple(tile.channels[c] for c in selected_channels) for tile in tiles}) != 1:
+            raise ValueError("Expected all tiles to have the same selected channel metadata")
+        if require_same_yx_when_variable and len({shape[1:] for shape in c_yx_shapes}) != 1:
+            raise ValueError("Expected position-file tiles to have the same y/x shape")
+    if selected_channels is None and not require_same_shape and require_same_yx_when_variable and len(c_yx_shapes) != 1:
         raise ValueError(
             f"Expected position-file tiles to have the same channel/y/x shape; found {sorted(c_yx_shapes)}"
         )
     if require_same_spacing and len(spacings) != 1:
         raise ValueError("Expected all tiles to have the same physical spacing")
-    if not require_same_spacing:
+    if not require_same_spacing and require_same_yx_spacing:
         yx_spacings = {(tile.spacing["y"], tile.spacing["x"]) for tile in tiles}
         if len(yx_spacings) != 1:
             raise ValueError("Expected position-file tiles to have the same y/x physical spacing")
-    if len(channels) != 1:
+    if selected_channels is None and len(channels) != 1:
         raise ValueError("Expected all tiles to have the same channel metadata")
-    if len(tracks) != 1:
+    if selected_channels is None and len(tracks) != 1:
         raise ValueError("Expected all tiles to have the same track metadata")
 
 
@@ -1477,6 +1489,8 @@ def read_position_input_tiles(
     *,
     input_dir: Path | None = None,
     registration_input: Path | None = None,
+    selected_channels: tuple[int, ...] | None = None,
+    require_same_yx_spacing: bool = True,
 ) -> list[TileMetadata]:
     payload = json.loads(position_input.read_text())
     if payload.get("units") != "micrometer":
@@ -1558,7 +1572,9 @@ def read_position_input_tiles(
         tiles,
         require_same_shape=False,
         require_same_spacing=False,
+        require_same_yx_spacing=require_same_yx_spacing,
         require_same_yx_when_variable=True,
+        selected_channels=selected_channels,
     )
     return tiles
 
@@ -2038,9 +2054,7 @@ def native_rigid_pairwise_registration(
     """Multiview-stitcher rigid pairwise registration backed by microImageLib reg_3dgpu."""
     from multiview_stitcher import param_utils
 
-    if str(NATIVE_REG3D_WRAPPER_DIR) not in sys.path:
-        sys.path.insert(0, str(NATIVE_REG3D_WRAPPER_DIR))
-    from native_reg3dgpu import _run_reg_3dgpu
+    from squisher_lightsheet.native_reg3dgpu import _run_reg_3dgpu
 
     fixed = np.asarray(fixed_data.data, dtype=np.float32)
     moving = np.asarray(moving_data.data, dtype=np.float32)
@@ -4873,6 +4887,25 @@ def profile_zarr_slice_materialization(*, enabled: bool):
         )
 
 
+def _source_grid_overlap_bb(
+    overlap_bb: dict[str, Any], source_bb: dict[str, Any]
+) -> dict[str, Any]:
+    """Enclose requested support in source voxels and retain their physical origin."""
+    origin: dict[str, float] = {}
+    shape: dict[str, int] = {}
+    for dim in overlap_bb["origin"]:
+        spacing = float(source_bb["spacing"][dim])
+        first = (float(overlap_bb["origin"][dim]) - float(source_bb["origin"][dim])) / spacing
+        last = first + int(overlap_bb["shape"][dim]) - 1
+        start = max(0, math.floor(round(first, 10)))
+        stop = min(int(source_bb["shape"][dim]), math.ceil(round(last, 10)) + 1)
+        if stop <= start:
+            raise ValueError(f"Source crop has no {dim} support: {overlap_bb}")
+        origin[dim] = float(source_bb["origin"][dim]) + start * spacing
+        shape[dim] = stop - start
+    return overlap_bb | {"origin": origin, "shape": shape}
+
+
 def _basic_slice_offsets(
     info: dict[str, Any], overlap_bb: dict[str, Any], dims: tuple[str, ...]
 ) -> dict[str, int]:
@@ -4903,6 +4936,7 @@ def _cached_slice_request_sim(
     cached_offsets = cached.get("offsets", {})
     shape = _basic_slice_shape(overlap_bb, dims)
     indexer = []
+    selected_origin = {}
     for dim in dims:
         if dim in offsets:
             start = offsets[dim] - int(cached_offsets.get(dim, 0))
@@ -4917,6 +4951,9 @@ def _cached_slice_request_sim(
                     f"cache_offset={cached_offsets.get(dim, 0)}, "
                     f"cache_shape={cached['data'].shape}"
                 )
+            selected_origin[dim] = (
+                info["origin"][dim] + (int(cached_offsets.get(dim, 0)) + clipped_start) * info["spacing"][dim]
+            )
             indexer.append(slice(clipped_start, clipped_stop))
         else:
             indexer.append(slice(None))
@@ -4926,7 +4963,7 @@ def _cached_slice_request_sim(
         data,
         dims=dims,
         scale={dim: info["spacing"][dim] for dim in spatial_dims},
-        translation={dim: overlap_bb["origin"][dim] for dim in spatial_dims},
+        translation=selected_origin,
         c_coords=info["c_coords"] if "c" in dims else None,
         t_coords=info["t_coords"] if "t" in dims else None,
     )
@@ -5445,6 +5482,8 @@ def basic_corrected_zarr_reads(
         )
 
     def raw_source_region(info, overlap_bb, sim_coord_dict):
+        source_shapes, _ = _source_spatial_layout(info)
+        overlap_bb = _source_grid_overlap_bb(overlap_bb, info | {"shape": source_shapes})
         if source_cache_max_bytes > 0:
             return source_region(info, overlap_bb, sim_coord_dict)
         return original_deserialize(
@@ -5495,7 +5534,7 @@ def basic_corrected_zarr_reads(
         if not correction_enabled:
             return sim
 
-        source_offsets = _source_request_offsets(info, overlap_bb)
+        source_offsets = _source_request_offsets(info, si_utils.get_stack_properties_from_sim(sim))
         z0 = source_offsets["z"]
         y0 = source_offsets["y"]
         x0 = source_offsets["x"]
@@ -5561,6 +5600,9 @@ def basic_corrected_zarr_reads(
         yield
     finally:
         _ACTIVE_DIRECT_SOURCE_READ_SESSION = None
+        si_utils.serialize_zarr_backed_sim = original_serialize
+        si_utils.deserialize_zarr_backed_sim = original_deserialize
+        si_utils.sim_sel_coords = original_sim_sel_coords
         cache = source_cache.cache
         log(
             "Fusion raw source-chunk cache summary: "
@@ -5574,9 +5616,6 @@ def basic_corrected_zarr_reads(
             f"uncached_edge_materialized={format_bytes(state['uncached_edge_materialized_bytes'])}, "
             f"uncached_edge_seconds={state['uncached_edge_seconds']:.3f}"
         )
-        si_utils.serialize_zarr_backed_sim = original_serialize
-        si_utils.deserialize_zarr_backed_sim = original_deserialize
-        si_utils.sim_sel_coords = original_sim_sel_coords
 
 
 def close_stores(stores: list[Any]) -> None:
@@ -6326,6 +6365,7 @@ def output_stack_properties_from_ome_zarr_template(
     _source_spacing: dict[str, float],
     *,
     level: int = 0,
+    bounds_zyx: tuple[int, int, int, int, int, int] | None = None,
 ) -> dict[str, dict[str, float | int]]:
     import zarr
 
@@ -6355,10 +6395,20 @@ def output_stack_properties_from_ome_zarr_template(
     if any(not np.isfinite(scale[dim]) or scale[dim] <= 0 for dim in dims):
         raise ValueError(f"{template} level {level} has invalid spacing {scale}")
 
+    shape = dict(zip(dims, (int(size) for size in template_array.shape), strict=True))
+    if bounds_zyx is not None:
+        if len(bounds_zyx) != 6 or not all(type(value) is int for value in bounds_zyx):
+            raise ValueError("output grid bounds must contain six integer ZYX start/stop coordinates")
+        start, stop = bounds_zyx[:3], bounds_zyx[3:]
+        for axis, lo, hi in zip(dims, start, stop, strict=True):
+            if lo < 0 or hi <= lo or hi > shape[axis]:
+                raise ValueError(f"output grid bounds for {axis} are outside template shape {shape}")
+            translation[axis] += lo * scale[axis]
+            shape[axis] = hi - lo
     return {
         "origin": translation,
         "spacing": {dim: float(scale[dim]) for dim in dims},
-        "shape": dict(zip(dims, (int(size) for size in template_array.shape), strict=True)),
+        "shape": shape,
     }
 
 
@@ -6824,7 +6874,7 @@ def direct_zarr_block_entry(
         views.append(
             {
                 "tile_info": tile_info,
-                "tile_overlap_bb": overlap[0],
+                "tile_overlap_bb": _source_grid_overlap_bb(overlap[0], view_bb),
                 "sparam": sparam,
                 "view_bb": view_bb,
             }
@@ -7153,15 +7203,10 @@ def resumable_mvs_zarr_create(*, scale0_path: Path, enabled: bool):
         yield
         return
 
-    from multiview_stitcher import fusion as mvs_fusion
     import zarr
 
-    fusion_core = sys.modules.get(mvs_fusion.fuse.__module__)
-    if fusion_core is None or not hasattr(fusion_core, "zarr"):
-        yield
-        return
-
-    original_create = fusion_core.zarr.create
+    backend_zarr = fusion_zarr_module()
+    original_create = backend_zarr.create
     target = scale0_path.resolve()
 
     def create_or_open_resumable(*args, **kwargs):
@@ -7184,11 +7229,11 @@ def resumable_mvs_zarr_create(*, scale0_path: Path, enabled: bool):
             return array
         return original_create(*args, **kwargs)
 
-    fusion_core.zarr.create = create_or_open_resumable
+    backend_zarr.create = create_or_open_resumable
     try:
         yield
     finally:
-        fusion_core.zarr.create = original_create
+        backend_zarr.create = original_create
 
 
 def mvs_fuse_chunk_payload(fuse_chunk) -> dict[str, Any] | None:
@@ -7593,9 +7638,9 @@ def prepare_mvs_direct_fusion_block(plan: dict[str, Any]) -> dict[str, Any]:
 def compute_mvs_prepared_fusion_block(prepared: dict[str, Any], device: int) -> dict[str, Any]:
     from dask import config as dask_config
     from multiview_stitcher import misc_utils
-    from multiview_stitcher.fusion import _core as fusion_core
     import cupy as cp
 
+    backend = MVSBackend.load()
     plan = prepared["plan"]
     fuse_kwargs = plan["payload"]["fuse_kwargs"]
     session = _ACTIVE_DIRECT_SOURCE_READ_SESSION
@@ -7610,12 +7655,12 @@ def compute_mvs_prepared_fusion_block(prepared: dict[str, Any], device: int) -> 
     def fuse_entry(block_entry, block_fusion_kwargs, reads=None):
         consume_context = nullcontext() if reads is None else session.consume(reads)
         with consume_context:
-            result = fusion_core._fuse_block_zarr_backed(
+            result = backend.fuse_block(
                 np.asarray(block_entry, dtype=object),
                 output_dtype=plan["output_dtype"],
                 sim_coord_dict=plan["sim_coord_dict"],
                 sdims=plan["sdims"],
-                fusion_func=fuse_kwargs.get("fusion_func", fusion_core.weighted_average_fusion),
+                fusion_func=fuse_kwargs.get("fusion_func", backend.weighted_average_fusion),
                 fusion_func_kwargs=block_fusion_kwargs,
                 weights_func=fuse_kwargs.get("weights_func"),
                 weights_func_kwargs=fuse_kwargs.get("weights_func_kwargs"),
@@ -7628,6 +7673,7 @@ def compute_mvs_prepared_fusion_block(prepared: dict[str, Any], device: int) -> 
                     fusion_func=fuse_kwargs.get("fusion_func"),
                     fusion_func_kwargs=block_fusion_kwargs,
                 ),
+                trim_overlap=True,
                 backend=fuse_kwargs.get("backend"),
             )
         if isinstance(result, cp.ndarray):
@@ -9113,6 +9159,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--output-grid-bounds-zyx", type=int, nargs=6, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--output-grid-template-level",
         type=int,
@@ -9502,6 +9549,9 @@ def run_stitch_once(
     log(f"Fusion output level: {args.fusion_level}; nominal output spacing: {nominal_output_spacing}")
     output_grid_template = getattr(args, "output_grid_template", None)
     output_grid_template_level = int(getattr(args, "output_grid_template_level", 0))
+    output_grid_bounds = getattr(args, "output_grid_bounds_zyx", None)
+    if output_grid_bounds is not None and output_grid_template is None:
+        raise ValueError("output grid bounds require an output grid template")
 
     registration_binning = None
     if args.registration_binning is not None:
@@ -9575,7 +9625,7 @@ def run_stitch_once(
         log(f"Channel {channel} output path: {channel_output}")
         if not args.register_only:
             raise_if_output_exists(channel_output)
-    from multiview_stitcher import fusion, misc_utils, registration
+    from multiview_stitcher import misc_utils, registration
     from multiview_stitcher.fusion._core import process_output_chunksize, process_output_stack_properties
     from multiview_stitcher import spatial_image_utils as si_utils
 
@@ -9944,6 +9994,7 @@ def run_stitch_once(
                 output_grid_template,
                 output_spacing,
                 level=output_grid_template_level,
+                bounds_zyx=None if output_grid_bounds is None else tuple(output_grid_bounds),
             )
             log(f"Fusion output grid template: {output_grid_template} level {output_grid_template_level}")
             log(f"Template output stack properties: {template_output_stack_properties}")
@@ -10330,44 +10381,43 @@ def run_stitch_once(
             else:
                 fusion_progress_context = nullcontext()
                 log("Filesystem progress logging for fusion output is disabled")
+            backend = MVSBackend.load()
             with ExitStack() as stack:
                 stack.enter_context(
-                    zarr_safe_fusion_selection(
-                        extra_attr_keys=(
-                            "source_view",
-                            "fusion_source_cache_key",
-                            "fusion_correction_source",
-                        )
+                    backend.patches(
+                        source_selection=zarr_safe_fusion_selection(
+                            extra_attr_keys=(
+                                "source_view",
+                                "fusion_source_cache_key",
+                                "fusion_correction_source",
+                            )
+                        ),
+                        source_reads=basic_corrected_zarr_reads(
+                            inverse_flatfields=inverse_flatfield,
+                            dataset_info_key=correction_key,
+                            dataset_attr_keys=() if correction_key is None else (correction_key,),
+                            cache_key_attr="fusion_source_cache_key",
+                            source_cache_max_bytes=source_cache_max_bytes,
+                        ),
+                        profiling=profile_zarr_slice_materialization(
+                            enabled=args.profile_max_fusion_batches is not None
+                            or args.profile_skip_fusion_batches > 0
+                        ),
+                        cleanup=cupy_cleanup_context(args.per_chunk_cupy_cleanup),
+                        normalization=inplace_mvs_normalize_weights_context(),
+                        spatial_chunks=spatial_chunks_for_package_pyramid(),
+                        single_scale=single_scale_fusion_output(),
+                        resume=resumable_mvs_zarr_create(
+                            scale0_path=fusion_output / "0", enabled=args.resume_fusion
+                        ),
                     )
-                )
-                stack.enter_context(
-                    basic_corrected_zarr_reads(
-                        inverse_flatfields=inverse_flatfield,
-                        dataset_info_key=correction_key,
-                        dataset_attr_keys=() if correction_key is None else (correction_key,),
-                        cache_key_attr="fusion_source_cache_key",
-                        source_cache_max_bytes=source_cache_max_bytes,
-                    )
-                )
-                stack.enter_context(
-                    profile_zarr_slice_materialization(
-                        enabled=args.profile_max_fusion_batches is not None
-                        or args.profile_skip_fusion_batches > 0
-                    )
-                )
-                stack.enter_context(cupy_cleanup_context(args.per_chunk_cupy_cleanup))
-                stack.enter_context(inplace_mvs_normalize_weights_context())
-                stack.enter_context(spatial_chunks_for_package_pyramid())
-                stack.enter_context(single_scale_fusion_output())
-                stack.enter_context(
-                    resumable_mvs_zarr_create(scale0_path=fusion_output / "0", enabled=args.resume_fusion)
                 )
                 stack.enter_context(fusion_progress_context)
                 stack.enter_context(dask.config.set({"array.chunk-size": dask_chunk_size_bytes}))
                 try:
                     log("Fusion write path: multiview-stitcher direct chunked OME-Zarr fuser")
                     with heartbeat(f"fusion direct OME-Zarr write channel {channel}"):
-                        fusion.fuse(
+                        backend.fuse(
                             images=sims,
                             transform_key=transform_key,
                             fusion_func=fusion_func,
@@ -10709,6 +10759,10 @@ def main() -> int:
             position_input,
             input_dir=input_dir,
             registration_input=registration_input,
+            **({"selected_channels": tuple(args.channels)} if args.channels is not None and not should_run_registration(args, registration_input) else {}),
+            # Fixed-grid fusion resamples each registered source using its own native spacing.
+            **({"require_same_yx_spacing": False} if args.output_grid_template is not None
+               and registration_input is not None and not should_run_registration(args, registration_input) else {}),
         )
         log(f"Read position-input metadata: {position_input}")
     elif registration_input is not None:

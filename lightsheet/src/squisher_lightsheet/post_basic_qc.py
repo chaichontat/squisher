@@ -511,7 +511,9 @@ Generalization curves hold out one complete plane at a time. The shared model
 uses the other requested planes; the single-plane model uses the training plane
 closest to the report's representative Z. Penalty selection uses training planes
 only, with all measurements of a source pair assigned to the same split.
-The curves report median absolute log2 seam discrepancy on the excluded plane.
+The curves report the median of per-pair median absolute pixel log2 discrepancies on the
+excluded plane. Absolute values are taken before spatial aggregation, so bright and dark
+errors within an overlap cannot cancel. Each source pair receives equal weight.
 Before/after images at every sampled Z are linked under each channel.
 """
     (qc_dir / "README.md").write_text(caption)

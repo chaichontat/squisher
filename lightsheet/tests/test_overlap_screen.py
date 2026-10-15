@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import zarr
 
 import squisher_lightsheet.method8_stitch_register as stitch_register
@@ -222,3 +223,69 @@ def test_load_level2_screen_fails_closed_on_missing_unit(tmp_path, monkeypatch) 
         assert "does not contain 2 samples" in str(error)
     else:
         raise AssertionError("incomplete screen must fail closed")
+
+
+def _wide_reviewed_positions(tmp_path: Path):
+    directory = tmp_path / "tiles"
+    directory.mkdir()
+    names = ["sample.000.ome.zarr", "sample.001.ome.zarr"]
+    for name, x in zip(names, (0.0, 43.0), strict=True):
+        _write_multiscale_tile(directory / name, x_um=x)
+    payload = {
+        "units": "micrometer",
+        "tiles": [
+            {
+                "tile": name,
+                "translation_um": {"z": 0, "y": 0, "x": x},
+                "scale_um": {"z": 0.6, "y": 0.3, "x": 0.3},
+            }
+            for name, x in zip(names, (0.0, 43.0), strict=True)
+        ],
+        "position_overrides": {"path": "reviewed.json", "sha256": "reviewed-identity"},
+        "additional_registration_pairs": [names],
+    }
+    from squisher_lightsheet.artifact_io import sha256_file
+
+    review = tmp_path / "reviewed.json"
+    review.write_text(json.dumps({"approved": True, "additional_registration_pairs": [names]}))
+    payload["position_overrides"] = {"path": str(review), "sha256": sha256_file(review)}
+    path = tmp_path / "positions.json"
+    path.write_text(json.dumps(payload))
+    return directory, path, payload
+
+
+def test_reviewed_continuation_link_is_included_without_broadening_automatic_adjacency(tmp_path):
+    directory, path, payload = _wide_reviewed_positions(tmp_path)
+    loaded = stitch_register._load_tiles(path, directory)
+    assert stitch_register._all_adjacent_pairs(loaded) == ["000-001"]
+    payload.pop("additional_registration_pairs")
+    path.write_text(json.dumps(payload))
+    assert stitch_register._all_adjacent_pairs(stitch_register._load_tiles(path, directory)) == []
+
+
+@pytest.mark.parametrize("bad", ["unknown", "self", "nonoverlap", "unreviewed", "shape"])
+def test_reviewed_registration_links_reject_invalid_graph_edges(tmp_path, bad):
+    directory, path, payload = _wide_reviewed_positions(tmp_path)
+    if bad == "unknown":
+        payload["additional_registration_pairs"] = [["sample.000.ome.zarr", "missing"]]
+    elif bad == "self":
+        payload["additional_registration_pairs"] = [["sample.000.ome.zarr"] * 2]
+    elif bad == "nonoverlap":
+        payload["tiles"][1]["translation_um"]["x"] = 100
+    elif bad == "unreviewed":
+        payload.pop("position_overrides")
+    else:
+        payload["additional_registration_pairs"] = "000-001"
+    if bad != "unreviewed":
+        from squisher_lightsheet.artifact_io import sha256_file
+
+        review = Path(payload["position_overrides"]["path"])
+        review.write_text(
+            json.dumps(
+                {"approved": True, "additional_registration_pairs": payload["additional_registration_pairs"]}
+            )
+        )
+        payload["position_overrides"]["sha256"] = sha256_file(review)
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        stitch_register._load_tiles(path, directory)

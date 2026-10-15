@@ -531,25 +531,82 @@ def _fused_fixed_registered_affine_um(
     return affine, fixed_origin
 
 
+def _validate_explicit_domain_row(
+    row: dict[str, Any], *, window_json: Path, source_shape_zyx: np.ndarray
+) -> dict[str, Any]:
+    if row.get("artifact_type") != "lightsheet.fused_fixed_explicit_domain.v1":
+        raise ValueError(f"{window_json} is not an explicit-domain record")
+    if row.get("status") != "accepted":
+        raise ValueError(f"{window_json} explicit domain is not accepted")
+    if row.get("domain_policy") not in {"validated_refinement", "retained_published_mapping"}:
+        raise ValueError(f"{window_json} has invalid domain_policy")
+    provenance = {}
+    for key in ("parent_window_json", "transform_record_json"):
+        value = row.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{window_json} requires {key}")
+        reference = Path(value)
+        if not reference.is_absolute():
+            reference = window_json.parent / reference
+        if not reference.is_file():
+            raise ValueError(f"{window_json} {key} does not exist: {reference}")
+        provenance[key] = str(reference.resolve())
+    vectors = {}
+    for key in ("moving_start_l0_zyx", "moving_stop_l0_zyx", "moving_shape_zyx"):
+        values = np.asarray(row.get(key))
+        if values.shape != (3,) or values.dtype.kind not in "iu":
+            raise ValueError(f"{window_json} requires integer {key} with three axes")
+        vectors[key] = values
+    start, stop, shape = (vectors[k] for k in ("moving_start_l0_zyx", "moving_stop_l0_zyx", "moving_shape_zyx"))
+    if np.any(shape <= 0) or not np.array_equal(stop - start, shape):
+        raise ValueError(f"{window_json} explicit domain shape does not match bounds")
+    if np.any(start < 0) or np.any(stop > source_shape_zyx):
+        raise ValueError(f"{window_json} explicit domain is outside source bounds")
+    affine_fields = {
+        "selected_local_matrix_zyx": (3, 3),
+        "selected_local_translation_zyx": (3,),
+        "selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx": (3, 3),
+        "selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx": (3,),
+    }
+    for key, expected_shape in affine_fields.items():
+        values = np.asarray(row.get(key), dtype=np.float64)
+        if values.shape != expected_shape or not np.all(np.isfinite(values)):
+            raise ValueError(f"{window_json} requires finite {key} with shape {expected_shape}")
+        if expected_shape == (3, 3) and np.linalg.det(values) == 0:
+            raise ValueError(f"{window_json} requires nonsingular {key}")
+        provenance[key] = values.tolist()
+    return provenance | {"domain_policy": row["domain_policy"], "explicit_domain_json": str(window_json.resolve())}
+
+
 def _fused_fixed_registration_from_summary(
     *,
     source_summary_input: Path,
     moving_by_tile: dict[str, dict[str, Any]],
     level_factor_zyx: np.ndarray,
+    use_explicit_domains: bool = False,
 ) -> dict[str, Any]:
     summary = _read_json(source_summary_input)
+    explicit = summary.get("artifact_type") == "lightsheet.fused_fixed_explicit_domain_summary.v1"
+    if explicit != use_explicit_domains:
+        raise ValueError("explicit-domain summary and use_explicit_domains must be supplied together")
     compact_rows = summary.get("windows")
     if not isinstance(compact_rows, list):
         raise ValueError(f"{source_summary_input} must contain a windows list")
+    if use_explicit_domains and not compact_rows:
+        raise ValueError("explicit-domain summary requires nonempty windows")
 
     records: list[dict[str, Any]] = []
     for compact in compact_rows:
         window_json = Path(str(compact["level0_json"]))
         row = _read_json(window_json)
-        if row.get("status") != "accepted":
+        if row.get("status") != "accepted" and not use_explicit_domains:
             continue
         moving_tile = str(row["moving_tile"])
         moving_record = moving_by_tile[moving_tile]
+        explicit_provenance = (
+            _validate_explicit_domain_row(row, window_json=window_json, source_shape_zyx=_shape_zyx_from_record(moving_record))
+            if use_explicit_domains else {}
+        )
         # Materialized chunks are written in oriented order, so they carry positive spacing.
         moving_spacing = np.abs(_vector_zyx(moving_record, "scale_um"))
         affine, fixed_origin = _fused_fixed_registered_affine_um(
@@ -566,6 +623,7 @@ def _fused_fixed_registration_from_summary(
         records.append(
             {
                 "tile": tile_name,
+                **explicit_provenance,
                 "moving_tile": moving_tile,
                 "method8_window_json": str(window_json),
                 "status": "accepted",
@@ -984,6 +1042,8 @@ def export_fused_fixed_overlapping_materialized_chunks(
     residual_correction: Path | None = None,
     output_dir: Path,
     source_channel: int = 0,
+    output_channel_label: str | None = None,
+    use_explicit_domains: bool = False,
     core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
     window_shape_zyx: tuple[int, int, int] = (528, 528, 528),
     level_factor_zyx: tuple[int, int, int] = DEFAULT_FUSED_FIXED_LEVEL_FACTOR_ZYX,
@@ -995,6 +1055,11 @@ def export_fused_fixed_overlapping_materialized_chunks(
     resume: bool = False,
 ) -> dict[str, Path]:
     """Rematerialize registered fused-fixed cores with cross-registration overlap."""
+    if output_channel_label is not None and (
+        not output_channel_label.strip() or output_channel_label != output_channel_label.strip()
+    ):
+        raise ValueError("output_channel_label must be a nonempty label without surrounding whitespace")
+    channel_label = str(source_channel) if output_channel_label is None else output_channel_label
     moving_payload = _read_json(moving_position_input)
     moving_by_tile = _merge_moving_pixel_sources(
         _records_by_tile(moving_position_input),
@@ -1004,17 +1069,21 @@ def export_fused_fixed_overlapping_materialized_chunks(
     core_shape = np.asarray(core_shape_zyx, dtype=np.int64)
     window_shape = np.asarray(window_shape_zyx, dtype=np.int64)
     level_factor = np.asarray(level_factor_zyx, dtype=np.int64)
-    if np.any(window_shape < core_shape) or np.all(window_shape == core_shape):
+    if not use_explicit_domains and (np.any(window_shape < core_shape) or np.all(window_shape == core_shape)):
         raise ValueError(
             f"overlap window {window_shape.tolist()} must not be smaller than core "
             f"{core_shape.tolist()} on any axis and must be larger on at least one axis"
         )
-    if np.any(window_shape % level_factor):
+    if not use_explicit_domains and np.any(window_shape % level_factor):
         raise ValueError(
             f"window shape {window_shape.tolist()} must be divisible by level factors {level_factor.tolist()}"
         )
     if (source_registration_input is None) == (source_summary_input is None):
         raise ValueError("exactly one of source_registration_input or source_summary_input is required")
+    if use_explicit_domains and source_summary_input is None:
+        raise ValueError("use_explicit_domains requires source_summary_input")
+    if level_factor.shape != (3,) or np.any(level_factor <= 0):
+        raise ValueError("level_factor_zyx must contain three positive values")
     if residual_correction is None:
         correction_identity = None
         corrections: dict[str, ResidualCorrection] = {}
@@ -1035,6 +1104,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
             source_summary_input=source_summary_input,
             moving_by_tile=moving_by_tile,
             level_factor_zyx=level_factor,
+            use_explicit_domains=use_explicit_domains,
         )
         source_metadata = {"source_summary_input": str(source_summary_input.resolve())}
     else:
@@ -1045,6 +1115,8 @@ def export_fused_fixed_overlapping_materialized_chunks(
     if not isinstance(source_records, list):
         raise ValueError("fused-fixed materialization source must contain a tiles list")
     selected_records = source_records if max_tiles is None else source_records[:max_tiles]
+    if use_explicit_domains and len({r["tile"] for r in selected_records}) != len(selected_records):
+        raise ValueError("explicit domains have duplicate materialized tile identities")
 
     output_records: list[dict[str, Any]] = []
     position_records: list[dict[str, Any]] = []
@@ -1058,7 +1130,11 @@ def export_fused_fixed_overlapping_materialized_chunks(
         core_start = np.asarray(row["moving_start_l0_zyx"], dtype=np.int64)
         core_stop = np.asarray(row["moving_stop_l0_zyx"], dtype=np.int64)
         recorded_shape = core_stop - core_start
-        if np.array_equal(recorded_shape, core_shape):
+        if use_explicit_domains:
+            overlap_start, overlap_stop = core_start, core_stop
+            if np.any(recorded_shape % level_factor):
+                raise ValueError(f"{window_json} explicit shape must be divisible by level factors")
+        elif np.array_equal(recorded_shape, core_shape):
             overlap_start, overlap_stop = _fused_fixed_overlapping_window_zyx(
                 core_start_zyx=core_start,
                 source_shape_zyx=moving_shape,
@@ -1090,12 +1166,14 @@ def export_fused_fixed_overlapping_materialized_chunks(
             raise ValueError(f"Residual correction is missing source {source_path}")
         tile_name = str(record["tile"])
         output_path = output_dir / "materialized_tiles" / tile_name
+        output_shape = ((overlap_stop - overlap_start) // level_factor).tolist()
         output_record = record | {
             "path": str(output_path),
-            "shape": (window_shape // level_factor).tolist(),
+            "shape": output_shape,
             "axes": "ZYX",
             "spacing_um": _dict_zyx(np.abs(expected_stage_scale)),
-            "channels": [str(source_channel)],
+            "channels": [channel_label],
+            "materialized_source_channel": source_channel,
             "stage_translation_um": _dict_zyx(stage_translation),
             "stage_scale_um": _dict_zyx(stage_scale),
             "materialized_source_path": str(source_path),
@@ -1103,7 +1181,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
             "materialized_source_stop_zyx": overlap_stop.tolist(),
             "materialized_fixed_origin_um": _dict_zyx(stage_translation),
             "materialized_fixed_spacing_um": _dict_zyx(stage_scale),
-            "materialized_fixed_shape_zyx": (window_shape // level_factor).tolist(),
+            "materialized_fixed_shape_zyx": output_shape,
             "registered_core_start_l0_zyx": core_start.tolist(),
             "registered_core_stop_l0_zyx": core_stop.tolist(),
             "residual_correction": correction_identity,
@@ -1149,6 +1227,19 @@ def export_fused_fixed_overlapping_materialized_chunks(
         "level_factor_zyx": level_factor.tolist(),
         "materialized_shape_zyx": expected_shape,
     }
+    if use_explicit_domains:
+        grid = {
+            "policy": "exact recorded explicit domains; no core expansion",
+            "level_factor_zyx": level_factor.tolist(),
+            "domains": [{key: record[key] for key in (
+                "tile", "shape", "parent_window_json", "transform_record_json", "domain_policy",
+                "explicit_domain_json", "materialized_source_start_zyx", "materialized_source_stop_zyx",
+                "materialized_source_path", "stage_translation_um", "stage_scale_um", "registered_affine",
+                "selected_local_matrix_zyx", "selected_local_translation_zyx",
+                "selected_fixed_fused_l0_to_moving_l0_pull_matrix_zyx",
+                "selected_fixed_fused_l0_to_moving_l0_pull_offset_zyx",
+            )} for record in output_records],
+        }
     summary_payload = {
         "artifact_type": "squisher_lightsheet.fused_fixed_overlapping_materialization_summary.v1",
         **source_metadata,
@@ -1157,6 +1248,7 @@ def export_fused_fixed_overlapping_materialized_chunks(
         "moving_source_dir": None if moving_source_dir is None else str(moving_source_dir.resolve()),
         "source_position_artifact_type": moving_payload.get("artifact_type"),
         "source_channel": source_channel,
+        "output_channel_label": channel_label,
         "residual_correction": correction_identity,
         "output_codec": output_codec,
         "zstd_level": zstd_level,
@@ -1278,7 +1370,14 @@ def export_fused_fixed_overlapping_materialized_chunks(
                         f"materialized {completed_count}/{len(tasks)} overlapping fused-fixed views",
                         flush=True,
                     )
-    if any(shape != expected_shape for shape in written_shapes) or len(written_shapes) != len(tasks):
+    expected_shapes = [record["shape"] for record in output_records]
+    if use_explicit_domains:
+        for task, shape in zip(tasks, expected_shapes, strict=True):
+            if _completed_materialization_shape(task) != shape:
+                raise ValueError(f"explicit-domain output does not match its own shape/provenance: {task['output_path']}")
+    shapes_match = (sorted(written_shapes) == sorted(expected_shapes) if use_explicit_domains
+                    else all(shape == expected_shape for shape in written_shapes))
+    if not shapes_match or len(written_shapes) != len(tasks):
         raise ValueError(
             f"materialized outputs do not all match expected {expected_shape}: "
             f"validated {len(written_shapes)}/{len(tasks)}"
@@ -1607,11 +1706,12 @@ def join_materialized_sides(*, side_output_dirs: list[Path], output_dir: Path) -
             raise ValueError(f"{side_dir} materialization is not complete")
         sides.append((side_dir.resolve(), payloads))
     reference = sides[0][1]
+    # Materialized windows are single-channel stores, so sides may come from different acquisition channel indices
+    # (a label acquired alone on one side and in a multichannel acquisition on the other); each side's is recorded.
     for side_dir, payloads in sides[1:]:
         for key, payload_key in (
             ("fixed_fused", "registration"),
             ("materialization_grid", "registration"),
-            ("source_channel", "summary"),
             ("output_codec", "summary"),
         ):
             if payloads[payload_key].get(key) != reference[payload_key].get(key):
@@ -1635,9 +1735,12 @@ def join_materialized_sides(*, side_output_dirs: list[Path], output_dir: Path) -
     )
     _write_json(
         outputs["summary"],
-        reference["summary"]
+        {key: value for key, value in reference["summary"].items() if key != "source_channel"}
         | {
             "joined_sides": joined_sides,
+            "source_channels": {
+                str(side_dir): int(payloads["summary"]["source_channel"]) for side_dir, payloads in sides
+            },
             "side_summaries": [payloads["summary"] for _side_dir, payloads in sides],
             "tile_count": len(registration_tiles),
         },

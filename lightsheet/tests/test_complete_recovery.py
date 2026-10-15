@@ -151,6 +151,9 @@ class _FakeScorer:
         self.checked.append(float(transform[11]))
         return self.residual
 
+    def aggregate_residual_shift(self, _row, _transform):
+        return None
+
 
 def _shift(y: float, x: float, *, peak: float = 0.6, second: float = 0.2) -> PlaneShift:
     return PlaneShift(shift_yx=(y, x), peak_ncc=peak, second_peak_ncc=second, at_search_edge=False)
@@ -189,6 +192,7 @@ def test_spatial_promotion_requires_recorded_support_and_clears_fit_metrics(
         native_method=native_method,
         scorer=scorer,
         image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
     )
 
     assert promoted["status"] == "accepted"
@@ -209,7 +213,7 @@ def test_spatial_promotion_rejects_insufficient_support() -> None:
 
     with pytest.raises(ValueError, match="Insufficient interpolation support"):
         subject._promote_spatial_fallback(
-            row, native_method="method6", scorer=_FakeScorer(), image_ncc_margin=0.02
+            row, native_method="method6", scorer=_FakeScorer(), image_ncc_margin=0.02, maximum_unverified_rerun_departure_px=60.0
         )
 
 
@@ -248,7 +252,7 @@ def test_spatial_promotion_recovers_only_native_attempt_mismatch(
     _write(summary, payload)
 
     result = subject._promote_spatial_fallbacks(
-        summary, tmp_path / "promoted", image_ncc_margin=0.02
+        summary, tmp_path / "promoted", image_ncc_margin=0.02, maximum_unverified_rerun_departure_px=60.0
     )
     promoted_summary = subject.read_json_object(result)
     promoted = subject.read_json_object(
@@ -297,7 +301,8 @@ def test_spatial_promotion_keeps_rejected_rerun_only_when_every_plane_favors_it(
     scorer = _FakeScorer({3.0: interpolated_planes, 7.0: native_planes})
 
     promoted = subject._promote_spatial_fallback(
-        _spatial_row(reason=reason), native_method="method6", scorer=scorer, image_ncc_margin=0.02
+        _spatial_row(reason=reason), native_method="method6", scorer=scorer, image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
     )
 
     promotion = promoted["interpolated_fallback_promotion"]
@@ -324,6 +329,7 @@ def test_spatial_promotion_never_compares_affine_rejected_rerun() -> None:
         native_method="method6",
         scorer=scorer,
         image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
     )
 
     assert scorer.compared == []
@@ -348,6 +354,7 @@ def test_spatial_promotion_withholds_image_contradicted_transform(
         native_method="method6",
         scorer=_FakeScorer(residual=residual),
         image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
     )
 
     assert promoted["status"] == status
@@ -363,7 +370,7 @@ def test_spatial_promotion_rejects_baseline_that_is_not_the_interpolation() -> N
 
     with pytest.raises(ValueError, match="does not match the interpolated initializer"):
         subject._promote_spatial_fallback(
-            row, native_method="method6", scorer=_FakeScorer(), image_ncc_margin=0.02
+            row, native_method="method6", scorer=_FakeScorer(), image_ncc_margin=0.02, maximum_unverified_rerun_departure_px=60.0
         )
 
 
@@ -393,12 +400,14 @@ def _transform_row(
         (([], []), False),
     ],
 )
+@pytest.mark.parametrize("local_3d", [False, True])
 def test_linear_recovery_uses_only_native_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     native_method: str,
     scores: tuple[list[float], list[float]],
     replaced: bool,
+    local_3d: bool,
 ) -> None:
     monkeypatch.setattr(
         subject.recovery,
@@ -409,9 +418,10 @@ def test_linear_recovery_uses_only_native_sources(
         _transform_row(
             status="accepted",
             reason=None,
-            attempt=f"native_{native_method.replace('-', '_')}_from_phase_primed_initializer",
+            attempt=("local_3d_affine_refinement" if local_3d else
+                     f"native_{native_method.replace('-', '_')}_from_phase_primed_initializer"),
             x=0.0,
-        ),
+        ) | {"cache_config": {"native_method": native_method, "local_3d_refinement": local_3d}},
         _transform_row(
             status="accepted",
             reason=None,
@@ -524,7 +534,8 @@ def test_spatial_promotion_accepts_manual_initializer_without_interpolation_supp
     row["outlier_recovery"].update(source_good_window_json=[], initializer_source="manual")
 
     promoted = subject._promote_spatial_fallback(
-        row, native_method="method6", scorer=_FakeScorer(residual=[_shift(0.0, 0.5), _shift(0.5, 0.0)]), image_ncc_margin=0.02
+        row, native_method="method6", scorer=_FakeScorer(residual=[_shift(0.0, 0.5), _shift(0.5, 0.0)]), image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
     )
 
     assert promoted["status"] == "accepted"
@@ -681,3 +692,351 @@ def test_manual_seed_arbitration_runs_on_the_linear_recovery_result(
     assert calls[-2:] == [("linear", "promote.json"), ("manual", "linear.json")]
     assert final == Path("manual.json")
     assert [stage for stage, _path in reports] == list(subject.POLICY_ORDER)
+
+
+class _CandidateScorer:
+    """Plane scores and residual shifts keyed by candidate x translation."""
+
+    def __init__(
+        self,
+        planes: dict[float, list[float]],
+        residuals: dict[float, list[PlaneShift]],
+        aggregate: dict[float, PlaneShift] | None = None,
+    ) -> None:
+        self.planes = planes
+        self.residuals = residuals
+        self.aggregate = aggregate or {}
+        self.checked: list[float] = []
+        self.aggregated: list[float] = []
+
+    def plane_scores(self, _row, transforms):
+        return [self.planes[float(transform[11])] for transform in transforms]
+
+    def residual_shifts(self, _row, transform):
+        self.checked.append(float(transform[11]))
+        return self.residuals[float(transform[11])]
+
+    def aggregate_residual_shift(self, _row, transform):
+        self.aggregated.append(float(transform[11]))
+        return self.aggregate.get(float(transform[11]))
+
+
+def _window_row(*, native_x: float, native_matrix: np.ndarray | None = None, manual: bool = False) -> dict:
+    """Spatial-fallback row on a 528-voxel window with interpolated x=3 and a quality-gate-rejected rerun."""
+    row = _spatial_row(reason="quality_gate_grad_ncc", native_x=native_x)
+    row["fixed_stop_zyx"] = [528, 528, 528 + row["fixed_start_zyx"][2]]
+    if native_matrix is not None:
+        row["method8_attempts"][1]["local_matrix_zyx"] = native_matrix.tolist()
+    if manual:
+        row["outlier_recovery"].update(source_good_window_json=[], initializer_source="manual")
+    return row
+
+
+def _promote_window(row: dict, scorer: _CandidateScorer) -> dict:
+    return subject._promote_spatial_fallback(
+        row,
+        native_method="method6",
+        scorer=scorer,
+        image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("native_x", "rerun_residual", "fallback_residual", "status", "selected", "checked"),
+    [
+        # An unverified rerun beyond the bound falls back to the interpolated placement.
+        (200.0, [], VERIFIED, "accepted", "interpolated", [200.0, 3.0]),
+        # The fallback still faces the residual check; its residual-shifted placement (x=-21) does not verify.
+        (200.0, UNVERIFIED, CONTRADICTED, "rejected", "interpolated", [200.0, 3.0, -21.0]),
+        # A verified rerun is kept at any distance.
+        (200.0, VERIFIED, CONTRADICTED, "accepted", "native_rerun", [200.0]),
+        # The bound is inclusive: a 60 px corner displacement keeps the rerun, whose residual-shifted
+        # placement (x=51) does not verify either.
+        (63.0, UNVERIFIED, VERIFIED, "accepted", "native_rerun", [63.0, 51.0]),
+    ],
+)
+def test_spatial_promotion_withholds_unverified_rerun_far_from_interpolation(
+    native_x: float,
+    rerun_residual: list[PlaneShift],
+    fallback_residual: list[PlaneShift],
+    status: str,
+    selected: str,
+    checked: list[float],
+) -> None:
+    scorer = _CandidateScorer(
+        {3.0: [0.01, 0.02], native_x: [0.05, 0.06]},
+        {native_x: rerun_residual, 3.0: fallback_residual, -21.0: UNVERIFIED, 51.0: UNVERIFIED},
+    )
+
+    promoted = _promote_window(_window_row(native_x=native_x), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    withheld = selected == "interpolated"
+    assert promoted["status"] == status
+    assert promotion["selected_candidate"] == selected
+    assert promotion["native_rerun_corner_departure_px"] == pytest.approx(native_x - 3.0)
+    assert promotion["native_rerun_withheld_for_departure"] == withheld
+    assert scorer.checked == checked
+    if withheld:
+        assert promotion["withheld_native_rerun_residual"]["verdict"] != "verified"
+    if status == "accepted":
+        expected_x = 3.0 if withheld else native_x
+        assert promoted["selected_local_translation_zyx"] == [0.0, 0.0, expected_x]
+    else:
+        assert promoted["rejection_reason"] == subject.CONTRADICTED_INTERPOLATION_REASON
+
+
+def test_spatial_promotion_bounds_rerun_rotation_without_translation_departure() -> None:
+    angle = np.deg2rad(10.0)
+    rotation = np.array(
+        [[1.0, 0.0, 0.0], [0.0, np.cos(angle), -np.sin(angle)], [0.0, np.sin(angle), np.cos(angle)]]
+    )
+    scorer = _CandidateScorer({3.0: [0.01, 0.02], 3.5: [0.05, 0.06]}, {3.5: UNVERIFIED, 3.0: VERIFIED})
+
+    promoted = _promote_window(_window_row(native_x=3.5, native_matrix=rotation), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    assert promotion["native_rerun_corner_departure_px"] > 60.0
+    assert promotion["selected_candidate"] == "interpolated"
+    assert promoted["selected_local_matrix_zyx"] == np.eye(3).tolist()
+
+
+def test_spatial_promotion_falls_back_to_the_manual_seed() -> None:
+    scorer = _CandidateScorer({3.0: [0.01, 0.02], 200.0: [0.05, 0.06]}, {200.0: UNVERIFIED, 3.0: VERIFIED})
+
+    promoted = _promote_window(_window_row(native_x=200.0, manual=True), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    assert promotion["initializer_source"] == "manual"
+    assert promotion["selected_candidate"] == "interpolated"
+    assert promoted["selected_local_translation_zyx"] == [0.0, 0.0, 3.0]
+
+
+def _recorded_fit_row(tmp_path: Path, *, original_matrix: np.ndarray | None = None) -> dict:
+    """Spatial-fallback row with interpolated x=3, a rejected original fit at x=9 and a parent initializer at x=11."""
+    row = _spatial_row(reason="local_3d_validation_residual")
+    row["moving_shape_zyx"] = [10, 10, 10]
+    source = tmp_path / "registration" / "window.json"
+    _write(source, {
+        **{key: row[key] for key in ("moving_tile", "fixed_start_zyx", "moving_start_l0_zyx", "moving_shape_zyx")},
+        "initializer_conversion": {"source": "accepted_parent_window"},
+        "initial_matrix_zyx": np.eye(3).tolist(),
+        "initial_translation_zyx": [0.0, 0.0, 11.0],
+    })
+    row["outlier_recovery"].update(
+        original_selected_local_matrix_zyx=(np.eye(3) if original_matrix is None else original_matrix).tolist(),
+        original_selected_local_translation_zyx=[0.0, 0.0, 9.0],
+        source_window_json=str(source),
+    )
+    return row
+
+
+@pytest.mark.parametrize(
+    ("residuals", "selected", "status"),
+    [
+        ({3.0: UNVERIFIED, 9.0: VERIFIED}, "original_fit", "accepted"),
+        ({3.0: UNVERIFIED, 9.0: UNVERIFIED, 11.0: VERIFIED}, "parent_initializer", "accepted"),
+        # A verified recorded fit also replaces a contradicted interpolation instead of leaving a hole.
+        ({3.0: CONTRADICTED, 9.0: VERIFIED}, "original_fit", "accepted"),
+        ({3.0: VERIFIED}, "interpolated", "accepted"),
+        # The interpolated x=3 shifted by four times its -3 px level-2 residual sits at x=-9.
+        ({3.0: UNVERIFIED, 9.0: UNVERIFIED, 11.0: CONTRADICTED, -9.0: UNVERIFIED}, "interpolated", "accepted"),
+        ({3.0: CONTRADICTED, 9.0: UNVERIFIED, 11.0: UNVERIFIED, -21.0: UNVERIFIED}, "interpolated", "rejected"),
+        # A contradicted interpolation shifted by its measured residual is promoted once that shift verifies.
+        (
+            {3.0: CONTRADICTED, 9.0: UNVERIFIED, 11.0: UNVERIFIED, -21.0: VERIFIED},
+            "residual_corrected_interpolated",
+            "accepted",
+        ),
+        # Unverified without a measured misalignment: no confident planes, or planes that disagree.
+        ({3.0: []}, "interpolated", "accepted"),
+        ({3.0: [_shift(0.0, 4.0), _shift(0.0, -4.0)]}, "interpolated", "accepted"),
+    ],
+)
+def test_spatial_promotion_replaces_measured_misalignment_with_verified_recorded_fit(
+    tmp_path: Path, residuals: dict[float, list[PlaneShift]], selected: str, status: str
+) -> None:
+    scorer = _CandidateScorer({}, residuals)
+
+    promoted = _promote_window(_recorded_fit_row(tmp_path), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    assert scorer.checked == list(residuals)
+    assert [check["candidate"] for check in promotion["recorded_fit_checks"]] == (
+        ["original_fit", "parent_initializer", "residual_corrected_interpolated"][: len(residuals) - 1]
+    )
+    assert promoted["status"] == status
+    assert promotion["selected_candidate"] == selected
+    if status == "accepted":
+        expected_x = {
+            "original_fit": 9.0,
+            "parent_initializer": 11.0,
+            "residual_corrected_interpolated": -21.0,
+            "interpolated": 3.0,
+        }[selected]
+        assert promoted["selected_local_translation_zyx"] == [0.0, 0.0, expected_x]
+    if selected == "interpolated":
+        assert promotion["replaced_selection_residual"] is None
+    else:
+        assert promoted["selected_attempt"] == f"residual_verified_{selected}"
+        assert promotion["residual"]["verdict"] == "verified"
+        assert promotion["replaced_selection_residual"]["verdict"] != "verified"
+
+
+def test_spatial_promotion_skips_an_implausible_recorded_original_fit(tmp_path: Path) -> None:
+    scorer = _CandidateScorer({}, {3.0: UNVERIFIED, 11.0: VERIFIED})
+
+    promoted = _promote_window(_recorded_fit_row(tmp_path, original_matrix=np.diag([1.0, 1.0, 1.5])), scorer)
+
+    assert scorer.checked == [3.0, 11.0]
+    assert promoted["interpolated_fallback_promotion"]["selected_candidate"] == "parent_initializer"
+
+
+def test_spatial_promotion_has_no_parent_candidate_when_the_original_fit_never_started(tmp_path: Path) -> None:
+    row = _recorded_fit_row(tmp_path)
+    source = Path(row["outlier_recovery"]["source_window_json"])
+    original = json.loads(source.read_text())
+    del original["initial_matrix_zyx"], original["initial_translation_zyx"]
+    _write(source, original)
+    scorer = _CandidateScorer({}, {3.0: UNVERIFIED, 9.0: UNVERIFIED, -9.0: UNVERIFIED})
+
+    promoted = _promote_window(row, scorer)
+
+    assert scorer.checked == [3.0, 9.0, -9.0]
+    assert promoted["interpolated_fallback_promotion"]["selected_candidate"] == "interpolated"
+
+
+def test_spatial_promotion_rejects_a_parent_initializer_from_another_window_frame(tmp_path: Path) -> None:
+    row = _recorded_fit_row(tmp_path)
+    source = Path(row["outlier_recovery"]["source_window_json"])
+    _write(source, {**json.loads(source.read_text()), "moving_start_l0_zyx": [80, 0, 3]})
+
+    with pytest.raises(ValueError, match="does not share the window frame"):
+        _promote_window(row, _CandidateScorer({}, {3.0: UNVERIFIED, 9.0: UNVERIFIED}))
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf"), -1.0])
+def test_complete_recovery_settings_reject_unusable_rerun_bound(bound: float) -> None:
+    with pytest.raises(ValueError, match="maximum_unverified_rerun_departure_px"):
+        subject.CompleteRecoverySettings(maximum_unverified_rerun_departure_px=bound)
+
+
+@pytest.mark.parametrize("cache", [
+    {}, {"native_method": "method6", "local_3d_refinement": False},
+    {"native_method": "method10-mattes", "local_3d_refinement": True},
+])
+def test_unvalidated_local_3d_attempt_cannot_seed_recovery(cache: dict) -> None:
+    row = {"status": "accepted", "selected_attempt": "local_3d_affine_refinement",
+           "cache_config": cache}
+    assert not subject._is_native_source(row, "method6")
+
+
+def test_quality_rejected_local_refinement_uses_final_attempt_not_native_precursor() -> None:
+    row = _spatial_row(reason='quality_gate_grad_ncc')
+    row['cache_config'] = dict(native_method='method6', local_3d_refinement=True)
+    row['method8_attempts'][1]['rejection_reason'] = None
+    row['method8_attempts'][1]['status'] = 'accepted'
+    row['method8_attempts'][1]['local_translation_zyx'] = [0, 0, 9]
+    row['method8_attempts'].append(_attempt('local_3d_affine_refinement', reason='quality_gate_grad_ncc', grad=0.15, x=7))
+    row['outlier_recovery']['native_rerun_gradient_component_ncc_mean'] = 0.15
+    scorer = _FakeScorer({3.0: [0.3, 0.4], 7.0: [0.5, 0.6]})
+    promoted = subject._promote_spatial_fallback(
+        row, native_method='method6', scorer=scorer, image_ncc_margin=0.02,
+        maximum_unverified_rerun_departure_px=60,
+    )
+    assert promoted['selected_attempt'] == 'local_3d_affine_refinement'
+    assert promoted['selected_local_translation_zyx'] == [0, 0, 7]
+    assert promoted['selected_gradient_component_ncc_mean'] == 0.15
+    assert scorer.compared == [[3, 7]]
+
+
+@pytest.mark.parametrize('reason', ['local_3d_validation_residual', 'insufficient_local_3d_support'])
+def test_local_refinement_validation_failure_is_not_quality_only(reason: str) -> None:
+    row = _spatial_row(reason=reason)
+    row['cache_config'] = dict(native_method='method6', local_3d_refinement=True)
+    row['method8_attempts'].append(_attempt('local_3d_affine_refinement', reason=reason, grad=0.15, x=7))
+    assert subject._quality_gate_rejected_native_rerun(
+        row, native_method='method6', interpolated=np.concatenate([np.eye(3).ravel(), [0, 0, 3]]),
+    ) is None
+
+
+def test_recorded_local_refinement_requires_one_final_attempt() -> None:
+    row = _spatial_row(reason='quality_gate_grad_ncc')
+    row['cache_config'] = dict(native_method='method6', local_3d_refinement=True)
+    with pytest.raises(ValueError, match='Expected one final local'):
+        subject._quality_gate_rejected_native_rerun(
+            row, native_method='method6', interpolated=np.concatenate([np.eye(3).ravel(), [0, 0, 3]]),
+        )
+
+
+WEAK_PLANES = [_shift(0.0, -6.0, peak=0.15, second=0.1), _shift(0.0, 2.0, peak=0.15, second=0.1)]
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "status", "selected", "aggregated"),
+    [
+        # Weak planes alone leave the interpolation unverified and accepted.
+        ({}, "accepted", "interpolated", [3.0]),
+        ({3.0: _shift(0.0, 0.0)}, "accepted", "interpolated", [3.0]),
+        # A confident aggregate misalignment is corrected (x = 3 + 4 * -6) once the aggregate verifies the shift.
+        ({3.0: _shift(0.0, -6.0), -21.0: _shift(0.0, 0.5)}, "accepted", "residual_corrected_interpolated", [3.0, 9.0, 11.0, -21.0]),
+        # Without a verified candidate the measured misalignment is withheld.
+        ({3.0: _shift(0.0, -6.0), -21.0: _shift(0.0, 5.0)}, "rejected", "interpolated", [3.0, 9.0, 11.0, -21.0]),
+    ],
+)
+def test_spatial_promotion_measures_weak_planes_with_the_aggregate_residual(
+    tmp_path: Path, aggregate: dict[float, PlaneShift], status: str, selected: str, aggregated: list[float]
+) -> None:
+    residuals = {x: WEAK_PLANES for x in (3.0, 9.0, 11.0, -21.0)}
+    scorer = _CandidateScorer({}, residuals, aggregate)
+
+    promoted = _promote_window(_recorded_fit_row(tmp_path), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    assert scorer.aggregated == aggregated
+    assert promoted["status"] == status
+    assert promotion["selected_candidate"] == selected
+    assert promotion["residual"]["verdict"] == ("verified" if selected != "interpolated" else "unverified")
+    if selected == "residual_corrected_interpolated":
+        assert promoted["selected_local_translation_zyx"] == [0.0, 0.0, -21.0]
+        assert promotion["residual"]["aggregate"]["verdict"] == "verified"
+    if status == "rejected":
+        assert promotion["aggregate_residual"]["verdict"] == "contradicted"
+
+
+def test_spatial_promotion_skips_the_aggregate_when_a_plane_is_confident(tmp_path: Path) -> None:
+    scorer = _CandidateScorer({}, {3.0: VERIFIED}, {3.0: _shift(0.0, -6.0)})
+
+    promoted = _promote_window(_recorded_fit_row(tmp_path), scorer)
+
+    assert scorer.aggregated == []
+    assert promoted["interpolated_fallback_promotion"]["aggregate_residual"] is None
+    assert promoted["status"] == "accepted"
+
+
+SPREAD_PLANES = [_shift(0.0, -5.0), _shift(0.0, -8.0), _shift(0.0, -11.0)]
+
+
+@pytest.mark.parametrize(
+    ("corrected", "status", "selected"),
+    [
+        # Planes 3 px apart around a -8 px median: the shift to x = 3 + 4 * -8 is promoted once it verifies.
+        (VERIFIED, "accepted", "residual_corrected_interpolated"),
+        # Disagreeing planes never contradict, so an unverified correction leaves the interpolation accepted.
+        (UNVERIFIED, "accepted", "interpolated"),
+    ],
+)
+def test_spatial_promotion_corrects_a_depth_varying_misalignment(
+    tmp_path: Path, corrected: list[PlaneShift], status: str, selected: str
+) -> None:
+    scorer = _CandidateScorer({}, {3.0: SPREAD_PLANES, 9.0: UNVERIFIED, 11.0: UNVERIFIED, -29.0: corrected})
+
+    promoted = _promote_window(_recorded_fit_row(tmp_path), scorer)
+
+    promotion = promoted["interpolated_fallback_promotion"]
+    assert scorer.checked == [3.0, 9.0, 11.0, -29.0]
+    assert promoted["status"] == status
+    assert promotion["selected_candidate"] == selected
+    expected_x = -29.0 if selected == "residual_corrected_interpolated" else 3.0
+    assert promoted["selected_local_translation_zyx"] == [0.0, 0.0, expected_x]

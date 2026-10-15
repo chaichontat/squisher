@@ -11,11 +11,11 @@ import numpy as np
 
 from squisher_lightsheet.channel_affine import write_global_channel_affine_registration
 from squisher_lightsheet.native_reg3dgpu import DEFAULT_LIB_DIR
+from squisher_lightsheet.local_affine import local_affine_cache_config
+from squisher_lightsheet._backends import backend_executable
 
 
-DEFAULT_SWEEP_RUNNER = Path(
-    "/home/chaichontat/nvme/lightsheet/scripts/run_fused_fixed_method8_sweep.py"
-)
+DEFAULT_SWEEP_RUNNER = Path(__file__).parent / "_backends" / "fused_fixed_sweep.py"
 SUMMARY_NAME = "fused_fixed_method8_summary.json"
 SPATIAL_RECOVERY_ATTEMPT = "interpolated_method6_spatial_recovery"
 LINEAR_MAPPING_RECOVERY_ATTEMPT = "interpolated_method6_linear_mapping_recovery"
@@ -370,6 +370,10 @@ def validate_method6_summary(
     fit_intensity_transform: FitIntensityTransform = "log1p",
     starting_affine_matrix_zyx: Sequence[float] = DEFAULT_STARTING_AFFINE_MATRIX_ZYX,
     min_grad_ncc: float = 0.24,
+    local_3d_refinement: bool = False,
+    local_affine_estimator: Literal["least-squares", "restrained"] = "least-squares",
+    level0_initializer: str = "level2-method8",
+    split_parent_windows: bool = False,
 ) -> dict[str, Any]:
     """Reject cached output unless it matches the canonical Method 6 contract."""
     payload = json.loads(summary_path.read_text())
@@ -382,7 +386,7 @@ def validate_method6_summary(
     expected_scalars = {
         "native_method": "method6",
         "fit_intensity_transform": fit_intensity_transform,
-        "level0_initializer": "level2-method8",
+        "level0_initializer": level0_initializer,
         "moving_channel": moving_channel,
     }
     for key, expected in expected_scalars.items():
@@ -391,6 +395,16 @@ def validate_method6_summary(
             raise ValueError(
                 f"Method 6 summary contract mismatch for {key}: expected {expected!r}, got {actual!r}"
             )
+    if cache.get("split_parent_windows", False) is not split_parent_windows:
+        raise ValueError("Method 6 summary contract mismatch for split_parent_windows")
+    if cache.get("local_3d_refinement", False) is not local_3d_refinement:
+        raise ValueError("Method 6 summary contract mismatch for local_3d_refinement")
+    expected_policy = local_affine_cache_config(local_affine_estimator)
+    if cache.get("local_affine_estimator", "least-squares") != local_affine_estimator:
+        raise ValueError("Method 6 summary contract mismatch for local_affine_estimator")
+    for key, expected in expected_policy.items():
+        if cache.get(key) != expected:
+            raise ValueError(f"Method 6 summary contract mismatch for {key}")
     expected_matrix = normalize_starting_affine_matrix_zyx(starting_affine_matrix_zyx)
     try:
         actual_matrix = normalize_starting_affine_matrix_zyx(cache["starting_affine_matrix_zyx"])
@@ -445,12 +459,17 @@ def run_fused_fixed_method6(
     target_label: str,
     sweep_runner: Path = DEFAULT_SWEEP_RUNNER,
     window_filter_json: Path | None = None,
+    parent_window_dir: Path | None = None,
+    parent_reference_fused: Path | None = None,
+    split_parent_windows: bool = False,
     core_shape_zyx: tuple[int, int, int] = (480, 480, 480),
     window_shape_zyx: tuple[int, int, int] = (528, 528, 528),
     fit_downsample_zyx: tuple[int, int, int] = (1, 1, 1),
     native_lib_dir: Path = DEFAULT_LIB_DIR,
     ftol: float = 1e-4,
     max_iterations: int = 300,
+    local_3d_refinement: bool = False,
+    local_affine_estimator: Literal["least-squares", "restrained"] = "least-squares",
     phase_upsample_factor: int = 10,
     min_corr: float = 0.15,
     min_grad_ncc: float = 0.24,
@@ -466,6 +485,13 @@ def run_fused_fixed_method6(
     resume: bool = True,
 ) -> tuple[Path, Path]:
     """Run the Prod2-style fused-fixed Method 6 fit and emit a canonical registration."""
+    if split_parent_windows and parent_window_dir is None:
+        raise ValueError("split_parent_windows requires parent_window_dir")
+    if parent_reference_fused is not None and parent_window_dir is None:
+        raise ValueError("parent_reference_fused requires parent_window_dir")
+    local_affine_cache_config(local_affine_estimator)
+    if local_affine_estimator != "least-squares" and not local_3d_refinement:
+        raise ValueError("restrained estimator requires local_3d_refinement")
     if fit_intensity_transform not in {"linear", "log1p"}:
         raise ValueError(
             "fit_intensity_transform must be either 'linear' or 'log1p', got "
@@ -480,10 +506,11 @@ def run_fused_fixed_method6(
         fixed_fused=fixed_fused,
         output_dir=output_dir,
     )
-    command = [
-        sys.executable,
-        "-u",
-        str(sweep_runner.resolve()),
+    if sweep_runner.resolve() == DEFAULT_SWEEP_RUNNER.resolve():
+        command = [str(backend_executable("lightsheet-fused-fixed-sweep"))]
+    else:
+        command = [sys.executable, "-u", str(sweep_runner.resolve())]
+    command.extend([
         "--fixed-position",
         str(effective_fixed_position.resolve()),
         "--moving-position",
@@ -535,9 +562,17 @@ def run_fused_fixed_method6(
         "--devices",
         ",".join(map(str, devices)),
         "--level0-initializer",
-        "level2-method8",
+        "window-parent" if parent_window_dir is not None else "level2-method8",
         "--resume" if resume else "--no-resume",
-    ]
+    ])
+    if parent_window_dir is not None:
+        command.extend(["--parent-window-dir", str(parent_window_dir.resolve())])
+    if parent_reference_fused is not None:
+        command.extend(["--parent-reference-fused", str(parent_reference_fused.resolve())])
+    if split_parent_windows:
+        command.append("--split-parent-windows")
+    if local_3d_refinement:
+        command.extend(["--local-3d-refinement", "--local-affine-estimator", local_affine_estimator])
     if window_filter_json is not None:
         command.extend(["--window-filter-json", str(window_filter_json.resolve())])
     if max_windows is not None:
@@ -557,6 +592,10 @@ def run_fused_fixed_method6(
         fit_intensity_transform=fit_intensity_transform,
         starting_affine_matrix_zyx=normalized_starting_affine,
         min_grad_ncc=min_grad_ncc,
+        local_3d_refinement=local_3d_refinement,
+        local_affine_estimator=local_affine_estimator,
+        level0_initializer="window-parent" if parent_window_dir is not None else "level2-method8",
+        split_parent_windows=split_parent_windows,
     )
     registration = write_global_channel_affine_registration(
         window_dir=output_dir / "window_json",
